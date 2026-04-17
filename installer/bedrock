@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Bedrock CLI — cluster management on each node.
+
+Commands:
+  bedrock bootstrap        — one-time OS prep (called by install.sh)
+  bedrock init             — start a new cluster (installs full mgmt stack)
+  bedrock join             — join an existing cluster (agent-only)
+  bedrock status           — cluster + node health
+  bedrock node ...         — node operations
+  bedrock vm ...           — VM operations
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib/bedrock")
+# Also support running from source tree during development
+_SRC_LIB = Path(__file__).parent / "lib"
+if _SRC_LIB.exists():
+    sys.path.insert(0, str(_SRC_LIB.parent))
+
+
+STATE_FILE = Path("/etc/bedrock/state.json")
+INSTALLER_ENV = Path("/etc/bedrock/installer.env")
+
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def get_repo():
+    """Return the repo URL (from /etc/bedrock/installer.env)."""
+    if INSTALLER_ENV.exists():
+        for line in INSTALLER_ENV.read_text().splitlines():
+            if line.startswith("BEDROCK_REPO="):
+                return line.split("=", 1)[1].strip()
+    return os.environ.get("BEDROCK_REPO", "http://192.168.2.145:8000")
+
+
+# ── Subcommands ────────────────────────────────────────────────────────────
+
+def cmd_bootstrap(args):
+    """One-time OS-level prep. Called right after install.sh."""
+    from lib import hardware, os_setup, packages
+
+    print("\n=== Bedrock Bootstrap ===\n")
+
+    hw = hardware.detect()
+    print(f"Node: {hw['hostname']}  ({hw['cpu_model']})")
+    print(f"  vCPUs: {hw['vcpus']}  RAM: {hw['ram_mb']}MB")
+    print(f"  NICs: {', '.join(n['name'] for n in hw['nics'] if n['state'] == 'UP')}")
+    print(f"  Storage: {hw['root_disk_gb']}GB root disk")
+    print()
+
+    print("Installing base packages (KVM, DRBD, libvirt, exporters)...")
+    packages.install_base()
+
+    print("Configuring OS (SELinux, firewall, hostname)...")
+    os_setup.configure_base(hw)
+
+    print("Configuring networking (br0 bridge)...")
+    os_setup.configure_bridge(hw)
+
+    # Save hardware info to state
+    state = load_state()
+    state["hardware"] = hw
+    state["bootstrap_done"] = True
+    save_state(state)
+
+    print()
+    print("Bootstrap complete. Next steps:")
+    print("  bedrock init             — start a new cluster")
+    print("  bedrock join [--witness HOST]  — join existing cluster")
+    print()
+
+
+def cmd_init(args):
+    """Start a new cluster as the first node."""
+    from lib import mgmt_install, state as state_mod
+    state = load_state()
+    if not state.get("bootstrap_done"):
+        print("ERROR: run `bedrock bootstrap` first.")
+        return 1
+
+    if state.get("cluster_uuid"):
+        print(f"Already a member of cluster {state.get('cluster_name')}")
+        return 1
+
+    print("\n=== Bedrock Init (new cluster) ===\n")
+    cluster_name = args.name or f"bedrock-{socket.gethostname()}"
+    print(f"Creating cluster: {cluster_name}")
+
+    mgmt_install.install_full(cluster_name=cluster_name, witness_host=args.witness,
+                              repo=get_repo())
+
+    state = load_state()
+    print()
+    print(f"Cluster {state.get('cluster_name')} initialised.")
+    my_ip = state.get("mgmt_ip", "<node-ip>")
+    print(f"Dashboard: http://{my_ip}:8080")
+    print()
+
+
+def cmd_join(args):
+    """Join an existing cluster."""
+    from lib import agent_install, discovery
+    state = load_state()
+    if not state.get("bootstrap_done"):
+        print("ERROR: run `bedrock bootstrap` first.")
+        return 1
+
+    if state.get("cluster_uuid"):
+        print(f"Already a member of cluster {state.get('cluster_name')}")
+        return 1
+
+    print("\n=== Bedrock Join (existing cluster) ===\n")
+
+    witness = args.witness
+    if not witness:
+        print("Discovering cluster on LAN...")
+        found = discovery.find_witness()
+        if not found:
+            print("No cluster found. Use --witness to specify manually.")
+            return 1
+        witness = found
+        print(f"Found witness: {witness}")
+
+    cluster_info = discovery.query_cluster(witness)
+    if not cluster_info:
+        print(f"Cannot get cluster info from {witness}")
+        return 1
+
+    print(f"Cluster: {cluster_info.get('cluster_name')} "
+          f"({len(cluster_info.get('nodes', []))} existing nodes)")
+    if not args.yes:
+        ans = input("Join this cluster? [Y/n] ").strip().lower()
+        if ans == "n":
+            return 0
+
+    agent_install.install(witness=witness, cluster_info=cluster_info, repo=get_repo())
+    print("\nJoined. Check status with: bedrock status")
+
+
+def cmd_status(args):
+    """Show cluster + node status."""
+    state = load_state()
+    if not state:
+        print("Not yet initialised. Run `bedrock bootstrap` then `bedrock init` or `bedrock join`.")
+        return
+
+    print(f"Cluster: {state.get('cluster_name', '<none>')}")
+    print(f"Node:    {state.get('node_name', socket.gethostname())}")
+    print(f"Role:    {state.get('role', 'compute')}")
+    print(f"Mgmt IP: {state.get('mgmt_ip', '-')}")
+    print(f"Witness: {state.get('witness_host', '-')}")
+    print()
+    # Delegate to the dashboard API if available for full cluster view
+    import urllib.request
+    try:
+        mgmt_url = state.get("mgmt_url", f"http://{state.get('mgmt_ip', 'localhost')}:8080")
+        r = urllib.request.urlopen(mgmt_url + "/api/cluster", timeout=3)
+        import json as _json
+        data = _json.loads(r.read())
+        for name, n in data.get("nodes", {}).items():
+            print(f"  {name}: online={n['online']}  vms={n.get('running_vms',[])}")
+    except Exception as e:
+        print(f"  (mgmt API unreachable: {e})")
+
+
+def cmd_node(args):
+    """Node subcommands."""
+    if args.action == "list":
+        _cmd_node_list()
+    elif args.action == "maintenance":
+        _cmd_node_maint(args.target, args.mode)
+
+
+def _cmd_node_list():
+    print("(TODO: node list)")
+
+
+def _cmd_node_maint(target, mode):
+    print(f"(TODO: node {target} maintenance {mode})")
+
+
+def cmd_vm(args):
+    """VM subcommands — delegates to lib/vm.py."""
+    from lib import vm as vm_mod
+    state = load_state()
+
+    if args.action == "list":
+        vm_mod.list_vms(state)
+    elif args.action == "create":
+        vm_mod.create_vm(state, name=args.name, vm_type=args.type,
+                         ram=args.ram, disk=args.disk)
+    elif args.action == "migrate":
+        vm_mod.migrate_vm(state, name=args.name, target=args.to)
+    elif args.action == "delete":
+        vm_mod.delete_vm(state, name=args.name)
+
+
+# ── argparse ───────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(prog="bedrock", description="Bedrock cluster CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("bootstrap",
+        help="One-time OS prep (called by install.sh)").set_defaults(func=cmd_bootstrap)
+
+    p_init = sub.add_parser("init", help="Start a new cluster")
+    p_init.add_argument("--name", help="Cluster name (default: bedrock-<hostname>)")
+    p_init.add_argument("--witness", help="External witness host (default: self-hosted)")
+    p_init.set_defaults(func=cmd_init)
+
+    p_join = sub.add_parser("join", help="Join an existing cluster")
+    p_join.add_argument("--witness", help="Witness host (auto-discovered if omitted)")
+    p_join.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_join.set_defaults(func=cmd_join)
+
+    sub.add_parser("status", help="Cluster + node status").set_defaults(func=cmd_status)
+
+    p_node = sub.add_parser("node", help="Node operations")
+    p_node_sub = p_node.add_subparsers(dest="action", required=True)
+    p_node_sub.add_parser("list")
+    p_node_maint = p_node_sub.add_parser("maintenance")
+    p_node_maint.add_argument("target")
+    p_node_maint.add_argument("mode", choices=["on", "off"])
+    p_node.set_defaults(func=cmd_node)
+
+    p_vm = sub.add_parser("vm", help="VM operations")
+    p_vm_sub = p_vm.add_subparsers(dest="action", required=True)
+    p_vm_sub.add_parser("list")
+    p_vm_create = p_vm_sub.add_parser("create")
+    p_vm_create.add_argument("name")
+    p_vm_create.add_argument("--type", choices=["cattle", "pet", "vipet"], default="cattle")
+    p_vm_create.add_argument("--ram", type=int, default=1024)
+    p_vm_create.add_argument("--disk", type=int, default=10)
+    p_vm_migrate = p_vm_sub.add_parser("migrate")
+    p_vm_migrate.add_argument("name")
+    p_vm_migrate.add_argument("--to")
+    p_vm_delete = p_vm_sub.add_parser("delete")
+    p_vm_delete.add_argument("name")
+    p_vm.set_defaults(func=cmd_vm)
+
+    args = p.parse_args()
+    rc = args.func(args)
+    sys.exit(rc or 0)
+
+
+if __name__ == "__main__":
+    main()

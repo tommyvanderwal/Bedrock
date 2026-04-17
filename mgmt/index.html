@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Bedrock Cluster Manager</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0d1117; color: #e6edf3; padding: 20px; }
+h1 { font-size: 22px; margin-bottom: 16px; color: #58a6ff; }
+h2 { font-size: 16px; margin: 16px 0 8px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+.card.offline { border-color: #f85149; opacity: 0.7; }
+.card h3 { font-size: 15px; margin-bottom: 8px; }
+.card .stat { display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px; }
+.card .stat .label { color: #8b949e; }
+.card .stat .value { font-weight: 500; }
+
+.tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.tag.running { background: #1a7f37; color: #fff; }
+.tag.off { background: #6e7681; color: #fff; }
+.tag.primary { background: #1f6feb; color: #fff; }
+.tag.secondary { background: #30363d; color: #8b949e; }
+.tag.uptodate { background: #1a7f37; color: #fff; }
+.tag.syncing { background: #d29922; color: #000; }
+.tag.online { background: #1a7f37; color: #fff; }
+.tag.offline { background: #f85149; color: #fff; }
+.tag.witness { background: #8957e5; color: #fff; }
+
+table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+th { background: #21262d; text-align: left; padding: 10px 12px; font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+td { padding: 10px 12px; border-top: 1px solid #21262d; font-size: 13px; }
+tr:hover td { background: #1c2128; }
+
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: #21262d; color: #e6edf3; font-size: 12px; cursor: pointer; text-decoration: none; }
+.btn:hover { background: #30363d; }
+.btn.start { border-color: #1a7f37; color: #3fb950; }
+.btn.migrate { border-color: #1f6feb; color: #58a6ff; }
+.btn.stop { border-color: #d29922; color: #d29922; }
+.btn.poweroff { border-color: #f85149; color: #f85149; }
+.btn.console { border-color: #8957e5; color: #bc8cff; }
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.status-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; font-size: 13px; }
+.status-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot.green { background: #3fb950; }
+.dot.red { background: #f85149; }
+.dot.yellow { background: #d29922; }
+
+.toast { position: fixed; bottom: 20px; right: 20px; background: #21262d; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; font-size: 13px; z-index: 100; display: none; }
+.toast.show { display: block; }
+.toast.error { border-color: #f85149; }
+.toast.success { border-color: #3fb950; }
+#refreshing { color: #8b949e; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <h1>Bedrock Cluster Manager</h1>
+  <span id="refreshing"></span>
+</div>
+
+<div class="status-bar" id="status-bar"></div>
+
+<h2>Nodes</h2>
+<div class="grid" id="nodes-grid"></div>
+
+<h2>Virtual Machines</h2>
+<table>
+  <thead>
+    <tr>
+      <th>VM</th>
+      <th>State</th>
+      <th>Running On</th>
+      <th>Backup</th>
+      <th>DRBD</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="vm-table"></tbody>
+</table>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let refreshTimer;
+
+function tag(text, cls) {
+  return `<span class="tag ${cls}">${text}</span>`;
+}
+
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (type || '');
+  setTimeout(() => t.className = 'toast', 4000);
+}
+
+async function apiAction(url, method) {
+  try {
+    const r = await fetch(url, { method: method || 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || d.message || 'Failed');
+    toast(JSON.stringify(d), 'success');
+    setTimeout(refresh, 1000);
+  } catch(e) {
+    toast(e.message, 'error');
+  }
+}
+
+function renderNodes(nodes) {
+  const grid = document.getElementById('nodes-grid');
+  let html = '';
+  for (const [name, n] of Object.entries(nodes)) {
+    const cls = n.online ? '' : 'offline';
+    const statusTag = n.online ? tag('Online', 'online') : tag('Offline', 'offline');
+    const memPct = n.mem_total_mb ? Math.round(n.mem_used_mb / n.mem_total_mb * 100) : 0;
+    html += `<div class="card ${cls}">
+      <h3>${name} ${statusTag}</h3>
+      <div class="stat"><span class="label">Host</span><span class="value">${n.host}</span></div>
+      <div class="stat"><span class="label">Kernel</span><span class="value">${n.kernel || '-'}</span></div>
+      <div class="stat"><span class="label">Load</span><span class="value">${n.load || '-'}</span></div>
+      <div class="stat"><span class="label">Memory</span><span class="value">${n.mem_used_mb}/${n.mem_total_mb} MB (${memPct}%)</span></div>
+      <div class="stat"><span class="label">VMs</span><span class="value">${(n.running_vms||[]).join(', ') || 'none'}</span></div>
+      <div class="stat"><span class="label">Up since</span><span class="value">${n.uptime_since || '-'}</span></div>
+      <div style="margin-top:8px"><a class="btn console" href="${n.cockpit_url}" target="_blank">Cockpit</a></div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function renderVMs(vms) {
+  const tbody = document.getElementById('vm-table');
+  let html = '';
+  for (const [name, vm] of Object.entries(vms)) {
+    const stateTag = vm.state === 'running' ? tag('Running', 'running') : tag('Shut off', 'off');
+    const running = vm.running_on || '-';
+    const backup = vm.backup_node || '-';
+
+    let drbdHtml = '';
+    if (vm.drbd_role) {
+      const roleTag = vm.drbd_role === 'Primary' ? tag('Primary', 'primary') : tag(vm.drbd_role, 'secondary');
+      const diskTag = vm.drbd_disk === 'UpToDate' ? tag('UpToDate', 'uptodate') : tag(vm.drbd_disk || '?', 'syncing');
+      drbdHtml = `${roleTag} ${diskTag}`;
+      if (vm.drbd_sync_pct) drbdHtml += ` <small>${vm.drbd_sync_pct}%</small>`;
+    } else {
+      drbdHtml = '<span style="color:#8b949e">-</span>';
+    }
+
+    const isRunning = vm.state === 'running';
+    const actions = `<div class="actions">
+      <button class="btn start" ${isRunning ? 'disabled' : ''} onclick="apiAction('/api/vms/${name}/start')">Start</button>
+      <button class="btn migrate" ${!isRunning ? 'disabled' : ''} onclick="apiAction('/api/vms/${name}/migrate')">Migrate</button>
+      <button class="btn stop" ${!isRunning ? 'disabled' : ''} onclick="apiAction('/api/vms/${name}/shutdown')">Shutdown</button>
+      <button class="btn poweroff" ${!isRunning ? 'disabled' : ''} onclick="apiAction('/api/vms/${name}/poweroff')">Power Off</button>
+      ${isRunning && vm.vnc_ws_url ? `<a class="btn console" href="/console/${name}" target="_blank">Console</a>` : ''}
+    </div>`;
+
+    html += `<tr>
+      <td><strong>${name}</strong><br><small style="color:#8b949e">${vm.drbd_resource}</small></td>
+      <td>${stateTag}</td>
+      <td>${running}</td>
+      <td>${backup}</td>
+      <td>${drbdHtml}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }
+  tbody.innerHTML = html;
+}
+
+function renderStatusBar(data) {
+  const bar = document.getElementById('status-bar');
+  let html = '';
+  for (const [name, n] of Object.entries(data.nodes)) {
+    const dot = n.online ? 'green' : 'red';
+    html += `<span><span class="dot ${dot}"></span> ${name}</span>`;
+  }
+  const wOk = !data.witness.error;
+  html += `<span><span class="dot ${wOk ? 'green' : 'red'}"></span> Witness</span>`;
+  if (data.witness.witness_uptime_secs) {
+    html += `<span style="color:#8b949e;font-size:12px">uptime ${Math.round(data.witness.witness_uptime_secs/60)}m</span>`;
+  }
+  bar.innerHTML = html;
+}
+
+async function refresh() {
+  document.getElementById('refreshing').textContent = 'Refreshing...';
+  try {
+    const r = await fetch('/api/cluster');
+    const data = await r.json();
+    renderStatusBar(data);
+    renderNodes(data.nodes);
+    renderVMs(data.vms);
+    document.getElementById('refreshing').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    document.getElementById('refreshing').textContent = 'Error: ' + e.message;
+  }
+}
+
+refresh();
+refreshTimer = setInterval(refresh, 5000);
+</script>
+</body>
+</html>

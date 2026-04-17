@@ -1,0 +1,6 @@
+<network>
+  <name>bedrock-drbd</name>
+  <!-- Isolated: simulates direct-cable full mesh between nodes.
+       No NAT, no DHCP — nodes get static IPs via cloud-init. -->
+  <bridge name='br-beddrbd' stp='on' delay='0'/>
+</network>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Bedrock VM/DRBD exporter
+After=libvirtd.service
+Wants=libvirtd.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/bedrock/bin/vm_exporter.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

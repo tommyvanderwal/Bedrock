@@ -1,0 +1,13 @@
+[Unit]
+Description=Prometheus node_exporter
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/bedrock/bin/node_exporter --web.listen-address=:9100
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

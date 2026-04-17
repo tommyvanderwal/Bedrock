@@ -1,0 +1,48 @@
+#cloud-config
+hostname: {HOSTNAME}
+fqdn: {HOSTNAME}.bedrock.local
+manage_etc_hosts: true
+
+users:
+  - name: root
+    lock_passwd: false
+    hashed_passwd: "{ROOT_PASSWD_HASH}"
+    ssh_authorized_keys:
+      - {SSH_PUBKEY}
+
+ssh_pwauth: true
+disable_root: false
+
+write_files:
+  - path: /etc/NetworkManager/system-connections/bedrock-drbd.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=bedrock-drbd
+      type=ethernet
+      interface-name=eth1
+      autoconnect=true
+
+      [ipv4]
+      method=manual
+      addresses={DRBD_IP}/24
+      dns-search=
+
+      [ipv6]
+      method=disabled
+
+  - path: /etc/hosts
+    append: true
+    content: |
+      # Bedrock testbed nodes
+{HOSTS_ENTRIES}
+
+runcmd:
+  - nmcli con delete "Wired connection 1" 2>/dev/null || true
+  - systemctl restart NetworkManager
+  - sleep 2
+  - nmcli con up bedrock-drbd || true
+  - setenforce 0 || true
+  - sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+  - systemctl disable --now firewalld 2>/dev/null || true
+  - echo "Bedrock testbed node {HOSTNAME} ready" > /etc/motd
