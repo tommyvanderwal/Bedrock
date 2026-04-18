@@ -45,6 +45,10 @@ All take `{vm_name}` in the path; return a JSON status blob.
 | POST | `/api/vms/{name}/migrate` | `{target_node?: string}` | `{status, from, to, duration_s}` | ~1 s (testbed), ~3 s (physical) |
 | POST | `/api/vms/{name}/convert` | `{target_type: "cattle"|"pet"|"vipet", peer_nodes?: [...]}` | `{status, from, to, duration_s?, resource?, peers?, added_peer?, dropped?}` | 4–15 s |
 | DELETE | `/api/vms/{name}` | — | `{status, name}` | 2–10 s (includes DRBD teardown + `lvremove`) |
+| GET | `/api/vms/{name}/settings` | — | full config blob (vcpus/ram_mb/disk_gb/priority/cdrom…) | ~instant |
+| POST | `/api/vms/{name}/resources` | `{vcpus?, ram_mb?, disk_gb?}` | per-field `{applied, requires_reboot, note}` | instant (queue) or ~1 s (disk grow) |
+| POST | `/api/vms/{name}/priority` | `{priority: "low"|"normal"|"high"}` | `{applied, priority, cpu_shares}` | instant |
+| POST | `/api/vms/{name}/cdrom` | `{action: "eject"|"insert", iso?: string}` | `{applied, note}` | instant |
 
 Typical migrate response:
 

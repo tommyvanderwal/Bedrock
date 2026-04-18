@@ -3,7 +3,7 @@
 	import { page } from '$app/stores';
 	import { vms, nodes, events } from '$lib/stores';
 	import { goto } from '$app/navigation';
-	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmConvert, vmDelete } from '$lib/api';
+	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmDelete } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
 
@@ -19,26 +19,8 @@
 	let actionStatus = $state('');
 	let converting = $state(false);
 
-	let nodeCount = $derived(Object.keys($nodes).length);
 	let replicaCount = $derived(vm?.defined_on?.length ?? 1);
-	let currentType = $derived(
-		replicaCount >= 3 ? 'vipet' : (replicaCount === 2 ? 'pet' : 'cattle')
-	);
-	let isPet = $derived(currentType === 'pet' || currentType === 'vipet');
-	let isViPet = $derived(currentType === 'vipet');
-
-	async function togglePet(e: Event) {
-		const wantHA = (e.target as HTMLInputElement).checked;
-		if (converting) return;
-		const target = wantHA ? 'pet' : 'cattle';
-		if (!confirm(`Convert ${vmName} to ${target.toUpperCase()}? VM stays online.`)) {
-			(e.target as HTMLInputElement).checked = !wantHA;
-			return;
-		}
-		converting = true;
-		await doAction(() => vmConvert(vmName, target), `Convert → ${target}`);
-		converting = false;
-	}
+	let isPet = $derived(replicaCount >= 2);  // drives Migrate button enabled/disabled
 
 	async function deleteVM() {
 		const name = vmName;
@@ -57,19 +39,6 @@
 			setTimeout(() => actionStatus = '', 8000);
 			converting = false;
 		}
-	}
-
-	async function toggleViPet(e: Event) {
-		const wantViPet = (e.target as HTMLInputElement).checked;
-		if (converting) return;
-		const target = wantViPet ? 'vipet' : 'pet';
-		if (!confirm(`Convert ${vmName} to ${target.toUpperCase()}?`)) {
-			(e.target as HTMLInputElement).checked = !wantViPet;
-			return;
-		}
-		converting = true;
-		await doAction(() => vmConvert(vmName, target), `Convert → ${target}`);
-		converting = false;
 	}
 
 	async function doAction(fn: () => Promise<any>, label: string) {
@@ -166,25 +135,6 @@
 		{/if}
 	</div>
 	<div class="info-card">
-		<h3>HA Replication</h3>
-		<label class="ha-check" class:disabled={nodeCount < 2 || converting}>
-			<input type="checkbox" checked={isPet}
-				disabled={nodeCount < 2 || converting}
-				onchange={togglePet} />
-			<span><strong>PET</strong> (HA — 2-way DRBD)</span>
-			{#if nodeCount < 2}<em class="hint">need ≥ 2 nodes</em>{/if}
-		</label>
-		<label class="ha-check nested" class:disabled={!isPet || nodeCount < 3 || converting}>
-			<input type="checkbox" checked={isViPet}
-				disabled={!isPet || nodeCount < 3 || converting}
-				onchange={toggleViPet} />
-			<span><strong>ViPet</strong> (VeryHA — 3-way DRBD)</span>
-			{#if nodeCount < 3}<em class="hint">need ≥ 3 nodes</em>
-			{:else if !isPet}<em class="hint">enable PET first</em>{/if}
-		</label>
-		<p class="ha-note">Current: <code>{currentType}</code>. Conversion is online — VM keeps running.</p>
-	</div>
-	<div class="info-card">
 		<h3>Actions</h3>
 		<div class="actions">
 			<button class="btn start" disabled={vm.state === 'running'}
@@ -199,6 +149,7 @@
 			{#if vm.state === 'running' && vm.vnc_ws_url}
 				<a href="/console/{vmName}" class="btn console">Open Console</a>
 			{/if}
+			<a href="/vm/{vmName}/settings" class="btn settings">Settings</a>
 			<button class="btn delete" disabled={converting}
 				title="Stop, tear down DRBD, remove LVs, drop from inventory"
 				onclick={deleteVM}>Delete VM</button>
@@ -252,7 +203,9 @@
 	.btn.stop { border-color: #d29922; color: #d29922; }
 	.btn.poweroff { border-color: #f85149; color: #f85149; }
 	.btn.console { border-color: #8957e5; color: #bc8cff; }
-	.btn.delete { border-color: #f85149; color: #f85149; margin-left: auto; }
+	.btn.settings { border-color: #6e7681; color: #c9d1d9; margin-left: auto; }
+	.btn.settings:hover { background: #30363d; text-decoration: none; }
+	.btn.delete { border-color: #f85149; color: #f85149; }
 	.btn.delete:hover:not(:disabled) { background: #f8514922; }
 
 	.ha-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; cursor: pointer; }

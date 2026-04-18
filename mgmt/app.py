@@ -585,6 +585,43 @@ def api_vm_delete(vm_name: str):
     return _vm_delete(vm_name)
 
 
+# ── VM settings (vcpus, ram, disk, priority, cdrom) ─────────────────────────
+
+class ResourcesRequest(BaseModel):
+    vcpus: Optional[int] = None
+    ram_mb: Optional[int] = None
+    disk_gb: Optional[int] = None
+
+
+class PriorityRequest(BaseModel):
+    priority: str  # low | normal | high
+
+
+class CdromRequest(BaseModel):
+    action: str  # "eject" | "insert"
+    iso: Optional[str] = None  # required when action=insert
+
+
+@app.get("/api/vms/{vm_name}/settings")
+def api_vm_get_settings(vm_name: str):
+    return _vm_get_settings(vm_name)
+
+
+@app.post("/api/vms/{vm_name}/resources")
+def api_vm_resources(vm_name: str, req: ResourcesRequest):
+    return _vm_set_resources(vm_name, req)
+
+
+@app.post("/api/vms/{vm_name}/priority")
+def api_vm_priority(vm_name: str, req: PriorityRequest):
+    return _vm_set_priority(vm_name, req.priority)
+
+
+@app.post("/api/vms/{vm_name}/cdrom")
+def api_vm_cdrom(vm_name: str, req: CdromRequest):
+    return _vm_set_cdrom(vm_name, req.action, req.iso)
+
+
 @app.post("/api/vms/{vm_name}/migrate")
 def api_vm_migrate(vm_name: str, req: MigrateRequest = MigrateRequest()):
     return _vm_migrate(vm_name, req.target_node)
@@ -1251,6 +1288,204 @@ def _vm_delete(vm_name: str) -> dict:
     push_log(f"Deleted VM {vm_name} (was on {','.join(defined_on)})",
              node="mgmt", app="bedrock-mgmt", level="warn")
     return {"status": "deleted", "name": vm_name}
+
+
+# ── Settings helpers ────────────────────────────────────────────────────────
+
+def _vm_host(vm_name: str) -> tuple:
+    """Return (running_on_name, host, resource_name) for a VM that exists."""
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm: raise HTTPException(404, f"Unknown VM: {vm_name}")
+    running = vm.get("running_on") or (vm.get("defined_on") or [None])[0]
+    if not running: raise HTTPException(503, "VM has no known node")
+    nodes_cfg = get_nodes()
+    return running, nodes_cfg[running]["host"], vm.get("drbd_resource", "")
+
+
+def _parse_dominfo(xml: str) -> dict:
+    """Pull vcpus, ram, cdrom target+source, disk target+source from VM XML."""
+    import re as _re
+    m_vcpu = _re.search(r"<vcpu[^>]*>(\d+)</vcpu>", xml)
+    m_mem = _re.search(r"<memory[^>]*unit=['\"]KiB['\"][^>]*>(\d+)</memory>", xml) or \
+            _re.search(r"<memory[^>]*>(\d+)</memory>", xml)
+    disks = []
+    for m in _re.finditer(r"<disk\b([^>]*)>(.*?)</disk>", xml, _re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        device = _re.search(r"device=['\"]([^'\"]+)['\"]", attrs)
+        device = device.group(1) if device else "disk"
+        src = _re.search(r"<source\s+(?:file|dev)=['\"]([^'\"]+)['\"]", body)
+        tgt = _re.search(r"<target\s+dev=['\"]([^'\"]+)['\"]\s+bus=['\"]([^'\"]+)['\"]", body)
+        if tgt:
+            disks.append({
+                "device": device, "target": tgt.group(1), "bus": tgt.group(2),
+                "source": src.group(1) if src else "",
+            })
+    return {
+        "vcpus": int(m_vcpu.group(1)) if m_vcpu else 0,
+        "ram_kib": int(m_mem.group(1)) if m_mem else 0,
+        "disks": disks,
+    }
+
+
+def _vm_get_settings(vm_name: str) -> dict:
+    running, host, resource = _vm_host(vm_name)
+    xml = ssh_cmd(host, f"virsh dumpxml {vm_name}")
+    info = _parse_dominfo(xml)
+    # disk size from the data disk (first <disk device='disk'>)
+    data_disk = next((d for d in info["disks"] if d["device"] == "disk"), None)
+    disk_bytes = 0
+    if data_disk and data_disk["source"]:
+        try:
+            disk_bytes = int(ssh_cmd(host, f"blockdev --getsize64 {data_disk['source']}"))
+        except Exception: pass
+    # Current CDROM inserted (if any). The USER's ISO slot is whichever SATA
+    # CDROM is NOT virtio-win.iso.
+    cdrom_slot, cdrom_iso = None, None
+    for d in info["disks"]:
+        if d["device"] == "cdrom":
+            fname = d["source"].rsplit("/", 1)[-1] if d["source"] else ""
+            if fname != "virtio-win.iso":
+                cdrom_slot = d["target"]
+                cdrom_iso = fname or None
+                break
+    # Priority from inventory
+    inv = load_inventory()
+    priority = (inv.get(vm_name) or {}).get("priority", "normal")
+    # Get cpu_shares live
+    try:
+        out = ssh_cmd(host, f"virsh schedinfo {vm_name} 2>/dev/null | awk '/cpu_shares/{{print $3}}'")
+        cpu_shares = int(out.strip()) if out.strip() else None
+    except Exception:
+        cpu_shares = None
+    return {
+        "name": vm_name,
+        "host": host,
+        "vcpus": info["vcpus"],
+        "ram_mb": info["ram_kib"] // 1024,
+        "disk_gb": disk_bytes // (1024**3),
+        "disk_path": data_disk["source"] if data_disk else "",
+        "disk_target": data_disk["target"] if data_disk else "",
+        "drbd_resource": resource,
+        "cdrom_slot": cdrom_slot,
+        "cdrom_iso": cdrom_iso,
+        "priority": priority,
+        "cpu_shares": cpu_shares,
+    }
+
+
+def _vm_set_resources(vm_name: str, req) -> dict:
+    running, host, resource = _vm_host(vm_name)
+    result = {}
+
+    if req.vcpus is not None:
+        if req.vcpus < 1 or req.vcpus > 32:
+            raise HTTPException(400, "vcpus must be 1-32")
+        # --config applies on next boot; also setvcpus-max to the new count so
+        # both the current and max declarations stay coherent.
+        ssh_cmd(host, f"virsh setvcpus {vm_name} {req.vcpus} --config --maximum", timeout=10)
+        ssh_cmd(host, f"virsh setvcpus {vm_name} {req.vcpus} --config", timeout=10)
+        result["vcpus"] = {"applied": True, "requires_reboot": True,
+                          "note": f"queued for next boot ({req.vcpus} vCPUs)"}
+        push_log(f"VM {vm_name}: vcpus → {req.vcpus} (reboot required)",
+                 node=running, app="bedrock-mgmt", level="info")
+
+    if req.ram_mb is not None:
+        if req.ram_mb < 128 or req.ram_mb > 131072:
+            raise HTTPException(400, "ram_mb must be 128-131072")
+        kib = req.ram_mb * 1024
+        ssh_cmd(host, f"virsh setmaxmem {vm_name} {kib} --config", timeout=10)
+        ssh_cmd(host, f"virsh setmem   {vm_name} {kib} --config", timeout=10)
+        result["ram_mb"] = {"applied": True, "requires_reboot": True,
+                           "note": f"queued for next boot ({req.ram_mb} MB)"}
+        push_log(f"VM {vm_name}: ram → {req.ram_mb} MB (reboot required)",
+                 node=running, app="bedrock-mgmt", level="info")
+
+    if req.disk_gb is not None:
+        # Grow the data LV (and DRBD if this VM is pet/ViPet), then tell QEMU.
+        cur = _vm_get_settings(vm_name)
+        cur_gb = cur["disk_gb"]
+        if req.disk_gb < cur_gb:
+            raise HTTPException(400, f"disk shrink not supported ({cur_gb}G → {req.disk_gb}G)")
+        if req.disk_gb == cur_gb:
+            result["disk_gb"] = {"applied": False, "requires_reboot": False, "note": "unchanged"}
+        else:
+            delta = req.disk_gb - cur_gb
+            nodes_cfg = get_nodes()
+            # If DRBD: grow data + meta LVs on every peer first
+            if resource:
+                existing = _parse_drbd_res(host, resource)
+                for n in existing["peers"]:
+                    ssh_cmd(nodes_cfg[n]["host"],
+                        f"lvextend -L +{delta}G {existing['lv_path']} 2>&1", timeout=30)
+                # drbdadm resize on primary propagates to peers
+                ssh_cmd(host, f"drbdadm resize {resource}", timeout=30)
+            else:
+                ssh_cmd(host, f"lvextend -L +{delta}G {cur['disk_path']} 2>&1", timeout=30)
+            # Tell QEMU the new size (live)
+            new_bytes = req.disk_gb * 1024 * 1024  # KiB units for blockresize
+            ssh_cmd(host,
+                f"virsh blockresize {vm_name} {cur['disk_target']} {new_bytes}K",
+                timeout=15)
+            # Inventory
+            inv = load_inventory()
+            if vm_name in inv:
+                inv[vm_name]["disk_gb"] = req.disk_gb
+                save_inventory(inv)
+            result["disk_gb"] = {"applied": True, "requires_reboot": False,
+                                 "note": f"live-grown {cur_gb}G → {req.disk_gb}G "
+                                         "(guest may need rescan)"}
+            push_log(f"VM {vm_name}: disk grown {cur_gb}G → {req.disk_gb}G (live)",
+                     node=running, app="bedrock-mgmt", level="info")
+
+    return result
+
+
+def _vm_set_priority(vm_name: str, priority: str) -> dict:
+    if priority not in _VALID_PRIORITIES:
+        raise HTTPException(400, f"priority must be one of {_VALID_PRIORITIES}")
+    running, host, _ = _vm_host(vm_name)
+    shares = PRIORITY_CPU_SHARES[priority]
+    ssh_cmd(host, f"virsh schedinfo {vm_name} --live --config cpu_shares={shares}",
+            timeout=10)
+    inv = load_inventory()
+    inv.setdefault(vm_name, {})["priority"] = priority
+    save_inventory(inv)
+    push_log(f"VM {vm_name}: priority → {priority} (cpu_shares={shares}, live)",
+             node=running, app="bedrock-mgmt", level="info")
+    return {"applied": True, "requires_reboot": False,
+            "priority": priority, "cpu_shares": shares}
+
+
+def _vm_set_cdrom(vm_name: str, action: str, iso: Optional[str]) -> dict:
+    if action not in ("eject", "insert"):
+        raise HTTPException(400, "action must be 'eject' or 'insert'")
+    running, host, _ = _vm_host(vm_name)
+    settings = _vm_get_settings(vm_name)
+    slot = settings.get("cdrom_slot")
+    if not slot:
+        raise HTTPException(400, "This VM has no CDROM device (was it created "
+                            "without an ISO?). Recreate with an ISO to get a "
+                            "CDROM slot.")
+    if action == "eject":
+        ssh_cmd(host, f"virsh change-media {vm_name} {slot} --eject --live --force",
+                timeout=10)
+        push_log(f"VM {vm_name}: ejected CDROM",
+                 node=running, app="bedrock-mgmt", level="info")
+        return {"applied": True, "requires_reboot": False, "note": "ejected"}
+    # insert
+    if not iso:
+        raise HTTPException(400, "iso filename required for insert")
+    iso_name = Path(iso).name
+    if not (ISO_DIR / iso_name).exists():
+        raise HTTPException(400, f"ISO not found: {iso_name}")
+    target = f"{ISO_MOUNT_DIR}/{iso_name}"
+    ssh_cmd(host,
+        f"virsh change-media {vm_name} {slot} {target} --insert --live --force",
+        timeout=10)
+    push_log(f"VM {vm_name}: inserted {iso_name}",
+             node=running, app="bedrock-mgmt", level="info")
+    return {"applied": True, "requires_reboot": False, "note": f"inserted {iso_name}"}
 
 
 # ── Metrics API (queries VictoriaMetrics) ───────────────────────────────────

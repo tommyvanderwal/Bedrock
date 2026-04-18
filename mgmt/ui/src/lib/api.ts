@@ -61,6 +61,37 @@ export async function vmDelete(name: string) {
 	return r.json();
 }
 
+export interface VMSettings {
+	name: string;
+	host: string;
+	vcpus: number;
+	ram_mb: number;
+	disk_gb: number;
+	disk_path: string;
+	disk_target: string;
+	drbd_resource: string;
+	cdrom_slot: string | null;
+	cdrom_iso: string | null;
+	priority: 'low' | 'normal' | 'high';
+	cpu_shares: number | null;
+}
+
+export async function getVmSettings(name: string): Promise<VMSettings> {
+	return apiGet(`/api/vms/${name}/settings`);
+}
+
+export async function setVmResources(name: string, body: Partial<Pick<VMSettings, 'vcpus' | 'ram_mb' | 'disk_gb'>>) {
+	return apiPost(`/api/vms/${name}/resources`, body);
+}
+
+export async function setVmPriority(name: string, priority: 'low' | 'normal' | 'high') {
+	return apiPost(`/api/vms/${name}/priority`, { priority });
+}
+
+export async function setVmCdrom(name: string, action: 'eject' | 'insert', iso?: string) {
+	return apiPost(`/api/vms/${name}/cdrom`, { action, iso });
+}
+
 export async function listIsos(): Promise<Array<{ name: string; size_bytes: number }>> {
 	return apiGet('/api/isos');
 }
