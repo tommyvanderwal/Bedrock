@@ -24,6 +24,7 @@ Only the node running `bedrock-mgmt.service` (init'd node, or a future HA mgmt):
 | 8428 | TCP | VictoriaMetrics | all IPs | `/api/v1/query`, `/api/v1/query_range`, `/-/reload` |
 | 9428 | TCP | VictoriaLogs HTTP | all IPs | `/insert/jsonline` (push_log writes), `/select/logsql/query` (reads) |
 | 5140 | TCP | VictoriaLogs syslog | all IPs | RFC 5424 syslog from cluster nodes (follow-up: auto-config per node) |
+| 2049 | TCP | NFS server (ISO library) | all IPs | Exports `/opt/bedrock/iso` read-only to cluster LAN + DRBD ring; automounted on each compute node at `/mnt/isos`. |
 
 ## External
 

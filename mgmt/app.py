@@ -580,6 +580,11 @@ def api_vm_create(req: VMCreateRequest):
     return _vm_create(req)
 
 
+@app.delete("/api/vms/{vm_name}")
+def api_vm_delete(vm_name: str):
+    return _vm_delete(vm_name)
+
+
 @app.post("/api/vms/{vm_name}/migrate")
 def api_vm_migrate(vm_name: str, req: MigrateRequest = MigrateRequest()):
     return _vm_migrate(vm_name, req.target_node)
@@ -1076,6 +1081,10 @@ def _parse_drbd_res(host: str, resource: str) -> dict:
 
 _VM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
 _VALID_PRIORITIES = ("low", "normal", "high")
+# Maps priority → libvirt cpu_shares (cgroup weight; default is 1024).
+# Powers of 2 on either side so the relative weights are clearly visible.
+PRIORITY_CPU_SHARES = {"low": 256, "normal": 1024, "high": 4096}
+ISO_MOUNT_DIR = "/mnt/isos"  # identical on every cluster node (bind/NFS)
 
 
 def _mgmt_node_name() -> str:
@@ -1118,7 +1127,9 @@ def _vm_create(req) -> dict:
     iso_path = ""
     if req.iso:
         iso_name = Path(req.iso).name  # prevent traversal
-        iso_path = f"/opt/bedrock/iso/{iso_name}"
+        # Reference via the cluster-wide auto-mount path — identical on every
+        # node so future cross-node creates work without changing this arg.
+        iso_path = f"{ISO_MOUNT_DIR}/{iso_name}"
         if not (ISO_DIR / iso_name).exists():
             raise HTTPException(400, f"ISO not found: {iso_name}")
 
@@ -1164,7 +1175,12 @@ def _vm_create(req) -> dict:
         ssh_cmd_rc(host, f"lvremove -f {lv_path} 2>&1", timeout=15)
         raise HTTPException(500, f"virt-install failed: {out[-400:]}")
 
-    # 3. Save inventory
+    # 3. Apply priority → cpu_shares (cgroup weight, default 1024)
+    shares = PRIORITY_CPU_SHARES[req.priority]
+    ssh_cmd_rc(host, f"virsh schedinfo {req.name} --live --config "
+                     f"cpu_shares={shares} 2>&1", timeout=15)
+
+    # 4. Save inventory
     inv = load_inventory()
     inv[req.name] = {
         "priority": req.priority,
@@ -1179,9 +1195,56 @@ def _vm_create(req) -> dict:
     save_inventory(inv)
 
     push_log(f"Created VM {req.name} on {home_name} "
-             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {req.disk_gb}GB, priority={req.priority})",
+             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {req.disk_gb}GB, "
+             f"priority={req.priority}, cpu_shares={shares})",
              node=home_name, app="bedrock-mgmt", level="info")
     return {"status": "created", "name": req.name, "node": home_name}
+
+
+def _vm_delete(vm_name: str) -> dict:
+    """Stop (if running), tear down DRBD (if any), undefine VM + remove LVs
+    on every node where it was defined, drop inventory entry."""
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm:
+        raise HTTPException(404, f"Unknown VM: {vm_name}")
+    nodes_cfg = get_nodes()
+    defined_on = vm.get("defined_on") or ([vm["running_on"]] if vm.get("running_on") else [])
+    if not defined_on:
+        raise HTTPException(500, "VM has no defined_on nodes")
+
+    resource = vm.get("drbd_resource", "")
+    existing = _parse_drbd_res(nodes_cfg[defined_on[0]]["host"], resource) if resource else {}
+    lv_path = existing.get("lv_path", f"/dev/almalinux/vm-{vm_name}-disk0")
+    meta_path = existing.get("meta_path", "")
+
+    # 1. Stop the VM (graceful shutdown → force-kill fallback)
+    if vm["state"] == "running" and vm.get("running_on"):
+        host = nodes_cfg[vm["running_on"]]["host"]
+        ssh_cmd_rc(host, f"virsh destroy {vm_name} 2>&1", timeout=15)
+
+    # 2. For each node that has the VM, tear it down
+    for nname in defined_on:
+        if nname not in nodes_cfg: continue
+        host = nodes_cfg[nname]["host"]
+        ssh_cmd_rc(host, f"virsh undefine {vm_name} --nvram 2>&1 || virsh undefine {vm_name} 2>&1", timeout=15)
+        if resource:
+            ssh_cmd_rc(host, f"drbdadm down {resource} 2>&1 || true", timeout=15)
+            ssh_cmd_rc(host, f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=15)
+            ssh_cmd_rc(host, f"rm -f /etc/drbd.d/{resource}.res", timeout=10)
+        # Remove LVs (data + meta if present)
+        rm_paths = lv_path + (f" {meta_path}" if meta_path else "")
+        ssh_cmd_rc(host, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
+
+    # 3. Drop inventory entry
+    inv = load_inventory()
+    if vm_name in inv:
+        inv.pop(vm_name)
+        save_inventory(inv)
+
+    push_log(f"Deleted VM {vm_name} (was on {','.join(defined_on)})",
+             node="mgmt", app="bedrock-mgmt", level="warn")
+    return {"status": "deleted", "name": vm_name}
 
 
 # ── Metrics API (queries VictoriaMetrics) ───────────────────────────────────

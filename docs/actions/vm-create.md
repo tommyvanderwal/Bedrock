@@ -1,17 +1,50 @@
-# Create a VM (`bedrock vm create`)
+# Create a VM
 
-Provisions a new VM of type `cattle`, `pet`, or `vipet`. Cattle: local thin
-LV + Alpine image. Pet: same, plus a peer LV + 2-way DRBD. ViPet: three
-peers + 3-way DRBD mesh.
+Two entry points:
 
-**Triggered by:** operator on any cluster node:
+1. **Dashboard** (`/vms/new` or `+ New VM` button on `/vms`) — simpler form
+   that always creates a cattle VM (with optional ISO boot) on the mgmt
+   node, then lets the operator convert to pet/ViPet later via the
+   checkboxes. See [`vm-convert.md`](vm-convert.md) for that. Persists
+   priority + creation metadata to `/etc/bedrock/vm_inventory.json`.
+2. **CLI** (`bedrock vm create`) — thin-client, supports direct
+   creation of any type (cattle / pet / vipet) with DRBD set up from the
+   start; runs on any cluster node.
 
-```bash
-bedrock vm create NAME --type {cattle|pet|vipet} --ram MB --disk GB
+**Source:**
+
+- Dashboard path: `mgmt/app.py:_vm_create` + `mgmt/ui/src/routes/vms/new/+page.svelte`.
+- CLI path: `installer/bedrock:cmd_vm`, `installer/lib/vm.py`,
+  `installer/lib/workload.py`.
+
+## Dashboard form
+
+```
+  /vms/new
+  ┌─────────────────────────────────────────────────────┐
+  │ Name         [ webapp2              ]               │
+  │ vCPUs        [ 2 ]  (default)                       │
+  │ RAM (MB)     [ 2048 ]  (default = 2 GB, step 128)   │
+  │ Disk (GB)    [ 20 ]    (thin-provisioned)           │
+  │ Priority     ( )low  (•)normal  ( )high             │
+  │ Install ISO  [ — no ISO —  ▼ ]   + Upload new ISO   │
+  │              (dropdown pulls from /api/isos)        │
+  │ [ Create VM ]  Cancel                               │
+  └─────────────────────────────────────────────────────┘
 ```
 
-**Source:** `installer/bedrock:cmd_vm`, `installer/lib/vm.py`,
-`installer/lib/workload.py`.
+Priority → libvirt `cpu_shares` (cgroup weight):
+
+```
+  low     =  256
+  normal  = 1024   (equals the historical libvirt default)
+  high    = 4096
+```
+
+Applied via `virsh schedinfo --live --config cpu_shares=<N>` after
+`virt-install` returns. Stored in inventory so it survives conversions
+and dashboard restarts. A "change priority" UI is a follow-up —
+`virsh schedinfo` on its own adjusts a running VM without downtime.
 
 ## Preconditions
 

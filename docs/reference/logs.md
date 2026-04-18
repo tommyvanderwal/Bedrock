@@ -61,6 +61,12 @@ Grep the code: `grep -n "push_log(" mgmt/app.py`. Full list:
 | `_vm_convert_downgrade` vipet→pet | convert API | `Convert {n}: vipet → pet (dropped {drop})` | info |
 | `_vm_convert_downgrade` →cattle | convert API | `Convert {n}: pivot {dev} back to {lv_path}` | info |
 |  |  | `Convert {n}: {cur} → cattle in {dur}s` | info |
+| `_vm_create` | `POST /api/vms/create` | `Create VM {n}: lvcreate {n}G thin on {host}` | info |
+|  |  | `Create VM {n}: virt-install (vcpus=., ram=.MB, iso=.)` | info |
+|  |  | `Created VM {n} on {host} (cattle, ...vCPU, ...MB, ...GB, priority=., cpu_shares=.)` | info |
+| `_vm_delete` | `DELETE /api/vms/{n}` | `Deleted VM {n} (was on {nodes})` | warn |
+| `api_upload_iso` | `POST /api/isos/upload` | `ISO uploaded: {name} ({N} MB)` | info |
+| `api_delete_iso` | `DELETE /api/isos/{n}` | `ISO deleted: {name}` | info |
 
 All entries carry:
 

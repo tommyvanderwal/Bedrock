@@ -62,8 +62,51 @@ DRBD state is untouched — the resource stays Primary on that node.
 
 ## Delete
 
-**Trigger:** `bedrock vm delete NAME` (CLI only today; no UI button yet).
-**Source:** `installer/lib/vm.py:delete_vm`.
+**Trigger:**
+
+- Dashboard: `Delete VM` button on the VM detail page → double-confirm
+  (browser `confirm()` + `prompt()` requiring the VM name to be typed).
+  On success, redirects to `/vms`.
+- HTTP: `DELETE /api/vms/{name}` — no body, idempotent-ish (a repeat
+  call on a non-existent VM returns 404).
+- CLI: `bedrock vm delete NAME` — same effect, different code path.
+
+**Source:** `mgmt/app.py:_vm_delete` (dashboard + HTTP) and
+`installer/lib/vm.py:delete_vm` (CLI).
+
+## Delete — dashboard / HTTP flow
+
+```
+  DELETE /api/vms/NAME
+  │
+  │ build_cluster_state → vm
+  │
+  │ if vm.drbd_resource:
+  │    existing = _parse_drbd_res(host, resource)
+  │      → peers, lv_path, meta_path
+  │ else:
+  │    lv_path  = /dev/almalinux/vm-NAME-disk0
+  │    meta_path = ""
+  │
+  │ if vm.state == running:
+  │    ssh host: virsh destroy NAME   (force-kill)
+  │
+  │ for node in defined_on:
+  │    ssh host: virsh undefine NAME --nvram (fallback: without --nvram)
+  │    if drbd:
+  │      ssh host: drbdadm down RES
+  │      ssh host: drbdadm wipe-md --force RES
+  │      ssh host: rm -f /etc/drbd.d/RES.res
+  │    ssh host: lvremove -f {lv_path} {meta_path}
+  │
+  │ load_inventory(); inv.pop(NAME); save_inventory(inv)
+  │
+  │ push_log "Deleted VM NAME (was on <nodes>)"   level=warn
+  │
+  │ return {"status": "deleted", "name": NAME}
+```
+
+## Delete — CLI flow (legacy)
 
 ```
   T=0    bedrock vm delete NAME
@@ -95,11 +138,13 @@ first (like the convert downgrade path does) and remove both LVs.
 VM NAME started on <host>                              level=info
 VM NAME shutdown requested on <host>                   level=info
 VM NAME powered off on <host>                          level=warn
+Deleted VM NAME (was on <node1>,<node2>,...)           level=warn
 ```
 
-`delete_vm` currently runs client-side (CLI) and doesn't `push_log` —
-history of deletion only shows up in bash / ssh session logs unless run
-via a future `/api/vms/{name}` DELETE endpoint.
+The dashboard DELETE path emits a `push_log` that streams live through
+Recent Logs. The CLI `bedrock vm delete` runs on a node, not in the
+mgmt process, so it does not yet stream. Running delete via the HTTP
+API is the stream-friendly path.
 
 ## Why
 

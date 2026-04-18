@@ -91,6 +91,18 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
     run("systemctl enable --now nfs-server >/dev/null 2>&1", check=False)
     run("exportfs -ra 2>&1 || true", check=False)
 
+    # Bind-mount /opt/bedrock/iso → /mnt/isos so the mgmt node references
+    # ISOs via the same path as compute nodes (which NFS-mount there).
+    Path("/mnt/isos").mkdir(exist_ok=True)
+    Path("/etc/systemd/system/mnt-isos.mount").write_text(
+        "[Unit]\nDescription=Bedrock ISO library (bind mount)\n\n"
+        "[Mount]\nWhat=/opt/bedrock/iso\nWhere=/mnt/isos\n"
+        "Type=none\nOptions=bind,ro\n\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+    run("systemctl daemon-reload", check=False)
+    run("systemctl enable --now mnt-isos.mount >/dev/null 2>&1", check=False)
+
     # 4. FastAPI + Svelte dashboard files
     print("  Installing dashboard application...")
     # Fetch a tarball of the mgmt app (pre-packaged on repo)

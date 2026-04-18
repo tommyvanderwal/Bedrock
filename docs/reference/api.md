@@ -21,17 +21,30 @@ Side effects: appends to `/etc/bedrock/cluster.json`, regenerates
 `/opt/bedrock/scrape.yml`, POSTs `/-/reload` to VictoriaMetrics,
 pushes `Node X (...) registered with cluster` log event.
 
+## ISO library
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/isos` | — | `[{name, size_bytes}, ...]` |
+| POST | `/api/isos/upload` | multipart/form-data with `file` field | `{status, name, size_bytes}` |
+| DELETE | `/api/isos/{name}` | — | `{status, name}` — 404 if not found |
+
+Uploads stream in 1 MB chunks directly to `/opt/bedrock/iso/` on the
+mgmt node; path traversal is blocked.
+
 ## VM actions
 
 All take `{vm_name}` in the path; return a JSON status blob.
 
 | Method | Path | Body | Returns | Duration |
 |---|---|---|---|---|
+| POST | `/api/vms/create` | `{name, vcpus=2, ram_mb=2048, disk_gb=20, priority="normal", iso?}` | `{status, name, node}` | 10–30 s (blank), 5–10 s (ISO boot) |
 | POST | `/api/vms/{name}/start` | — | `{status, ...}` | ~instant |
 | POST | `/api/vms/{name}/shutdown` | — | `{status}` | ~instant (guest takes longer) |
 | POST | `/api/vms/{name}/poweroff` | — | `{status}` | ~instant |
 | POST | `/api/vms/{name}/migrate` | `{target_node?: string}` | `{status, from, to, duration_s}` | ~1 s (testbed), ~3 s (physical) |
 | POST | `/api/vms/{name}/convert` | `{target_type: "cattle"|"pet"|"vipet", peer_nodes?: [...]}` | `{status, from, to, duration_s?, resource?, peers?, added_peer?, dropped?}` | 4–15 s |
+| DELETE | `/api/vms/{name}` | — | `{status, name}` | 2–10 s (includes DRBD teardown + `lvremove`) |
 
 Typical migrate response:
 

@@ -73,6 +73,28 @@ def install(witness: str, cluster_info: dict, repo: str):
             shell=True, check=False)
         print(f"  Pre-scanned {len(peer_ips)} peer host keys.")
 
+    # NFS mount the ISO library at /mnt/isos so --cdrom paths work identically
+    # on every node in the cluster.
+    print("  Installing NFS client + mounting ISO library...")
+    subprocess.run("dnf install -y -q nfs-utils >/dev/null 2>&1",
+                   shell=True, check=False)
+    Path("/mnt/isos").mkdir(exist_ok=True)
+    Path("/etc/systemd/system/mnt-isos.mount").write_text(
+        "[Unit]\nDescription=Bedrock ISO library (NFS)\nAfter=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        f"[Mount]\nWhat={mgmt_ip}:/opt/bedrock/iso\nWhere=/mnt/isos\n"
+        "Type=nfs\nOptions=ro,nolock,soft,_netdev\n\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+    Path("/etc/systemd/system/mnt-isos.automount").write_text(
+        "[Unit]\nDescription=Bedrock ISO library (automount)\n\n"
+        "[Automount]\nWhere=/mnt/isos\nTimeoutIdleSec=300\n\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+    subprocess.run("systemctl daemon-reload", shell=True, check=False)
+    subprocess.run("systemctl enable --now mnt-isos.automount >/dev/null 2>&1",
+                   shell=True, check=False)
+
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")
     print(f"  Dashboard: {s['mgmt_url']}")

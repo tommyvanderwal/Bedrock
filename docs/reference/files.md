@@ -79,8 +79,21 @@ There is no OTA mechanism yet.
 | `/opt/bedrock/data/vm/` | VictoriaMetrics (on mgmt node) | 90 d retention |
 | `/opt/bedrock/data/vl/` | VictoriaLogs (on mgmt node) | 90 d retention |
 | `/opt/bedrock/scrape.yml` | `save_cluster()` → `write_scrape_config()` on register | regenerated every time |
+| `/opt/bedrock/iso/` | operator (via dashboard `/isos` or scp) | never auto-rotated |
+| `/etc/bedrock/vm_inventory.json` | `_vm_create` and `_vm_delete` in mgmt | per-VM priority + creation metadata |
 | `/var/lib/bedrock/alpine.qcow2` | `_download_alpine_on_node()` in vm.py | cached per node, never rotated |
 | `/var/lib/bedrock-vg.img` | `_ensure_thin_pool()` (testbed only) | 20 GB loop file for synthetic VG |
+
+## ISO mount points (identical on every node)
+
+| Path | Node | Source | Mode |
+|---|---|---|---|
+| `/opt/bedrock/iso/` | mgmt | local directory | rw (writable by mgmt only) |
+| `/mnt/isos/` | mgmt | bind-mount of `/opt/bedrock/iso` | ro |
+| `/mnt/isos/` | compute | NFS automount of `<mgmt>:/opt/bedrock/iso` | ro, idle-timeout 5 min |
+
+Mount units: `/etc/systemd/system/mnt-isos.mount` (bind or NFS) and,
+on compute nodes, `/etc/systemd/system/mnt-isos.automount`.
 
 ## Systemd units
 

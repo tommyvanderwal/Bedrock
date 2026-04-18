@@ -55,6 +55,12 @@ export async function vmCreate(req: VMCreateRequest) {
 	return apiPost('/api/vms/create', req);
 }
 
+export async function vmDelete(name: string) {
+	const r = await fetch(`/api/vms/${encodeURIComponent(name)}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
 export async function listIsos(): Promise<Array<{ name: string; size_bytes: number }>> {
 	return apiGet('/api/isos');
 }

@@ -89,8 +89,11 @@
 	</div>
 
 	<div class="row">
-		<label class="field">
-			<span class="lbl">Install ISO (optional)</span>
+		<div class="field">
+			<div class="lbl-row">
+				<span class="lbl">Install ISO (optional)</span>
+				<a href="/isos" class="upload-link">+ Upload new ISO</a>
+			</div>
 			<select bind:value={iso}>
 				<option value="">— no ISO (blank VM) —</option>
 				{#each isos as i}
@@ -98,11 +101,11 @@
 				{/each}
 			</select>
 			<span class="hint">
-				{#if isos.length === 0}No ISOs available. <a href="/isos">Upload one</a>.
-				{:else}From /opt/bedrock/iso — <a href="/isos">manage</a>.
+				{#if isos.length === 0}No ISOs yet — click <strong>Upload new ISO</strong> above.
+				{:else}NFS-mounted at <code>/mnt/isos/</code> on every cluster node.
 				{/if}
 			</span>
-		</label>
+		</div>
 	</div>
 
 	{#if error}
@@ -134,6 +137,9 @@
 
 	.field { display: flex; flex-direction: column; gap: 4px; }
 	.lbl { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+	.lbl-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+	.upload-link { font-size: 11px; color: #58a6ff; padding: 2px 8px; border: 1px solid #1f6feb; border-radius: 4px; }
+	.upload-link:hover { background: #1f6feb22; text-decoration: none; }
 	.hint { font-size: 11px; color: #6e7681; }
 	.hint.ok { color: #3fb950; }
 	.hint.bad { color: #d29922; }

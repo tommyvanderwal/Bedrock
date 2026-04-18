@@ -2,7 +2,8 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { vms, nodes, events } from '$lib/stores';
-	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmConvert } from '$lib/api';
+	import { goto } from '$app/navigation';
+	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmConvert, vmDelete } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
 
@@ -37,6 +38,25 @@
 		converting = true;
 		await doAction(() => vmConvert(vmName, target), `Convert → ${target}`);
 		converting = false;
+	}
+
+	async function deleteVM() {
+		const name = vmName;
+		if (!confirm(`Delete ${name}?\n\nThis stops the VM, tears down any DRBD resource, and removes the disk LVs on every node. This cannot be undone.`)) return;
+		const confirmed = prompt(`Type the VM name to confirm:`, '');
+		if (confirmed !== name) {
+			if (confirmed !== null) alert('Name did not match. Cancelled.');
+			return;
+		}
+		converting = true;
+		try {
+			await vmDelete(name);
+			goto('/vms');
+		} catch (e: any) {
+			actionStatus = `Delete failed: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+			converting = false;
+		}
 	}
 
 	async function toggleViPet(e: Event) {
@@ -179,6 +199,9 @@
 			{#if vm.state === 'running' && vm.vnc_ws_url}
 				<a href="/console/{vmName}" class="btn console">Open Console</a>
 			{/if}
+			<button class="btn delete" disabled={converting}
+				title="Stop, tear down DRBD, remove LVs, drop from inventory"
+				onclick={deleteVM}>Delete VM</button>
 		</div>
 	</div>
 </div>
@@ -229,6 +252,8 @@
 	.btn.stop { border-color: #d29922; color: #d29922; }
 	.btn.poweroff { border-color: #f85149; color: #f85149; }
 	.btn.console { border-color: #8957e5; color: #bc8cff; }
+	.btn.delete { border-color: #f85149; color: #f85149; margin-left: auto; }
+	.btn.delete:hover:not(:disabled) { background: #f8514922; }
 
 	.ha-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; cursor: pointer; }
 	.ha-check.nested { margin-left: 20px; }
