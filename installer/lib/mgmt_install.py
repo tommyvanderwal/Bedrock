@@ -82,6 +82,22 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         "Upload install ISOs via the dashboard (/isos) or scp here directly.\n"
         "Files appear in the 'Create VM' dropdown.\n"
     )
+    # Pre-fetch the virtio-win driver ISO. Attached as a 2nd CDROM on every
+    # VM install so Windows Setup can load viostor + NetKVM without manual
+    # download. Harmless for Linux installs — ignored by the installer.
+    virtio_win = iso_dir / "virtio-win.iso"
+    if not virtio_win.exists():
+        print("  Fetching virtio-win.iso (~750 MB, one-time)...")
+        r = subprocess.run(
+            f"curl -fsSL -o {virtio_win}.tmp "
+            "https://fedorapeople.org/groups/virt/virtio-win/"
+            "direct-downloads/stable-virtio/virtio-win.iso",
+            shell=True)
+        if r.returncode == 0:
+            (iso_dir / "virtio-win.iso.tmp").rename(virtio_win)
+        else:
+            print("  WARN: virtio-win.iso download failed; Windows installs "
+                  "will need the driver ISO attached manually.")
     run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
     Path("/etc/exports.d").mkdir(exist_ok=True)
     Path("/etc/exports.d/bedrock-iso.exports").write_text(

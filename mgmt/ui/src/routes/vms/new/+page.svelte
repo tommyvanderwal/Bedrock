@@ -15,7 +15,12 @@
 	let error = $state('');
 
 	onMount(async () => {
-		try { isos = await listIsos(); } catch (e) { /* ignore */ }
+		try {
+			const all = await listIsos();
+			// virtio-win.iso is the driver disk — auto-attached by the server,
+			// not a bootable installer the operator should pick.
+			isos = all.filter((i) => i.name !== 'virtio-win.iso');
+		} catch (e) { /* ignore */ }
 	});
 
 	const nameValid = $derived(/^[a-z][a-z0-9-]{1,30}[a-z0-9]$/.test(name));
@@ -104,6 +109,8 @@
 				{#if isos.length === 0}No ISOs yet — click <strong>Upload new ISO</strong> above.
 				{:else}NFS-mounted at <code>/mnt/isos/</code> on every cluster node.
 				{/if}
+				<br />The virtio-win driver ISO is attached automatically so Windows
+				Setup can find the disk — you don't need to pick it.
 			</span>
 		</div>
 	</div>

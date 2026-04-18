@@ -1145,8 +1145,14 @@ def _vm_create(req) -> dict:
     if rc != 0 and "already exists" not in out:
         raise HTTPException(500, f"lvcreate failed: {out}")
 
-    # 2. virt-install — with or without CDROM
-    cdrom_arg = f"--cdrom {iso_path}" if iso_path else "--import"
+    # 2. virt-install — with or without CDROM. Always attach virtio-win.iso
+    #    as a 2nd CDROM when any ISO is used: Windows Setup needs it for
+    #    viostor+NetKVM; Linux installs ignore it.
+    virtio_extra = ""
+    if iso_path and (ISO_DIR / "virtio-win.iso").exists():
+        virtio_extra = (f" --disk path={ISO_MOUNT_DIR}/virtio-win.iso,"
+                        "device=cdrom,bus=sata,readonly=on")
+    cdrom_arg = f"--cdrom {iso_path}{virtio_extra}" if iso_path else "--import"
     boot_arg = "--boot cdrom,hd" if iso_path else "--boot hd"
 
     # For Windows ISOs virt-install's os-variant auto-detect works well;

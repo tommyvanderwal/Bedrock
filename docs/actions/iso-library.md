@@ -33,6 +33,21 @@ the VM is being built.
 Bedrock's VM-create code uses `/mnt/isos/` exclusively, so future
 cross-node VM provisioning works without any path rewriting.
 
+## `virtio-win.iso` — always attached, never selected
+
+When `bedrock init` runs, it fetches Red Hat's signed virtio-win ISO to
+`/opt/bedrock/iso/virtio-win.iso` (~750 MB, one-time). The mgmt node's
+`_vm_create` automatically attaches this ISO as a **second CDROM** (SATA
+bus) on every new VM that uses an install ISO. For Windows Setup it's
+the source of `viostor` (disk) and `NetKVM` (network) drivers — click
+"Load driver" during Setup and point it at the virtio-win CDROM. For
+Linux installs the extra CDROM is harmless and ignored.
+
+The driver ISO is hidden from the "New VM" install-ISO dropdown so no
+one accidentally boots off it. It stays visible on the `/isos` page
+alongside user-uploaded ISOs, where it can be deleted (the next `init`
+will re-fetch) or updated by replacing the file.
+
 ## Uploading an ISO
 
 **Via the dashboard** — recommended:
