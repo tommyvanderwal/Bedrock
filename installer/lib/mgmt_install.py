@@ -73,17 +73,35 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         _download(f"{repo}/binaries/victoria-logs", BINARIES / "victoria-logs")
         os.chmod(BINARIES / "victoria-logs", 0o755)
 
-    # 3. FastAPI + Svelte dashboard files
+    # 3. ISO library + NFS export (mgmt-node-only; compute nodes can mount it
+    #    on demand. Read-only export on mgmt LAN + DRBD ring.)
+    iso_dir = BEDROCK_BASE / "iso"
+    iso_dir.mkdir(parents=True, exist_ok=True)
+    (iso_dir / "README.md").write_text(
+        "# Bedrock ISO library\n\n"
+        "Upload install ISOs via the dashboard (/isos) or scp here directly.\n"
+        "Files appear in the 'Create VM' dropdown.\n"
+    )
+    run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
+    Path("/etc/exports.d").mkdir(exist_ok=True)
+    Path("/etc/exports.d/bedrock-iso.exports").write_text(
+        "/opt/bedrock/iso  192.168.2.0/24(ro,sync,no_subtree_check) "
+        "10.99.0.0/24(ro,sync,no_subtree_check)\n"
+    )
+    run("systemctl enable --now nfs-server >/dev/null 2>&1", check=False)
+    run("exportfs -ra 2>&1 || true", check=False)
+
+    # 4. FastAPI + Svelte dashboard files
     print("  Installing dashboard application...")
     # Fetch a tarball of the mgmt app (pre-packaged on repo)
     mgmt_tar = f"{repo}/mgmt.tar.gz"
     r = subprocess.run(f"curl -fsSL '{mgmt_tar}' -o /tmp/mgmt.tar.gz", shell=True)
     if r.returncode == 0:
         run(f"tar xzf /tmp/mgmt.tar.gz -C {MGMT} --strip-components=1")
-        run("pip3 install -q fastapi uvicorn paramiko websockets pydantic 2>&1 | tail -1 || true",
+        run("pip3 install -q fastapi uvicorn paramiko websockets pydantic python-multipart 2>&1 | tail -1 || true",
             check=False)
 
-    # 4. Prometheus scrape config — mgmt app will rewrite this whenever
+    # 5. Prometheus scrape config — mgmt app will rewrite this whenever
     #    nodes register/unregister, so we just seed with this node.
     mgmt_ip = _pick_mgmt_ip(hw)
     scrape_conf = f"""scrape_configs:
@@ -102,10 +120,10 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
 """
     (BEDROCK_BASE / "scrape.yml").write_text(scrape_conf)
 
-    # 5. Install node_exporter + vm_exporter (this node is mgmt+compute)
+    # 6. Install node_exporter + vm_exporter (this node is mgmt+compute)
     exporters.install(repo)
 
-    # 6. Systemd units
+    # 7. Systemd units
     _write_systemd("bedrock-vm", f"""[Unit]
 Description=Bedrock VictoriaMetrics
 After=network.target

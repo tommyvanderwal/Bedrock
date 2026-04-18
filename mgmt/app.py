@@ -11,7 +11,7 @@ from typing import Optional
 
 import paramiko
 import urllib.request
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -320,6 +320,19 @@ def build_cluster_state() -> dict:
             "vnc_ws_url": vnc_ws_url,
         }
 
+    # Merge per-VM inventory (priority, creation metadata)
+    inventory = load_inventory()
+    for vm_name, data in inventory.items():
+        if vm_name in vms_data:
+            vms_data[vm_name].update({
+                "priority":  data.get("priority", "normal"),
+                "vcpus":     data.get("vcpus"),
+                "ram_mb":    data.get("ram_mb"),
+                "disk_gb":   data.get("disk_gb"),
+                "iso":       data.get("iso"),
+                "created_at": data.get("created_at"),
+            })
+
     return {"nodes": nodes_data, "vms": vms_data, "witness": get_witness_status()}
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
@@ -465,6 +478,69 @@ def register_node(req: NodeRegister):
 def list_nodes():
     return load_cluster().get("nodes", {})
 
+
+# ── ISO library ─────────────────────────────────────────────────────────────
+
+ISO_DIR = Path("/opt/bedrock/iso")
+VM_INVENTORY_FILE = Path("/etc/bedrock/vm_inventory.json")
+
+
+def load_inventory() -> dict:
+    if VM_INVENTORY_FILE.exists():
+        try: return json.loads(VM_INVENTORY_FILE.read_text())
+        except Exception: return {}
+    return {}
+
+
+def save_inventory(inv: dict):
+    VM_INVENTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    VM_INVENTORY_FILE.write_text(json.dumps(inv, indent=2))
+
+
+@app.get("/api/isos")
+def api_list_isos():
+    """Return the list of .iso files in /opt/bedrock/iso with sizes."""
+    if not ISO_DIR.exists(): return []
+    out = []
+    for p in sorted(ISO_DIR.glob("*.iso")):
+        try:
+            out.append({"name": p.name, "size_bytes": p.stat().st_size})
+        except Exception: continue
+    return out
+
+
+@app.post("/api/isos/upload")
+async def api_upload_iso(file: UploadFile = File(...)):
+    """Stream-upload an ISO to /opt/bedrock/iso. Chunked to stay memory-safe
+    for multi-GB Windows ISOs."""
+    if not file.filename.lower().endswith(".iso"):
+        raise HTTPException(400, "filename must end in .iso")
+    ISO_DIR.mkdir(parents=True, exist_ok=True)
+    dst = ISO_DIR / Path(file.filename).name  # strip any directory
+    total = 0
+    with dst.open("wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk: break
+            fh.write(chunk)
+            total += len(chunk)
+    push_log(f"ISO uploaded: {dst.name} ({total // 1024 // 1024} MB)",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {"status": "uploaded", "name": dst.name, "size_bytes": total}
+
+
+@app.delete("/api/isos/{name}")
+def api_delete_iso(name: str):
+    # Prevent path traversal
+    safe = Path(name).name
+    p = ISO_DIR / safe
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404, "Not found")
+    p.unlink()
+    push_log(f"ISO deleted: {safe}", node="mgmt", app="bedrock-mgmt", level="info")
+    return {"status": "deleted", "name": safe}
+
+
 class MigrateRequest(BaseModel):
     target_node: Optional[str] = None
 
@@ -472,6 +548,15 @@ class MigrateRequest(BaseModel):
 class ConvertRequest(BaseModel):
     target_type: str  # "cattle", "pet", or "vipet"
     peer_nodes: Optional[list] = None  # auto-pick if not specified
+
+
+class VMCreateRequest(BaseModel):
+    name: str
+    vcpus: int = 2
+    ram_mb: int = 2048
+    disk_gb: int = 20
+    priority: str = "normal"  # low | normal | high
+    iso: Optional[str] = None  # filename in /opt/bedrock/iso, optional
 
 @app.post("/api/vms/{vm_name}/start")
 def api_vm_start(vm_name: str):
@@ -488,6 +573,11 @@ def api_vm_poweroff(vm_name: str):
 @app.post("/api/vms/{vm_name}/convert")
 def api_vm_convert(vm_name: str, req: ConvertRequest):
     return _vm_convert(vm_name, req.target_type, req.peer_nodes)
+
+
+@app.post("/api/vms/create")
+def api_vm_create(req: VMCreateRequest):
+    return _vm_create(req)
 
 
 @app.post("/api/vms/{vm_name}/migrate")
@@ -980,6 +1070,118 @@ def _parse_drbd_res(host: str, resource: str) -> dict:
     return {"peers": peers, "lv_path": lv_path, "lv_name": lv_name,
             "lv_vg": vg_name, "meta_path": meta_path,
             "minor": minor, "size_bytes": size}
+
+
+# ── VM creation (cattle, optionally ISO-booted) ─────────────────────────────
+
+_VM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
+_VALID_PRIORITIES = ("low", "normal", "high")
+
+
+def _mgmt_node_name() -> str:
+    """Return the cluster.json node name of the mgmt host (where ISOs live)."""
+    cfg = get_nodes()
+    for name, node in cfg.items():
+        if "mgmt" in node.get("role", ""):
+            return name
+    # Fallback: first node
+    return next(iter(cfg)) if cfg else ""
+
+
+def _vm_create(req) -> dict:
+    """Provision a cattle VM on the mgmt node. ISO optional.
+    Stores priority + creation metadata in /etc/bedrock/vm_inventory.json."""
+    if not _VM_NAME_RE.match(req.name):
+        raise HTTPException(400, "VM name: 3-32 chars, lowercase letters/digits/dashes, start with a letter")
+    if req.priority not in _VALID_PRIORITIES:
+        raise HTTPException(400, f"priority must be one of {_VALID_PRIORITIES}")
+    if req.vcpus < 1 or req.vcpus > 32:
+        raise HTTPException(400, "vcpus must be 1-32")
+    if req.ram_mb < 128 or req.ram_mb > 131072:
+        raise HTTPException(400, "ram_mb must be 128-131072")
+    if req.disk_gb < 1 or req.disk_gb > 2048:
+        raise HTTPException(400, "disk_gb must be 1-2048")
+
+    # Existing VM?
+    state = build_cluster_state()
+    if req.name in state["vms"]:
+        raise HTTPException(409, f"VM {req.name} already exists")
+
+    home_name = _mgmt_node_name()
+    nodes_cfg = get_nodes()
+    home = nodes_cfg.get(home_name)
+    if not home:
+        raise HTTPException(500, "No mgmt node found in cluster.json")
+    host = home["host"]
+
+    # Validate ISO if given
+    iso_path = ""
+    if req.iso:
+        iso_name = Path(req.iso).name  # prevent traversal
+        iso_path = f"/opt/bedrock/iso/{iso_name}"
+        if not (ISO_DIR / iso_name).exists():
+            raise HTTPException(400, f"ISO not found: {iso_name}")
+
+    lv_name = f"vm-{req.name}-disk0"
+    lv_path = f"/dev/almalinux/{lv_name}"
+
+    # 1. Ensure thin pool, create data LV (thin)
+    _ensure_thinpool(host)
+    push_log(f"Create VM {req.name}: lvcreate {req.disk_gb}G thin on {home_name}",
+             node=home_name, app="bedrock-mgmt")
+    out, rc = ssh_cmd_rc(host,
+        f"lvcreate -y -V {req.disk_gb}G --thin -n {lv_name} almalinux/thinpool", timeout=30)
+    if rc != 0 and "already exists" not in out:
+        raise HTTPException(500, f"lvcreate failed: {out}")
+
+    # 2. virt-install — with or without CDROM
+    cdrom_arg = f"--cdrom {iso_path}" if iso_path else "--import"
+    boot_arg = "--boot cdrom,hd" if iso_path else "--boot hd"
+
+    # For Windows ISOs virt-install's os-variant auto-detect works well;
+    # for others, 'generic' is a safe default.
+    vi_cmd = (
+        f"virt-install "
+        f"--name {req.name} "
+        f"--vcpus {req.vcpus} "
+        f"--ram {req.ram_mb} "
+        f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
+        f"--network bridge=br0,model=virtio "
+        f"--graphics vnc,listen=0.0.0.0 "
+        f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
+        f"--os-variant detect=on,name=generic "
+        f"--noautoconsole "
+        f"{cdrom_arg} "
+        f"{boot_arg} "
+        f"2>&1"
+    )
+    push_log(f"Create VM {req.name}: virt-install (vcpus={req.vcpus}, "
+             f"ram={req.ram_mb}MB, iso={req.iso or 'none'})",
+             node=home_name, app="bedrock-mgmt")
+    out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
+    if rc != 0:
+        # Clean up the LV so the name is free for retry
+        ssh_cmd_rc(host, f"lvremove -f {lv_path} 2>&1", timeout=15)
+        raise HTTPException(500, f"virt-install failed: {out[-400:]}")
+
+    # 3. Save inventory
+    inv = load_inventory()
+    inv[req.name] = {
+        "priority": req.priority,
+        "vcpus": req.vcpus,
+        "ram_mb": req.ram_mb,
+        "disk_gb": req.disk_gb,
+        "iso": req.iso,
+        "home_node": home_name,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_by": "dashboard",
+    }
+    save_inventory(inv)
+
+    push_log(f"Created VM {req.name} on {home_name} "
+             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {req.disk_gb}GB, priority={req.priority})",
+             node=home_name, app="bedrock-mgmt", level="info")
+    return {"status": "created", "name": req.name, "node": home_name}
 
 
 # ── Metrics API (queries VictoriaMetrics) ───────────────────────────────────

@@ -30,6 +30,7 @@
 <div class="header">
 	<h1>Virtual Machines</h1>
 	<span class="meta">{rows.length} total</span>
+	<a href="/vms/new" class="btn-new">+ New VM</a>
 	{#if actionStatus}
 		<span class="toast">{actionStatus}</span>
 	{/if}
@@ -106,7 +107,9 @@
 	.header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
 	h1 { font-size: 22px; margin: 0; }
 	.meta { color: #8b949e; font-size: 12px; }
-	.toast { margin-left: auto; background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; font-size: 12px; }
+	.btn-new { margin-left: auto; padding: 4px 12px; border: 1px solid #1a7f37; border-radius: 6px; background: #1a7f3722; color: #3fb950; font-size: 12px; font-weight: 600; }
+	.btn-new:hover { background: #1a7f3744; text-decoration: none; }
+	.toast { background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; font-size: 12px; }
 
 	table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
 	th { background: #21262d; text-align: left; padding: 10px 12px; font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }

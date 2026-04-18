@@ -53,6 +53,9 @@
 			<a class="tree-top" class:active={isActive('/')} href="/">
 				<span class="tree-icon">☰</span> Datacenter
 			</a>
+			<a class="tree-top" class:active={isActive('/isos')} href="/isos">
+				<span class="tree-icon">⊙</span> ISOs
+			</a>
 
 			<div class="tree-group">
 				<div class="tree-header" class:active={isActive('/hosts')}>
