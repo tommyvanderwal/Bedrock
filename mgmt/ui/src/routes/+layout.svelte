@@ -95,6 +95,11 @@
 					</a>
 				</div>
 				{#if vmsOpen}
+					<a class="tree-item tree-new" class:active={isActive('/vms/new')}
+						href="/vms/new">
+						<span class="plus">+</span>
+						<span class="name">New VM</span>
+					</a>
 					{#each sortedVms as [name, vm]}
 						<a class="tree-item" class:active={isActive(`/vm/${name}`)}
 							href="/vm/{name}">
@@ -103,9 +108,6 @@
 							<span class="name">{name}</span>
 						</a>
 					{/each}
-					{#if Object.keys($vms).length === 0}
-						<div class="tree-empty">no VMs</div>
-					{/if}
 				{/if}
 			</div>
 		</nav>
@@ -257,6 +259,10 @@
 		color: #6e7681;
 		font-style: italic;
 	}
+
+	.tree-new { color: #3fb950; }
+	.tree-new:hover { background: #1a7f3722; text-decoration: none; }
+	.tree-new .plus { width: 6px; text-align: center; color: #3fb950; font-weight: 600; }
 
 	.sidebar-foot {
 		padding: 10px 14px;
