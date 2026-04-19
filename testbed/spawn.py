@@ -33,7 +33,9 @@ ALMA_URL = "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux
 MAX_NODES = 4
 NODE_RAM_MB = 16384
 NODE_VCPUS = 4
-NODE_DISK_GB = 100  # thin qcow2 overlay, actual usage much less
+NODE_DISK_GB = 160  # thin qcow2 overlay, actual usage much less — needs
+                    # headroom for 80 GB thin pool + /opt/bedrock imports
+                    # (up to ~20 GB for Windows VHDX + converted qcow2) + OS.
 
 MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"

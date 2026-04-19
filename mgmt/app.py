@@ -1797,6 +1797,32 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         except Exception: pass
 
     _ensure_thinpool(host)
+
+    # Pre-flight: the converted disk is virtual_gb — but qemu-img convert to
+    # raw writes the full size (zero-skip notwithstanding for sparse LVs on
+    # thin pools, any non-zero block allocates). Reject up front if the thin
+    # pool can't fit the worst case, so we never partially fill and brick the
+    # pool. We fail the request cleanly instead of leaving a zombie LV behind.
+    pool_info, _ = ssh_cmd_rc(host,
+        "lvs --noheadings --units b --nosuffix --separator '|' "
+        "-o lv_size,data_percent almalinux/thinpool 2>/dev/null | head -1",
+        timeout=10)
+    try:
+        parts = [p.strip() for p in pool_info.split("|") if p.strip()]
+        pool_size_b = int(parts[0]); pool_used_pct = float(parts[1])
+        pool_free_b = int(pool_size_b * (100.0 - pool_used_pct) / 100.0)
+        need_b = int(size_mb) * 1024 * 1024
+        if pool_free_b < need_b + (1 << 30):  # +1 GB slack
+            raise HTTPException(507,
+                f"Thin pool on {home_name} has "
+                f"{pool_free_b // (1<<30)} GB free; this import needs "
+                f"{need_b // (1<<30)} GB + 1 GB slack. Free space or grow the "
+                f"pool before retrying.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # non-fatal — proceed and let lvcreate fail loudly if needed
+
     push_log(f"Import {meta['id']} → create VM {req.name}: lvcreate {virtual_gb}G thin",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host,
@@ -1814,7 +1840,7 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         timeout=3600)
     if rc != 0:
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
-        raise HTTPException(500, f"qemu-img convert failed: {out[-400:]}")
+        raise HTTPException(500, "qemu-img convert failed:\n" + (out or "(no output)"))
 
     # virt-install with Q35 + matched firmware + UTC. --import + --wait 0
     # means "define and start the VM, then return immediately" (don't block
@@ -1838,7 +1864,7 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     if rc != 0:
         ssh_cmd_rc(host, f"virsh undefine {req.name} --nvram 2>&1", timeout=10)
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
-        raise HTTPException(500, f"virt-install failed: {out[-400:]}")
+        raise HTTPException(500, "virt-install failed:\n" + (out or "(no output)"))
 
     # Priority
     shares = PRIORITY_CPU_SHARES[req.priority]
