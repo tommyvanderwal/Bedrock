@@ -4,11 +4,15 @@
 	let rows = $derived.by(() => {
 		return Object.entries($nodes)
 			.sort((a, b) => a[0].localeCompare(b[0]))
-			.map(([name, n]) => {
-				const running = Object.values($vms).filter(v => v.running_on === name).length;
-				const defined = Object.values($vms).filter(v => (v.defined_on || []).includes(name)).length;
+			.map(([name, n]: [string, any]) => {
+				const running = Object.values($vms).filter((v: any) => v.running_on === name).length;
+				const defined = Object.values($vms).filter((v: any) => (v.defined_on || []).includes(name)).length;
 				const memPct = n.mem_total_mb ? Math.round(n.mem_used_mb / n.mem_total_mb * 100) : 0;
-				return { name, node: n, running, defined, memPct };
+				// Worst thinpool data usage on this node (null if no pool)
+				const pools: any[] = n.thinpools || [];
+				const poolPct = pools.length ? Math.max(...pools.map(p => p.data_pct)) : null;
+				const poolSizeGb = pools.length ? Math.round(pools.reduce((s, p) => s + p.size_bytes, 0) / (1024**3)) : 0;
+				return { name, node: n, running, defined, memPct, poolPct, poolSizeGb };
 			});
 	});
 </script>
@@ -28,6 +32,7 @@
 			<th>Host</th>
 			<th>Load</th>
 			<th>Memory</th>
+			<th>Thin pool</th>
 			<th>VMs (running / defined)</th>
 			<th>Kernel</th>
 			<th></th>
@@ -54,6 +59,19 @@
 						<span class="muted">-</span>
 					{/if}
 				</td>
+				<td>
+					{#if r.poolPct !== null}
+						<div class="bar"
+							class:pool-warn={r.poolPct >= 80 && r.poolPct < 95}
+							class:pool-full={r.poolPct >= 95}
+							title="{r.poolPct}% of {r.poolSizeGb} GB">
+							<div class="bar-fill" style="width: {r.poolPct}%"></div>
+							<span class="bar-label">{r.poolPct}%</span>
+						</div>
+					{:else}
+						<span class="muted">-</span>
+					{/if}
+				</td>
 				<td>{r.running} / {r.defined}</td>
 				<td class="kernel">{r.node.kernel || '-'}</td>
 				<td>
@@ -64,7 +82,7 @@
 			</tr>
 		{/each}
 		{#if rows.length === 0}
-			<tr><td colspan="8" class="muted centered">no hosts yet</td></tr>
+			<tr><td colspan="9" class="muted centered">no hosts yet</td></tr>
 		{/if}
 	</tbody>
 </table>
@@ -86,6 +104,8 @@
 
 	.bar { position: relative; width: 140px; height: 16px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; }
 	.bar-fill { height: 100%; background: linear-gradient(90deg, #1f6feb, #58a6ff); }
+	.bar.pool-warn .bar-fill { background: linear-gradient(90deg, #bf8700, #d29922); }
+	.bar.pool-full .bar-fill { background: linear-gradient(90deg, #a40e26, #f85149); }
 	.bar-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #e6edf3; }
 
 	.muted { color: #8b949e; }

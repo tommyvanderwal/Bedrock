@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -129,13 +131,16 @@ def ssh_cmd(host: str, cmd: str, timeout: int = 10) -> str:
 
 
 def ssh_cmd_rc(host: str, cmd: str, timeout: int = 30) -> tuple[str, int]:
+    """Run cmd over SSH, return (combined_output, exit_code). Always combines
+    stdout+stderr so callers never lose the failure reason."""
     c = _ssh_connect(host)
     _, so, se = c.exec_command(cmd, timeout=timeout)
     out = so.read().decode().strip()
     err = se.read().decode().strip()
     rc = so.channel.recv_exit_status()
     c.close()
-    return out if rc == 0 else err, rc
+    combined = (out + ("\n" + err if err else "")).strip()
+    return combined, rc
 
 # ── Data gathering ──────────────────────────────────────────────────────────
 
@@ -149,7 +154,10 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "echo '---LOAD---'; cat /proc/loadavg; "
             "echo '---MEM---'; free -m | grep Mem; "
             "echo '---UPTIME---'; uptime -s; "
-            "echo '---KERNEL---'; uname -r"
+            "echo '---KERNEL---'; uname -r; "
+            "echo '---THINPOOL---'; lvs --noheadings --units b --nosuffix "
+            "--separator '|' -o vg_name,lv_name,lv_size,data_percent,metadata_percent "
+            "--select 'lv_attr=~\"^t\"' 2>/dev/null"
         ))
         sections = {}
         current = None
@@ -165,6 +173,20 @@ def get_node_info(name: str, cfg: dict) -> dict:
         mem_parts = sections.get("MEM", [""])[0].split()
         load_parts = sections.get("LOAD", ["0 0 0"])[0].split()
 
+        # Thin pools: list of {vg, name, size_bytes, data_pct, meta_pct}
+        thinpools = []
+        for row in sections.get("THINPOOL", []):
+            parts = [p.strip() for p in row.split("|") if p.strip()]
+            if len(parts) >= 5:
+                try:
+                    thinpools.append({
+                        "vg": parts[0], "name": parts[1],
+                        "size_bytes": int(parts[2]),
+                        "data_pct": float(parts[3]),
+                        "meta_pct": float(parts[4]),
+                    })
+                except ValueError: pass
+
         return {
             "name": name, "host": host, "online": True,
             "kernel": sections.get("KERNEL", [""])[0],
@@ -174,12 +196,14 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "mem_used_mb": int(mem_parts[2]) if len(mem_parts) > 2 else 0,
             "all_vms": all_vms, "running_vms": running_vms,
             "drbd_raw": "\n".join(sections.get("DRBD", [])),
+            "thinpools": thinpools,
             "cockpit_url": cfg["cockpit"],
         }
     except Exception as e:
         return {
             "name": name, "host": host, "online": False, "error": str(e),
             "all_vms": [], "running_vms": [], "drbd_raw": "",
+            "thinpools": [],
             "cockpit_url": cfg["cockpit"],
             "kernel": "", "uptime_since": "", "load": "0",
             "mem_total_mb": 0, "mem_used_mb": 0,
@@ -529,6 +553,409 @@ async def api_upload_iso(file: UploadFile = File(...)):
     return {"status": "uploaded", "name": dst.name, "size_bytes": total}
 
 
+# ── Import library (VMware/Hyper-V/qcow2 → Bedrock) ──────────────────────
+
+IMPORT_ROOT = Path("/opt/bedrock/imports")
+EXPORT_ROOT = Path("/opt/bedrock/exports")
+IMPORT_INPUT_FORMATS = {".ova", ".ovf", ".vmdk", ".vhd", ".vhdx",
+                        ".qcow2", ".raw", ".img"}
+
+
+def _import_dir(job_id: str) -> Path:
+    # Strict job-id form to prevent traversal
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", job_id):
+        raise HTTPException(400, "invalid id")
+    return IMPORT_ROOT / job_id
+
+
+def _import_meta(d: Path) -> dict:
+    mp = d / "meta.json"
+    if not mp.exists(): return {}
+    try: return json.loads(mp.read_text())
+    except Exception: return {}
+
+
+def _write_import_meta(d: Path, meta: dict):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+@app.get("/api/imports")
+def api_imports_list():
+    """Every import job with its current status."""
+    if not IMPORT_ROOT.exists(): return []
+    out = []
+    for d in sorted(IMPORT_ROOT.iterdir()):
+        if not d.is_dir(): continue
+        m = _import_meta(d)
+        if m: out.append({**m, "id": d.name})
+    # newest first
+    out.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return out
+
+
+@app.get("/api/imports/{job_id}")
+def api_import_get(job_id: str):
+    d = _import_dir(job_id)
+    if not d.exists(): raise HTTPException(404, "no such import")
+    m = _import_meta(d) or {"id": job_id, "status": "unknown"}
+    m["id"] = job_id
+    # Tail of log for the UI
+    log_file = d / "log.txt"
+    if log_file.exists():
+        try:
+            txt = log_file.read_text()
+            m["log_tail"] = txt[-4000:]
+            m["log_size"] = len(txt)
+        except Exception: pass
+    return m
+
+
+@app.post("/api/imports/upload")
+async def api_imports_upload(file: UploadFile = File(...)):
+    """Accept a disk image (VMware/Hyper-V/qcow2/raw/OVA) and stage it for
+    conversion. The file is written in 1 MB chunks directly to
+    /opt/bedrock/imports/<id>/original.<ext>; conversion is a separate
+    step (POST /api/imports/{id}/convert) so long uploads don't block."""
+    name = Path(file.filename or "").name
+    ext = "".join(Path(name).suffixes[-1:]).lower()  # last suffix only
+    if ext not in IMPORT_INPUT_FORMATS:
+        raise HTTPException(400,
+            f"unsupported extension {ext!r}; want {sorted(IMPORT_INPUT_FORMATS)}")
+
+    # Build a job id: timestamp + slug of original stem
+    stem = re.sub(r"[^a-z0-9]+", "-", Path(name).stem.lower()).strip("-")[:40] or "disk"
+    job_id = f"{int(time.time())}-{stem}"
+    d = _import_dir(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+    dst = d / f"original{ext}"
+
+    total = 0
+    with dst.open("wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk: break
+            fh.write(chunk)
+            total += len(chunk)
+
+    meta = {
+        "id": job_id,
+        "original_name": name,
+        "input_format": ext.lstrip("."),
+        "input_path": str(dst),
+        "input_size_bytes": total,
+        "status": "uploaded",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _write_import_meta(d, meta)
+    push_log(f"Import uploaded: {name} ({total // 1024 // 1024} MB, id={job_id})",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return meta
+
+
+QEMU_FORMAT_MAP = {
+    "qcow2": "qcow2", "raw": "raw", "img": "raw",
+    "vmdk": "vmdk",  "vhd": "vpc",  "vhdx": "vhdx",
+}
+
+
+def _run_cmd(log_path: Path, cmd: list) -> int:
+    """Synchronous subprocess run with log file. Returns exit code."""
+    with log_path.open("a") as lf:
+        lf.write(f"\n# command: {' '.join(cmd)}\n"); lf.flush()
+        return subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+
+
+async def _run_convert(job_id: str, inject_drivers: bool = False):
+    """Convert uploaded image → qcow2 at /opt/bedrock/imports/<id>/converted/disk.qcow2.
+    Default path: qemu-img (fast, format-only). virt-v2v is invoked for OVA
+    (bundled disk+metadata) or when the operator explicitly asked for
+    driver injection (Windows imports)."""
+    d = _import_dir(job_id)
+    meta = _import_meta(d)
+    if not meta: return
+    src = Path(meta["input_path"])
+    ext = meta["input_format"]
+    meta["status"] = "converting"
+    meta["convert_started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    meta["injected_drivers"] = bool(inject_drivers)
+    _write_import_meta(d, meta)
+    push_log(f"Import convert started: {job_id} ({ext}, "
+             f"{'virt-v2v+drivers' if inject_drivers or ext in ('ova','ovf') else 'qemu-img'})",
+             node="mgmt", app="bedrock-mgmt", level="info")
+
+    log = d / "log.txt"
+    log.write_text("")  # reset on retry
+    dst_dir = d / "converted"
+    if dst_dir.exists(): shutil.rmtree(dst_dir)
+    dst_dir.mkdir()
+    out_qcow = dst_dir / "disk.qcow2"
+
+    loop = asyncio.get_event_loop()
+    rc = 0
+
+    try:
+        if ext in ("ova", "ovf"):
+            # OVA = tar with OVF + disk(s). Extract, find the disk, convert.
+            extract = d / "ova-extract"
+            extract.mkdir(exist_ok=True)
+            rc = await loop.run_in_executor(None, _run_cmd, log,
+                ["tar", "-xf", str(src), "-C", str(extract)])
+            if rc == 0:
+                # Find the first *.vmdk (or *.raw/*.img) referenced by the OVF
+                disks = [p for p in extract.glob("*.vmdk")] + \
+                        [p for p in extract.glob("*.img")] + \
+                        [p for p in extract.glob("*.raw")]
+                if not disks:
+                    meta["error"] = "OVA contained no recognisable disk"; rc = 1
+                else:
+                    d0 = disks[0]
+                    fmt_in = QEMU_FORMAT_MAP.get(d0.suffix.lstrip(".").lower(), "raw")
+                    if inject_drivers:
+                        # Use virt-v2v on the bundled disk
+                        rc = await loop.run_in_executor(None, _run_cmd, log,
+                            ["virt-v2v", "-v", "-x", "-i", "disk", str(d0),
+                             "-o", "local", "-os", str(dst_dir), "-of", "qcow2"])
+                    else:
+                        rc = await loop.run_in_executor(None, _run_cmd, log,
+                            ["qemu-img", "convert", "-p", "-f", fmt_in,
+                             "-O", "qcow2", str(d0), str(out_qcow)])
+        elif inject_drivers:
+            # Windows import path — virt-v2v inspects, rewrites bootloader, inject viostor/NetKVM
+            rc = await loop.run_in_executor(None, _run_cmd, log,
+                ["virt-v2v", "-v", "-x", "-i", "disk", str(src),
+                 "-o", "local", "-os", str(dst_dir), "-of", "qcow2"])
+        else:
+            fmt_in = QEMU_FORMAT_MAP.get(ext, "raw")
+            rc = await loop.run_in_executor(None, _run_cmd, log,
+                ["qemu-img", "convert", "-p", "-f", fmt_in, "-O", "qcow2",
+                 str(src), str(out_qcow)])
+
+        if rc != 0:
+            meta["status"] = "failed"
+            meta.setdefault("error", f"convert exit {rc}")
+            push_log(f"Import convert FAILED: {job_id} (exit {rc})",
+                     node="mgmt", app="bedrock-mgmt", level="error")
+        else:
+            # virt-v2v produces <name>-sda, our qemu-img path produces disk.qcow2
+            qcow = out_qcow if out_qcow.exists() else \
+                   next((p for p in dst_dir.glob("*.qcow2")), None) or \
+                   next((p for p in dst_dir.glob("*-sd?")), None)
+            if not qcow:
+                meta["status"] = "failed"; meta["error"] = "no output file"
+            else:
+                iq = json.loads(subprocess.run(
+                    ["qemu-img", "info", "--output=json", str(qcow)],
+                    capture_output=True, text=True).stdout or "{}")
+                meta["status"] = "ready"
+                meta["disk_path"] = str(qcow)
+                meta["virtual_size_bytes"] = iq.get("virtual-size") or 0
+                meta["virtual_size_gb"] = max(1,
+                    (meta["virtual_size_bytes"] + (1<<30) - 1) >> 30)
+                # OS detection from virt-v2v sidecar XML
+                xml = next((p for p in dst_dir.glob("*.xml")), None)
+                if xml:
+                    xt = xml.read_text()
+                    m = re.search(r"<name>([^<]+)</name>", xt)
+                    if m: meta["detected_name"] = m.group(1)
+                    m = re.search(r"<os>.*?<type[^>]*>([^<]+)</type>", xt, re.S)
+                    if m: meta["detected_os_type"] = m.group(1)
+                meta["convert_finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                push_log(f"Import convert done: {job_id} → {qcow.name} "
+                         f"({meta['virtual_size_gb']}G virtual)",
+                         node="mgmt", app="bedrock-mgmt", level="info")
+    except Exception as e:
+        meta["status"] = "failed"; meta["error"] = str(e)
+        push_log(f"Import convert EXCEPTION: {job_id}: {e}",
+                 node="mgmt", app="bedrock-mgmt", level="error")
+    _write_import_meta(d, meta)
+
+
+class ImportConvertRequest(BaseModel):
+    inject_drivers: bool = False  # true → virt-v2v for Windows driver injection
+
+
+@app.post("/api/imports/{job_id}/convert")
+async def api_import_convert(job_id: str, req: ImportConvertRequest = ImportConvertRequest()):
+    d = _import_dir(job_id)
+    if not d.exists(): raise HTTPException(404)
+    meta = _import_meta(d)
+    if meta.get("status") not in ("uploaded", "failed"):
+        raise HTTPException(400, f"cannot convert from status '{meta.get('status')}'")
+    # Fire-and-forget; caller polls GET /api/imports/{id} for progress
+    asyncio.create_task(_run_convert(job_id, inject_drivers=req.inject_drivers))
+    meta["status"] = "converting"
+    _write_import_meta(d, meta)
+    return {"status": "converting", "id": job_id,
+            "inject_drivers": req.inject_drivers}
+
+
+class ImportCreateVMRequest(BaseModel):
+    name: str
+    vcpus: int = 2
+    ram_mb: int = 2048
+    priority: str = "normal"
+
+
+@app.post("/api/imports/{job_id}/create-vm")
+def api_import_create_vm(job_id: str, req: ImportCreateVMRequest):
+    d = _import_dir(job_id)
+    meta = _import_meta(d)
+    if meta.get("status") != "ready":
+        raise HTTPException(400, f"import status {meta.get('status')!r}, need 'ready'")
+    return _vm_create_from_import(meta, req)
+
+
+@app.delete("/api/imports/{job_id}")
+def api_import_delete(job_id: str):
+    d = _import_dir(job_id)
+    if not d.exists(): raise HTTPException(404)
+    shutil.rmtree(d, ignore_errors=True)
+    push_log(f"Import deleted: {job_id}", node="mgmt", app="bedrock-mgmt", level="info")
+    return {"status": "deleted", "id": job_id}
+
+
+# ── Export library ─────────────────────────────────────────────────────────
+
+EXPORT_FORMATS = {"qcow2", "vmdk", "vhdx", "raw"}
+
+
+def _export_dir(job_id: str) -> Path:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", job_id):
+        raise HTTPException(400, "invalid id")
+    return EXPORT_ROOT / job_id
+
+
+@app.get("/api/exports")
+def api_exports_list():
+    if not EXPORT_ROOT.exists(): return []
+    out = []
+    for d in sorted(EXPORT_ROOT.iterdir()):
+        if not d.is_dir(): continue
+        m = {}
+        mp = d / "meta.json"
+        if mp.exists():
+            try: m = json.loads(mp.read_text())
+            except Exception: continue
+        m["id"] = d.name
+        out.append(m)
+    out.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return out
+
+
+class ExportRequest(BaseModel):
+    format: str = "qcow2"
+
+
+@app.post("/api/vms/{vm_name}/export")
+async def api_vm_export(vm_name: str, req: ExportRequest):
+    if req.format not in EXPORT_FORMATS:
+        raise HTTPException(400, f"format must be one of {sorted(EXPORT_FORMATS)}")
+    # Find the VM + its disk path
+    running, host, _ = _vm_host(vm_name)
+    s = _vm_get_settings(vm_name)
+    src_path = s["disk_path"]
+    if not src_path:
+        raise HTTPException(500, "VM has no disk_path")
+    job_id = f"{int(time.time())}-{vm_name}-{req.format}"
+    d = _export_dir(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+    dst = d / f"{vm_name}.{req.format}"
+    meta = {
+        "id": job_id, "vm": vm_name, "format": req.format,
+        "src_host": host, "src_path": src_path,
+        "dst_path": str(dst), "status": "converting",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    asyncio.create_task(_run_export(job_id, meta))
+    push_log(f"Export started: {vm_name} → {req.format} (id={job_id})",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return meta
+
+
+async def _run_export(job_id: str, meta: dict):
+    """qemu-img convert the source disk directly (live — works while VM runs
+    because DRBD/raw LVs are read-consistent through QEMU's page cache)."""
+    d = _export_dir(job_id)
+    log = d / "log.txt"
+    fmt_flag = meta["format"]  # qcow2/vmdk/vhdx/raw — all pass straight to qemu-img
+
+    # Determine locality: is the source disk on the mgmt node (this process)?
+    # Compare the src_host to every local interface address rather than doing
+    # a hostname lookup, which is unreliable on multi-NIC machines.
+    import socket as _s
+    local_ips = {"127.0.0.1", "localhost"}
+    try:
+        for fam, _, _, _, sockaddr in _s.getaddrinfo(_s.gethostname(), None):
+            local_ips.add(sockaddr[0])
+    except Exception: pass
+    try:
+        # Include every bound IP via /proc/net/fib_trie if possible
+        for ln in subprocess.run(
+                ["hostname", "-I"], capture_output=True, text=True).stdout.split():
+            local_ips.add(ln.strip())
+    except Exception: pass
+
+    if meta["src_host"] in local_ips:
+        cmd = ["qemu-img", "convert", "-p", "-f", "raw", "-O", fmt_flag,
+               meta["src_path"], meta["dst_path"]]
+    else:
+        # Remote source: ssh + dd → qemu-img. qemu-img can't read /dev/stdin,
+        # so stream via a named pipe.
+        fifo = str(d / "src.fifo")
+        cmd = [
+            "bash", "-c",
+            f"mkfifo {fifo}; "
+            f"( ssh -o BatchMode=yes root@{meta['src_host']} "
+            f"'dd if={meta['src_path']} bs=1M status=none' > {fifo} & ) && "
+            f"qemu-img convert -p -f raw -O {fmt_flag} {fifo} {meta['dst_path']}; "
+            f"rm -f {fifo}"
+        ]
+    try:
+        with log.open("w") as lf:
+            lf.write(f"# command: {' '.join(cmd)}\n"); lf.flush()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=lf, stderr=asyncio.subprocess.STDOUT)
+            rc = await proc.wait()
+        meta["status"] = "ready" if rc == 0 else "failed"
+        if rc == 0:
+            try: meta["size_bytes"] = Path(meta["dst_path"]).stat().st_size
+            except Exception: pass
+            push_log(f"Export done: {meta['vm']} ({meta['format']}, "
+                     f"{meta.get('size_bytes',0)//1024//1024} MB)",
+                     node="mgmt", app="bedrock-mgmt", level="info")
+        else:
+            meta["error"] = f"exit {rc}"
+            push_log(f"Export FAILED: {meta['vm']} (exit {rc})",
+                     node="mgmt", app="bedrock-mgmt", level="error")
+    except Exception as e:
+        meta["status"] = "failed"; meta["error"] = str(e)
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+@app.get("/api/exports/{job_id}/download")
+def api_export_download(job_id: str):
+    d = _export_dir(job_id)
+    if not d.exists(): raise HTTPException(404)
+    mp = d / "meta.json"
+    if not mp.exists(): raise HTTPException(404)
+    m = json.loads(mp.read_text())
+    if m.get("status") != "ready":
+        raise HTTPException(400, f"status {m.get('status')!r}")
+    from fastapi.responses import FileResponse as _FR
+    return _FR(path=m["dst_path"], filename=Path(m["dst_path"]).name,
+               media_type="application/octet-stream")
+
+
+@app.delete("/api/exports/{job_id}")
+def api_export_delete(job_id: str):
+    d = _export_dir(job_id)
+    if not d.exists(): raise HTTPException(404)
+    shutil.rmtree(d, ignore_errors=True)
+    return {"status": "deleted", "id": job_id}
+
+
 @app.delete("/api/isos/{name}")
 def api_delete_iso(name: str):
     # Prevent path traversal
@@ -733,7 +1160,7 @@ def _ensure_thinpool(host: str, vg_name: str = "almalinux", pool: str = "thinpoo
     vg_out = ssh_cmd(host, f"vgs --noheadings -o vg_name 2>/dev/null || true")
     if vg_name not in vg_out.split():
         ssh_cmd(host,
-            "truncate -s 20G /var/lib/bedrock-vg.img && "
+            "truncate -s 60G /var/lib/bedrock-vg.img && "
             "LOOP=$(losetup --find --show /var/lib/bedrock-vg.img) && "
             f"pvcreate -f -y $LOOP >/dev/null && vgcreate {vg_name} $LOOP >/dev/null",
             timeout=30)
@@ -1240,6 +1667,104 @@ def _vm_create(req) -> dict:
     push_log(f"Created VM {req.name} on {home_name} "
              f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {req.disk_gb}GB, "
              f"priority={req.priority}, cpu_shares={shares})",
+             node=home_name, app="bedrock-mgmt", level="info")
+    return {"status": "created", "name": req.name, "node": home_name}
+
+
+def _vm_create_from_import(meta: dict, req) -> dict:
+    """Turn a converted import (qcow2 on mgmt node) into a cattle VM.
+    Creates a thin LV sized to the qcow2 virtual size, qemu-img converts the
+    qcow2 into the LV (raw), then virt-installs with machine=q35, UEFI
+    firmware, clock=UTC. Marks the import meta as consumed."""
+    if not _VM_NAME_RE.match(req.name):
+        raise HTTPException(400, "invalid VM name (3-32 chars, lowercase)")
+    if req.priority not in _VALID_PRIORITIES:
+        raise HTTPException(400, f"priority must be one of {_VALID_PRIORITIES}")
+
+    state = build_cluster_state()
+    if req.name in state["vms"]:
+        raise HTTPException(409, f"VM {req.name} already exists")
+
+    home_name = _mgmt_node_name()
+    nodes_cfg = get_nodes()
+    host = nodes_cfg[home_name]["host"]
+
+    src_qcow = meta.get("disk_path")
+    if not src_qcow or not Path(src_qcow).exists():
+        raise HTTPException(500, "converted disk is gone — re-run convert?")
+
+    virtual_gb = meta.get("virtual_size_gb") or 20
+    size_mb = max(virtual_gb * 1024, 1024)
+    lv_name = f"vm-{req.name}-disk0"
+    lv_path = f"/dev/almalinux/{lv_name}"
+
+    _ensure_thinpool(host)
+    push_log(f"Import {meta['id']} → create VM {req.name}: lvcreate {virtual_gb}G thin",
+             node=home_name, app="bedrock-mgmt", level="info")
+    out, rc = ssh_cmd_rc(host,
+        f"lvcreate -y -V {size_mb}M --thin -n {lv_name} almalinux/thinpool 2>&1",
+        timeout=60)
+    if rc != 0 and "already exists" not in out:
+        raise HTTPException(500, f"lvcreate failed: {out}")
+
+    # Stream the qcow2 into the LV. Fast on mgmt node (local disk).
+    push_log(f"Import {meta['id']} → qemu-img convert qcow2 → raw LV",
+             node=home_name, app="bedrock-mgmt", level="info")
+    out, rc = ssh_cmd_rc(host,
+        f"qemu-img convert -p -f qcow2 -O raw {src_qcow} {lv_path} 2>&1",
+        timeout=3600)
+    if rc != 0:
+        ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
+        raise HTTPException(500, f"qemu-img convert failed: {out[-400:]}")
+
+    # virt-install with Q35 + UEFI + UTC. --import tells it not to run an
+    # installer — boot the existing disk directly.
+    vi_cmd = (
+        f"virt-install --name {req.name} --vcpus {req.vcpus} --ram {req.ram_mb} "
+        f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
+        f"--network bridge=br0,model=virtio "
+        f"--graphics vnc,listen=0.0.0.0 "
+        f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
+        f"--machine q35 "
+        f"--boot uefi "
+        f"--clock offset=utc "
+        f"--os-variant detect=on,name=generic "
+        f"--noautoconsole --import 2>&1"
+    )
+    push_log(f"Import {meta['id']} → virt-install",
+             node=home_name, app="bedrock-mgmt", level="info")
+    out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
+    if rc != 0:
+        ssh_cmd_rc(host, f"virsh undefine {req.name} --nvram 2>&1", timeout=10)
+        ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
+        raise HTTPException(500, f"virt-install failed: {out[-400:]}")
+
+    # Priority
+    shares = PRIORITY_CPU_SHARES[req.priority]
+    ssh_cmd_rc(host, f"virsh schedinfo {req.name} --live --config cpu_shares={shares}",
+               timeout=10)
+
+    # Inventory
+    inv = load_inventory()
+    inv[req.name] = {
+        "priority": req.priority, "vcpus": req.vcpus, "ram_mb": req.ram_mb,
+        "disk_gb": virtual_gb, "iso": None,
+        "home_node": home_name,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_by": "import",
+        "imported_from": meta.get("original_name", meta["id"]),
+    }
+    save_inventory(inv)
+
+    # Mark import as consumed
+    d = _import_dir(meta["id"])
+    meta["status"] = "consumed"
+    meta["consumed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    meta["consumed_as"] = req.name
+    _write_import_meta(d, meta)
+
+    push_log(f"Imported VM {req.name} on {home_name} (vcpus={req.vcpus}, "
+             f"ram={req.ram_mb}MB, {virtual_gb}GB, from {meta.get('original_name')})",
              node=home_name, app="bedrock-mgmt", level="info")
     return {"status": "created", "name": req.name, "node": home_name}
 

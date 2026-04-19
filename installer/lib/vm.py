@@ -76,7 +76,7 @@ def _ensure_thin_pool(host: str, size_gb: int = 20):
         print(f"  Creating loop-backed VG on {host}...")
         run_on(host, f"""
             dd if=/dev/zero of=/var/lib/bedrock-vg.img bs=1 count=0 seek=20G 2>/dev/null || \\
-              truncate -s 20G /var/lib/bedrock-vg.img
+              truncate -s 60G /var/lib/bedrock-vg.img
             LOOP=$(losetup --find --show /var/lib/bedrock-vg.img)
             pvcreate -f -y $LOOP >/dev/null
             vgcreate {VG_NAME} $LOOP >/dev/null

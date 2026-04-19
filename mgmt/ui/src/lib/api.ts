@@ -92,6 +92,70 @@ export async function setVmCdrom(name: string, action: 'eject' | 'insert', iso?:
 	return apiPost(`/api/vms/${name}/cdrom`, { action, iso });
 }
 
+// ── Imports ───────────────────────────────────────────────────────────────
+export interface ImportJob {
+	id: string;
+	original_name: string;
+	input_format: string;
+	input_size_bytes: number;
+	status: 'uploading' | 'uploaded' | 'converting' | 'ready' | 'failed' | 'consumed';
+	created_at: string;
+	virtual_size_gb?: number;
+	virtual_size_bytes?: number;
+	detected_name?: string;
+	detected_os_type?: string;
+	error?: string;
+	consumed_as?: string;
+	log_tail?: string;
+	log_size?: number;
+}
+
+export async function listImports(): Promise<ImportJob[]> { return apiGet('/api/imports'); }
+export async function getImport(id: string): Promise<ImportJob> { return apiGet(`/api/imports/${id}`); }
+export async function uploadImport(file: File, onProgress?: (pct: number) => void): Promise<ImportJob> {
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		xhr.open('POST', '/api/imports/upload');
+		xhr.upload.onprogress = (e) => {
+			if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+		};
+		xhr.onload = () => {
+			if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
+			else reject(new Error(`${xhr.status}: ${xhr.responseText}`));
+		};
+		xhr.onerror = () => reject(new Error('Upload failed'));
+		const fd = new FormData();
+		fd.append('file', file);
+		xhr.send(fd);
+	});
+}
+export async function convertImport(id: string, injectDrivers: boolean = false) {
+	return apiPost(`/api/imports/${id}/convert`, { inject_drivers: injectDrivers });
+}
+export async function deleteImport(id: string) {
+	const r = await fetch(`/api/imports/${encodeURIComponent(id)}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+export async function importCreateVM(id: string, body: {name: string; vcpus: number; ram_mb: number; priority: 'low'|'normal'|'high'}) {
+	return apiPost(`/api/imports/${id}/create-vm`, body);
+}
+
+// ── Exports ───────────────────────────────────────────────────────────────
+export interface ExportJob {
+	id: string; vm: string; format: string; status: string;
+	size_bytes?: number; created_at: string; error?: string;
+}
+export async function listExports(): Promise<ExportJob[]> { return apiGet('/api/exports'); }
+export async function startVmExport(name: string, format: 'qcow2'|'vmdk'|'vhdx'|'raw'): Promise<ExportJob> {
+	return apiPost(`/api/vms/${name}/export`, { format });
+}
+export async function deleteExport(id: string) {
+	const r = await fetch(`/api/exports/${encodeURIComponent(id)}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
 export async function listIsos(): Promise<Array<{ name: string; size_bytes: number }>> {
 	return apiGet('/api/isos');
 }

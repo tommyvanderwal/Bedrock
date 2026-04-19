@@ -33,6 +33,8 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | Create a VM | dashboard `+ New VM` / `bedrock vm create` | [`actions/vm-create.md`](actions/vm-create.md) |
 | Change HA level | PET / ViPet checkboxes in Settings | [`actions/vm-convert.md`](actions/vm-convert.md) |
 | Change vCPU / RAM / Disk / Priority / CDROM | Settings page | [`actions/vm-settings.md`](actions/vm-settings.md) |
+| Import a VM from VMware/Hyper-V/… | `/imports` upload + convert | [`actions/vm-import-export.md`](actions/vm-import-export.md) |
+| Export a VM to qcow2/vmdk/vhdx/raw | Export card on Settings | [`actions/vm-import-export.md`](actions/vm-import-export.md) |
 | Live-migrate a VM | `Live Migrate` button | [`actions/vm-migrate.md`](actions/vm-migrate.md) |
 | Start / stop / delete a VM | dashboard buttons | [`actions/vm-lifecycle.md`](actions/vm-lifecycle.md) |
 

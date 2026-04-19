@@ -94,6 +94,26 @@ def collect_vm_metrics():
     return lines
 
 
+def collect_thinpool_metrics():
+    """Report LVM thin-pool data/metadata usage — dashboard warns at > 80 %."""
+    lines = []
+    raw = run("lvs --units b --nosuffix --separator '|' "
+              "-o vg_name,lv_name,lv_size,data_percent,metadata_percent "
+              "--select 'lv_attr=~\"^t\"' --noheadings 2>/dev/null")
+    for row in raw.splitlines():
+        parts = [p.strip() for p in row.split("|") if p.strip() != ""]
+        if len(parts) < 5: continue
+        vg, lv, size, data_pct, meta_pct = parts[:5]
+        try:
+            size_b = int(size); data_f = float(data_pct); meta_f = float(meta_pct)
+        except ValueError:
+            continue
+        lines.append('bedrock_thinpool_size_bytes{vg="%s",pool="%s"} %d' % (vg, lv, size_b))
+        lines.append('bedrock_thinpool_data_percent{vg="%s",pool="%s"} %.2f' % (vg, lv, data_f))
+        lines.append('bedrock_thinpool_metadata_percent{vg="%s",pool="%s"} %.2f' % (vg, lv, meta_f))
+    return lines
+
+
 def collect_drbd_metrics():
     lines = []
     raw = run("drbdsetup status --json 2>/dev/null")
@@ -152,6 +172,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
         lines.append("# Bedrock VM and DRBD metrics exporter")
         lines.extend(collect_vm_metrics())
         lines.extend(collect_drbd_metrics())
+        lines.extend(collect_thinpool_metrics())
 
         body = "\n".join(lines) + "\n"
         self.send_response(200)

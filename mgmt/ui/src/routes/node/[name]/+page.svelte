@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { nodes, vms, events } from '$lib/stores';
 	import { apiGet } from '$lib/api';
@@ -31,9 +30,7 @@
 		return out;
 	}
 
-	async function fetchData() {
-		if (!node) return;
-		const host = node.host;
+	async function fetchMetrics(host: string) {
 		try {
 			const nm = await apiGet('/api/metrics/nodes?hours=1&step=15s');
 			metrics = {
@@ -43,23 +40,35 @@
 				net_tx: filterByHost(nm.net_tx, host),
 			};
 		} catch (e) { /* not ready */ }
+	}
+
+	async function fetchSeededLogs(name: string) {
 		try {
-			if (seededLogs.length === 0) {
-				const r = await apiGet(`/api/logs/node/${nodeName}?limit=50&hours=4`);
-				seededLogs = r.sort((a: any, b: any) => (b._time || '').localeCompare(a._time || ''));
-			}
+			const r = await apiGet(`/api/logs/node/${name}?limit=50&hours=4`);
+			seededLogs = r.sort((a: any, b: any) => (b._time || '').localeCompare(a._time || ''));
 		} catch (e) { /* keep whatever we have */ }
 	}
 
-	onMount(() => {
-		fetchData();
-		const i = setInterval(fetchData, 15000);
-		const short = nodeName.split('.')[0];
+	// Re-run whenever the route parameter changes. $effect cleans up the
+	// previous setInterval + store subscription before rebinding — otherwise
+	// a navigation like /node/A → /node/B leaves the old filter attached and
+	// metrics/logs stay bound to node A.
+	$effect(() => {
+		const name = nodeName;          // reactive dep
+		const short = name.split('.')[0];
+		metrics = {};                    // clear old data so stale graph doesn't linger
+		seededLogs = [];
+		liveLogs = [];
+		fetchSeededLogs(name);
+		if (node) fetchMetrics(node.host);
+		const iv = setInterval(() => {
+			if (node) fetchMetrics(node.host);
+		}, 15000);
 		const unsub = events.subscribe(all => {
 			liveLogs = all.filter((e: any) =>
 				(e.hostname || '').includes(short) || (e._msg || '').includes(short));
 		});
-		return () => { clearInterval(i); unsub(); };
+		return () => { clearInterval(iv); unsub(); };
 	});
 
 	function memPct(n: any): number {

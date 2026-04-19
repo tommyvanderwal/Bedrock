@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { vms, nodes, events } from '$lib/stores';
 	import { goto } from '$app/navigation';
@@ -53,38 +52,43 @@
 		}
 	}
 
-	async function fetchData() {
+	async function fetchMetrics(name: string) {
 		try {
 			const allVm = await apiGet('/api/metrics/vms?hours=1&step=15s');
-			// Filter metrics for this VM
-			metrics = {};
+			const filtered: any = {};
 			for (const [metricName, series] of Object.entries(allVm)) {
-				metrics[metricName] = {};
+				filtered[metricName] = {};
 				if (series && typeof series === 'object') {
 					for (const [label, points] of Object.entries(series as any)) {
-						if (label.includes(vmName)) {
-							(metrics[metricName] as any)[label] = points;
-						}
+						if (label.includes(name)) filtered[metricName][label] = points;
 					}
 				}
 			}
+			metrics = filtered;
 		} catch (e) { /* not ready */ }
+	}
+
+	async function fetchSeededLogs(name: string) {
 		try {
-			if (seededLogs.length === 0) {
-				const r = await apiGet(`/api/logs/vm/${vmName}?limit=50&hours=4`);
-				seededLogs = r.sort((a: any, b: any) => (b._time || '').localeCompare(a._time || ''));
-			}
+			const r = await apiGet(`/api/logs/vm/${name}?limit=50&hours=4`);
+			seededLogs = r.sort((a: any, b: any) => (b._time || '').localeCompare(a._time || ''));
 		} catch (e) { /* keep whatever we have */ }
 	}
 
-	onMount(() => {
-		fetchData();
-		const i = setInterval(fetchData, 15000);
-		// Subscribe directly to the events store so WS pushes appear instantly.
+	// Rebinds on route param change — previous setInterval + store subscription
+	// are cleaned up so a navigation /vm/A → /vm/B doesn't leave stale filters.
+	$effect(() => {
+		const name = vmName;  // reactive dep
+		metrics = {};
+		seededLogs = [];
+		liveLogs = [];
+		fetchMetrics(name);
+		fetchSeededLogs(name);
+		const iv = setInterval(() => fetchMetrics(name), 15000);
 		const unsub = events.subscribe(all => {
-			liveLogs = all.filter((e: any) => (e._msg || '').includes(vmName));
+			liveLogs = all.filter((e: any) => (e._msg || '').includes(name));
 		});
-		return () => { clearInterval(i); unsub(); };
+		return () => { clearInterval(iv); unsub(); };
 	});
 </script>
 

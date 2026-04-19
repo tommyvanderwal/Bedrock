@@ -1,11 +1,10 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { nodes } from '$lib/stores';
 	import {
 		getVmSettings, setVmResources, setVmPriority, setVmCdrom,
-		vmConvert, listIsos,
-		type VMSettings,
+		vmConvert, listIsos, startVmExport, listExports, deleteExport,
+		type VMSettings, type ExportJob,
 	} from '$lib/api';
 
 	let vmName = $derived($page.params.name);
@@ -25,6 +24,11 @@
 	// CDROM + ISO list
 	let isos = $state<Array<{ name: string; size_bytes: number }>>([]);
 	let cdromToInsert = $state('');
+
+	// Exports for this VM
+	let exports = $state<ExportJob[]>([]);
+	let exportFormat = $state<'qcow2'|'vmdk'|'vhdx'|'raw'>('qcow2');
+	let exportPoll: any = null;
 
 	// HA state
 	let nodeCount = $derived(Object.keys($nodes).length);
@@ -57,6 +61,8 @@
 			// ISO list
 			const all = await listIsos();
 			isos = all.filter(i => i.name !== 'virtio-win.iso');
+			// Exports for this VM
+			await refreshExports();
 			loaded = true;
 		} catch (e: any) {
 			error = e.message;
@@ -64,7 +70,43 @@
 		}
 	}
 
-	onMount(load);
+	async function refreshExports() {
+		try {
+			const all = await listExports();
+			exports = all.filter(e => e.vm === vmName);
+		} catch (e) { /* ignore */ }
+	}
+
+	async function startExport() {
+		busy = `Starting ${exportFormat} export...`;
+		try {
+			await startVmExport(vmName, exportFormat);
+			await refreshExports();
+		} catch (e: any) { error = e.message; }
+		finally { busy = ''; }
+	}
+
+	async function removeExport(id: string) {
+		if (!confirm('Delete this export?')) return;
+		try { await deleteExport(id); await refreshExports(); }
+		catch (e: any) { error = e.message; }
+	}
+
+	function fmtBytes(b: number | undefined): string {
+		if (!b) return '-';
+		const mb = b / 1024 / 1024;
+		return mb < 1024 ? `${mb.toFixed(0)} MB` : `${(mb / 1024).toFixed(2)} GB`;
+	}
+
+	$effect(() => {
+		// Reactive dependency: reload whenever the route param changes.
+		const _ = vmName;
+		loaded = false; settings = null; error = '';
+		load();
+		// Poll exports every 2 s while the page is mounted
+		exportPoll = setInterval(refreshExports, 2000);
+		return () => clearInterval(exportPoll);
+	});
 
 	let resourcesDirty = $derived(
 		settings && (vcpus !== settings.vcpus || ramMb !== settings.ram_mb || diskGb !== settings.disk_gb)
@@ -259,9 +301,60 @@
 	{/if}
 </div>
 
+<div class="card">
+	<h3>Export disk image</h3>
+	<div class="row">
+		<select bind:value={exportFormat}>
+			<option value="qcow2">qcow2 (libvirt / QEMU native, compressed)</option>
+			<option value="vmdk">vmdk (VMware)</option>
+			<option value="vhdx">vhdx (Hyper-V)</option>
+			<option value="raw">raw (dd-style)</option>
+		</select>
+		<button class="btn-primary" disabled={!!busy} onclick={startExport}>Start export</button>
+	</div>
+	<p class="note">Reads the live disk. For cattle VMs: reads the raw LV.
+		For pet/ViPet: reads /dev/drbdN (consistent via DRBD). Output lands in
+		<code>/opt/bedrock/exports/</code> on the mgmt node; download below.</p>
+	{#if exports.length}
+		<table class="mini">
+			<thead><tr><th>Format</th><th>Status</th><th>Size</th><th>When</th><th></th></tr></thead>
+			<tbody>
+				{#each exports as ex (ex.id)}
+					<tr>
+						<td><span class="fmt">{ex.format}</span></td>
+						<td><span class="status status-{ex.status}">{ex.status}</span>
+							{#if ex.error}<div class="err-s">{ex.error}</div>{/if}
+						</td>
+						<td>{fmtBytes(ex.size_bytes)}</td>
+						<td class="dim">{(ex.created_at || '').replace('T',' ')}</td>
+						<td>
+							{#if ex.status === 'ready'}
+								<a class="btn-primary" href={`/api/exports/${ex.id}/download`}>Download</a>
+							{/if}
+							<button class="btn-del" onclick={() => removeExport(ex.id)}>×</button>
+						</td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+</div>
+
 {/if}
 
 <style>
+	table.mini { width: 100%; border-collapse: collapse; margin-top: 10px; }
+	table.mini th { text-align: left; font-size: 10px; color: #8b949e; padding: 4px 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+	table.mini td { padding: 6px; font-size: 12px; border-top: 1px solid #21262d; }
+	.fmt { background: #21262d; padding: 1px 8px; border-radius: 10px; font-size: 11px; text-transform: uppercase; }
+	.status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+	.status-converting { background: #d2992244; color: #d29922; }
+	.status-ready { background: #1a7f37; color: #fff; }
+	.status-failed { background: #f85149; color: #fff; }
+	.dim { color: #6e7681; }
+	.err-s { color: #f85149; font-size: 10px; margin-top: 2px; }
+	.btn-del { padding: 2px 8px; border: 1px solid #30363d; border-radius: 4px; background: transparent; color: #8b949e; font-size: 12px; cursor: pointer; }
+	.btn-del:hover { border-color: #f85149; color: #f85149; }
 	.breadcrumb { font-size: 13px; color: #8b949e; margin-bottom: 14px; }
 	.breadcrumb strong { color: #e6edf3; }
 
