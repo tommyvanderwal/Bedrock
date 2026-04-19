@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ws import hub
+from tasks import registry as task_registry, Task
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bedrock")
@@ -249,30 +250,84 @@ def get_witness_status() -> dict:
         return {"nodes": {}, "error": "unreachable"}
 
 def get_vm_drbd_resource(host: str, vm_name: str) -> str:
-    """Parse virsh dumpxml to find the DRBD resource backing this VM's disk."""
+    """Parse virsh dumpxml to find the DRBD resource backing this VM's
+    first data disk. Back-compat shim over get_vm_disks — prefer that."""
+    disks = get_vm_disks(host, vm_name)
+    for d in disks:
+        if d.get("drbd_resource"):
+            return d["drbd_resource"]
+    return ""
+
+
+def get_vm_disks(host: str, vm_name: str) -> list[dict]:
+    """Parse virsh dumpxml + drbdsetup status to enumerate every block disk
+    attached to the VM (cdroms excluded). One entry per disk:
+      {
+        target: "vda" | "vdb" | ...,     # guest-visible device name
+        bus: "virtio" | "sata" | "scsi",
+        source: "/dev/almalinux/vm-X-disk0" | "/dev/drbd1000",
+        drbd_resource: "vm-X-disk0" | "",
+        drbd_minor: 1000 | None,
+        backing_lv: "/dev/almalinux/vm-X-disk0",  # raw LV under the DRBD device
+      }
+    Ordered by target (vda, vdb, vdc …). Returns [] if the VM doesn't exist.
+    """
     try:
-        xml = ssh_cmd(host, f"virsh dumpxml {vm_name} 2>/dev/null")
-        import re as _re
-        # Look for source dev='/dev/drbdN' — standard block DRBD device
-        m = _re.search(r"source dev='/dev/drbd([^']+)'", xml)
-        if m:
-            drbd_dev = m.group(1)
-            # Find the matching resource name from drbdsetup
-            res_out = ssh_cmd(host, f"drbdsetup status --json 2>/dev/null || echo '[]'")
-            try:
-                import json as _json
-                resources = _json.loads(res_out)
-                for res in resources:
-                    for dev in res.get("devices", []):
-                        if str(dev.get("minor", "")) == drbd_dev.lstrip("/"):
-                            return res.get("name", "")
-            except Exception:
-                pass
-            # Fallback: derive resource name from device path (drbd1 → guess from ls)
-            return ""
+        xml = ssh_cmd(host, f"virsh dumpxml {vm_name} 2>/dev/null") or ""
+    except Exception:
+        return []
+    if not xml:
+        return []
+
+    import re as _re
+    out = []
+    # DRBD status lookup (one call per host, reused across disks)
+    drbd_by_minor: dict[str, str] = {}
+    try:
+        import json as _json
+        raw = ssh_cmd(host, "drbdsetup status --json 2>/dev/null || echo '[]'")
+        for res in _json.loads(raw or "[]"):
+            for dev in res.get("devices", []):
+                drbd_by_minor[str(dev.get("minor", ""))] = res.get("name", "")
     except Exception:
         pass
-    return ""
+
+    for m in _re.finditer(r"<disk\b([^>]*)>(.*?)</disk>", xml, _re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        dev_m = _re.search(r"device=['\"]([^'\"]+)['\"]", attrs)
+        device = dev_m.group(1) if dev_m else "disk"
+        if device != "disk":
+            continue  # skip cdroms / floppies
+        src_m = _re.search(r"<source\s+(?:file|dev)=['\"]([^'\"]+)['\"]", body)
+        tgt_m = _re.search(r"<target\s+dev=['\"]([^'\"]+)['\"]\s+bus=['\"]([^'\"]+)['\"]", body)
+        if not (src_m and tgt_m):
+            continue
+        source = src_m.group(1)
+        target = tgt_m.group(1)
+        bus = tgt_m.group(2)
+
+        drbd_resource = ""
+        drbd_minor = None
+        backing_lv = source
+        minor_m = _re.match(r"/dev/drbd(\d+)$", source)
+        if minor_m:
+            drbd_minor = int(minor_m.group(1))
+            drbd_resource = drbd_by_minor.get(str(drbd_minor), "")
+            # Resolve backing LV via drbdadm show. Cheap; cached would be nicer.
+            try:
+                show = ssh_cmd(host,
+                    f"drbdadm show {drbd_resource} 2>/dev/null | head -30") if drbd_resource else ""
+                lv_m = _re.search(r"disk\s+(/dev/[^\s;]+);", show)
+                if lv_m:
+                    backing_lv = lv_m.group(1)
+            except Exception: pass
+        out.append({
+            "target": target, "bus": bus, "source": source,
+            "drbd_resource": drbd_resource, "drbd_minor": drbd_minor,
+            "backing_lv": backing_lv,
+        })
+    out.sort(key=lambda d: d["target"])
+    return out
 
 
 def get_vm_vnc_port(host: str, vm_name: str) -> int:
@@ -318,24 +373,52 @@ def build_cluster_state() -> dict:
         for nname, info in nodes_data.items():
             if vm_name in info["running_vms"]: running_on = nname
             if vm_name in info["all_vms"]: defined_on.append(nname)
-        resource = (get_vm_drbd_resource(nodes_cfg[defined_on[0]]["host"], vm_name)
-                    if defined_on else "")
+        disks = (get_vm_disks(nodes_cfg[defined_on[0]]["host"], vm_name)
+                 if defined_on else [])
         vnc_port = (get_vm_vnc_port(nodes_cfg[running_on]["host"], vm_name)
                     if running_on and running_on in nodes_cfg else -1)
-        return vm_name, running_on, defined_on, resource, vnc_port
+        return vm_name, running_on, defined_on, disks, vnc_port
 
     with ThreadPoolExecutor(max_workers=max(4, len(all_vm_names) or 1)) as ex:
         probes = list(ex.map(_probe_vm, sorted(all_vm_names)))
 
-    for vm_name, running_on, defined_on, resource, vnc_port in probes:
+    for vm_name, running_on, defined_on, disks, vnc_port in probes:
         backup_node = next((n for n in defined_on if n != running_on), None)
-        drbd_state = drbd.get(resource, {}) if resource else {}
+        # Back-compat: drbd_resource = first disk's resource. New clients
+        # should read the disks[] array instead.
+        first_resource = next((d["drbd_resource"] for d in disks
+                              if d.get("drbd_resource")), "")
+        drbd_state = drbd.get(first_resource, {}) if first_resource else {}
         vnc_ws_url = f"/vnc/{vm_name}" if vnc_port > 0 else ""
+
+        # Enrich each disk with its DRBD state (if any), and with LV size
+        # so the settings UI can show per-disk capacity without a second call.
+        disks_out = []
+        size_host = (nodes_cfg[defined_on[0]]["host"] if defined_on else None)
+        for d in disks:
+            disk = dict(d)
+            r = d.get("drbd_resource", "")
+            if r and r in drbd:
+                disk["drbd_role"] = drbd[r].get("role", "")
+                disk["drbd_disk"] = drbd[r].get("disk", "")
+                disk["drbd_peer_disk"] = drbd[r].get("peer_disk", "")
+                disk["drbd_sync_pct"] = drbd[r].get("done", "")
+            # Resolve size from the backing LV (cheap blockdev call)
+            try:
+                if size_host and d.get("backing_lv"):
+                    b = ssh_cmd(size_host,
+                        f"blockdev --getsize64 {d['backing_lv']} 2>/dev/null || echo 0")
+                    disk["size_bytes"] = int((b or "0").strip())
+                    disk["size_gb"] = max(1, disk["size_bytes"] // (1 << 30))
+            except Exception: pass
+            disks_out.append(disk)
 
         vms_data[vm_name] = {
             "name": vm_name, "state": "running" if running_on else "shut off",
             "running_on": running_on, "backup_node": backup_node, "defined_on": defined_on,
-            "drbd_resource": resource,
+            "disks": disks_out,
+            # Back-compat fields — kept until all callers switched to disks[]:
+            "drbd_resource": first_resource,
             "drbd_role": drbd_state.get("role", ""),
             "drbd_disk": drbd_state.get("disk", ""),
             "drbd_peer_disk": drbd_state.get("peer_disk", ""),
@@ -435,6 +518,7 @@ async def startup():
         "vms": {},
         "witness": {"nodes": {}},
     }
+    task_registry().wire(_main_loop, hub.broadcast)
     asyncio.create_task(state_push_loop())
     write_scrape_config(cfg)
 
@@ -444,6 +528,22 @@ async def startup():
 def api_cluster():
     # Serve cached state. Fresh data lands every 3s via the push loop.
     return _last_state
+
+
+@app.get("/api/tasks")
+def api_tasks():
+    """Active + recently-finished tasks. Clients use WS 'task' channel for
+    live updates; this endpoint is the snapshot on fresh page load."""
+    return task_registry().list()
+
+
+@app.get("/api/tasks/{task_id}")
+def api_task_get(task_id: str):
+    t = task_registry().get(task_id)
+    if not t:
+        raise HTTPException(404, "task not found (finished and aged out, or never existed)")
+    from tasks import _serialize
+    return _serialize(t)
 
 
 @app.get("/cluster-info")
@@ -1169,8 +1269,45 @@ def api_vm_poweroff(vm_name: str):
     return _vm_poweroff(vm_name)
 
 @app.post("/api/vms/{vm_name}/convert")
-def api_vm_convert(vm_name: str, req: ConvertRequest):
-    return _vm_convert(vm_name, req.target_type, req.peer_nodes)
+async def api_vm_convert(vm_name: str, req: ConvertRequest):
+    """Fire-and-forget. Returns task_id immediately; the dashboard reads
+    progress from /api/tasks (WS 'task' channel)."""
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm: raise HTTPException(404, f"VM {vm_name} not found")
+    if vm["state"] != "running":
+        raise HTTPException(400, "VM must be running to hot-convert")
+    if req.target_type not in ("cattle", "pet", "vipet"):
+        raise HTTPException(400, f"Invalid target_type: {req.target_type}")
+    nodes_cfg = get_nodes()
+    src_name = vm["running_on"]
+    current_type = (
+        "vipet" if vm.get("drbd_resource")
+            and _count_drbd_peers(nodes_cfg[src_name]["host"], vm["drbd_resource"]) >= 3
+        else ("pet" if vm.get("drbd_resource") else "cattle")
+    )
+    if current_type == req.target_type:
+        return {"status": "no-op", "current": current_type}
+
+    task = task_registry().create(
+        "vm.convert", f"VM {vm_name}: {current_type} → {req.target_type}",
+        vm_name=vm_name, node=src_name)
+
+    async def _runner():
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, _vm_convert, vm_name, req.target_type, req.peer_nodes, task)
+            task.log(f"result: {result}")
+            task.succeed()
+        except HTTPException as e:
+            task.fail(f"{e.status_code}: {e.detail}")
+        except Exception as e:
+            task.fail(str(e))
+
+    asyncio.create_task(_runner())
+    return {"status": "accepted", "task_id": task.id,
+            "from": current_type, "to": req.target_type}
 
 
 @app.post("/api/vms/create")
@@ -1370,13 +1507,13 @@ def _lv_bytes(host: str, lv_path: str) -> int:
     return int(ssh_cmd(host, f"blockdev --getsize64 {lv_path}"))
 
 
-def _gen_drbd_res(vm_name: str, minor: int, peers: list) -> str:
+def _gen_drbd_res(resource: str, minor: int, peers: list) -> str:
     """peers: list of (node_name, drbd_ip, lv_path, meta_lv_path). 2 or 3 entries.
     External meta-disk keeps the DRBD device the same size as the data LV,
     so virsh blockcopy can pivot 1:1 without size mismatch.
     """
     port = 7000 + minor
-    lines = [f"resource vm-{vm_name}-disk0 {{",
+    lines = [f"resource {resource} {{",
              "    protocol C;",
              "    net { allow-two-primaries no; after-sb-0pri discard-zero-changes;",
              "          after-sb-1pri discard-secondary; after-sb-2pri disconnect; }"]
@@ -1392,16 +1529,19 @@ def _gen_drbd_res(vm_name: str, minor: int, peers: list) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write_drbd_res(hosts: list, vm_name: str, content: str):
-    """Write /etc/drbd.d/vm-<name>-disk0.res on all hosts via SSH."""
+def _write_drbd_res(hosts: list, resource: str, content: str):
+    """Write /etc/drbd.d/<resource>.res on all hosts via SSH. The file name
+    matches the resource name so one VM can have multiple .res files
+    (vm-foo-disk0.res, vm-foo-disk1.res)."""
     import base64
     b64 = base64.b64encode(content.encode()).decode()
-    path = f"/etc/drbd.d/vm-{vm_name}-disk0.res"
+    path = f"/etc/drbd.d/{resource}.res"
     for h in hosts:
         ssh_cmd(h, f"echo {b64} | base64 -d > {path}")
 
 
-def _vm_convert(vm_name: str, target_type: str, peer_nodes=None) -> dict:
+def _vm_convert(vm_name: str, target_type: str, peer_nodes=None,
+                task: Optional[Task] = None) -> dict:
     if target_type not in ("cattle", "pet", "vipet"):
         raise HTTPException(400, f"Invalid target_type: {target_type}")
 
@@ -1422,9 +1562,9 @@ def _vm_convert(vm_name: str, target_type: str, peer_nodes=None) -> dict:
 
     rank = {"cattle": 0, "pet": 1, "vipet": 2}
     if rank[target_type] > rank[current_type]:
-        return _vm_convert_upgrade(vm_name, current_type, target_type, src_name, peer_nodes)
+        return _vm_convert_upgrade(vm_name, current_type, target_type, src_name, peer_nodes, task)
     else:
-        return _vm_convert_downgrade(vm_name, current_type, target_type, src_name, peer_nodes)
+        return _vm_convert_downgrade(vm_name, current_type, target_type, src_name, peer_nodes, task)
 
 
 def _count_drbd_peers(host: str, resource: str) -> int:
@@ -1439,245 +1579,346 @@ def _count_drbd_peers(host: str, resource: str) -> int:
 
 
 def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
-                         peer_nodes) -> dict:
+                         peer_nodes, task: Optional[Task] = None) -> dict:
+    """Cattle → pet / cattle → ViPet / pet → ViPet.
+
+    Iterates over every disk the VM has, so multi-disk guests become
+    pet/ViPet across ALL their disks. Atomic: if any disk fails mid-way,
+    rollback unwinds the changes already made to earlier disks."""
     nodes_cfg = get_nodes()
     src = nodes_cfg[src_name]
 
     need_peers = {"pet": 1, "vipet": 2}[tgt]
     available = [n for n in nodes_cfg if n != src_name]
 
+    # Enumerate disks the VM actually has. Works for cattle (plain LVs) and
+    # for pet→ViPet (DRBD devices). cdroms are excluded by get_vm_disks.
+    disks = get_vm_disks(src["host"], vm_name)
+    if not disks:
+        raise HTTPException(500, f"No disks found on VM {vm_name}")
+
     if cur == "cattle":
-        # Need `need_peers` new peers
         chosen = (peer_nodes or available)[:need_peers]
         if len(chosen) < need_peers:
             raise HTTPException(400, f"{tgt} needs {need_peers} peers, have {len(chosen)}")
 
-        disk = _find_vm_disk(src["host"], vm_name)
-        src_lv = disk["source_dev"]
-        target_dev = disk["target"]
-        lv_name = src_lv.split("/")[-1]
-        vg_name = src_lv.split("/")[-2]
-        meta_lv_name = f"{lv_name}-meta"
-        meta_path = f"/dev/{vg_name}/{meta_lv_name}"
+        # Track what we created so we can unwind on failure
+        created: list[dict] = []  # [{resource, hosts: [host, lv, meta]}]
 
-        src_size = _lv_bytes(src["host"], src_lv)
-        size_mb = (src_size + 1024*1024 - 1) // (1024*1024)
-        # External DRBD metadata: ~32KB + 4KB × peers. 4MB LV covers up to many peers.
-        meta_mb = 4
+        def _unwind():
+            for c in reversed(created):
+                for h, lv, meta in c["hosts"]:
+                    ssh_cmd_rc(h, f"drbdadm down {c['resource']} 2>&1 || true", timeout=15)
+                    ssh_cmd_rc(h, f"drbdadm wipe-md --force {c['resource']} 2>&1 || true", timeout=15)
+                    ssh_cmd_rc(h, f"rm -f /etc/drbd.d/{c['resource']}.res", timeout=5)
+                    rm_paths = " ".join(p for p in (lv, meta) if p and "-meta" in (meta or ""))
+                    if rm_paths:
+                        ssh_cmd_rc(h, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
 
-        # 1. Create external metadata LV on source
-        push_log(f"Convert {vm_name}: create external DRBD meta LV {meta_path}",
-                 node=src_name, app="bedrock-mgmt")
-        ssh_cmd(src["host"],
-                f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool -n {meta_lv_name} -y "
-                f"2>&1 || true", timeout=30)
+        t_start = time.time()
+        try:
+            converted_disks = []
+            for i, disk in enumerate(disks):
+                src_lv = disk["backing_lv"]
+                target_dev = disk["target"]
+                lv_name = src_lv.split("/")[-1]
+                vg_name = src_lv.split("/")[-2]
+                resource = f"vm-{vm_name}-disk{i}"
+                # Meta LV name must be unique per resource; keep the
+                # historical `<lv>-meta` suffix so existing resources parse.
+                meta_lv_name = f"{lv_name}-meta"
+                meta_path = f"/dev/{vg_name}/{meta_lv_name}"
 
-        # 2. Create matching data + meta LV on each peer
-        peers_info = [(src_name, src.get("drbd_ip") or src["host"], src_lv, meta_path)]
-        for pname in chosen:
-            p = nodes_cfg[pname]
-            _ensure_thinpool(p["host"], vg_name)
-            push_log(f"Convert {vm_name}: create peer LVs on {pname} ({size_mb}M data + {meta_mb}M meta)",
-                     node=pname, app="bedrock-mgmt")
-            ssh_cmd(p["host"],
-                    f"lvcreate -V {size_mb}M -T {vg_name}/thinpool -n {lv_name} -y",
-                    timeout=30)
-            ssh_cmd(p["host"],
-                    f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool -n {meta_lv_name} -y",
-                    timeout=30)
-            peers_info.append((pname, p.get("drbd_ip") or p["host"],
-                               f"/dev/{vg_name}/{lv_name}",
-                               f"/dev/{vg_name}/{meta_lv_name}"))
+                src_size = _lv_bytes(src["host"], src_lv)
+                size_mb = (src_size + 1024*1024 - 1) // (1024*1024)
+                meta_mb = 4
 
-        # 3. Generate + deploy DRBD resource config
-        all_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in peers_info]
-        minor = _next_drbd_minor(all_hosts)
-        res_text = _gen_drbd_res(vm_name, minor, peers_info)
-        _write_drbd_res(all_hosts, vm_name, res_text)
+                step_prefix = f"disk{i} ({target_dev})"
+                if task: task.step_start(f"{step_prefix}: create meta LV on source")
 
-        # 4. Initialise metadata on all nodes, bring resource up
-        resource = f"vm-{vm_name}-disk0"
-        for h in all_hosts:
-            ssh_cmd(h, f"drbdadm create-md --force --max-peers=7 {resource}", timeout=30)
-            ssh_cmd(h, f"drbdadm up {resource}", timeout=30)
+                # 1. Create external metadata LV on source for this disk
+                ssh_cmd(src["host"],
+                        f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool "
+                        f"-n {meta_lv_name} -y 2>&1 || true", timeout=30)
 
-        # 5. Force primary on source (current LV has the data)
-        ssh_cmd(src["host"],
-                f"drbdadm primary --force {resource}", timeout=30)
+                # 2. Create matching data + meta LV on each peer
+                peers_info = [(src_name, src.get("drbd_ip") or src["host"],
+                               src_lv, meta_path)]
+                for pname in chosen:
+                    p = nodes_cfg[pname]
+                    _ensure_thinpool(p["host"], vg_name)
+                    ssh_cmd(p["host"],
+                            f"lvcreate -V {size_mb}M -T {vg_name}/thinpool "
+                            f"-n {lv_name} -y", timeout=30)
+                    ssh_cmd(p["host"],
+                            f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool "
+                            f"-n {meta_lv_name} -y", timeout=30)
+                    peers_info.append((pname, p.get("drbd_ip") or p["host"],
+                                       f"/dev/{vg_name}/{lv_name}",
+                                       f"/dev/{vg_name}/{meta_lv_name}"))
+                all_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in peers_info]
+                # record for unwind: hosts + the peer LV paths (we don't
+                # remove the source-side original LV — blockcopy will
+                # repoint the VM away from it but the original LV stays)
+                created.append({
+                    "resource": resource,
+                    "hosts": [(nodes_cfg[n]["host"],
+                               f"/dev/{vg_name}/{lv_name}" if n != src_name else "",
+                               f"/dev/{vg_name}/{meta_lv_name}")
+                              for n, _, _, _ in peers_info],
+                })
+                if task: task.step_done(f"{step_prefix}: create meta LV on source")
 
-        # 6. Hot-swap VM: blockcopy source LV → /dev/drbdN, --reuse-external --pivot
-        push_log(f"Convert {vm_name}: blockcopy {target_dev} → /dev/drbd{minor}",
-                 node=src_name, app="bedrock-mgmt")
-        t0 = time.time()
-        out, rc = ssh_cmd_rc(src["host"],
-            f"virsh blockcopy {vm_name} {target_dev} /dev/drbd{minor} "
-            f"--reuse-external --wait --pivot --verbose --transient-job --blockdev --format raw", timeout=600)
-        dur = round(time.time() - t0, 2)
-        if rc != 0:
-            raise HTTPException(500, f"blockcopy failed: {out}")
+                if task: task.step_start(f"{step_prefix}: generate DRBD res")
+                minor = _next_drbd_minor(all_hosts)
+                res_text = _gen_drbd_res(resource, minor, peers_info)
+                _write_drbd_res(all_hosts, resource, res_text)
+                if task: task.step_done(f"{step_prefix}: generate DRBD res")
 
-        # 7. Define VM on peer nodes so it's a true HA pet (migration works, failover works)
-        xml_text = ssh_cmd(src["host"], f"virsh dumpxml {vm_name}", timeout=15)
-        import base64 as _b64
-        xml_b64 = _b64.b64encode(xml_text.encode()).decode()
-        for pname, _, _, _ in peers_info:
-            if pname == src_name: continue
-            ph = nodes_cfg[pname]["host"]
-            ssh_cmd(ph, f"echo {xml_b64} | base64 -d > /tmp/{vm_name}.xml && "
-                        f"virsh define /tmp/{vm_name}.xml >/dev/null", timeout=15)
+                if task: task.step_start(f"{step_prefix}: create-md + up")
+                for h in all_hosts:
+                    ssh_cmd(h, f"drbdadm create-md --force --max-peers=7 "
+                               f"{resource}", timeout=30)
+                    ssh_cmd(h, f"drbdadm up {resource}", timeout=30)
+                ssh_cmd(src["host"], f"drbdadm primary --force {resource}",
+                        timeout=30)
+                if task: task.step_done(f"{step_prefix}: create-md + up")
 
-        push_log(f"Convert {vm_name}: {cur} → {tgt} in {dur}s (DRBD minor {minor})",
-                 node=src_name, app="bedrock-mgmt", level="info")
+                if task: task.step_start(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                out, rc = ssh_cmd_rc(src["host"],
+                    f"virsh blockcopy {vm_name} {target_dev} /dev/drbd{minor} "
+                    f"--reuse-external --wait --pivot --verbose "
+                    f"--transient-job --blockdev --format raw", timeout=1800)
+                if rc != 0:
+                    if task: task.step_fail(f"{step_prefix}: blockcopy → /dev/drbd{minor}",
+                                            f"rc={rc}: {out[-400:]}")
+                    raise HTTPException(500, f"blockcopy failed on disk{i}: {out}")
+                if task: task.step_done(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                converted_disks.append({"index": i, "target": target_dev,
+                                        "resource": resource, "minor": minor})
 
-        return {"status": "converted", "from": cur, "to": tgt,
-                "resource": resource, "duration_s": dur,
-                "peers": [p[0] for p in peers_info]}
+            # After all disks succeed: define VM on peers so migration works.
+            if task: task.step_start("define VM on peers")
+            xml_text = ssh_cmd(src["host"], f"virsh dumpxml {vm_name}", timeout=15)
+            import base64 as _b64
+            xml_b64 = _b64.b64encode(xml_text.encode()).decode()
+            for pname in chosen:
+                ph = nodes_cfg[pname]["host"]
+                ssh_cmd(ph, f"echo {xml_b64} | base64 -d > /tmp/{vm_name}.xml && "
+                            f"virsh define /tmp/{vm_name}.xml >/dev/null", timeout=15)
+            if task: task.step_done("define VM on peers")
+
+            dur = round(time.time() - t_start, 2)
+            push_log(f"Convert {vm_name}: {cur} → {tgt} in {dur}s "
+                     f"({len(converted_disks)} disk(s))",
+                     node=src_name, app="bedrock-mgmt", level="info")
+            return {"status": "converted", "from": cur, "to": tgt,
+                    "disks": converted_disks, "duration_s": dur,
+                    "peers": [src_name] + chosen}
+        except Exception as e:
+            push_log(f"Convert {vm_name}: FAILED ({e}) — unwinding",
+                     node=src_name, app="bedrock-mgmt", level="error")
+            _unwind()
+            raise
 
     elif cur == "pet" and tgt == "vipet":
-        # Add a third peer to an existing 2-way resource
-        resource = f"vm-{vm_name}-disk0"
-        existing = _parse_drbd_res(src["host"], resource)
-        if not existing:
-            raise HTTPException(500, f"Cannot parse existing {resource}")
+        # Add a third peer to every existing DRBD resource the VM has.
+        resources = [d["drbd_resource"] for d in disks if d.get("drbd_resource")]
+        if not resources:
+            raise HTTPException(500, f"No DRBD resources found on {vm_name}")
 
-        chosen = (peer_nodes or [n for n in available if n not in existing["peers"]])[:1]
+        chosen = peer_nodes or []
+        if not chosen:
+            # Pick a node not already in the first resource's peer list
+            first_existing = _parse_drbd_res(src["host"], resources[0]) or {}
+            chosen = [n for n in available if n not in first_existing.get("peers", [])][:1]
         if not chosen:
             raise HTTPException(400, "vipet needs a third peer")
         new_peer = chosen[0]
         p = nodes_cfg[new_peer]
-        vg_name = existing["lv_vg"]
-        lv_name = existing["lv_name"]
-        meta_lv_name = f"{lv_name}-meta"
-        size_mb = (existing["size_bytes"] + 1024*1024 - 1) // (1024*1024)
 
-        _ensure_thinpool(p["host"], vg_name)
-        push_log(f"Convert {vm_name}: add 3rd peer {new_peer}",
-                 node=new_peer, app="bedrock-mgmt")
-        ssh_cmd(p["host"],
-                f"lvcreate -V {size_mb}M -T {vg_name}/thinpool -n {lv_name} -y",
-                timeout=30)
-        ssh_cmd(p["host"],
-                f"lvcreate -V 4M -T {vg_name}/thinpool -n {meta_lv_name} -y",
-                timeout=30)
+        added = []
+        t_start = time.time()
+        for i, resource in enumerate(resources):
+            existing = _parse_drbd_res(src["host"], resource)
+            if not existing:
+                raise HTTPException(500, f"Cannot parse existing {resource}")
+            vg_name = existing["lv_vg"]
+            lv_name = existing["lv_name"]
+            meta_lv_name = f"{lv_name}-meta"
+            size_mb = (existing["size_bytes"] + 1024*1024 - 1) // (1024*1024)
 
-        peers_info = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
-                       existing["lv_path"], existing["meta_path"])
-                      for n in existing["peers"]]
-        peers_info.append((new_peer, p.get("drbd_ip") or p["host"],
-                           f"/dev/{vg_name}/{lv_name}",
-                           f"/dev/{vg_name}/{meta_lv_name}"))
+            step_prefix = f"disk{i} ({resource})"
+            if task: task.step_start(f"{step_prefix}: LVs on new peer {new_peer}")
+            _ensure_thinpool(p["host"], vg_name)
+            ssh_cmd(p["host"], f"lvcreate -V {size_mb}M -T {vg_name}/thinpool "
+                               f"-n {lv_name} -y", timeout=30)
+            ssh_cmd(p["host"], f"lvcreate -V 4M -T {vg_name}/thinpool "
+                               f"-n {meta_lv_name} -y", timeout=30)
+            if task: task.step_done(f"{step_prefix}: LVs on new peer {new_peer}")
 
-        minor = existing["minor"]
-        res_text = _gen_drbd_res(vm_name, minor, peers_info)
-        all_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in peers_info]
-        _write_drbd_res(all_hosts, vm_name, res_text)
+            peers_info = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
+                           existing["lv_path"], existing["meta_path"])
+                          for n in existing["peers"]]
+            peers_info.append((new_peer, p.get("drbd_ip") or p["host"],
+                               f"/dev/{vg_name}/{lv_name}",
+                               f"/dev/{vg_name}/{meta_lv_name}"))
+            minor = existing["minor"]
+            res_text = _gen_drbd_res(resource, minor, peers_info)
+            all_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in peers_info]
+            _write_drbd_res(all_hosts, resource, res_text)
 
-        # Initialise meta on the new peer only
-        ssh_cmd(p["host"], f"drbdadm create-md --force --max-peers=7 {resource}", timeout=30)
-        # Reload config on all, bring up on new peer
-        for h in all_hosts:
-            ssh_cmd(h, f"drbdadm adjust {resource} 2>&1 || true", timeout=30)
-        ssh_cmd(p["host"], f"drbdadm up {resource}", timeout=30)
+            if task: task.step_start(f"{step_prefix}: create-md + adjust")
+            ssh_cmd(p["host"], f"drbdadm create-md --force --max-peers=7 "
+                               f"{resource}", timeout=30)
+            for h in all_hosts:
+                ssh_cmd(h, f"drbdadm adjust {resource} 2>&1 || true", timeout=30)
+            ssh_cmd(p["host"], f"drbdadm up {resource}", timeout=30)
+            if task: task.step_done(f"{step_prefix}: create-md + adjust")
+            added.append(resource)
 
-        # Define VM on new peer as well
+        # Define VM on new peer (once; shared XML for all disks)
+        if task: task.step_start(f"define VM on new peer {new_peer}")
         xml_text = ssh_cmd(src["host"], f"virsh dumpxml {vm_name}", timeout=15)
         import base64 as _b64
         xml_b64 = _b64.b64encode(xml_text.encode()).decode()
         ssh_cmd(p["host"], f"echo {xml_b64} | base64 -d > /tmp/{vm_name}.xml && "
                             f"virsh define /tmp/{vm_name}.xml >/dev/null", timeout=15)
+        if task: task.step_done(f"define VM on new peer {new_peer}")
 
-        push_log(f"Convert {vm_name}: pet → vipet, added {new_peer}",
+        dur = round(time.time() - t_start, 2)
+        push_log(f"Convert {vm_name}: pet → vipet in {dur}s "
+                 f"({len(added)} resource(s) added peer {new_peer})",
                  node=src_name, app="bedrock-mgmt", level="info")
         return {"status": "converted", "from": cur, "to": tgt,
-                "resource": resource, "added_peer": new_peer}
+                "resources": added, "added_peer": new_peer,
+                "duration_s": dur}
 
 
 def _vm_convert_downgrade(vm_name: str, cur: str, tgt: str, src_name: str,
-                           peer_nodes) -> dict:
+                           peer_nodes, task: Optional[Task] = None) -> dict:
+    """ViPet → pet / pet → cattle / ViPet → cattle. Iterates over every
+    DRBD resource the VM has (one per disk)."""
     nodes_cfg = get_nodes()
     src = nodes_cfg[src_name]
-    resource = f"vm-{vm_name}-disk0"
-    existing = _parse_drbd_res(src["host"], resource)
-    if not existing:
-        raise HTTPException(500, f"Cannot parse {resource}")
+    disks = get_vm_disks(src["host"], vm_name)
+    resources = [d["drbd_resource"] for d in disks if d.get("drbd_resource")]
+    if not resources:
+        raise HTTPException(500, f"No DRBD resources found on {vm_name}")
 
     if cur == "vipet" and tgt == "pet":
-        # Drop one peer (not the primary). Prefer user-chosen.
-        candidates = [n for n in existing["peers"] if n != src_name]
-        drop_name = (peer_nodes[0] if peer_nodes else candidates[0])
-        if drop_name == src_name:
-            raise HTTPException(400, "Cannot drop primary")
+        # Pick one peer to drop (not src). Use first resource's peer list
+        # to make the choice; we'll drop the same peer from every resource.
+        first_existing = _parse_drbd_res(src["host"], resources[0]) or {}
+        candidates = [n for n in first_existing.get("peers", []) if n != src_name]
+        drop_name = (peer_nodes[0] if peer_nodes else (candidates[0] if candidates else None))
+        if not drop_name or drop_name == src_name:
+            raise HTTPException(400, "Cannot drop primary / no drop candidate")
         drop = nodes_cfg[drop_name]
 
-        # 1. Undefine VM on dropped peer, disconnect + down DRBD
+        # 1. Undefine VM on dropped peer (once for all disks)
+        if task: task.step_start(f"undefine VM on {drop_name}")
         ssh_cmd(drop["host"], f"virsh undefine {vm_name} 2>&1 || true", timeout=15)
-        ssh_cmd(drop["host"], f"drbdadm down {resource} 2>&1 || true", timeout=30)
-        ssh_cmd(drop["host"], f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=30)
+        if task: task.step_done(f"undefine VM on {drop_name}")
 
-        # 2. Rewrite config with remaining 2 peers, reload
-        remaining = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
-                      existing["lv_path"], existing["meta_path"])
-                     for n in existing["peers"] if n != drop_name]
-        minor = existing["minor"]
-        res_text = _gen_drbd_res(vm_name, minor, remaining)
-        kept_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in remaining]
-        _write_drbd_res(kept_hosts, vm_name, res_text)
-        # Remove res file on dropped
-        ssh_cmd(drop["host"],
-                f"rm -f /etc/drbd.d/vm-{vm_name}-disk0.res", timeout=10)
-        # Tell remaining nodes to forget the dropped peer (node-id of the drop)
-        drop_idx = existing["peers"].index(drop_name)
-        for h in kept_hosts:
-            ssh_cmd(h, f"drbdsetup disconnect {resource} {drop_idx} --force 2>&1 || true", timeout=15)
-            ssh_cmd(h, f"drbdsetup del-peer {resource} {drop_idx} --force 2>&1 || true", timeout=15)
-            ssh_cmd(h, f"drbdadm adjust {resource} 2>&1 || true", timeout=30)
+        # 2. Per-resource: tear down DRBD on drop, rewrite config on kept, remove LVs
+        for i, resource in enumerate(resources):
+            existing = _parse_drbd_res(src["host"], resource)
+            if not existing: continue
+            step_prefix = f"disk{i} ({resource})"
 
-        # 3. Free the LV + meta LV on dropped peer
-        ssh_cmd(drop["host"],
-                f"lvremove -f {existing['lv_path']} {existing['meta_path']} 2>&1 || true",
-                timeout=30)
+            if task: task.step_start(f"{step_prefix}: drop DRBD on {drop_name}")
+            ssh_cmd(drop["host"], f"drbdadm down {resource} 2>&1 || true", timeout=30)
+            ssh_cmd(drop["host"], f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=30)
 
-        push_log(f"Convert {vm_name}: vipet → pet (dropped {drop_name})",
+            remaining = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
+                          existing["lv_path"], existing["meta_path"])
+                         for n in existing["peers"] if n != drop_name]
+            minor = existing["minor"]
+            res_text = _gen_drbd_res(resource, minor, remaining)
+            kept_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in remaining]
+            _write_drbd_res(kept_hosts, resource, res_text)
+            ssh_cmd(drop["host"], f"rm -f /etc/drbd.d/{resource}.res", timeout=10)
+
+            drop_idx = existing["peers"].index(drop_name)
+            for h in kept_hosts:
+                ssh_cmd(h, f"drbdsetup disconnect {resource} {drop_idx} --force 2>&1 || true", timeout=15)
+                ssh_cmd(h, f"drbdsetup del-peer {resource} {drop_idx} --force 2>&1 || true", timeout=15)
+                ssh_cmd(h, f"drbdadm adjust {resource} 2>&1 || true", timeout=30)
+
+            ssh_cmd(drop["host"],
+                    f"lvremove -f {existing['lv_path']} {existing['meta_path']} 2>&1 || true",
+                    timeout=30)
+            if task: task.step_done(f"{step_prefix}: drop DRBD on {drop_name}")
+
+        push_log(f"Convert {vm_name}: vipet → pet (dropped {drop_name}, "
+                 f"{len(resources)} resource(s))",
                  node=src_name, app="bedrock-mgmt", level="info")
-        return {"status": "converted", "from": cur, "to": tgt, "dropped": drop_name}
+        return {"status": "converted", "from": cur, "to": tgt,
+                "dropped": drop_name, "resources": resources}
 
     elif cur in ("pet", "vipet") and tgt == "cattle":
-        # Pivot VM back to raw LV, tear DRBD down, drop all peer LVs
-        disk = _find_vm_disk(src["host"], vm_name)
-        target_dev = disk["target"]
-        lv_path = existing["lv_path"]
-        minor = existing["minor"]
+        # Pivot every DRBD device back to its raw LV, tear down DRBD, drop peer LVs.
+        t_start = time.time()
+        # Collect all peers affected across all resources (they should overlap).
+        all_peer_names: set[str] = set()
+        per_resource: list[dict] = []
+        for r in resources:
+            existing = _parse_drbd_res(src["host"], r)
+            if not existing:
+                raise HTTPException(500, f"Cannot parse {r}")
+            per_resource.append({"resource": r, "existing": existing})
+            all_peer_names.update(existing["peers"])
 
-        # blockcopy from /dev/drbdN → LV  (both same physical bytes; self-copy).
-        push_log(f"Convert {vm_name}: pivot {target_dev} back to {lv_path}",
-                 node=src_name, app="bedrock-mgmt")
-        t0 = time.time()
-        out, rc = ssh_cmd_rc(src["host"],
-            f"virsh blockcopy {vm_name} {target_dev} {lv_path} "
-            f"--reuse-external --wait --pivot --verbose --transient-job --blockdev --format raw", timeout=600)
-        dur = round(time.time() - t0, 2)
-        if rc != 0:
-            raise HTTPException(500, f"blockcopy pivot failed: {out}")
+        # Pivot each disk from /dev/drbdN → raw LV (same backing bytes)
+        for i, pr in enumerate(per_resource):
+            existing = pr["existing"]
+            # Find the disk in the VM XML that matches this resource's minor
+            target_dev = None
+            for d in disks:
+                if d.get("drbd_minor") == existing["minor"]:
+                    target_dev = d["target"]; break
+            if target_dev is None:
+                raise HTTPException(500, f"Cannot match disk for resource {pr['resource']}")
+            step_prefix = f"disk{i} ({pr['resource']})"
+            if task: task.step_start(f"{step_prefix}: pivot {target_dev} → {existing['lv_path']}")
+            out, rc = ssh_cmd_rc(src["host"],
+                f"virsh blockcopy {vm_name} {target_dev} {existing['lv_path']} "
+                f"--reuse-external --wait --pivot --verbose --transient-job "
+                f"--blockdev --format raw", timeout=1800)
+            if rc != 0:
+                if task: task.step_fail(f"{step_prefix}: pivot {target_dev} → {existing['lv_path']}",
+                                        f"rc={rc}: {out[-400:]}")
+                raise HTTPException(500, f"blockcopy pivot failed on {pr['resource']}: {out}")
+            if task: task.step_done(f"{step_prefix}: pivot {target_dev} → {existing['lv_path']}")
 
-        # Undefine VM on all peers (keep primary), tear DRBD down
-        for n in existing["peers"]:
-            h = nodes_cfg[n]["host"]
-            if n != src_name:
-                ssh_cmd(h, f"virsh undefine {vm_name} 2>&1 || true", timeout=15)
-            ssh_cmd(h, f"drbdadm down {resource} 2>&1 || true", timeout=30)
-            ssh_cmd(h, f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=30)
-            ssh_cmd(h, f"rm -f /etc/drbd.d/vm-{vm_name}-disk0.res", timeout=10)
-        all_hosts = [nodes_cfg[n]["host"] for n in existing["peers"]]
+        # Undefine VM on non-primary peers (once)
+        for n in all_peer_names:
+            if n == src_name: continue
+            if n not in nodes_cfg: continue
+            ssh_cmd(nodes_cfg[n]["host"], f"virsh undefine {vm_name} 2>&1 || true", timeout=15)
 
-        # Remove data+meta LVs on peers; remove only meta on primary (LV is now VM disk)
-        for n in existing["peers"]:
-            if n == src_name:
-                ssh_cmd(nodes_cfg[n]["host"],
-                        f"lvremove -f {existing['meta_path']} 2>&1 || true", timeout=30)
-            else:
-                ssh_cmd(nodes_cfg[n]["host"],
-                        f"lvremove -f {lv_path} {existing['meta_path']} 2>&1 || true",
-                        timeout=30)
+        # For every resource, tear DRBD down on every peer, remove peer data LVs,
+        # remove only meta on primary (data LV IS the VM disk now).
+        for i, pr in enumerate(per_resource):
+            existing = pr["existing"]
+            resource = pr["resource"]
+            step_prefix = f"disk{i} ({resource})"
+            if task: task.step_start(f"{step_prefix}: tear DRBD down + remove LVs")
+            for n in existing["peers"]:
+                if n not in nodes_cfg: continue
+                h = nodes_cfg[n]["host"]
+                ssh_cmd(h, f"drbdadm down {resource} 2>&1 || true", timeout=30)
+                ssh_cmd(h, f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=30)
+                ssh_cmd(h, f"rm -f /etc/drbd.d/{resource}.res", timeout=10)
+                if n == src_name:
+                    ssh_cmd(h, f"lvremove -f {existing['meta_path']} 2>&1 || true", timeout=30)
+                else:
+                    ssh_cmd(h, f"lvremove -f {existing['lv_path']} "
+                               f"{existing['meta_path']} 2>&1 || true", timeout=30)
+            if task: task.step_done(f"{step_prefix}: tear DRBD down + remove LVs")
+
+        dur = round(time.time() - t_start, 2)
 
         push_log(f"Convert {vm_name}: {cur} → cattle in {dur}s",
                  node=src_name, app="bedrock-mgmt", level="info")
@@ -2024,9 +2265,10 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     return {"status": "created", "name": req.name, "node": home_name}
 
 
-def _vm_delete(vm_name: str) -> dict:
+def _vm_delete(vm_name: str, task: Optional[Task] = None) -> dict:
     """Stop (if running), tear down DRBD (if any), undefine VM + remove LVs
-    on every node where it was defined, drop inventory entry."""
+    on every node where it was defined, drop inventory entry. Iterates every
+    disk the VM had, so multi-disk VMs clean up fully."""
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm:
@@ -2036,28 +2278,75 @@ def _vm_delete(vm_name: str) -> dict:
     if not defined_on:
         raise HTTPException(500, "VM has no defined_on nodes")
 
-    resource = vm.get("drbd_resource", "")
-    existing = _parse_drbd_res(nodes_cfg[defined_on[0]]["host"], resource) if resource else {}
-    lv_path = existing.get("lv_path", f"/dev/almalinux/vm-{vm_name}-disk0")
-    meta_path = existing.get("meta_path", "")
+    # Per-disk teardown plan. For each disk figure out its DRBD resource (if any)
+    # and the LV paths (data + meta) on every peer. We parse the .res on one node
+    # for peer LV paths — DRBD resource config has on <node> { disk / meta-disk }.
+    disks = vm.get("disks") or []
+    if not disks:
+        # Fallback — VM has no disks in state (pure cattle, or state stale).
+        # Guess the legacy single-disk path.
+        disks = [{"drbd_resource": vm.get("drbd_resource", ""),
+                  "backing_lv": f"/dev/almalinux/vm-{vm_name}-disk0"}]
 
-    # 1. Stop the VM (graceful shutdown → force-kill fallback)
+    # For each disk, collect a mini-plan: {resource, lv_by_node, meta_by_node}.
+    host0 = nodes_cfg[defined_on[0]]["host"]
+    disk_plans = []
+    for d in disks:
+        r = d.get("drbd_resource") or ""
+        plan = {"resource": r, "lv_by_node": {}, "meta_by_node": {}}
+        if r:
+            existing = _parse_drbd_res(host0, r) or {}
+            # _parse_drbd_res today returns single peer view; extend to parse all
+            # 'on <node>' blocks.
+            try:
+                cfg_text = ssh_cmd_rc(host0, f"cat /etc/drbd.d/{r}.res 2>/dev/null", timeout=10)[0]
+                import re as _re
+                for m in _re.finditer(
+                    r"on\s+(\S+)\s*\{([^}]*)\}", cfg_text or "", _re.DOTALL):
+                    node_fqdn, body = m.group(1), m.group(2)
+                    dm = _re.search(r"disk\s+(/dev/[^\s;]+)\s*;", body)
+                    mm = _re.search(r"meta-disk\s+(/dev/[^\s;]+)\s*;", body)
+                    if dm: plan["lv_by_node"][node_fqdn] = dm.group(1)
+                    if mm: plan["meta_by_node"][node_fqdn] = mm.group(1)
+            except Exception: pass
+        if not plan["lv_by_node"]:
+            # No DRBD, or parse failed — use backing_lv we saw on the live node.
+            default_lv = d.get("backing_lv") or \
+                f"/dev/almalinux/vm-{vm_name}-disk0"
+            for n in defined_on:
+                plan["lv_by_node"][n] = default_lv
+        disk_plans.append(plan)
+
+    # 1. Stop the VM (force-kill; this is delete, not shutdown)
+    if task: task.step_start("destroy VM")
     if vm["state"] == "running" and vm.get("running_on"):
         host = nodes_cfg[vm["running_on"]]["host"]
         ssh_cmd_rc(host, f"virsh destroy {vm_name} 2>&1", timeout=15)
+    if task: task.step_done("destroy VM")
 
-    # 2. For each node that has the VM, tear it down
+    # 2. For each node that has the VM, undefine it + tear down DRBD + remove LVs
     for nname in defined_on:
         if nname not in nodes_cfg: continue
         host = nodes_cfg[nname]["host"]
+        if task: task.step_start(f"undefine on {nname}")
         ssh_cmd_rc(host, f"virsh undefine {vm_name} --nvram 2>&1 || virsh undefine {vm_name} 2>&1", timeout=15)
-        if resource:
-            ssh_cmd_rc(host, f"drbdadm down {resource} 2>&1 || true", timeout=15)
-            ssh_cmd_rc(host, f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=15)
-            ssh_cmd_rc(host, f"rm -f /etc/drbd.d/{resource}.res", timeout=10)
-        # Remove LVs (data + meta if present)
-        rm_paths = lv_path + (f" {meta_path}" if meta_path else "")
-        ssh_cmd_rc(host, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
+        if task: task.step_done(f"undefine on {nname}")
+
+        # Per-disk teardown on this node
+        for i, plan in enumerate(disk_plans):
+            r = plan["resource"]
+            sn = f"disk{i}"
+            if task: task.step_start(f"{sn} teardown on {nname}")
+            if r:
+                ssh_cmd_rc(host, f"drbdadm down {r} 2>&1 || true", timeout=15)
+                ssh_cmd_rc(host, f"drbdadm wipe-md --force {r} 2>&1 || true", timeout=15)
+                ssh_cmd_rc(host, f"rm -f /etc/drbd.d/{r}.res", timeout=10)
+            lv = plan["lv_by_node"].get(nname) or next(iter(plan["lv_by_node"].values()), "")
+            mv = plan["meta_by_node"].get(nname, "")
+            rm_paths = " ".join(p for p in (lv, mv) if p)
+            if rm_paths:
+                ssh_cmd_rc(host, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
+            if task: task.step_done(f"{sn} teardown on {nname}")
 
     # 3. Drop inventory entry
     inv = load_inventory()
