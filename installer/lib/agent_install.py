@@ -10,14 +10,30 @@ from pathlib import Path
 from . import state, exporters
 
 
-def _register(mgmt_url: str, name: str, host: str, drbd_ip: str):
+def _register(mgmt_url: str, name: str, host: str, drbd_ip: str, pubkey: str):
     payload = json.dumps({"name": name, "host": host, "drbd_ip": drbd_ip,
-                          "role": "compute"}).encode()
+                          "role": "compute", "pubkey": pubkey}).encode()
     req = urllib.request.Request(
         f"{mgmt_url}/api/nodes/register", data=payload,
         headers={"Content-Type": "application/json"}, method="POST")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=10)
     return json.loads(r.read())
+
+
+def _install_peer_pubkeys(pubkeys: list):
+    """Add each peer pubkey to /root/.ssh/authorized_keys (dedup)."""
+    if not pubkeys:
+        return
+    authz = Path("/root/.ssh/authorized_keys")
+    authz.parent.mkdir(mode=0o700, exist_ok=True)
+    existing = authz.read_text() if authz.exists() else ""
+    lines = [ln.strip() for ln in existing.splitlines() if ln.strip()]
+    for pk in pubkeys:
+        pk = pk.strip()
+        if pk and pk not in lines:
+            lines.append(pk)
+    authz.write_text("\n".join(lines) + "\n")
+    authz.chmod(0o600)
 
 
 def install(witness: str, cluster_info: dict, repo: str):
@@ -56,9 +72,16 @@ def install(witness: str, cluster_info: dict, repo: str):
     print("  Installing exporters...")
     exporters.install(repo)
 
+    # Read our own pubkey to send with register so mgmt (and peers) can SSH in.
+    pub_path = Path("/root/.ssh/id_ed25519.pub")
+    my_pubkey = pub_path.read_text().strip() if pub_path.exists() else ""
+
     print(f"  Registering with mgmt at {s['mgmt_url']}...")
-    result = _register(s["mgmt_url"], s["node_name"], mgmt_ip, drbd_ip)
+    result = _register(s["mgmt_url"], s["node_name"], mgmt_ip, drbd_ip, my_pubkey)
     print(f"  Registered. Cluster now has {len(result.get('nodes', []))} nodes.")
+
+    # Install every peer's pubkey locally so mgmt + peers can SSH to this node.
+    _install_peer_pubkeys(result.get("peer_pubkeys", []))
 
     # Pre-scan peer host keys so `virsh migrate` via qemu+ssh works on first try.
     peer_ips = result.get("peer_ips", [])

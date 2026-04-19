@@ -469,13 +469,58 @@ class NodeRegister(BaseModel):
     host: str
     drbd_ip: Optional[str] = None
     role: str = "compute"
+    pubkey: Optional[str] = None
+
+
+def _append_authorized_key(pubkey: str, target_host: Optional[str] = None):
+    """Append pubkey to /root/.ssh/authorized_keys on target_host (or local)."""
+    line = pubkey.strip()
+    if not line:
+        return
+    if target_host is None:
+        authz = Path("/root/.ssh/authorized_keys")
+        authz.parent.mkdir(mode=0o700, exist_ok=True)
+        existing = authz.read_text() if authz.exists() else ""
+        if line not in existing:
+            authz.write_text(existing.rstrip() + "\n" + line + "\n")
+            authz.chmod(0o600)
+        return
+    # On a peer over SSH — mgmt already has SSH trust there (peer joined earlier).
+    import shlex as _shlex
+    quoted = _shlex.quote(line)
+    try:
+        ssh_cmd(target_host,
+            f"mkdir -p -m 700 /root/.ssh && "
+            f"grep -qxF {quoted} /root/.ssh/authorized_keys 2>/dev/null || "
+            f"echo {quoted} >> /root/.ssh/authorized_keys && "
+            f"chmod 600 /root/.ssh/authorized_keys",
+            timeout=10)
+    except Exception as e:
+        push_log(f"Could not push pubkey to {target_host}: {e}",
+                 node="mgmt", app="bedrock-mgmt", level="warn")
+
+
+def _read_local_pubkey() -> str:
+    p = Path("/root/.ssh/id_ed25519.pub")
+    return p.read_text().strip() if p.exists() else ""
 
 
 @app.post("/api/nodes/register")
 def register_node(req: NodeRegister):
-    """Called by `bedrock join` to register a new node with the cluster."""
+    """Called by `bedrock join` to register a new node with the cluster.
+
+    SSH mesh: the joining node sends its pubkey; we install it locally (so
+    mgmt's paramiko can reach the new node) and fan it out over existing SSH
+    trust to every previously-registered peer. In the response we return
+    every peer's pubkey so the joiner can trust them back.
+    """
     cluster = load_cluster()
     cluster.setdefault("nodes", {})
+
+    # Snapshot existing peers before adding this one, so we know who to fan out to.
+    prior_peers = [(name, n) for name, n in cluster["nodes"].items()
+                   if n.get("host") and n["host"] != req.host]
+
     cluster["nodes"][req.name] = {
         "host": req.host,
         "drbd_ip": req.drbd_ip or "",
@@ -483,10 +528,27 @@ def register_node(req: NodeRegister):
         "eno_ip": req.drbd_ip or "",
         "role": req.role,
         "cockpit": f"https://{req.host}:9090",
+        "pubkey": (req.pubkey or "").strip(),
     }
     save_cluster(cluster)
+
+    # SSH mesh: (a) trust joiner from mgmt, (b) trust joiner from every prior peer,
+    # (c) return every peer's pubkey (including mgmt's) for the joiner to trust back.
+    peer_pubkeys = []
+    mgmt_pubkey = _read_local_pubkey()
+    if mgmt_pubkey:
+        peer_pubkeys.append(mgmt_pubkey)
+    if req.pubkey:
+        _append_authorized_key(req.pubkey)                 # mgmt trusts joiner
+        for name, n in prior_peers:
+            _append_authorized_key(req.pubkey, n["host"])  # peer trusts joiner
+    for name, n in prior_peers:
+        if n.get("pubkey"):
+            peer_pubkeys.append(n["pubkey"])
+
     push_log(f"Node {req.name} ({req.host}) registered with cluster",
              node="mgmt", app="bedrock-mgmt", level="info")
+
     # Return all peer IPs so the joining node can pre-populate known_hosts
     # for virsh migrate / DRBD SSH over both mgmt and replication networks.
     peer_ips = []
@@ -495,7 +557,8 @@ def register_node(req: NodeRegister):
         if n.get("drbd_ip"): peer_ips.append(n["drbd_ip"])
     return {"status": "registered", "cluster": cluster.get("cluster_name"),
             "nodes": list(cluster["nodes"].keys()),
-            "peer_ips": sorted(set(peer_ips))}
+            "peer_ips": sorted(set(peer_ips)),
+            "peer_pubkeys": peer_pubkeys}
 
 
 @app.get("/api/nodes")
