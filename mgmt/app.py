@@ -1069,12 +1069,35 @@ class ImportCreateVMRequest(BaseModel):
 
 
 @app.post("/api/imports/{job_id}/create-vm")
-def api_import_create_vm(job_id: str, req: ImportCreateVMRequest):
+async def api_import_create_vm(job_id: str, req: ImportCreateVMRequest):
+    """Fire-and-forget: spinning a 40 GB Windows image into a thin LV +
+    virt-install can take a minute or two. Task-tracked so the UI shows
+    per-step progress (lvcreate, qemu-img convert, virt-install)."""
     d = _import_dir(job_id)
     meta = _import_meta(d)
     if meta.get("status") != "ready":
         raise HTTPException(400, f"import status {meta.get('status')!r}, need 'ready'")
-    return _vm_create_from_import(meta, req)
+
+    task = task_registry().create(
+        "vm.create_from_import",
+        f"Create VM {req.name} from import ({meta.get('original_name','')})",
+        vm_name=req.name, import_id=job_id)
+
+    async def _runner():
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, _vm_create_from_import, meta, req, task)
+            task.log(f"created: {result}")
+            task.succeed()
+        except HTTPException as e:
+            task.fail(f"{e.status_code}: {e.detail}")
+        except Exception as e:
+            task.fail(str(e))
+
+    asyncio.create_task(_runner())
+    return {"status": "accepted", "task_id": task.id, "name": req.name,
+            "import_id": job_id}
 
 
 @app.delete("/api/imports/{job_id}")
@@ -1248,13 +1271,20 @@ class ConvertRequest(BaseModel):
     peer_nodes: Optional[list] = None  # auto-pick if not specified
 
 
+class VMDiskSpec(BaseModel):
+    size_gb: int
+
+
 class VMCreateRequest(BaseModel):
     name: str
     vcpus: int = 2
     ram_mb: int = 2048
-    disk_gb: int = 20
+    disk_gb: int = 20        # size of the primary (boot) disk
     priority: str = "normal"  # low | normal | high
     iso: Optional[str] = None  # filename in /opt/bedrock/iso, optional
+    # Additional data disks, in order — vdb, vdc, vdd … Each is another thin LV
+    # attached to the VM via virtio. Empty list = single-disk VM (unchanged).
+    extra_disks: list[VMDiskSpec] = []
 
 @app.post("/api/vms/{vm_name}/start")
 def api_vm_start(vm_name: str):
@@ -1311,13 +1341,60 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
 
 
 @app.post("/api/vms/create")
-def api_vm_create(req: VMCreateRequest):
-    return _vm_create(req)
+async def api_vm_create(req: VMCreateRequest):
+    """Fire-and-forget: returns {task_id} immediately. Create can take 1-2
+    minutes for VMs with a big ISO or many disks; we don't block the UI."""
+    disk_count = 1 + len(req.extra_disks or [])
+    task = task_registry().create(
+        "vm.create",
+        f"Create VM {req.name} ({req.vcpus} vCPU, {req.ram_mb} MB, "
+        f"{disk_count} disk{'s' if disk_count != 1 else ''})",
+        vm_name=req.name)
+
+    async def _runner():
+        loop = asyncio.get_event_loop()
+        try:
+            task.step_start("provision + virt-install")
+            result = await loop.run_in_executor(None, _vm_create, req)
+            task.step_done("provision + virt-install")
+            task.log(f"created: {result}")
+            task.succeed()
+        except HTTPException as e:
+            task.fail(f"{e.status_code}: {e.detail}")
+        except Exception as e:
+            task.fail(str(e))
+
+    asyncio.create_task(_runner())
+    return {"status": "accepted", "task_id": task.id, "name": req.name}
 
 
 @app.delete("/api/vms/{vm_name}")
-def api_vm_delete(vm_name: str):
-    return _vm_delete(vm_name)
+async def api_vm_delete(vm_name: str):
+    """Fire-and-forget. Runs teardown in background; task reports per-disk
+    per-node progress so the UI can show what's happening."""
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm:
+        raise HTTPException(404, f"Unknown VM: {vm_name}")
+    disk_count = len(vm.get("disks") or []) or 1
+    task = task_registry().create(
+        "vm.delete",
+        f"Delete VM {vm_name} ({disk_count} disk{'s' if disk_count != 1 else ''})",
+        vm_name=vm_name)
+
+    async def _runner():
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, _vm_delete, vm_name, task)
+            task.log(f"deleted: {result}")
+            task.succeed()
+        except HTTPException as e:
+            task.fail(f"{e.status_code}: {e.detail}")
+        except Exception as e:
+            task.fail(str(e))
+
+    asyncio.create_task(_runner())
+    return {"status": "accepted", "task_id": task.id, "name": vm_name}
 
 
 # ── VM settings (vcpus, ram, disk, priority, cdrom) ─────────────────────────
@@ -1355,6 +1432,73 @@ def api_vm_priority(vm_name: str, req: PriorityRequest):
 @app.post("/api/vms/{vm_name}/cdrom")
 def api_vm_cdrom(vm_name: str, req: CdromRequest):
     return _vm_set_cdrom(vm_name, req.action, req.iso)
+
+
+class AttachDiskRequest(BaseModel):
+    size_gb: int  # thin LV size
+
+
+@app.post("/api/vms/{vm_name}/disks")
+def api_vm_attach_disk(vm_name: str, req: AttachDiskRequest):
+    """Attach a new thin-provisioned disk to an existing VM. Live-attach via
+    `virsh attach-disk --live --config` so the guest sees the new disk
+    immediately and it survives reboot. For pet/ViPet VMs, converting the
+    newly-attached disk to DRBD is a separate `pet → pet` re-convert step
+    (not implemented in this endpoint; the attach only adds a local LV."""
+    if req.size_gb < 1 or req.size_gb > 8192:
+        raise HTTPException(400, "size_gb must be 1-8192")
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm: raise HTTPException(404, f"VM {vm_name} not found")
+    nodes_cfg = get_nodes()
+    host_name = vm.get("running_on") or (vm.get("defined_on") or [None])[0]
+    if not host_name: raise HTTPException(503, "VM has no known node")
+    host = nodes_cfg[host_name]["host"]
+
+    existing_targets = {d["target"] for d in vm.get("disks", [])}
+    # Pick next free vd* letter
+    for ch in "bcdefghijklmnop":
+        tgt = f"vd{ch}"
+        if tgt not in existing_targets: break
+    else:
+        raise HTTPException(400, "No free virtio target (vda..vdp in use)")
+    idx = len(vm.get("disks", []))
+    lv_name = f"vm-{vm_name}-disk{idx}"
+    lv_path = f"/dev/almalinux/{lv_name}"
+
+    _ensure_thinpool(host)
+    push_log(f"Attach disk to {vm_name}: lvcreate {req.size_gb}G ({lv_name})",
+             node=host_name, app="bedrock-mgmt")
+    out, rc = ssh_cmd_rc(host,
+        f"lvcreate -y -V {req.size_gb}G --thin -n {lv_name} almalinux/thinpool "
+        f"2>&1", timeout=60)
+    if rc != 0 and "already exists" not in out:
+        raise HTTPException(500, f"lvcreate failed: {out}")
+
+    # virsh attach-disk — live attach when VM is running, --config either way
+    live_flag = "--live" if vm["state"] == "running" else ""
+    out, rc = ssh_cmd_rc(host,
+        f"virsh attach-disk {vm_name} {lv_path} {tgt} --targetbus virtio "
+        f"--driver qemu --subdriver raw --sourcetype block "
+        f"{live_flag} --config 2>&1", timeout=30)
+    if rc != 0:
+        ssh_cmd_rc(host, f"lvremove -f {lv_path} 2>&1", timeout=15)
+        raise HTTPException(500, f"attach-disk failed: {out}")
+
+    # Update inventory
+    inv = load_inventory()
+    entry = inv.setdefault(vm_name, {})
+    entry.setdefault("disks", [
+        {"index": 0, "lv": f"vm-{vm_name}-disk0",
+         "size_gb": entry.get("disk_gb", 0)},
+    ])
+    entry["disks"].append({"index": idx, "lv": lv_name, "size_gb": req.size_gb})
+    save_inventory(inv)
+
+    push_log(f"Attached {req.size_gb}G disk {tgt} to VM {vm_name}",
+             node=host_name, app="bedrock-mgmt", level="info")
+    return {"status": "attached", "target": tgt, "lv": lv_name,
+            "size_gb": req.size_gb}
 
 
 @app.post("/api/vms/{vm_name}/migrate")
@@ -1421,9 +1565,14 @@ def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
-    resource = vm.get("drbd_resource", "")
-    if not resource:
-        raise HTTPException(400, f"VM {vm_name} has no DRBD resource (cattle VM — cannot migrate)")
+
+    # Multi-disk: virsh migrate handles all disks in one call, but we must
+    # cycle allow-two-primaries + primary across EVERY DRBD resource. Cattle
+    # disks (no resource) are no-ops.
+    resources = [d["drbd_resource"] for d in vm.get("disks", [])
+                 if d.get("drbd_resource")]
+    if not resources:
+        raise HTTPException(400, f"VM {vm_name} has no DRBD resources (cattle VM — cannot migrate)")
 
     nodes_cfg = get_nodes()
     src_name = vm["running_on"]
@@ -1434,9 +1583,10 @@ def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
     # For migration URI, prefer USB4 IP, fall back to DRBD IP, fall back to LAN
     dst_migrate_ip = dst.get("tb_ip") or dst.get("drbd_ip") or dst.get("eno_ip") or dst.get("host")
 
-    ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=yes {resource}")
-    ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=yes {resource}")
-    ssh_cmd(dst["host"], f"drbdadm primary {resource}")
+    for r in resources:
+        ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=yes {r}")
+        ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=yes {r}")
+        ssh_cmd(dst["host"], f"drbdadm primary {r}")
 
     t0 = time.time()
     out, rc = ssh_cmd_rc(src["host"],
@@ -1444,9 +1594,10 @@ def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
         f'{vm_name} qemu+ssh://root@{dst_migrate_ip}/system', timeout=120)
     duration = time.time() - t0
 
-    ssh_cmd(src["host"], f"drbdadm secondary {resource}")
-    ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=no {resource}")
-    ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=no {resource}")
+    for r in resources:
+        ssh_cmd(src["host"], f"drbdadm secondary {r}")
+        ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=no {r}")
+        ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=no {r}")
 
     if rc != 0:
         push_log(f"VM {vm_name} migration FAILED from {src_name} to {dst_name}: {out}",
@@ -2009,17 +2160,34 @@ def _vm_create(req) -> dict:
         if not (ISO_DIR / iso_name).exists():
             raise HTTPException(400, f"ISO not found: {iso_name}")
 
-    lv_name = f"vm-{req.name}-disk0"
-    lv_path = f"/dev/almalinux/{lv_name}"
+    # All disks: disk0 is the primary/boot disk (req.disk_gb), any additional
+    # entries from req.extra_disks become vdb, vdc, ... at their given sizes.
+    extra = req.extra_disks or []
+    disks_plan: list[dict] = []
+    for i, spec in enumerate([VMDiskSpec(size_gb=req.disk_gb)] + extra):
+        if spec.size_gb < 1 or spec.size_gb > 8192:
+            raise HTTPException(400, f"disk{i} size_gb must be 1-8192")
+        lv_name = f"vm-{req.name}-disk{i}"
+        disks_plan.append({
+            "index": i, "lv_name": lv_name,
+            "lv_path": f"/dev/almalinux/{lv_name}",
+            "size_gb": spec.size_gb,
+        })
 
-    # 1. Ensure thin pool, create data LV (thin)
+    # 1. Ensure thin pool, create every thin LV
     _ensure_thinpool(host)
-    push_log(f"Create VM {req.name}: lvcreate {req.disk_gb}G thin on {home_name}",
-             node=home_name, app="bedrock-mgmt")
-    out, rc = ssh_cmd_rc(host,
-        f"lvcreate -y -V {req.disk_gb}G --thin -n {lv_name} almalinux/thinpool", timeout=30)
-    if rc != 0 and "already exists" not in out:
-        raise HTTPException(500, f"lvcreate failed: {out}")
+    for d in disks_plan:
+        push_log(f"Create VM {req.name}: lvcreate {d['size_gb']}G thin "
+                 f"({d['lv_name']}) on {home_name}",
+                 node=home_name, app="bedrock-mgmt")
+        out, rc = ssh_cmd_rc(host,
+            f"lvcreate -y -V {d['size_gb']}G --thin -n {d['lv_name']} "
+            f"almalinux/thinpool", timeout=30)
+        if rc != 0 and "already exists" not in out:
+            # Unwind any LVs we already made
+            for prev in disks_plan[:d["index"]]:
+                ssh_cmd_rc(host, f"lvremove -f {prev['lv_path']} 2>&1", timeout=15)
+            raise HTTPException(500, f"lvcreate {d['lv_name']} failed: {out}")
 
     # 2. virt-install — with or without CDROM. Always attach virtio-win.iso
     #    as a 2nd CDROM when any ISO is used: Windows Setup needs it for
@@ -2031,14 +2199,17 @@ def _vm_create(req) -> dict:
     cdrom_arg = f"--cdrom {iso_path}{virtio_extra}" if iso_path else "--import"
     boot_arg = "--boot cdrom,hd" if iso_path else "--boot hd"
 
-    # For Windows ISOs virt-install's os-variant auto-detect works well;
-    # for others, 'generic' is a safe default.
+    # Build the --disk argument list: one per data disk.
+    disk_args = " ".join(
+        f"--disk path={d['lv_path']},format=raw,bus=virtio,cache=none,discard=unmap"
+        for d in disks_plan)
+
     vi_cmd = (
         f"virt-install "
         f"--name {req.name} "
         f"--vcpus {req.vcpus} "
         f"--ram {req.ram_mb} "
-        f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
+        f"{disk_args} "
         f"--network bridge=br0,model=virtio "
         f"--graphics vnc,listen=0.0.0.0 "
         f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
@@ -2049,12 +2220,14 @@ def _vm_create(req) -> dict:
         f"2>&1"
     )
     push_log(f"Create VM {req.name}: virt-install (vcpus={req.vcpus}, "
-             f"ram={req.ram_mb}MB, iso={req.iso or 'none'})",
+             f"ram={req.ram_mb}MB, disks={len(disks_plan)}, "
+             f"iso={req.iso or 'none'})",
              node=home_name, app="bedrock-mgmt")
     out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
     if rc != 0:
-        # Clean up the LV so the name is free for retry
-        ssh_cmd_rc(host, f"lvremove -f {lv_path} 2>&1", timeout=15)
+        # Clean up all LVs so the name is free for retry
+        for d in disks_plan:
+            ssh_cmd_rc(host, f"lvremove -f {d['lv_path']} 2>&1", timeout=15)
         raise HTTPException(500, f"virt-install failed: {out[-400:]}")
 
     # 3. Apply priority → cpu_shares (cgroup weight, default 1024)
@@ -2068,7 +2241,11 @@ def _vm_create(req) -> dict:
         "priority": req.priority,
         "vcpus": req.vcpus,
         "ram_mb": req.ram_mb,
-        "disk_gb": req.disk_gb,
+        "disk_gb": req.disk_gb,        # primary disk size (back-compat)
+        "disks": [                      # full per-disk record (multi-disk aware)
+            {"index": d["index"], "lv": d["lv_name"], "size_gb": d["size_gb"]}
+            for d in disks_plan
+        ],
         "iso": req.iso,
         "home_node": home_name,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2076,14 +2253,16 @@ def _vm_create(req) -> dict:
     }
     save_inventory(inv)
 
+    disk_summary = ", ".join(f"disk{d['index']}={d['size_gb']}G" for d in disks_plan)
     push_log(f"Created VM {req.name} on {home_name} "
-             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {req.disk_gb}GB, "
+             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {disk_summary}, "
              f"priority={req.priority}, cpu_shares={shares})",
              node=home_name, app="bedrock-mgmt", level="info")
-    return {"status": "created", "name": req.name, "node": home_name}
+    return {"status": "created", "name": req.name, "node": home_name,
+            "disks": [d["lv_name"] for d in disks_plan]}
 
 
-def _vm_create_from_import(meta: dict, req) -> dict:
+def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict:
     """Turn a converted import (qcow2 on mgmt node) into a cattle VM.
     Creates a thin LV sized to the qcow2 virtual size, qemu-img converts the
     qcow2 into the LV (raw), then virt-installs with machine=q35, UEFI
@@ -2163,13 +2342,16 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     except Exception:
         pass  # non-fatal — proceed and let lvcreate fail loudly if needed
 
+    if task: task.step_start(f"lvcreate {virtual_gb} GB thin")
     push_log(f"Import {meta['id']} → create VM {req.name}: lvcreate {virtual_gb}G thin",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host,
         f"lvcreate -y -V {size_mb}M --thin -n {lv_name} almalinux/thinpool 2>&1",
         timeout=60)
     if rc != 0 and "already exists" not in out:
+        if task: task.step_fail(f"lvcreate {virtual_gb} GB thin", out[-300:])
         raise HTTPException(500, f"lvcreate failed: {out}")
+    if task: task.step_done(f"lvcreate {virtual_gb} GB thin")
 
     # Stream the converted image into the LV. Auto-detect the input format
     # (virt-v2v sometimes outputs raw, sometimes qcow2 depending on flags).
@@ -2177,6 +2359,7 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     # blocks in the qcow2 are not rewritten as zeros to the thin LV, so a
     # 10 GB-on-disk Windows image stays ~10 GB allocated in the thin pool
     # instead of thickening to the full 40 GB virtual size.
+    if task: task.step_start("qemu-img convert → thin LV (sparse)")
     push_log(f"Import {meta['id']} → qemu-img convert → thin LV (sparse)",
              node=home_name, app="bedrock-mgmt", level="info")
     # -n: don't create/truncate the target; the LV already exists and
@@ -2187,7 +2370,9 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         timeout=3600)
     if rc != 0:
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
+        if task: task.step_fail("qemu-img convert → thin LV (sparse)", (out or "")[-300:])
         raise HTTPException(500, "qemu-img convert failed:\n" + (out or "(no output)"))
+    if task: task.step_done("qemu-img convert → thin LV (sparse)")
 
     # virt-install with Q35 + matched firmware + UTC. --import + --wait 0
     # means "define and start the VM, then return immediately" (don't block
@@ -2227,13 +2412,16 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         f"--os-variant detect=on,name=generic "
         f"--noautoconsole --wait 0 --import 2>&1"
     )
+    if task: task.step_start("virt-install")
     push_log(f"Import {meta['id']} → virt-install",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
     if rc != 0:
         ssh_cmd_rc(host, f"virsh undefine {req.name} --nvram 2>&1", timeout=10)
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
+        if task: task.step_fail("virt-install", (out or "")[-300:])
         raise HTTPException(500, "virt-install failed:\n" + (out or "(no output)"))
+    if task: task.step_done("virt-install")
 
     # Priority
     shares = PRIORITY_CPU_SHARES[req.priority]

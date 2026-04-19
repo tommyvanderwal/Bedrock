@@ -130,21 +130,46 @@
 		</div>
 	</div>
 	<div class="info-card">
-		<h3>DRBD Storage</h3>
-		<div class="stat"><span>Resource</span><span>{vm.drbd_resource}</span></div>
-		<div class="stat"><span>Role</span>
-			<span class="tag" class:primary={vm.drbd_role === 'Primary'} class:secondary={vm.drbd_role !== 'Primary'}>
-				{vm.drbd_role || '-'}
-			</span>
-		</div>
-		<div class="stat"><span>Disk</span>
-			<span class="tag" class:uptodate={vm.drbd_disk === 'UpToDate'} class:syncing={vm.drbd_disk && vm.drbd_disk !== 'UpToDate'}>
-				{vm.drbd_disk || '-'}
-			</span>
-		</div>
-		<div class="stat"><span>Peer disk</span><span>{vm.drbd_peer_disk || '-'}</span></div>
-		{#if vm.drbd_sync_pct}
-			<div class="stat"><span>Sync</span><span>{vm.drbd_sync_pct}%</span></div>
+		<h3>Disks ({vm.disks?.length ?? 0})</h3>
+		{#if vm.disks && vm.disks.length > 0}
+			<table class="disks-table">
+				<thead>
+					<tr><th>Target</th><th>Size</th><th>DRBD</th><th>State</th></tr>
+				</thead>
+				<tbody>
+					{#each vm.disks as d}
+						<tr>
+							<td><code>{d.target}</code></td>
+							<td>{d.size_gb ?? '?'} G</td>
+							<td>
+								{#if d.drbd_resource}
+									<code class="drbd-res">{d.drbd_resource}</code>
+									<span class="sub">minor {d.drbd_minor}</span>
+								{:else}
+									<span class="muted">local</span>
+								{/if}
+							</td>
+							<td>
+								{#if d.drbd_resource}
+									<span class="tag" class:primary={d.drbd_role === 'Primary'}
+										class:secondary={d.drbd_role !== 'Primary'}>
+										{d.drbd_role || '-'}
+									</span>
+									<span class="tag" class:uptodate={d.drbd_disk === 'UpToDate'}
+										class:syncing={d.drbd_disk && d.drbd_disk !== 'UpToDate'}>
+										{d.drbd_disk || '-'}
+									</span>
+									{#if d.drbd_sync_pct}<span class="sub">{d.drbd_sync_pct}%</span>{/if}
+								{:else}
+									<span class="muted">—</span>
+								{/if}
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		{:else}
+			<p class="muted">No disks reported.</p>
 		{/if}
 	</div>
 	<div class="info-card">
@@ -254,6 +279,15 @@
 	.ha-check .hint { font-style: italic; color: #8b949e; font-size: 11px; }
 	.ha-note { font-size: 11px; color: #8b949e; margin: 8px 0 0; }
 	.ha-note code { background: #21262d; padding: 1px 6px; border-radius: 3px; color: #e6edf3; }
+
+	/* Disks table in the info card */
+	.disks-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+	.disks-table th, .disks-table td { text-align: left; padding: 4px 6px; }
+	.disks-table th { color: #8b949e; font-weight: 500; border-bottom: 1px solid #30363d; }
+	.disks-table td code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+	.disks-table .drbd-res { font-size: 11px; }
+	.sub { color: #6e7681; font-size: 11px; margin-left: 4px; }
+	.muted { color: #6e7681; }
 
 	/* Delete confirmation modal (Proxmox-style) */
 	.modal-bg {

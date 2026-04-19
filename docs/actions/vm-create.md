@@ -22,16 +22,28 @@ Two entry points:
 ```
   /vms/new
   ┌─────────────────────────────────────────────────────┐
-  │ Name         [ webapp2              ]               │
-  │ vCPUs        [ 2 ]  (default)                       │
-  │ RAM (MB)     [ 2048 ]  (default = 2 GB, step 128)   │
-  │ Disk (GB)    [ 20 ]    (thin-provisioned)           │
+  │ Name             [ webapp2              ]           │
+  │ vCPUs            [ 2 ]  (default)                   │
+  │ RAM (MB)         [ 2048 ]                           │
+  │ Disk 0 (vda,GB)  [ 20 ]    ← boot disk              │
+  │                                        + Add disk   │
+  │                                                     │
+  │   vdb [ 500 ]  GB, thin-provisioned     ×           │
+  │   vdc [  50 ]  GB, thin-provisioned     ×           │
+  │                                                     │
   │ Priority     ( )low  (•)normal  ( )high             │
   │ Install ISO  [ — no ISO —  ▼ ]   + Upload new ISO   │
-  │              (dropdown pulls from /api/isos)        │
   │ [ Create VM ]  Cancel                               │
   └─────────────────────────────────────────────────────┘
 ```
+
+**Multiple disks** (Hyper-V / VMware migration reality, SQL Server
+best-practice, etc.) — click **+ Add disk** to add another thin LV.
+Each extra disk becomes `vdb`, `vdc`, `vdd` … guest-side, and
+`vm-<name>-disk1`, `…-disk2` … on the thin pool. A `POST
+/api/vms/{name}/disks` endpoint attaches a new disk to an existing VM
+live (`virsh attach-disk --live --config`), so "start small, grow
+later" works too.
 
 Priority → libvirt `cpu_shares` (cgroup weight):
 

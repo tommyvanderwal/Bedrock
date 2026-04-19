@@ -77,34 +77,36 @@ DRBD state is untouched — the resource stays Primary on that node.
 ## Delete — dashboard / HTTP flow
 
 ```
-  DELETE /api/vms/NAME
+  DELETE /api/vms/NAME   → 202 Accepted + {task_id}
   │
-  │ build_cluster_state → vm
-  │
-  │ if vm.drbd_resource:
-  │    existing = _parse_drbd_res(host, resource)
-  │      → peers, lv_path, meta_path
-  │ else:
-  │    lv_path  = /dev/almalinux/vm-NAME-disk0
-  │    meta_path = ""
+  │ build_cluster_state → vm  (includes vm.disks[] — multi-disk aware)
   │
   │ if vm.state == running:
   │    ssh host: virsh destroy NAME   (force-kill)
   │
   │ for node in defined_on:
-  │    ssh host: virsh undefine NAME --nvram (fallback: without --nvram)
-  │    if drbd:
-  │      ssh host: drbdadm down RES
-  │      ssh host: drbdadm wipe-md --force RES
-  │      ssh host: rm -f /etc/drbd.d/RES.res
-  │    ssh host: lvremove -f {lv_path} {meta_path}
+  │    ssh host: virsh undefine NAME --nvram
+  │    for disk in vm.disks:
+  │       resource = disk.drbd_resource     (or "" if cattle)
+  │       if resource:
+  │          lv_by_node, meta_by_node = _parse_drbd_res(host, resource)
+  │          ssh host: drbdadm down RES
+  │          ssh host: drbdadm wipe-md --force RES
+  │          ssh host: rm -f /etc/drbd.d/RES.res
+  │       else:
+  │          lv_by_node = { every node: disk.backing_lv }
+  │          meta_by_node = {}
+  │       ssh host: lvremove -f {lv_by_node[node]} {meta_by_node[node]}
   │
   │ load_inventory(); inv.pop(NAME); save_inventory(inv)
   │
   │ push_log "Deleted VM NAME (was on <nodes>)"   level=warn
-  │
-  │ return {"status": "deleted", "name": NAME}
+  │ task.succeed()
 ```
+
+Multi-disk: every disk on the VM (vda, vdb, …) is torn down in order.
+Each one gets its own task step (`disk0 teardown on <node>`,
+`disk1 teardown on <node>`, …) so the drawer shows where cleanup is.
 
 ## Delete — CLI flow (legacy)
 

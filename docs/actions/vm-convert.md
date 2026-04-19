@@ -8,9 +8,41 @@ time — data is swung in or out of DRBD via `virsh blockcopy --reuse-external
 
 - Dashboard: VM detail page → PET / ViPet checkboxes
 - HTTP: `POST /api/vms/{name}/convert` with `{"target_type": "cattle|pet|vipet"}`
+  → returns **202 Accepted + `{task_id, from, to}`**; progress flows over
+  the WS `task` channel. See [`../components/tasks.md`](../components/tasks.md).
 
 **Source:** `mgmt/app.py:_vm_convert`, `_vm_convert_upgrade`,
 `_vm_convert_downgrade`.
+
+## Multi-disk semantics
+
+The convert iterates over **every** data disk the VM has. A VM with
+`vda` + `vdb` + `vdc` becomes three DRBD resources on cattle→pet:
+
+```
+  vm-NAME-disk0   (minor 1000, port 8000)   ← was vda's local LV
+  vm-NAME-disk1   (minor 1001, port 8001)   ← was vdb's local LV
+  vm-NAME-disk2   (minor 1002, port 8002)   ← was vdc's local LV
+```
+
+Each resource has its own `.res` file, its own external meta LV, its own
+pair of peer LVs. `_next_drbd_minor()` picks unique minors across the
+cluster; `_gen_drbd_res(resource, minor, peers)` takes the resource name
+explicitly so one VM's .res files don't collide.
+
+**Atomicity:** the upgrade is all-or-nothing per operation. If disk 2's
+`blockcopy` fails mid-way, the rollback stack unwinds disks 0 and 1
+(drbd-down + wipe-md + remove peer LVs + delete `.res`) before the task
+fails, so the VM doesn't end up half-pet, half-cattle. Task steps are
+emitted per disk so the dashboard drawer shows where it is:
+
+```
+  disk0 (vda): create meta LV on source          ok   0.9 s
+  disk0 (vda): generate DRBD res                 ok   1.1 s
+  disk0 (vda): create-md + up                    ok   1.3 s
+  disk0 (vda): blockcopy → /dev/drbd1000         ok  12.4 s
+  disk1 (vdb): create meta LV on source          running …
+```
 
 ## What each transition does
 

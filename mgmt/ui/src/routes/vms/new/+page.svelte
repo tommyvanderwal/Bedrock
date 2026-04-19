@@ -7,6 +7,7 @@
 	let vcpus = $state(2);
 	let ramMb = $state(2048);
 	let diskGb = $state(20);
+	let extraDisks = $state<number[]>([]);  // sizes in GB for vdb, vdc, …
 	let priority = $state<'low' | 'normal' | 'high'>('normal');
 	let iso = $state('');
 
@@ -34,8 +35,11 @@
 			const r = await vmCreate({
 				name, vcpus, ram_mb: ramMb, disk_gb: diskGb, priority,
 				iso: iso || null,
+				extra_disks: extraDisks.map(g => ({ size_gb: g })),
 			}) as any;
-			goto(`/vm/${r.name}`);
+			// Navigate to VMs list — create is fire-and-forget, task drawer
+			// shows progress.
+			goto(`/vms`);
 		} catch (e: any) {
 			error = e.message;
 			creating = false;
@@ -72,10 +76,35 @@
 			<span class="hint">{(ramMb / 1024).toFixed(ramMb >= 1024 ? 1 : 2)} GB</span>
 		</label>
 		<label class="field">
-			<span class="lbl">Disk (GB)</span>
+			<span class="lbl">Disk 0 (vda, GB)</span>
 			<input type="number" bind:value={diskGb} min="1" max="2048" step="1" />
-			<span class="hint">thin-provisioned</span>
+			<span class="hint">boot disk, thin-provisioned</span>
 		</label>
+	</div>
+
+	<div class="row">
+		<div class="field">
+			<div class="lbl-row">
+				<span class="lbl">Additional disks (optional)</span>
+				<button type="button" class="upload-link"
+					onclick={() => extraDisks = [...extraDisks, 20]}>+ Add disk</button>
+			</div>
+			{#if extraDisks.length === 0}
+				<span class="hint">Most VMs are fine with one disk. Windows Server / SQL
+					workloads often want a separate data disk — add one here.</span>
+			{:else}
+				{#each extraDisks as size, i}
+					<div class="extra-disk-row">
+						<span class="disk-label">vd{String.fromCharCode(98 + i)}</span>
+						<input type="number" bind:value={extraDisks[i]}
+							min="1" max="2048" step="1" />
+						<span class="hint">GB, thin-provisioned</span>
+						<button type="button" class="btn-remove"
+							onclick={() => extraDisks = extraDisks.filter((_, idx) => idx !== i)}>×</button>
+					</div>
+				{/each}
+			{/if}
+		</div>
 	</div>
 
 	<div class="row">
@@ -177,4 +206,16 @@
 	.btn-cancel { padding: 8px 14px; font-size: 13px; color: #8b949e; }
 
 	.summary { font-size: 12px; color: #8b949e; margin: 20px 0 0; line-height: 1.5; }
+	.extra-disk-row {
+		display: grid; grid-template-columns: 60px 120px 1fr auto;
+		align-items: center; gap: 10px; margin: 6px 0;
+	}
+	.disk-label {
+		font-family: ui-monospace, monospace; color: #8b949e; font-size: 12px;
+	}
+	.btn-remove {
+		background: none; border: none; color: #8b949e; font-size: 18px;
+		cursor: pointer; padding: 0 8px; line-height: 1;
+	}
+	.btn-remove:hover { color: #f85149; }
 </style>

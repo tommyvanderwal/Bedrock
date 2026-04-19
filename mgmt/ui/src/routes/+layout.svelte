@@ -2,12 +2,20 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { ws } from '$lib/ws';
-	import { nodes, vms, witness, connected, lastUpdate, events } from '$lib/stores';
+	import { nodes, vms, witness, connected, lastUpdate, events, tasks,
+		type TaskInfo } from '$lib/stores';
+	import { apiGet } from '$lib/api';
 
 	let { children } = $props();
 
 	let hostsOpen = $state(true);
 	let vmsOpen = $state(true);
+	let taskDrawerOpen = $state(false);
+
+	// Reactive view of tasks: actives first, recents below. Subscribe
+	// explicitly so the badge count reacts (Svelte 5 $derived + store gotcha).
+	let tasksSnapshot = $state<TaskInfo[]>([]);
+	let activeCount = $derived(tasksSnapshot.filter(t => t.state === 'running' || t.state === 'pending').length);
 
 	onMount(() => {
 		ws.connect();
@@ -30,9 +38,40 @@
 			events.update(e => [msg, ...e].slice(0, 100));
 		});
 
+		// Tasks: live updates from WS, seeded via REST on mount.
+		ws.on('task', (msg: any) => {
+			if (!msg?.task) return;
+			tasks.update(t => { t[msg.task.id] = msg.task; return t; });
+		});
+		const unsubTasks = tasks.subscribe(map => {
+			tasksSnapshot = Object.values(map)
+				.sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''));
+		});
+		apiGet('/api/tasks').then((initial: TaskInfo[]) => {
+			const map: Record<string, TaskInfo> = {};
+			for (const t of initial) map[t.id] = t;
+			tasks.set(map);
+		}).catch(() => {});
+
 		const checkConn = setInterval(() => connected.set(ws.connected), 1000);
-		return () => clearInterval(checkConn);
+		return () => { clearInterval(checkConn); unsubTasks(); };
 	});
+
+	function fmtDur(ms: number | undefined): string {
+		if (!ms) return '';
+		if (ms < 1000) return `${ms} ms`;
+		if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+		return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+	}
+	function fmtAge(from: string | undefined): string {
+		if (!from) return '';
+		const t = Date.parse(from);
+		if (isNaN(t)) return '';
+		const ago = Math.max(0, (Date.now() - t) / 1000);
+		if (ago < 60) return `${Math.floor(ago)}s ago`;
+		if (ago < 3600) return `${Math.floor(ago / 60)}m ago`;
+		return `${Math.floor(ago / 3600)}h ago`;
+	}
 
 	let sortedNodes = $derived(Object.entries($nodes).sort((a, b) => a[0].localeCompare(b[0])));
 	let sortedVms = $derived(Object.entries($vms).sort((a, b) => a[0].localeCompare(b[0])));
@@ -45,6 +84,12 @@
 	<aside class="sidebar">
 		<div class="brand">
 			<a href="/">Bedrock</a>
+			<button class="task-badge" class:active={activeCount > 0}
+				onclick={() => taskDrawerOpen = !taskDrawerOpen}
+				title="Tasks">
+				<span class="task-icon">⏳</span>
+				{#if activeCount > 0}<span class="task-count">{activeCount}</span>{/if}
+			</button>
 			<span class="conn-dot" class:online={$connected}
 				title={$connected ? 'connected' : 'disconnected'}></span>
 		</div>
@@ -123,6 +168,50 @@
 	<main>
 		{@render children()}
 	</main>
+
+	{#if taskDrawerOpen}
+		<aside class="task-drawer" role="complementary">
+			<div class="task-drawer-head">
+				<h3>Tasks</h3>
+				<button class="drawer-close" onclick={() => taskDrawerOpen = false}>×</button>
+			</div>
+			{#if tasksSnapshot.length === 0}
+				<p class="muted" style="padding:12px">No tasks.</p>
+			{:else}
+				<div class="task-list">
+					{#each tasksSnapshot as t (t.id)}
+						<div class="task-row" class:running={t.state === 'running'}
+							class:failed={t.state === 'failed'}
+							class:succeeded={t.state === 'succeeded'}>
+							<div class="task-head">
+								<span class="task-state task-state-{t.state}">{t.state}</span>
+								<span class="task-subject" title={t.type}>{t.subject}</span>
+								<span class="task-age">{fmtAge(t.started_at)}</span>
+							</div>
+							{#if t.steps && t.steps.length > 0}
+								<div class="task-steps">
+									{#each t.steps as s}
+										<div class="task-step step-{s.state}">
+											<span class="step-dot step-dot-{s.state}"></span>
+											<span class="step-name">{s.name}</span>
+											{#if s.duration_ms}<span class="step-dur">{fmtDur(s.duration_ms)}</span>{/if}
+											{#if s.progress !== null && s.progress !== undefined && s.state === 'running'}
+												<span class="step-prog">{s.progress}%</span>
+											{/if}
+											{#if s.error}<span class="step-err" title={s.error}>⚠</span>{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
+							{#if t.error}
+								<div class="task-error" title={t.error}>{t.error}</div>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</aside>
+	{/if}
 </div>
 
 <style>
@@ -277,4 +366,80 @@
 		padding: 20px;
 		max-width: 1600px;
 	}
+
+	/* Task badge next to the brand */
+	.task-badge {
+		background: none; border: 1px solid #30363d; border-radius: 12px;
+		padding: 2px 8px; cursor: pointer; font-size: 12px; color: #8b949e;
+		display: inline-flex; align-items: center; gap: 4px; margin-left: auto;
+	}
+	.task-badge:hover { background: #161b22; color: #e6edf3; }
+	.task-badge.active { border-color: #d29922; color: #d29922; }
+	.task-icon { font-size: 11px; }
+	.task-count {
+		background: #d29922; color: #000; font-weight: 600;
+		border-radius: 8px; padding: 0 5px; min-width: 14px; text-align: center;
+	}
+
+	/* Task drawer */
+	.task-drawer {
+		position: fixed; top: 0; right: 0; height: 100vh; width: 380px;
+		background: #0d1117; border-left: 1px solid #30363d; z-index: 900;
+		display: flex; flex-direction: column;
+		box-shadow: -4px 0 12px #0006;
+	}
+	.task-drawer-head {
+		display: flex; align-items: center; justify-content: space-between;
+		padding: 12px 16px; border-bottom: 1px solid #21262d;
+	}
+	.task-drawer-head h3 {
+		margin: 0; font-size: 14px; text-transform: uppercase;
+		letter-spacing: 1px; color: #8b949e;
+	}
+	.drawer-close {
+		background: none; border: none; color: #8b949e; font-size: 22px;
+		cursor: pointer; padding: 0; line-height: 1;
+	}
+	.drawer-close:hover { color: #e6edf3; }
+	.task-list { overflow-y: auto; flex: 1; padding: 8px; }
+	.task-row {
+		background: #161b22; border: 1px solid #21262d; border-radius: 6px;
+		padding: 10px 12px; margin-bottom: 8px;
+	}
+	.task-row.running { border-left: 3px solid #d29922; }
+	.task-row.failed { border-left: 3px solid #f85149; }
+	.task-row.succeeded { border-left: 3px solid #3fb950; }
+	.task-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+	.task-subject { flex: 1; color: #c9d1d9; }
+	.task-age { color: #6e7681; font-size: 11px; }
+	.task-state {
+		font-size: 10px; padding: 1px 6px; border-radius: 8px; font-weight: 600;
+		text-transform: uppercase;
+	}
+	.task-state-running { background: #d2992244; color: #d29922; }
+	.task-state-succeeded { background: #1a7f3744; color: #3fb950; }
+	.task-state-failed { background: #f8514944; color: #f85149; }
+	.task-state-pending { background: #30363d; color: #8b949e; }
+	.task-state-cancelled { background: #30363d; color: #8b949e; }
+	.task-steps { margin-top: 6px; }
+	.task-step {
+		display: flex; align-items: center; gap: 6px; font-size: 11px;
+		padding: 2px 0; color: #8b949e;
+	}
+	.step-dot {
+		width: 6px; height: 6px; border-radius: 50%; background: #30363d;
+	}
+	.step-dot-running { background: #d29922; animation: pulse 1.2s infinite; }
+	.step-dot-done { background: #3fb950; }
+	.step-dot-failed { background: #f85149; }
+	.step-dot-skipped { background: #6e7681; }
+	.step-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.step-dur { color: #6e7681; font-variant-numeric: tabular-nums; }
+	.step-prog { color: #d29922; font-variant-numeric: tabular-nums; }
+	.step-err { color: #f85149; }
+	.task-error {
+		margin-top: 4px; font-size: 11px; color: #f85149;
+		overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+	}
+	@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 </style>

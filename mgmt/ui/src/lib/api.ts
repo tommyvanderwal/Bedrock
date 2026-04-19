@@ -49,10 +49,15 @@ export interface VMCreateRequest {
 	disk_gb: number;
 	priority: 'low' | 'normal' | 'high';
 	iso?: string | null;
+	extra_disks?: Array<{ size_gb: number }>;
 }
 
 export async function vmCreate(req: VMCreateRequest) {
 	return apiPost('/api/vms/create', req);
+}
+
+export async function vmAttachDisk(name: string, size_gb: number) {
+	return apiPost(`/api/vms/${encodeURIComponent(name)}/disks`, { size_gb });
 }
 
 export async function vmDelete(name: string) {
