@@ -1849,8 +1849,10 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     # instead of thickening to the full 40 GB virtual size.
     push_log(f"Import {meta['id']} → qemu-img convert → thin LV (sparse)",
              node=home_name, app="bedrock-mgmt", level="info")
+    # -n: don't create/truncate the target; the LV already exists and
+    #     --target-is-zero requires it.
     out, rc = ssh_cmd_rc(host,
-        f"qemu-img convert -p -S 4k --target-is-zero -O raw "
+        f"qemu-img convert -p -n -S 4k --target-is-zero -O raw "
         f"{src_qcow} {lv_path} 2>&1",
         timeout=3600)
     if rc != 0:
