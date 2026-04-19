@@ -9,8 +9,8 @@
 	let uploading = $state(false);
 	let uploadPct = $state(0);
 	let uploadName = $state('');
+	let uploadPhase = $state<'uploading' | 'inspecting' | ''>('');
 	let error = $state('');
-	let injectDrivers = $state(false);
 	let poll: any = null;
 
 	// VM-creation modal state
@@ -41,19 +41,25 @@
 			return;
 		}
 		error = ''; uploading = true; uploadPct = 0; uploadName = file.name;
+		uploadPhase = 'uploading';
 		try {
-			const job = await uploadImport(file, p => uploadPct = p);
-			// Auto-start conversion once upload lands
-			await convertImport(job.id, injectDrivers);
+			const job = await uploadImport(file, p => {
+				uploadPct = p;
+				// Once the client finishes sending, the server is inspecting
+				// the image (virt-inspector) before returning. Show it.
+				if (p >= 100) uploadPhase = 'inspecting';
+			});
+			// Server auto-selected inject_drivers from detected OS; pass null.
+			await convertImport(job.id, null);
 			await refresh();
 		} catch (e: any) {
 			error = e.message;
 		} finally {
-			uploading = false; input.value = '';
+			uploading = false; uploadPhase = ''; input.value = '';
 		}
 	}
 
-	async function retryConvert(id: string, retryWithDrivers = false) {
+	async function retryConvert(id: string, retryWithDrivers: boolean | null = null) {
 		try { await convertImport(id, retryWithDrivers); await refresh(); }
 		catch (e: any) { error = e.message; }
 	}
@@ -109,23 +115,27 @@
 	<h3>Upload a disk image</h3>
 	{#if uploading}
 		<div class="progress-wrap">
-			<div class="progress-label">{uploadName} — {uploadPct}%</div>
-			<div class="progress-bar"><div class="progress-fill" style="width: {uploadPct}%"></div></div>
+			<div class="progress-label">
+				{uploadName} — {uploadPhase === 'inspecting'
+					? 'inspecting OS…'
+					: `${uploadPct}%`}
+			</div>
+			<div class="progress-bar">
+				<div class="progress-fill {uploadPhase === 'inspecting' ? 'indeterminate' : ''}"
+					style="width: {uploadPhase === 'inspecting' ? 100 : uploadPct}%"></div>
+			</div>
 		</div>
 	{:else}
 		<label class="upload-btn">
 			<input type="file" accept=".ova,.ovf,.vmdk,.vhd,.vhdx,.qcow2,.raw,.img" onchange={handleFile} />
 			<span>Choose a file…</span>
 		</label>
-		<label class="inject">
-			<input type="checkbox" bind:checked={injectDrivers} />
-			<span>Windows guest — <strong>inject virtio drivers</strong> with virt-v2v
-				<em>(viostor + NetKVM; slower, ~2–10 min)</em></span>
-		</label>
 		<p class="hint">
-			VMware: .ova, .ovf, .vmdk · Hyper-V: .vhd, .vhdx · Generic: .qcow2, .raw, .img.
-			Linux guests: format-only convert via qemu-img (~seconds).
-			New VMs spawned from imports are Q35 + UEFI + clock=UTC.
+			Bedrock runs <code>virt-inspector</code> on the uploaded image to detect the guest OS.
+			Windows → <strong>virt-v2v</strong> injects viostor + NetKVM drivers; Linux → fast
+			<code>qemu-img</code> convert. Use the <em>Re-convert</em> button on a ready import
+			to override. VMs spawned from imports are Q35 + matched firmware + UTC; Windows
+			also gets Hyper-V enlightenments + hypervclock.
 		</p>
 	{/if}
 	{#if error}<div class="error">{error}</div>{/if}
@@ -161,13 +171,19 @@
 						{/if}
 					</td>
 					<td>
-						{#if j.detected_name || j.detected_os_type || j.detected_firmware}
-							<div>{j.detected_name || '-'}</div>
+						{#if j.os_product_name || j.os_type || j.detected_name || j.detected_firmware}
+							<div>{j.os_product_name || j.detected_name || j.os_type || '-'}</div>
 							<div class="sub">
-								{j.detected_os_type || ''}
-								{#if j.detected_firmware}· <strong>{j.detected_firmware.toUpperCase()}</strong>{/if}
+								{#if j.os_type}<strong>{j.os_type}</strong>{/if}
+								{#if j.os_version}· {j.os_version}{/if}
+								{#if j.detected_firmware}· {j.detected_firmware.toUpperCase()}{/if}
 								{#if j.injected_drivers}· drivers injected{/if}
 							</div>
+							{#if j.os_detection}
+								<div class="sub muted" style="font-size:0.75em">via {j.os_detection}</div>
+							{/if}
+						{:else if j.status === 'uploaded'}
+							<span class="muted">inspecting…</span>
 						{:else}<span class="muted">-</span>{/if}
 					</td>
 					<td class="sub">{fmtTime(j.created_at)}</td>

@@ -624,6 +624,51 @@ IMPORT_INPUT_FORMATS = {".ova", ".ovf", ".vmdk", ".vhd", ".vhdx",
                         ".qcow2", ".raw", ".img"}
 
 
+def _inspect_os(src: str, fmt: str) -> dict:
+    """Detect the guest OS on an uploaded disk image.
+
+    Order of fallbacks:
+      1. virt-inspector with explicit format (authoritative — mounts the
+         filesystem + reads registry/os-release).
+      2. For VHD / VHDX where libguestfs often fails to introspect the
+         container: assume Windows (the Hyper-V-native formats are almost
+         exclusively Windows). virt-v2v will re-inspect + correct if wrong.
+      3. Unknown.
+
+    Returns dict with os_type, os_distro, os_product_name, os_version,
+    os_osinfo, os_detection (which path produced the result). Empty keys
+    stay absent so UI can show "unknown" cleanly.
+    """
+    cmd = ["virt-inspector"]
+    if fmt: cmd += ["--format", fmt]
+    cmd += ["-a", src]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if r.returncode == 0 and r.stdout.strip():
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.stdout)
+            os_el = root.find(".//operatingsystem")
+            if os_el is not None:
+                name = (os_el.findtext("name") or "").lower()
+                out = {
+                    "os_type": name,  # windows / linux / freebsd / ...
+                    "os_distro": os_el.findtext("distro") or "",
+                    "os_product_name": os_el.findtext("product_name") or "",
+                    "os_version": os_el.findtext("major_version") or "",
+                    "os_osinfo": os_el.findtext("osinfo") or "",
+                    "os_detection": "virt-inspector",
+                }
+                return {k: v for k, v in out.items() if v or k == "os_detection"}
+    except Exception as e:
+        push_log(f"virt-inspector failed on {src}: {e}",
+                 node="mgmt", app="bedrock-mgmt", level="warn")
+    # Fallback: Hyper-V formats are almost always Windows
+    if (fmt or "").lower() in ("vpc", "vhdx"):
+        return {"os_type": "windows",
+                "os_detection": "format-hint (vhd/vhdx → Hyper-V)"}
+    return {"os_detection": "none"}
+
+
 def _import_dir(job_id: str) -> Path:
     # Strict job-id form to prevent traversal
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", job_id):
@@ -713,6 +758,19 @@ async def api_imports_upload(file: UploadFile = File(...)):
     _write_import_meta(d, meta)
     push_log(f"Import uploaded: {name} ({total // 1024 // 1024} MB, id={job_id})",
              node="mgmt", app="bedrock-mgmt", level="info")
+
+    # Inspect the image so the UI can show detected OS and auto-select
+    # driver injection on convert. Synchronous (5-30 s typical) so the
+    # /convert call that the UI fires right after sees the result in meta.
+    fmt = QEMU_FORMAT_MAP.get(ext.lstrip("."))
+    loop = asyncio.get_event_loop()
+    det = await loop.run_in_executor(None, _inspect_os, str(dst), fmt)
+    meta.update(det)
+    _write_import_meta(d, meta)
+    if det.get("os_type"):
+        push_log(f"Import {job_id} OS detected: {det['os_type']} "
+                 f"{det.get('os_product_name','')} (via {det['os_detection']})",
+                 node="mgmt", app="bedrock-mgmt", level="info")
     return meta
 
 
@@ -854,7 +912,9 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
 
 
 class ImportConvertRequest(BaseModel):
-    inject_drivers: bool = False  # true → virt-v2v for Windows driver injection
+    # None → auto-select based on detected OS (Windows → True). Explicit
+    # True/False overrides detection.
+    inject_drivers: Optional[bool] = None
 
 
 @app.post("/api/imports/{job_id}/convert")
@@ -864,12 +924,14 @@ async def api_import_convert(job_id: str, req: ImportConvertRequest = ImportConv
     meta = _import_meta(d)
     if meta.get("status") not in ("uploaded", "failed"):
         raise HTTPException(400, f"cannot convert from status '{meta.get('status')}'")
-    # Fire-and-forget; caller polls GET /api/imports/{id} for progress
-    asyncio.create_task(_run_convert(job_id, inject_drivers=req.inject_drivers))
+    # Auto-select driver injection from detected OS when caller didn't pick.
+    inject = req.inject_drivers
+    if inject is None:
+        inject = (meta.get("os_type", "").lower() == "windows")
+    asyncio.create_task(_run_convert(job_id, inject_drivers=inject))
     meta["status"] = "converting"
     _write_import_meta(d, meta)
-    return {"status": "converting", "id": job_id,
-            "inject_drivers": req.inject_drivers}
+    return {"status": "converting", "id": job_id, "inject_drivers": inject}
 
 
 class ImportCreateVMRequest(BaseModel):
@@ -1863,6 +1925,27 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     # means "define and start the VM, then return immediately" (don't block
     # waiting for the guest to shut down — it has an OS, not an installer).
     boot_arg = "--boot uefi" if firmware == "uefi" else ""
+
+    # Hyper-V enlightenments for Windows guests — Windows detects these at
+    # boot and uses faster code paths for APICs, spinlocks, synthetic timer,
+    # etc. Red Hat's recommended safe set; measurable CPU-load drop on idle
+    # Windows VMs, a few % win on busy ones. No-op for non-Windows guests,
+    # so we only set it when we're confident the guest is Windows.
+    is_windows = meta.get("os_type", "").lower() == "windows"
+    if is_windows:
+        features_arg = (
+            "--features acpi=on,apic=on,"
+            "hyperv.relaxed.state=on,hyperv.vapic.state=on,"
+            "hyperv.spinlocks.state=on,hyperv.spinlocks.retries=8191,"
+            "hyperv.vpindex.state=on,hyperv.runtime.state=on,"
+            "hyperv.synic.state=on,hyperv.stimer.state=on,"
+            "hyperv.reset.state=on,hyperv.frequencies.state=on "
+        )
+        clock_arg = "--clock offset=utc,hypervclock_present=yes "
+    else:
+        features_arg = ""
+        clock_arg = "--clock offset=utc "
+
     vi_cmd = (
         f"virt-install --name {req.name} --vcpus {req.vcpus} --ram {req.ram_mb} "
         f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
@@ -1871,7 +1954,8 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
         f"--machine q35 "
         f"{boot_arg} "
-        f"--clock offset=utc "
+        f"{features_arg}"
+        f"{clock_arg}"
         f"--os-variant detect=on,name=generic "
         f"--noautoconsole --wait 0 --import 2>&1"
     )

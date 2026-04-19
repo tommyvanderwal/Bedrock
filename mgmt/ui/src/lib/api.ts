@@ -106,6 +106,13 @@ export interface ImportJob {
 	detected_os_type?: string;
 	detected_firmware?: 'bios' | 'uefi';
 	injected_drivers?: boolean;
+	// Populated at upload time by virt-inspector (or format hint for VHD/VHDX)
+	os_type?: string;        // windows / linux / freebsd / ""
+	os_distro?: string;
+	os_product_name?: string;
+	os_version?: string;
+	os_osinfo?: string;
+	os_detection?: string;   // which path produced the result
 	error?: string;
 	consumed_as?: string;
 	log_tail?: string;
@@ -131,8 +138,11 @@ export async function uploadImport(file: File, onProgress?: (pct: number) => voi
 		xhr.send(fd);
 	});
 }
-export async function convertImport(id: string, injectDrivers: boolean = false) {
-	return apiPost(`/api/imports/${id}/convert`, { inject_drivers: injectDrivers });
+export async function convertImport(id: string, injectDrivers: boolean | null = null) {
+	// null → server auto-selects based on detected OS at upload time.
+	const body: any = {};
+	if (injectDrivers !== null) body.inject_drivers = injectDrivers;
+	return apiPost(`/api/imports/${id}/convert`, body);
 }
 export async function deleteImport(id: string) {
 	const r = await fetch(`/api/imports/${encodeURIComponent(id)}`, { method: 'DELETE' });
