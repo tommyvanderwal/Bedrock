@@ -43,7 +43,8 @@ for URLs. Each job is self-contained in its own directory; clean-up is
 | `.vmdk` | VMware | `qemu-img convert -f vmdk -O qcow2` | no (default) |
 | `.vhd` | Hyper-V gen 1 | `qemu-img convert -f vpc -O qcow2` | no |
 | `.vhdx` | Hyper-V gen 2 | `qemu-img convert -f vhdx -O qcow2` | no |
-| `.ova`, `.ovf` | VMware Appliance | `tar -xf` → find disk → `qemu-img convert` | no (default) |
+| `.ova`, `.ovf` (Linux/generic) | VMware Appliance | `tar -xf` → **parse OVF** → `qemu-img convert` per disk (multi-VMDK aware) | no (default) |
+| `.ova`, `.ovf` + **Inject drivers** | Windows OVA | `virt-v2v -i ova` — parses OVF, converts every VMDK to qcow2, injects drivers on boot disk | yes |
 | any + **Inject drivers** ticked | full `virt-v2v` | Inspects guest OS, rewrites boot config, **injects viostor + NetKVM on Windows** | yes |
 
 ### When to tick "Windows guest — inject virtio drivers"
@@ -66,6 +67,36 @@ Injection cost: 2–10 minutes per VM on modern hardware, longer in
 nested-KVM testbeds. virt-v2v boots a libguestfs appliance to mount
 and edit the guest disk — needs a few hundred MB RAM and /var/tmp
 space ≥ virtual-disk-size.
+
+### Multi-disk OVAs (Hyper-V appliances, SQL servers, security VMs)
+
+Appliance vendors and SQL-style "OS + data" splits ship OVAs with
+multiple VMDKs. Bedrock handles them end-to-end:
+
+```
+  OVA containing disk-boot.vmdk + disk-data.vmdk
+       │
+       │  tar -xf → parse <Disk> entries in OVF
+       │
+       ▼
+  disk-boot.vmdk  → qemu-img convert → converted/disk0.qcow2   boot=true
+  disk-data.vmdk  → qemu-img convert → converted/disk1.qcow2   boot=false
+       │
+       │  meta.json['disks'] = [{path, index, virtual_size_gb, boot}, ...]
+       │
+       ▼
+  Create VM from import:
+       for each disk →  lvcreate thin + qemu-img sparse-convert
+       virt-install --disk disk0 --disk disk1 ...   → vda + vdb + ...
+```
+
+Disk order comes from the OVF's `<Disk>` element order (which matches
+the VirtualHardwareSection's `AddressOnParent`), so disk 0 is always
+the boot disk. For Windows OVAs, virt-v2v's own `-i ova` mode is used
+instead — it does the same OVF parsing + emits `<name>-sda`, `-sdb`,
+... outputs. Both paths converge on the same multi-disk
+`meta.json['disks']` structure, so `_vm_create_from_import` iterates
+them identically.
 
 ### Firmware auto-detection
 

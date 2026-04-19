@@ -882,9 +882,19 @@ QEMU_FORMAT_MAP = {
 
 def _run_cmd(log_path: Path, cmd: list) -> int:
     """Synchronous subprocess run with log file. Returns exit code."""
+    # Give virt-v2v's libguestfs appliance enough memory + tmpfs workspace.
+    # Default is 768 MB; on multi-disk OVAs virt-v2v's inner-appliance root
+    # fills up with staging data and dies with 'not enough free space on /'.
+    # 2048 MB is safe and RAM-cheap (only touched during convert).
+    env = None
+    if cmd and cmd[0] in ("virt-v2v", "virt-inspector", "virt-win-reg",
+                          "virt-filesystems", "guestfish"):
+        import os as _os
+        env = {**_os.environ, "LIBGUESTFS_MEMSIZE": "2048"}
     with log_path.open("a") as lf:
         lf.write(f"\n# command: {' '.join(cmd)}\n"); lf.flush()
-        return subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+        return subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                              env=env).returncode
 
 
 async def _run_convert(job_id: str, inject_drivers: bool = False):
@@ -916,31 +926,78 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
     rc = 0
 
     try:
-        if ext in ("ova", "ovf"):
-            # OVA = tar with OVF + disk(s). Extract, find the disk, convert.
+        if ext in ("ova", "ovf") and inject_drivers:
+            # Windows OVA path: virt-v2v parses the OVF, inspects the guest,
+            # converts each disk to qcow2 and injects viostor/NetKVM on the
+            # boot disk. Emits <name>-sda, <name>-sdb, ... plus a .xml sidecar.
+            rc = await loop.run_in_executor(None, _run_cmd, log,
+                ["virt-v2v", "-v", "-x", "-i", "ova", str(src),
+                 "-o", "local", "-os", str(dst_dir), "-of", "qcow2"])
+        elif ext in ("ova", "ovf"):
+            # Linux / generic OVA path: extract the tar, parse the OVF to get
+            # the disk file list in slot order (so disks[0] is the boot disk
+            # virt-install's vda wants), and qemu-img convert each one to
+            # qcow2 individually. Avoids virt-v2v's libguestfs appliance
+            # (which would otherwise boot a tiny Linux to do the same work
+            # and occasionally run out of ram-fs space on multi-disk OVAs).
+            # Result is byte-identical qcow2s, one per source VMDK.
             extract = d / "ova-extract"
-            extract.mkdir(exist_ok=True)
+            if extract.exists(): shutil.rmtree(extract)
+            extract.mkdir()
             rc = await loop.run_in_executor(None, _run_cmd, log,
                 ["tar", "-xf", str(src), "-C", str(extract)])
             if rc == 0:
-                # Find the first *.vmdk (or *.raw/*.img) referenced by the OVF
-                disks = [p for p in extract.glob("*.vmdk")] + \
-                        [p for p in extract.glob("*.img")] + \
-                        [p for p in extract.glob("*.raw")]
-                if not disks:
-                    meta["error"] = "OVA contained no recognisable disk"; rc = 1
+                ovf_files = list(extract.glob("*.ovf"))
+                disk_refs: list[Path] = []
+                if ovf_files:
+                    # Parse OVF: <References><File ovf:id=... ovf:href=...>,
+                    # plus <DiskSection><Disk ovf:fileRef=...>. The order of
+                    # Disk elements (+ their VirtualHardwareSection Items)
+                    # is the slot order. For a simple OVA, the File order
+                    # = the Disk order = slot order.
+                    try:
+                        import xml.etree.ElementTree as _ET
+                        ovf = _ET.parse(ovf_files[0]).getroot()
+                        ns = {"ovf": "http://schemas.dmtf.org/ovf/envelope/1"}
+                        id_to_href = {}
+                        for f in ovf.iter():
+                            if f.tag.endswith("}File"):
+                                fid = f.attrib.get(f"{{{ns['ovf']}}}id") \
+                                      or f.attrib.get("ovf:id") or f.attrib.get("id")
+                                href = f.attrib.get(f"{{{ns['ovf']}}}href") \
+                                      or f.attrib.get("ovf:href") or f.attrib.get("href")
+                                if fid and href: id_to_href[fid] = href
+                        disk_order = []
+                        for d_el in ovf.iter():
+                            if d_el.tag.endswith("}Disk"):
+                                fr = (d_el.attrib.get(f"{{{ns['ovf']}}}fileRef")
+                                      or d_el.attrib.get("ovf:fileRef")
+                                      or d_el.attrib.get("fileRef"))
+                                if fr and fr in id_to_href:
+                                    disk_order.append(id_to_href[fr])
+                        for href in disk_order:
+                            p = extract / href
+                            if p.exists(): disk_refs.append(p)
+                    except Exception as e:
+                        push_log(f"OVF parse failed, falling back to glob: {e}",
+                                 node="mgmt", app="bedrock-mgmt", level="warn")
+                if not disk_refs:
+                    # Fallback: glob-find disks in whatever order the tar gives
+                    disk_refs = (sorted(extract.glob("*.vmdk"))
+                                 + sorted(extract.glob("*.img"))
+                                 + sorted(extract.glob("*.raw")))
+                if not disk_refs:
+                    meta["error"] = "OVA contained no recognisable disks"
+                    rc = 1
                 else:
-                    d0 = disks[0]
-                    fmt_in = QEMU_FORMAT_MAP.get(d0.suffix.lstrip(".").lower(), "raw")
-                    if inject_drivers:
-                        # Use virt-v2v on the bundled disk
-                        rc = await loop.run_in_executor(None, _run_cmd, log,
-                            ["virt-v2v", "-v", "-x", "-i", "disk", str(d0),
-                             "-o", "local", "-os", str(dst_dir), "-of", "qcow2"])
-                    else:
+                    for i, dp in enumerate(disk_refs):
+                        fmt_in = QEMU_FORMAT_MAP.get(
+                            dp.suffix.lstrip(".").lower(), "raw")
+                        out_path = dst_dir / f"disk{i}.qcow2"
                         rc = await loop.run_in_executor(None, _run_cmd, log,
                             ["qemu-img", "convert", "-p", "-f", fmt_in,
-                             "-O", "qcow2", str(d0), str(out_qcow)])
+                             "-O", "qcow2", str(dp), str(out_path)])
+                        if rc != 0: break
         elif inject_drivers:
             # Windows import path — virt-v2v inspects, rewrites bootloader, inject viostor/NetKVM
             rc = await loop.run_in_executor(None, _run_cmd, log,
@@ -958,19 +1015,36 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
             push_log(f"Import convert FAILED: {job_id} (exit {rc})",
                      node="mgmt", app="bedrock-mgmt", level="error")
         else:
-            # virt-v2v produces <name>-sda, our qemu-img path produces disk.qcow2
-            qcow = out_qcow if out_qcow.exists() else \
-                   next((p for p in dst_dir.glob("*.qcow2")), None) or \
-                   next((p for p in dst_dir.glob("*-sd?")), None)
-            if not qcow:
+            # Collect every qcow2 output in the right order.
+            #   Single-disk (VHDX/qcow2/raw + qemu-img):   disk.qcow2
+            #   Linux OVA (our tar + qemu-img):            disk0.qcow2, disk1.qcow2, ...
+            #   Windows OVA (virt-v2v -i ova):             <name>-sda, -sdb, ...
+            #   Windows single-disk (virt-v2v -i disk):    <name>-sda
+            # Order must match guest slot order (first = boot disk), so we
+            # sort by the ordering suffix.
+            found: list[Path] = []
+            if out_qcow.exists():
+                found.append(out_qcow)
+            # diskN.qcow2 from the manual OVA path
+            numbered = sorted(dst_dir.glob("disk[0-9]*.qcow2"),
+                              key=lambda p: int(re.search(r"disk(\d+)", p.name).group(1)))
+            for p in numbered:
+                if p not in found: found.append(p)
+            # -sdX from virt-v2v (sorted by letter: sda, sdb, sdc...)
+            v2v_outs = sorted([p for p in dst_dir.iterdir()
+                               if re.search(r"-sd[a-z]$", p.name)],
+                              key=lambda p: p.name)
+            for p in v2v_outs:
+                if p not in found: found.append(p)
+            # Any other *.qcow2 (catchall — won't duplicate)
+            for p in sorted(dst_dir.glob("*.qcow2")):
+                if p not in found: found.append(p)
+            if not found:
                 meta["status"] = "failed"; meta["error"] = "no output file"
             else:
-                # UTC everywhere: for Windows imports, set RealTimeIsUniversal=1
-                # so the guest reads the libvirt offset="utc" RTC correctly and
-                # displays UTC instead of UTC+localtz nonsense. Done offline via
-                # virt-win-reg (libguestfs writes to the NTFS SYSTEM hive). We
-                # only do it when drivers were injected (i.e. virt-v2v already
-                # mounted the filesystem and knows it's Windows).
+                # UTC registry key for Windows (only meaningful on the boot
+                # disk which is always found[0]). virt-win-reg mounts the
+                # SYSTEM hive from the NTFS on that qcow2.
                 if inject_drivers:
                     reg_file = dst_dir / "utc.reg"
                     reg_file.write_text(
@@ -980,7 +1054,7 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                         '"RealTimeIsUniversal"=dword:00000001\r\n'
                     )
                     rc_reg = await loop.run_in_executor(None, _run_cmd, log,
-                        ["virt-win-reg", "--merge", str(qcow), str(reg_file)])
+                        ["virt-win-reg", "--merge", str(found[0]), str(reg_file)])
                     meta["utc_registry_applied"] = (rc_reg == 0)
                     if rc_reg == 0:
                         push_log(f"Import {job_id}: RealTimeIsUniversal=1 set "
@@ -992,15 +1066,29 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                                  f"until NTP corrects it",
                                  node="mgmt", app="bedrock-mgmt", level="warn")
 
-                iq = json.loads(subprocess.run(
-                    ["qemu-img", "info", "--output=json", str(qcow)],
-                    capture_output=True, text=True).stdout or "{}")
+                # Describe each output disk (virtual_size, actual_size).
+                disk_metas = []
+                for i, p in enumerate(found):
+                    iq = json.loads(subprocess.run(
+                        ["qemu-img", "info", "--output=json", str(p)],
+                        capture_output=True, text=True).stdout or "{}")
+                    vsz = iq.get("virtual-size") or 0
+                    disk_metas.append({
+                        "index": i,
+                        "path": str(p),
+                        "virtual_size_bytes": vsz,
+                        "virtual_size_gb": max(1, (vsz + (1 << 30) - 1) >> 30),
+                        "actual_size_bytes": iq.get("actual-size") or 0,
+                        "boot": (i == 0),   # first disk = boot
+                    })
                 meta["status"] = "ready"
-                meta["disk_path"] = str(qcow)
-                meta["virtual_size_bytes"] = iq.get("virtual-size") or 0
-                meta["virtual_size_gb"] = max(1,
-                    (meta["virtual_size_bytes"] + (1<<30) - 1) >> 30)
-                # OS detection from virt-v2v sidecar XML (if present)
+                meta["disks"] = disk_metas
+                # Back-compat single-disk fields (disks[0])
+                meta["disk_path"] = disk_metas[0]["path"]
+                meta["virtual_size_bytes"] = disk_metas[0]["virtual_size_bytes"]
+                meta["virtual_size_gb"]    = disk_metas[0]["virtual_size_gb"]
+
+                # OS detection from virt-v2v sidecar XML
                 xml = next((p for p in dst_dir.glob("*.xml")), None)
                 if xml:
                     xt = xml.read_text()
@@ -1008,19 +1096,17 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                     if m: meta["detected_name"] = m.group(1)
                     m = re.search(r"<os>.*?<type[^>]*>([^<]+)</type>", xt, re.S)
                     if m: meta["detected_os_type"] = m.group(1)
-                    # Firmware choice — virt-v2v adds <firmware>efi</firmware>
-                    # (or firmware='efi' on <os>) for GPT/UEFI guests.
                     meta["detected_firmware"] = (
                         "uefi" if ("firmware='efi'" in xt or
                                    "<firmware>efi</firmware>" in xt)
                         else "bios"
                     )
-                # Fallback partition-table sniff if no sidecar
                 if "detected_firmware" not in meta:
+                    # Sniff partition table of the BOOT disk (disks[0])
                     try:
                         head = subprocess.run(
                             ["qemu-img", "dd", "-O", "raw", "bs=512", "count=34",
-                             f"if={qcow}", "of=/dev/stdout"],
+                             f"if={disk_metas[0]['path']}", "of=/dev/stdout"],
                             capture_output=True, timeout=20).stdout
                         meta["detected_firmware"] = (
                             "uefi" if len(head) >= 520 and head[512:520] == b"EFI PART"
@@ -1028,8 +1114,10 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                         )
                     except Exception: meta["detected_firmware"] = "bios"
                 meta["convert_finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-                push_log(f"Import convert done: {job_id} → {qcow.name} "
-                         f"({meta['virtual_size_gb']}G virtual)",
+                total_virtual_gb = sum(d["virtual_size_gb"] for d in disk_metas)
+                push_log(f"Import convert done: {job_id} → {len(disk_metas)} "
+                         f"disk{'s' if len(disk_metas)!=1 else ''}, "
+                         f"{total_virtual_gb}G virtual total",
                          node="mgmt", app="bedrock-mgmt", level="info")
     except Exception as e:
         meta["status"] = "failed"; meta["error"] = str(e)
@@ -1754,9 +1842,24 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
             raise HTTPException(400, f"{tgt} needs {need_peers} peers, have {len(chosen)}")
 
         # Track what we created so we can unwind on failure
-        created: list[dict] = []  # [{resource, hosts: [host, lv, meta]}]
+        created: list[dict] = []  # [{resource, hosts: [host, lv, meta], target_dev}]
+        # Targets we started a blockcopy on; need `virsh blockjob --abort` if it
+        # was interrupted, otherwise libvirt keeps disk->blockjob set and all
+        # future blockcopies on this disk fail with "already in active block
+        # job" until the daemon restarts.
+        copy_started: list[str] = []
 
         def _unwind():
+            # First: abort any blockcopy that failed mid-flight, so libvirt
+            # clears disk->blockjob. The pivot was never reached (blockcopy
+            # raised) so the VM is still on its original LV.
+            for tgt in copy_started:
+                ssh_cmd_rc(src["host"],
+                    f"virsh blockjob {vm_name} {tgt} --abort 2>&1 || true",
+                    timeout=15)
+                ssh_cmd_rc(src["host"],
+                    f"virsh blockjob {vm_name} {tgt} --abort --async 2>&1 || true",
+                    timeout=15)
             for c in reversed(created):
                 for h, lv, meta in c["hosts"]:
                     ssh_cmd_rc(h, f"drbdadm down {c['resource']} 2>&1 || true", timeout=15)
@@ -1782,7 +1885,19 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
 
                 src_size = _lv_bytes(src["host"], src_lv)
                 size_mb = (src_size + 1024*1024 - 1) // (1024*1024)
-                meta_mb = 4
+                # DRBD 9 external metadata size: a 4 MB LV is enough for
+                # the superblock + bitmap of a TINY data disk (say < 2 GB)
+                # with max-peers=7, but on a 40 GB disk the bitmap alone
+                # needs ~10 MB per peer. An undersized meta LV doesn't
+                # error out — DRBD silently TRUNCATES the effective device
+                # size (/dev/drbdN reads as shorter than the backing LV),
+                # which then makes virsh blockcopy --pivot fail with
+                # "Copy failed" at 0 %.
+                # Rule of thumb: 32 MB base + 1 MB per GB of data covers
+                # max-peers=7 with plenty of headroom. Meta is thin on the
+                # same pool, so only actually-used blocks allocate.
+                size_gb = (src_size + (1 << 30) - 1) >> 30
+                meta_mb = max(32, 32 + size_gb)
 
                 step_prefix = f"disk{i} ({target_dev})"
                 if task: task.step_start(f"{step_prefix}: create meta LV on source")
@@ -1836,6 +1951,12 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                 if task: task.step_done(f"{step_prefix}: create-md + up")
 
                 if task: task.step_start(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                # Belt-and-braces: clear any stale libvirt blockjob state on
+                # this disk before we start. No-op if nothing is pending.
+                ssh_cmd_rc(src["host"],
+                    f"virsh blockjob {vm_name} {target_dev} --abort 2>&1 || true",
+                    timeout=10)
+                copy_started.append(target_dev)
                 out, rc = ssh_cmd_rc(src["host"],
                     f"virsh blockcopy {vm_name} {target_dev} /dev/drbd{minor} "
                     f"--reuse-external --wait --pivot --verbose "
@@ -1844,6 +1965,10 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                     if task: task.step_fail(f"{step_prefix}: blockcopy → /dev/drbd{minor}",
                                             f"rc={rc}: {out[-400:]}")
                     raise HTTPException(500, f"blockcopy failed on disk{i}: {out}")
+                # Blockcopy succeeded + pivoted → target_dev is no longer in
+                # the `needs-abort` set (pivot drops the mirror).
+                if target_dev in copy_started:
+                    copy_started.remove(target_dev)
                 if task: task.step_done(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
                 converted_disks.append({"index": i, "target": target_dev,
                                         "resource": resource, "minor": minor})
@@ -1898,13 +2023,17 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
             lv_name = existing["lv_name"]
             meta_lv_name = f"{lv_name}-meta"
             size_mb = (existing["size_bytes"] + 1024*1024 - 1) // (1024*1024)
+            # Meta LV sized to match the other peers — see _vm_convert_upgrade
+            # cattle→pet path for why 4 MB is too small for real data disks.
+            size_gb = (existing["size_bytes"] + (1 << 30) - 1) >> 30
+            meta_mb = max(32, 32 + size_gb)
 
             step_prefix = f"disk{i} ({resource})"
             if task: task.step_start(f"{step_prefix}: LVs on new peer {new_peer}")
             _ensure_thinpool(p["host"], vg_name)
             ssh_cmd(p["host"], f"lvcreate -V {size_mb}M -T {vg_name}/thinpool "
                                f"-n {lv_name} -y", timeout=30)
-            ssh_cmd(p["host"], f"lvcreate -V 4M -T {vg_name}/thinpool "
+            ssh_cmd(p["host"], f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool "
                                f"-n {meta_lv_name} -y", timeout=30)
             if task: task.step_done(f"{step_prefix}: LVs on new peer {new_peer}")
 
@@ -2280,26 +2409,35 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     nodes_cfg = get_nodes()
     host = nodes_cfg[home_name]["host"]
 
-    src_qcow = meta.get("disk_path")
-    if not src_qcow or not Path(src_qcow).exists():
-        raise HTTPException(500, "converted disk is gone — re-run convert?")
-
-    virtual_gb = meta.get("virtual_size_gb") or 20
-    size_mb = max(virtual_gb * 1024, 1024)
-    lv_name = f"vm-{req.name}-disk0"
-    lv_path = f"/dev/almalinux/{lv_name}"
+    # Multi-disk imports: OVA with multiple VMDKs produces meta['disks'] with
+    # one entry per disk. Single-disk imports (VHDX/qcow2/etc) still fill in
+    # disk_path/virtual_size_gb so we synthesise a one-element disks list
+    # for uniform iteration below.
+    src_disks = meta.get("disks") or [{
+        "index": 0,
+        "path": meta.get("disk_path", ""),
+        "virtual_size_bytes": meta.get("virtual_size_bytes", 0),
+        "virtual_size_gb": meta.get("virtual_size_gb", 20),
+        "actual_size_bytes": 0,
+        "boot": True,
+    }]
+    for sd in src_disks:
+        if not sd.get("path") or not Path(sd["path"]).exists():
+            raise HTTPException(500,
+                f"converted disk {sd.get('path','?')} is gone — re-run convert?")
 
     # Firmware: trust the inspection result from _run_convert if available.
-    # Otherwise sniff the disk's partition table here. Rationale: a BIOS-boot
-    # disk can't boot on UEFI firmware — Windows traps 0x7B, Linux drops to
-    # EFI shell. Match the source to avoid the footgun.
+    # Otherwise sniff the BOOT disk's partition table here. Rationale: a BIOS
+    # -boot disk can't boot on UEFI firmware — Windows traps 0x7B, Linux drops
+    # to EFI shell. Match the source to avoid the footgun.
+    boot_src = next((d for d in src_disks if d.get("boot")), src_disks[0])
     firmware = meta.get("detected_firmware")
     if firmware not in ("bios", "uefi"):
         firmware = "bios"
         try:
             head = subprocess.run(
                 ["qemu-img", "dd", "-O", "raw", "bs=512", "count=34",
-                 f"if={src_qcow}", "of=/dev/stdout"],
+                 f"if={boot_src['path']}", "of=/dev/stdout"],
                 capture_output=True, timeout=20).stdout
             if len(head) >= 520 and head[512:520] == b"EFI PART":
                 firmware = "uefi"
@@ -2307,19 +2445,18 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
 
     _ensure_thinpool(host)
 
-    # Pre-flight: check thin-pool free space against the source's *actual*
-    # on-disk size (qcow2 "actual-size"), not its virtual size. With sparse
-    # convert (--target-is-zero) a 10 GB-on-disk Windows image only allocates
-    # ~10 GB in the thin pool even though the virtual disk is 40 GB. Reject
-    # up front if the pool can't absorb the delta, so we never partially
-    # fill the pool and leave a zombie LV.
-    try:
-        iq = json.loads(subprocess.run(
-            ["qemu-img", "info", "--output=json", src_qcow],
-            capture_output=True, text=True).stdout or "{}")
-        actual_b = int(iq.get("actual-size") or 0)
-    except Exception:
-        actual_b = 0
+    # Pre-flight: thin-pool must fit the SUM of actual sizes of all disks.
+    total_actual_b = sum(int(d.get("actual_size_bytes") or 0) for d in src_disks)
+    if not total_actual_b:
+        # Fallback when we couldn't read actual-size from the qcow2
+        for sd in src_disks:
+            try:
+                iq = json.loads(subprocess.run(
+                    ["qemu-img", "info", "--output=json", sd["path"]],
+                    capture_output=True, text=True).stdout or "{}")
+                sd["actual_size_bytes"] = int(iq.get("actual-size") or 0)
+            except Exception: pass
+        total_actual_b = sum(int(d.get("actual_size_bytes") or 0) for d in src_disks)
     pool_info, _ = ssh_cmd_rc(host,
         "lvs --noheadings --units b --nosuffix --separator '|' "
         "-o lv_size,data_percent almalinux/thinpool 2>/dev/null | head -1",
@@ -2328,9 +2465,8 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
         parts = [p.strip() for p in pool_info.split("|") if p.strip()]
         pool_size_b = int(parts[0]); pool_used_pct = float(parts[1])
         pool_free_b = int(pool_size_b * (100.0 - pool_used_pct) / 100.0)
-        # If we couldn't read actual-size, fall back to the virtual size —
-        # safer to reject than thicken and brick the pool.
-        need_b = actual_b or int(size_mb) * 1024 * 1024
+        need_b = total_actual_b or \
+                 sum(d["virtual_size_gb"] for d in src_disks) * (1 << 30)
         if pool_free_b < need_b + (1 << 30):  # +1 GB slack
             raise HTTPException(507,
                 f"Thin pool on {home_name} has "
@@ -2340,39 +2476,50 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     except HTTPException:
         raise
     except Exception:
-        pass  # non-fatal — proceed and let lvcreate fail loudly if needed
+        pass
 
-    if task: task.step_start(f"lvcreate {virtual_gb} GB thin")
-    push_log(f"Import {meta['id']} → create VM {req.name}: lvcreate {virtual_gb}G thin",
-             node=home_name, app="bedrock-mgmt", level="info")
-    out, rc = ssh_cmd_rc(host,
-        f"lvcreate -y -V {size_mb}M --thin -n {lv_name} almalinux/thinpool 2>&1",
-        timeout=60)
-    if rc != 0 and "already exists" not in out:
-        if task: task.step_fail(f"lvcreate {virtual_gb} GB thin", out[-300:])
-        raise HTTPException(500, f"lvcreate failed: {out}")
-    if task: task.step_done(f"lvcreate {virtual_gb} GB thin")
+    # Per-disk plan: one LV per source disk, named vm-<vm>-disk0/1/2...
+    disks_plan = []
+    for sd in src_disks:
+        vgb = sd["virtual_size_gb"] or 1
+        ln = f"vm-{req.name}-disk{sd['index']}"
+        disks_plan.append({
+            "index": sd["index"],
+            "lv_name": ln,
+            "lv_path": f"/dev/almalinux/{ln}",
+            "size_gb": vgb,
+            "size_mb": max(vgb * 1024, 1024),
+            "src_qcow": sd["path"],
+        })
 
-    # Stream the converted image into the LV. Auto-detect the input format
-    # (virt-v2v sometimes outputs raw, sometimes qcow2 depending on flags).
-    # --target-is-zero + -S 4k preserve the source's sparsity: unallocated
-    # blocks in the qcow2 are not rewritten as zeros to the thin LV, so a
-    # 10 GB-on-disk Windows image stays ~10 GB allocated in the thin pool
-    # instead of thickening to the full 40 GB virtual size.
-    if task: task.step_start("qemu-img convert → thin LV (sparse)")
-    push_log(f"Import {meta['id']} → qemu-img convert → thin LV (sparse)",
-             node=home_name, app="bedrock-mgmt", level="info")
-    # -n: don't create/truncate the target; the LV already exists and
-    #     --target-is-zero requires it.
-    out, rc = ssh_cmd_rc(host,
-        f"qemu-img convert -p -n -S 4k --target-is-zero -O raw "
-        f"{src_qcow} {lv_path} 2>&1",
-        timeout=3600)
-    if rc != 0:
-        ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
-        if task: task.step_fail("qemu-img convert → thin LV (sparse)", (out or "")[-300:])
-        raise HTTPException(500, "qemu-img convert failed:\n" + (out or "(no output)"))
-    if task: task.step_done("qemu-img convert → thin LV (sparse)")
+    # 1. lvcreate + qemu-img convert for every disk. Iterative, unwind on fail.
+    created_lvs: list[str] = []
+    for d in disks_plan:
+        step_name = f"disk{d['index']}: lvcreate + qemu-img convert ({d['size_gb']} GB)"
+        if task: task.step_start(step_name)
+        push_log(f"Import {meta['id']} → create VM {req.name}: "
+                 f"lvcreate {d['size_gb']}G thin ({d['lv_name']})",
+                 node=home_name, app="bedrock-mgmt", level="info")
+        out, rc = ssh_cmd_rc(host,
+            f"lvcreate -y -V {d['size_mb']}M --thin -n {d['lv_name']} "
+            f"almalinux/thinpool 2>&1", timeout=60)
+        if rc != 0 and "already exists" not in out:
+            for lv in created_lvs:
+                ssh_cmd_rc(host, f"lvremove -f {lv} 2>&1", timeout=15)
+            if task: task.step_fail(step_name, out[-300:])
+            raise HTTPException(500, f"lvcreate {d['lv_name']} failed: {out}")
+        created_lvs.append(d["lv_path"])
+        # Sparse-preserving convert into the LV
+        out, rc = ssh_cmd_rc(host,
+            f"qemu-img convert -p -n -S 4k --target-is-zero -O raw "
+            f"{d['src_qcow']} {d['lv_path']} 2>&1", timeout=3600)
+        if rc != 0:
+            for lv in created_lvs:
+                ssh_cmd_rc(host, f"lvremove -f {lv} 2>&1", timeout=30)
+            if task: task.step_fail(step_name, (out or "")[-300:])
+            raise HTTPException(500,
+                f"qemu-img convert {d['lv_name']} failed:\n" + (out or "(no output)"))
+        if task: task.step_done(step_name)
 
     # virt-install with Q35 + matched firmware + UTC. --import + --wait 0
     # means "define and start the VM, then return immediately" (don't block
@@ -2399,9 +2546,14 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
         features_arg = ""
         clock_arg = "--clock offset=utc "
 
+    # One --disk arg per data disk, in index order → vda, vdb, vdc, ...
+    disk_args = " ".join(
+        f"--disk path={d['lv_path']},format=raw,bus=virtio,cache=none,discard=unmap"
+        for d in disks_plan)
+
     vi_cmd = (
         f"virt-install --name {req.name} --vcpus {req.vcpus} --ram {req.ram_mb} "
-        f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
+        f"{disk_args} "
         f"--network bridge=br0,model=virtio "
         f"--graphics vnc,listen=0.0.0.0 "
         f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
@@ -2413,12 +2565,13 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
         f"--noautoconsole --wait 0 --import 2>&1"
     )
     if task: task.step_start("virt-install")
-    push_log(f"Import {meta['id']} → virt-install",
+    push_log(f"Import {meta['id']} → virt-install ({len(disks_plan)} disk(s))",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
     if rc != 0:
         ssh_cmd_rc(host, f"virsh undefine {req.name} --nvram 2>&1", timeout=10)
-        ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
+        for lv in created_lvs:
+            ssh_cmd_rc(host, f"lvremove -f {lv}", timeout=30)
         if task: task.step_fail("virt-install", (out or "")[-300:])
         raise HTTPException(500, "virt-install failed:\n" + (out or "(no output)"))
     if task: task.step_done("virt-install")
@@ -2432,7 +2585,12 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     inv = load_inventory()
     inv[req.name] = {
         "priority": req.priority, "vcpus": req.vcpus, "ram_mb": req.ram_mb,
-        "disk_gb": virtual_gb, "iso": None,
+        "disk_gb": disks_plan[0]["size_gb"],   # back-compat primary disk
+        "disks": [
+            {"index": d["index"], "lv": d["lv_name"], "size_gb": d["size_gb"]}
+            for d in disks_plan
+        ],
+        "iso": None,
         "home_node": home_name,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "created_by": "import",
@@ -2447,10 +2605,13 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     meta["consumed_as"] = req.name
     _write_import_meta(d, meta)
 
+    disk_summary = ", ".join(f"disk{d['index']}={d['size_gb']}G" for d in disks_plan)
     push_log(f"Imported VM {req.name} on {home_name} (vcpus={req.vcpus}, "
-             f"ram={req.ram_mb}MB, {virtual_gb}GB, from {meta.get('original_name')})",
+             f"ram={req.ram_mb}MB, {disk_summary}, "
+             f"from {meta.get('original_name')})",
              node=home_name, app="bedrock-mgmt", level="info")
-    return {"status": "created", "name": req.name, "node": home_name}
+    return {"status": "created", "name": req.name, "node": home_name,
+            "disks": [d["lv_name"] for d in disks_plan]}
 
 
 def _vm_delete(vm_name: str, task: Optional[Task] = None) -> dict:

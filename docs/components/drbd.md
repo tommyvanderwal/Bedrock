@@ -10,14 +10,28 @@ grow and shrink peers online without full resync.
 ### External meta-disk
 
 Every resource has a **separate** small thin LV holding DRBD metadata,
-referenced as `meta-disk /dev/<vg>/vm-<name>-disk0-meta`. Allocation is
-4 MB regardless of VM size — enough for up to 7 peers.
+referenced as `meta-disk /dev/<vg>/vm-<name>-disk0-meta`. Allocation
+scales with data size:
+
+```
+  meta_mb = max(32, 32 + data_gb)
+```
+
+i.e. 32 MB baseline + 1 MB per GB of data. A 40 GB disk gets a 72 MB
+meta LV; a 10 GB disk gets 42 MB. Meta LVs are thin-provisioned on the
+same pool so the actual block footprint is a few MB — the size just
+defines the *ceiling*.
 
 Why: DRBD internal metadata (the default) eats ~128 KB from the tail of
 the underlying data LV, making `/dev/drbdN` strictly smaller than the
 underlying LV. `virsh blockcopy` then refuses to pivot into it
 ("destination is smaller than source"). External meta keeps the DRBD
-device byte-for-byte the same size as the data LV.
+device byte-for-byte the same size as the data LV — **provided the meta
+LV is big enough**. DRBD doesn't error on an undersized meta LV; it
+silently truncates the effective device size to what fits, and
+subsequent `blockcopy --pivot` fails with "Copy failed" at 0 % (the
+destination is still smaller than the source). The formula above
+gives plenty of headroom for max-peers=7.
 
 ### `--max-peers=7`
 
