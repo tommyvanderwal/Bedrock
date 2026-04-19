@@ -865,6 +865,33 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
             if not qcow:
                 meta["status"] = "failed"; meta["error"] = "no output file"
             else:
+                # UTC everywhere: for Windows imports, set RealTimeIsUniversal=1
+                # so the guest reads the libvirt offset="utc" RTC correctly and
+                # displays UTC instead of UTC+localtz nonsense. Done offline via
+                # virt-win-reg (libguestfs writes to the NTFS SYSTEM hive). We
+                # only do it when drivers were injected (i.e. virt-v2v already
+                # mounted the filesystem and knows it's Windows).
+                if inject_drivers:
+                    reg_file = dst_dir / "utc.reg"
+                    reg_file.write_text(
+                        "Windows Registry Editor Version 5.00\r\n\r\n"
+                        "[HKLM\\SYSTEM\\CurrentControlSet\\Control\\"
+                        "TimeZoneInformation]\r\n"
+                        '"RealTimeIsUniversal"=dword:00000001\r\n'
+                    )
+                    rc_reg = await loop.run_in_executor(None, _run_cmd, log,
+                        ["virt-win-reg", "--merge", str(qcow), str(reg_file)])
+                    meta["utc_registry_applied"] = (rc_reg == 0)
+                    if rc_reg == 0:
+                        push_log(f"Import {job_id}: RealTimeIsUniversal=1 set "
+                                 f"(guest will read RTC as UTC)",
+                                 node="mgmt", app="bedrock-mgmt", level="info")
+                    else:
+                        push_log(f"Import {job_id}: virt-win-reg failed (exit "
+                                 f"{rc_reg}); guest may show local-time offset "
+                                 f"until NTP corrects it",
+                                 node="mgmt", app="bedrock-mgmt", level="warn")
+
                 iq = json.loads(subprocess.run(
                     ["qemu-img", "info", "--output=json", str(qcow)],
                     capture_output=True, text=True).stdout or "{}")
