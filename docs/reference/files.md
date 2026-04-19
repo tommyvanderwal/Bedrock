@@ -122,6 +122,11 @@ Per-resource `/etc/drbd.d/vm-<name>-disk0.res`, one per VM with HA:
 
 `global_common.conf` is left at its ELRepo package default.
 
+`/etc/modules-load.d/drbd.conf` (one line: `drbd`) is written during
+`bedrock bootstrap` by `installer/lib/packages.py` so systemd's
+`systemd-modules-load.service` loads the DRBD kernel module at every
+boot — no `modprobe drbd` needed at runtime.
+
 ## SSH / cluster identity
 
 | Path | Who writes | Purpose |

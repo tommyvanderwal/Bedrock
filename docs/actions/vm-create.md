@@ -36,15 +36,42 @@ Two entry points:
 Priority → libvirt `cpu_shares` (cgroup weight):
 
 ```
-  low     =  256
-  normal  = 1024   (equals the historical libvirt default)
-  high    = 4096
+  low     =  256        # quarter-share of a normal VM
+  normal  = 1024        # libvirt default
+  high    = 4096        # 4x a normal VM
 ```
 
-Applied via `virsh schedinfo --live --config cpu_shares=<N>` after
-`virt-install` returns. Stored in inventory so it survives conversions
-and dashboard restarts. A "change priority" UI is a follow-up —
-`virsh schedinfo` on its own adjusts a running VM without downtime.
+Applied via `virsh schedinfo <vm> --live --config cpu_shares=<N>` after
+`virt-install` returns. On cgroup v2 (AlmaLinux 9) libvirt translates
+to `cpu.weight`; on v1 it writes `cpu.shares` directly. Stored in
+inventory so it survives conversions and dashboard restarts. Changing
+priority post-create is fully live — no reboot — via the Settings page
+(see [`vm-settings.md`](vm-settings.md)).
+
+### virtio-win.iso is auto-attached when any install ISO is used
+
+The dashboard create flow always adds a second SATA CDROM pointing at
+`/mnt/isos/virtio-win.iso` when the operator selects any install ISO:
+
+```
+  if iso_path and (ISO_DIR / "virtio-win.iso").exists():
+      virtio_extra = (f" --disk path={ISO_MOUNT_DIR}/virtio-win.iso,"
+                      "device=cdrom,bus=sata,readonly=on")
+```
+
+Windows Setup on Server 2022 already has inbox viostor+NetKVM, but for
+Server 2016 / 2012 / Win 7-8-10 the operator clicks **Load driver**
+during Setup's disk screen and points it at the virtio-win CDROM. Linux
+installers ignore the extra CDROM. The file itself is pre-fetched to
+`/opt/bedrock/iso/virtio-win.iso` by `bedrock init` — see
+[`iso-library.md`](iso-library.md#virtio-winiso--always-attached-never-selected).
+
+### The VM auto-starts
+
+`virt-install --import` boots the VM immediately after defining it.
+No `--noautoboot`, no `--wait 0` here — we want the dashboard state
+push to pick it up and the ISO to boot straight into Setup. The next
+state_push_loop tick (≤ 3 s) surfaces the new VM in the sidebar.
 
 ## Preconditions
 
@@ -103,13 +130,17 @@ The dashboard's state push picks this up in ≤ 3 s.
          │ port  = 7789 + minor             # historical; convert uses 7000+minor
          │
   T+0.5  for h in (home, peer):
-         │   _ensure_thin_pool(h)
+         │   _ensure_thin_pool(h)   # lvcreate only if thinpool missing
          │   ssh h: lvcreate -V {disk}G --thin -n vm-NAME-disk0
          │          almalinux/thinpool
          │
-  T+3s   generate DRBD 2-way resource text  (internal meta-disk today —
-         │   NOTE: the vm-convert path uses external meta; see the
-         │   lessons in docs/components/drbd.md)
+  T+3s   _next_drbd_minor(home_host)   # picks first unused 1000..1899
+         │   port = 7000 + minor                # config uses 7000+minor
+         │
+         │ generate DRBD 2-way resource (meta-disk is internal in the CLI
+         │ create path; the convert path uses external meta — see
+         │ docs/components/drbd.md). With --max-peers=7 at create-md you
+         │ can later grow the same resource to ViPet without wipe-md.
          │
          │ for h in (home, peer):
          │   ssh h: cat > /etc/drbd.d/vm-NAME-disk0.res

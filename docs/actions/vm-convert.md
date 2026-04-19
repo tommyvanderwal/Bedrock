@@ -143,7 +143,12 @@ No blockcopy. Just add a third peer to an already-primary DRBD resource:
 
 ```
   T=0   POST /api/vms/NAME/convert {"target_type":"pet", "peer_nodes":["<drop>"]}
-        │  (if peer_nodes omitted, auto-pick a non-primary)
+        │
+        │ Peer selection: peer_nodes[0] if set, else
+        │   candidates = [n for n in existing.peers if n != src_name]
+        │   drop = candidates[0]
+        │ (Never drops the current Primary. If the operator passes the
+        │ Primary as peer_nodes[0] the request 400s.)
         │
   T+0.1 ssh drop: virsh undefine NAME     (remove VM from peer's libvirt)
         │ ssh drop: drbdadm down vm-NAME-disk0
@@ -152,10 +157,17 @@ No blockcopy. Just add a third peer to an already-primary DRBD resource:
   T+0.5 rewrite /etc/drbd.d/vm-NAME-disk0.res for the remaining 2 peers
         │ write to kept_hosts; rm on dropped host
         │
-  T+0.8 for h in kept_hosts:
+  T+0.8 # del-peer dance per kept host — three steps in strict order:
+        │  1. disconnect  — tear the TCP link (--force because state may
+        │     be mid-sync and drbdadm disconnect refuses otherwise)
+        │  2. del-peer    — free the node-id slot in DRBD kernel state
+        │  3. adjust      — re-read the now-2-peer .res so each host
+        │     sees the reduced connection-mesh
+        │
+        │ for h in kept_hosts:
         │   ssh h: drbdsetup disconnect RES <dropped_node_id> --force
-        │   ssh h: drbdsetup del-peer RES <dropped_node_id> --force
-        │   ssh h: drbdadm adjust vm-NAME-disk0
+        │   ssh h: drbdsetup del-peer   RES <dropped_node_id> --force
+        │   ssh h: drbdadm  adjust      vm-NAME-disk0
         │
   T+1s  ssh drop: lvremove -f <lv_path> <meta_path>
         │ push_log "Convert NAME: vipet → pet (dropped <drop>)"

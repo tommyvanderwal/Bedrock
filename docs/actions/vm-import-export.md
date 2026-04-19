@@ -70,20 +70,65 @@ space ≥ virtual-disk-size.
 ### Firmware auto-detection
 
 A Gen-1 Hyper-V VHD (MBR partition table) cannot boot on UEFI
-firmware — Windows traps `0x7B INACCESSIBLE_BOOT_DEVICE`. Bedrock
-reads the source's partition table during convert:
+firmware — Windows traps `0x7B INACCESSIBLE_BOOT_DEVICE`, Linux
+drops to EFI shell. Bedrock reads the source's partition table
+during convert and records the choice in `meta.json`.
 
-- **GPT** (EFI PART signature at LBA 1) → domain XML gets `<os firmware='efi'>`
-- **MBR** → no firmware attribute (= BIOS, the libvirt default)
+```
+  if converted/*.xml exists:                      # virt-v2v ran
+      if "firmware='efi'" or "<firmware>efi</firmware>" in xml
+          → uefi
+      else → bios
 
-virt-v2v's sidecar XML carries its own firmware decision; when we
-have it (injection path), we trust it. Otherwise we sniff 34 sectors
-of the disk head and check for `EFI PART` at offset 512.
+  else:                                            # qemu-img-only path
+      read first 34 sectors of the disk:
+          peek = qemu-img dd -O raw bs=512 count=34 if=<disk>
+      if peek[512:520] == b"EFI PART"             # LBA 1 of GPT
+          → uefi
+      else → bios
+```
 
-Detected firmware is stored in `meta.json` as `detected_firmware`
-and shown under the Detected column on `/imports`. The Create VM
-flow passes `--boot uefi` to virt-install iff GPT; otherwise it
-omits the flag and Q35 firmware defaults to SeaBIOS.
+Detected firmware lands in `meta.detected_firmware` and shows up
+under the Detected column on `/imports` (`BIOS` or `UEFI`). The
+`_vm_create_from_import` helper then passes `--boot uefi` to
+`virt-install` **iff** `firmware == "uefi"`; otherwise it omits the
+flag and Q35 firmware defaults to SeaBIOS.
+
+### Windows driver injection — what virt-v2v actually does
+
+For Server 2012 R2 / Win 7 / Win 8 / Server 2016 VMs (no inbox
+virtio), `inject_drivers=true` runs virt-v2v, which uses libguestfs
+to mount the NTFS offline and:
+
+1. Copies driver payloads from `/usr/share/virtio-win/`:
+   - `viostor.sys` (boot disk), `vioscsi.sys` (if scsi controller),
+     `netkvm.sys` (NIC), `balloon.sys`, `vioserial.sys`, `viorng.sys`
+   - Destination: `C:\Windows\System32\drivers\` + matching `.inf`
+     under `C:\Windows\INF\`.
+2. Opens the `SYSTEM` registry hive (hivex library) and adds entries:
+   - `ControlSet001\Services\viostor\` — start=0 (boot), tag=…
+   - `ControlSet001\Control\CriticalDeviceDatabase\pci#ven_1af4&dev_1001` → viostor
+   - Same PnP IDs for virtio-net (dev_1000), balloon (1002), scsi
+     (1004), serial (1003), rng (1005).
+3. Installs `rhsrvany.exe` as a Windows service + writes a
+   first-logon command that runs `pnputil.exe /add-driver *.inf
+   /install` for any remaining drivers on first boot.
+4. Rewrites BCD if needed (BIOS → UEFI conversion isn't attempted;
+   matched firmware above avoids that class of breakage).
+5. Emits the converted qcow2 + a libvirt domain XML sidecar with
+   `<target bus='virtio'>` and `<model type='virtio'/>`.
+
+Same pattern Datto DRaaS / Veeam / Zerto use. Bedrock just invokes
+the off-the-shelf virt-v2v binary — no re-implementation needed.
+
+### virtio-win driver ISO — always attached on install flow
+
+For the **new-VM-from-ISO** flow (not imports), the dashboard always
+attaches `/mnt/isos/virtio-win.iso` as a second SATA CDROM when the
+operator picks any install ISO. Pre-fetched by `bedrock init` to
+`/opt/bedrock/iso/virtio-win.iso` (750 MB, Red Hat-signed). Hidden
+from the install-ISO dropdown so it can't be selected as a boot
+source. See [`iso-library.md`](iso-library.md#virtio-winiso--always-attached-never-selected).
 
 ### Verified with Windows Server 2022 Datacenter Eval
 
@@ -117,11 +162,18 @@ Microsoft's official eval VHD (build 20348.169, ~9.5 GB on disk,
   GET /api/imports/<id>            │
       (poll every 2 s from UI)    ◀── status, log_tail
   POST /api/imports/<id>/create-vm│
-      { name, vcpus, ram_mb,      │  lvcreate thin
-        priority }                │  qemu-img qcow2→raw on LV
+      { name, vcpus, ram_mb,      │  lvcreate -V <gb>G --thin thinpool
+        priority }                │  qemu-img convert -p -O raw
+                                   │    (format auto-detect — works
+                                   │     for both virt-v2v's qcow2 or
+                                   │     raw outputs)
                                    │  virt-install --machine q35
-                                   │    --boot uefi --clock offset=utc
+                                   │    {--boot uefi if firmware=uefi}
+                                   │    --clock offset=utc
                                    │    --os-variant detect=on
+                                   │    --wait 0 --import
+                                   │    (--wait 0 = define+start, don't
+                                   │     block waiting for VM shutdown)
                                    │  virsh schedinfo --live --config
                                    │    cpu_shares=<N>
                                    │  inventory.json update

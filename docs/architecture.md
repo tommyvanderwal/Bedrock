@@ -98,12 +98,15 @@ Operator (browser)                       mgmt node (node1)
         │   WS /ws                               │  ┌───────────────────────┐
         │ ────────────────────────────────────── │  │ state_push_loop (3s)  │
         │   ws.on('cluster', ...)                │  │   build_cluster_state │
-        │ <═══════════════════════════════════ │  │     concurrent SSH to │
-        │   (json: nodes, vms, witness)        │  │     all cluster nodes │
+        │ <═══════════════════════════════════ │  │   ThreadPoolExecutor  │
+        │   (json: nodes, vms, witness)        │  │   fan-out SSH to all  │
+        │                                        │  │   nodes + all VMs     │
+        │                                        │  │   (was ~3 s seq,      │
+        │                                        │  │    now ~0.7 s)        │
         │                                        │  └─────────┬─────────────┘
         │   ws.on('event', ...)  ◀ instant       │            │
         │ <═══════════════════════════════════ │            │   SSH
-        │   (push_log broadcast)                 │  ┌─────────▼─────────┐
+        │   (push_log: WS first, VL second)      │  ┌─────────▼─────────┐
         │                                        │  │ /etc/bedrock/     │
         │   POST /api/vms/X/convert              │  │   cluster.json    │
         │ ─────────────────────────────────────> │  └───────────────────┘

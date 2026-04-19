@@ -100,12 +100,27 @@ the first state push repopulates them.
 - **Main event loop**: FastAPI + WebSocket hub + state_push_loop
   (`await asyncio.sleep(3)`).
 - **Per-request threads** (Starlette's `run_in_threadpool`): REST
-  handlers that do blocking I/O (paramiko SSH).
+  handlers that do blocking I/O (paramiko SSH). Required because the
+  paramiko socket read blocks — serving this on the main loop would
+  freeze every other client.
 - **ThreadPoolExecutor in `build_cluster_state`**: parallelises SSH
-  to all nodes + all VMs (3-node cluster went from ~3 s sequential
-  to ~0.7 s).
-- **`asyncio.run_coroutine_threadsafe`** in `push_log`: schedules the
-  WS broadcast from a worker thread onto the main loop safely.
+  to all nodes + all VMs. Each node costs ~250 ms to query
+  (virsh + drbdadm + lvs); sequential = 3 nodes × 250 ms + 3 VMs ×
+  150 ms ≈ 1.2 s; parallel = max(node, vm) ≈ 0.3 s. 3-node cluster
+  went from ~3 s to ~0.7 s on the wall clock.
+- **`asyncio.run_coroutine_threadsafe`** in `push_log`: the
+  orchestrator runs in worker threads (paramiko blocks them), but
+  `hub.broadcast` is async. The helper marshals the coroutine onto
+  the captured main loop so workers can push events without
+  blocking or touching the loop directly.
+  ```python
+  # order matters — WS first so browsers react while VL absorbs the insert
+  entry = {"_msg": msg, "hostname": node, ..., "_time": strftime(...)}
+  if _main_loop is not None:
+      asyncio.run_coroutine_threadsafe(
+          hub.broadcast("event", entry), _main_loop)
+  _vl_push_log(msg, node=node, app=app, level=level)   # 20 ms HTTP POST
+  ```
 
 ## Client subscriptions (how the Svelte side consumes this)
 

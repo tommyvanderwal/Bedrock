@@ -126,11 +126,16 @@ DRBD state is untouched — the resource stays Primary on that node.
   T+~5s  print "VM NAME deleted."
 ```
 
-Note: `delete_vm` does **not** yet remove the external meta-disk LV
-(`vm-NAME-disk0-meta`). If the VM was converter-managed, clean it up
+Note on the two delete paths:
+
+| Path | Meta-LV cleanup | Import reset | Live log |
+|---|---|---|---|
+| **HTTP `DELETE /api/vms/{name}`** (dashboard) | yes — `_parse_drbd_res` finds `meta_path`, `lvremove` hits both data + meta | yes — flips the import that spawned this VM back to `status:ready` | yes, push_log streams |
+| **CLI `bedrock vm delete NAME`** | only data LV; `vm-NAME-disk0-meta` stays behind | no | no stream |
+
+Prefer the HTTP path. If you must use the CLI on a converter-managed VM,
 manually: `lvremove -f almalinux/vm-NAME-disk0-meta` on every host that
-had the VM. A follow-up is to teach `delete_vm` to call `_parse_drbd_res`
-first (like the convert downgrade path does) and remove both LVs.
+had the VM.
 
 ## Log lines
 

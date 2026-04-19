@@ -32,6 +32,33 @@ pushes `Node X (...) registered with cluster` log event.
 Uploads stream in 1 MB chunks directly to `/opt/bedrock/iso/` on the
 mgmt node; path traversal is blocked.
 
+## Import library  (VMware / Hyper-V / qcow2 → Bedrock)
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/imports` | — | `[{id, original_name, input_format, status, virtual_size_gb?, detected_firmware?, detected_os_type?, ...}, ...]` |
+| GET | `/api/imports/{id}` | — | one job + `log_tail` (last 4 KB of convert output) |
+| POST | `/api/imports/upload` | multipart, `file` field | `{id, original_name, input_format, input_size_bytes, status: "uploaded"}` |
+| POST | `/api/imports/{id}/convert` | `{inject_drivers?: bool}` (default `false`) | `{status: "converting", id, inject_drivers}` |
+| POST | `/api/imports/{id}/create-vm` | `{name, vcpus=2, ram_mb=2048, priority="normal"}` | `{status: "created", name, node}` |
+| DELETE | `/api/imports/{id}` | — | `{status: "deleted", id}` — wipes the whole `<id>/` dir |
+
+`inject_drivers=true` takes the virt-v2v path (inspect guest, inject
+viostor + NetKVM, edit Windows registry). `false` (default) uses
+`qemu-img convert` — format conversion only, ~seconds for Linux guests.
+
+## Export library
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/exports` | — | `[{id, vm, format, status, size_bytes?, created_at, error?}, ...]` |
+| POST | `/api/vms/{name}/export` | `{format: "qcow2"|"vmdk"|"vhdx"|"raw"}` | `{id, vm, format, src_host, src_path, dst_path, status: "converting", created_at}` |
+| GET | `/api/exports/{id}/download` | — | streaming `application/octet-stream` of the disk image (400 if status != ready) |
+| DELETE | `/api/exports/{id}` | — | `{status: "deleted", id}` |
+
+Local source → `qemu-img convert -p -f raw -O <fmt> <src_lv> <dst>`.
+Cross-node source → `ssh host dd ... > fifo & qemu-img convert fifo dst`.
+
 ## VM actions
 
 All take `{vm_name}` in the path; return a JSON status blob.
