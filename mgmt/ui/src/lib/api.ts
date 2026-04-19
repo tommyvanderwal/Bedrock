@@ -104,6 +104,8 @@ export interface ImportJob {
 	virtual_size_bytes?: number;
 	detected_name?: string;
 	detected_os_type?: string;
+	detected_firmware?: 'bios' | 'uefi';
+	injected_drivers?: boolean;
 	error?: string;
 	consumed_as?: string;
 	log_tail?: string;

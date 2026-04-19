@@ -48,15 +48,55 @@ for URLs. Each job is self-contained in its own directory; clean-up is
 
 ### When to tick "Windows guest — inject virtio drivers"
 
-- **Windows guest** (any version) being migrated *from* VMware or Hyper-V
-  where the current drivers are vmxnet / vmscsi / integration services.
-  Without virt-v2v, the VM boots but has no disk/network in KVM.
-- Any guest whose boot loader needs rewriting for KVM (rare for Linux;
-  common for Windows).
+- **Windows 7, Windows 8/8.1, Windows Server 2008/2012/2012R2** — no
+  inbox virtio. virt-v2v copies `viostor.sys` + `netkvm.sys` into
+  `C:\Windows\System32\drivers\`, edits the SYSTEM hive's
+  `CriticalDeviceDatabase` + `Services` keys via libguestfs registry
+  editing, installs a first-boot `RHSrvAny` service so PnP enumerates
+  remaining drivers on first login. Same mechanism Datto DRaaS and
+  Veeam use for VMware/Hyper-V → KVM migration.
+- **Windows 10, Windows 11, Server 2016 / 2019 / 2022** — virtio is
+  *inbox* (Microsoft ships viostor + NetKVM for Azure). virt-v2v
+  detects this (`virt-v2v: This guest has virtio drivers installed.`)
+  and does a minimal conversion — just the domain XML.
+- **Linux guests** — don't need injection; just tick nothing and the
+  qemu-img path is ~seconds.
 
-Injection cost: 2–10 minutes per VM (virt-v2v boots a small libguestfs
-appliance to mount and edit the disk). Linux guests don't need it — they
-already ship with virtio drivers.
+Injection cost: 2–10 minutes per VM on modern hardware, longer in
+nested-KVM testbeds. virt-v2v boots a libguestfs appliance to mount
+and edit the guest disk — needs a few hundred MB RAM and /var/tmp
+space ≥ virtual-disk-size.
+
+### Firmware auto-detection
+
+A Gen-1 Hyper-V VHD (MBR partition table) cannot boot on UEFI
+firmware — Windows traps `0x7B INACCESSIBLE_BOOT_DEVICE`. Bedrock
+reads the source's partition table during convert:
+
+- **GPT** (EFI PART signature at LBA 1) → domain XML gets `<os firmware='efi'>`
+- **MBR** → no firmware attribute (= BIOS, the libvirt default)
+
+virt-v2v's sidecar XML carries its own firmware decision; when we
+have it (injection path), we trust it. Otherwise we sniff 34 sectors
+of the disk head and check for `EFI PART` at offset 512.
+
+Detected firmware is stored in `meta.json` as `detected_firmware`
+and shown under the Detected column on `/imports`. The Create VM
+flow passes `--boot uefi` to virt-install iff GPT; otherwise it
+omits the flag and Q35 firmware defaults to SeaBIOS.
+
+### Verified with Windows Server 2022 Datacenter Eval
+
+Microsoft's official eval VHD (build 20348.169, ~9.5 GB on disk,
+40 GB virtual, MBR/BIOS) was imported end-to-end:
+
+- Upload: 162 s (9.5 GB over LAN)
+- virt-v2v convert: 115 s (small — no injection needed; inbox
+  virtio detected)
+- Create VM → virtio-only domain XML, Q35, BIOS, UTC clock
+- First boot reached OOBE "Hi there" screen in ~180 s — proves
+  kernel loaded via viostor, NTFS mounted, user-mode started
+- No SATA, no e1000, no IDE, no rtl8139 in the domain XML.
 
 ## Typical flow
 

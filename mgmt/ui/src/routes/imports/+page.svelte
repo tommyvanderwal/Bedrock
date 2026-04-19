@@ -161,9 +161,13 @@
 						{/if}
 					</td>
 					<td>
-						{#if j.detected_name || j.detected_os_type}
+						{#if j.detected_name || j.detected_os_type || j.detected_firmware}
 							<div>{j.detected_name || '-'}</div>
-							<div class="sub">{j.detected_os_type || ''}</div>
+							<div class="sub">
+								{j.detected_os_type || ''}
+								{#if j.detected_firmware}· <strong>{j.detected_firmware.toUpperCase()}</strong>{/if}
+								{#if j.injected_drivers}· drivers injected{/if}
+							</div>
 						{:else}<span class="muted">-</span>{/if}
 					</td>
 					<td class="sub">{fmtTime(j.created_at)}</td>

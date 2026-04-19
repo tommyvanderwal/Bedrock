@@ -752,7 +752,7 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                 meta["virtual_size_bytes"] = iq.get("virtual-size") or 0
                 meta["virtual_size_gb"] = max(1,
                     (meta["virtual_size_bytes"] + (1<<30) - 1) >> 30)
-                # OS detection from virt-v2v sidecar XML
+                # OS detection from virt-v2v sidecar XML (if present)
                 xml = next((p for p in dst_dir.glob("*.xml")), None)
                 if xml:
                     xt = xml.read_text()
@@ -760,6 +760,25 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                     if m: meta["detected_name"] = m.group(1)
                     m = re.search(r"<os>.*?<type[^>]*>([^<]+)</type>", xt, re.S)
                     if m: meta["detected_os_type"] = m.group(1)
+                    # Firmware choice — virt-v2v adds <firmware>efi</firmware>
+                    # (or firmware='efi' on <os>) for GPT/UEFI guests.
+                    meta["detected_firmware"] = (
+                        "uefi" if ("firmware='efi'" in xt or
+                                   "<firmware>efi</firmware>" in xt)
+                        else "bios"
+                    )
+                # Fallback partition-table sniff if no sidecar
+                if "detected_firmware" not in meta:
+                    try:
+                        head = subprocess.run(
+                            ["qemu-img", "dd", "-O", "raw", "bs=512", "count=34",
+                             f"if={qcow}", "of=/dev/stdout"],
+                            capture_output=True, timeout=20).stdout
+                        meta["detected_firmware"] = (
+                            "uefi" if len(head) >= 520 and head[512:520] == b"EFI PART"
+                            else "bios"
+                        )
+                    except Exception: meta["detected_firmware"] = "bios"
                 meta["convert_finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 push_log(f"Import convert done: {job_id} → {qcow.name} "
                          f"({meta['virtual_size_gb']}G virtual)",
@@ -1698,6 +1717,22 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     lv_name = f"vm-{req.name}-disk0"
     lv_path = f"/dev/almalinux/{lv_name}"
 
+    # Firmware: trust the inspection result from _run_convert if available.
+    # Otherwise sniff the disk's partition table here. Rationale: a BIOS-boot
+    # disk can't boot on UEFI firmware — Windows traps 0x7B, Linux drops to
+    # EFI shell. Match the source to avoid the footgun.
+    firmware = meta.get("detected_firmware")
+    if firmware not in ("bios", "uefi"):
+        firmware = "bios"
+        try:
+            head = subprocess.run(
+                ["qemu-img", "dd", "-O", "raw", "bs=512", "count=34",
+                 f"if={src_qcow}", "of=/dev/stdout"],
+                capture_output=True, timeout=20).stdout
+            if len(head) >= 520 and head[512:520] == b"EFI PART":
+                firmware = "uefi"
+        except Exception: pass
+
     _ensure_thinpool(host)
     push_log(f"Import {meta['id']} → create VM {req.name}: lvcreate {virtual_gb}G thin",
              node=home_name, app="bedrock-mgmt", level="info")
@@ -1707,18 +1742,21 @@ def _vm_create_from_import(meta: dict, req) -> dict:
     if rc != 0 and "already exists" not in out:
         raise HTTPException(500, f"lvcreate failed: {out}")
 
-    # Stream the qcow2 into the LV. Fast on mgmt node (local disk).
-    push_log(f"Import {meta['id']} → qemu-img convert qcow2 → raw LV",
+    # Stream the converted image into the LV. Auto-detect the input format
+    # (virt-v2v sometimes outputs raw, sometimes qcow2 depending on flags).
+    push_log(f"Import {meta['id']} → qemu-img convert → raw LV",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host,
-        f"qemu-img convert -p -f qcow2 -O raw {src_qcow} {lv_path} 2>&1",
+        f"qemu-img convert -p -O raw {src_qcow} {lv_path} 2>&1",
         timeout=3600)
     if rc != 0:
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)
         raise HTTPException(500, f"qemu-img convert failed: {out[-400:]}")
 
-    # virt-install with Q35 + UEFI + UTC. --import tells it not to run an
-    # installer — boot the existing disk directly.
+    # virt-install with Q35 + matched firmware + UTC. --import + --wait 0
+    # means "define and start the VM, then return immediately" (don't block
+    # waiting for the guest to shut down — it has an OS, not an installer).
+    boot_arg = "--boot uefi" if firmware == "uefi" else ""
     vi_cmd = (
         f"virt-install --name {req.name} --vcpus {req.vcpus} --ram {req.ram_mb} "
         f"--disk path={lv_path},format=raw,bus=virtio,cache=none,discard=unmap "
@@ -1726,10 +1764,10 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         f"--graphics vnc,listen=0.0.0.0 "
         f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
         f"--machine q35 "
-        f"--boot uefi "
+        f"{boot_arg} "
         f"--clock offset=utc "
         f"--os-variant detect=on,name=generic "
-        f"--noautoconsole --import 2>&1"
+        f"--noautoconsole --wait 0 --import 2>&1"
     )
     push_log(f"Import {meta['id']} → virt-install",
              node=home_name, app="bedrock-mgmt", level="info")
@@ -1809,6 +1847,22 @@ def _vm_delete(vm_name: str) -> dict:
     if vm_name in inv:
         inv.pop(vm_name)
         save_inventory(inv)
+
+    # 4. If this VM was created from an import, reset the import to "ready"
+    #    so the operator can recreate the same VM (or a different one) from
+    #    the already-converted disk without re-uploading.
+    if IMPORT_ROOT.exists():
+        for d in IMPORT_ROOT.iterdir():
+            if not d.is_dir(): continue
+            m = _import_meta(d)
+            if m.get("consumed_as") == vm_name:
+                m["status"] = "ready"
+                m.pop("consumed_as", None)
+                m.pop("consumed_at", None)
+                _write_import_meta(d, m)
+                push_log(f"Import {d.name} reset to ready (was VM {vm_name})",
+                         node="mgmt", app="bedrock-mgmt", level="info")
+                break
 
     push_log(f"Deleted VM {vm_name} (was on {','.join(defined_on)})",
              node="mgmt", app="bedrock-mgmt", level="warn")
