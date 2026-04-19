@@ -1798,11 +1798,19 @@ def _vm_create_from_import(meta: dict, req) -> dict:
 
     _ensure_thinpool(host)
 
-    # Pre-flight: the converted disk is virtual_gb — but qemu-img convert to
-    # raw writes the full size (zero-skip notwithstanding for sparse LVs on
-    # thin pools, any non-zero block allocates). Reject up front if the thin
-    # pool can't fit the worst case, so we never partially fill and brick the
-    # pool. We fail the request cleanly instead of leaving a zombie LV behind.
+    # Pre-flight: check thin-pool free space against the source's *actual*
+    # on-disk size (qcow2 "actual-size"), not its virtual size. With sparse
+    # convert (--target-is-zero) a 10 GB-on-disk Windows image only allocates
+    # ~10 GB in the thin pool even though the virtual disk is 40 GB. Reject
+    # up front if the pool can't absorb the delta, so we never partially
+    # fill the pool and leave a zombie LV.
+    try:
+        iq = json.loads(subprocess.run(
+            ["qemu-img", "info", "--output=json", src_qcow],
+            capture_output=True, text=True).stdout or "{}")
+        actual_b = int(iq.get("actual-size") or 0)
+    except Exception:
+        actual_b = 0
     pool_info, _ = ssh_cmd_rc(host,
         "lvs --noheadings --units b --nosuffix --separator '|' "
         "-o lv_size,data_percent almalinux/thinpool 2>/dev/null | head -1",
@@ -1811,13 +1819,15 @@ def _vm_create_from_import(meta: dict, req) -> dict:
         parts = [p.strip() for p in pool_info.split("|") if p.strip()]
         pool_size_b = int(parts[0]); pool_used_pct = float(parts[1])
         pool_free_b = int(pool_size_b * (100.0 - pool_used_pct) / 100.0)
-        need_b = int(size_mb) * 1024 * 1024
+        # If we couldn't read actual-size, fall back to the virtual size —
+        # safer to reject than thicken and brick the pool.
+        need_b = actual_b or int(size_mb) * 1024 * 1024
         if pool_free_b < need_b + (1 << 30):  # +1 GB slack
             raise HTTPException(507,
                 f"Thin pool on {home_name} has "
                 f"{pool_free_b // (1<<30)} GB free; this import needs "
-                f"{need_b // (1<<30)} GB + 1 GB slack. Free space or grow the "
-                f"pool before retrying.")
+                f"{need_b // (1<<30)} GB + 1 GB slack. Free space or grow "
+                f"the pool before retrying.")
     except HTTPException:
         raise
     except Exception:
@@ -1833,10 +1843,15 @@ def _vm_create_from_import(meta: dict, req) -> dict:
 
     # Stream the converted image into the LV. Auto-detect the input format
     # (virt-v2v sometimes outputs raw, sometimes qcow2 depending on flags).
-    push_log(f"Import {meta['id']} → qemu-img convert → raw LV",
+    # --target-is-zero + -S 4k preserve the source's sparsity: unallocated
+    # blocks in the qcow2 are not rewritten as zeros to the thin LV, so a
+    # 10 GB-on-disk Windows image stays ~10 GB allocated in the thin pool
+    # instead of thickening to the full 40 GB virtual size.
+    push_log(f"Import {meta['id']} → qemu-img convert → thin LV (sparse)",
              node=home_name, app="bedrock-mgmt", level="info")
     out, rc = ssh_cmd_rc(host,
-        f"qemu-img convert -p -O raw {src_qcow} {lv_path} 2>&1",
+        f"qemu-img convert -p -S 4k --target-is-zero -O raw "
+        f"{src_qcow} {lv_path} 2>&1",
         timeout=3600)
     if rc != 0:
         ssh_cmd_rc(host, f"lvremove -f {lv_path}", timeout=30)

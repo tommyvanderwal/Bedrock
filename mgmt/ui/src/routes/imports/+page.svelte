@@ -174,8 +174,11 @@
 					<td class="actions">
 						{#if j.status === 'ready'}
 							<button class="btn-primary" onclick={() => openCreateVM(j)}>Create VM</button>
-						{:else if j.status === 'failed'}
-							<button class="btn-warn" onclick={() => retryConvert(j.id)}>Retry</button>
+							<button class="btn-warn" title="Re-run conversion (toggles driver injection)"
+								onclick={() => retryConvert(j.id, !j.injected_drivers)}>Re-convert</button>
+						{:else if j.status === 'failed' || j.status === 'uploaded'}
+							<button class="btn-warn" onclick={() => retryConvert(j.id, true)}>Convert + drivers</button>
+							<button class="btn-warn" onclick={() => retryConvert(j.id, false)}>Convert</button>
 						{/if}
 						{#if j.status !== 'consumed'}
 							<button class="btn-del" onclick={() => remove(j.id)}>×</button>
