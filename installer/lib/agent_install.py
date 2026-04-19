@@ -74,15 +74,18 @@ def install(witness: str, cluster_info: dict, repo: str):
         print(f"  Pre-scanned {len(peer_ips)} peer host keys.")
 
     # NFS mount the ISO library at /mnt/isos so --cdrom paths work identically
-    # on every node in the cluster.
+    # on every node in the cluster. Source is the mgmt node's host IP (parsed
+    # from mgmt_url), NOT this node's own IP.
     print("  Installing NFS client + mounting ISO library...")
     subprocess.run("dnf install -y -q nfs-utils >/dev/null 2>&1",
                    shell=True, check=False)
+    from urllib.parse import urlparse as _urlparse
+    mgmt_host = _urlparse(s["mgmt_url"]).hostname or witness
     Path("/mnt/isos").mkdir(exist_ok=True)
     Path("/etc/systemd/system/mnt-isos.mount").write_text(
         "[Unit]\nDescription=Bedrock ISO library (NFS)\nAfter=network-online.target\n"
         "Wants=network-online.target\n\n"
-        f"[Mount]\nWhat={mgmt_ip}:/opt/bedrock/iso\nWhere=/mnt/isos\n"
+        f"[Mount]\nWhat={mgmt_host}:/opt/bedrock/iso\nWhere=/mnt/isos\n"
         "Type=nfs\nOptions=ro,nolock,soft,_netdev\n\n"
         "[Install]\nWantedBy=multi-user.target\n"
     )

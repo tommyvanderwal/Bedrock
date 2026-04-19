@@ -61,9 +61,12 @@ def _api_post(state, path: str, body: dict = None) -> dict:
     return json.loads(r.read())
 
 
-def _ensure_thin_pool(host: str, size_gb: int = 20):
-    """Make sure there's an LVM thin pool on the node. Creates a small loop-backed
-    pool if nothing suitable exists — works for nested testbed without extra disks."""
+def _ensure_thin_pool(host: str, size_gb: int = 80):
+    """Make sure there's an LVM thin pool on the node. Creates a loop-backed
+    pool if nothing suitable exists — works for nested testbed without extra
+    disks. Default 80 GB sparse loop file on a 100 GB sim-node root disk is
+    enough for a Windows install (25 GB disk) + a couple of Linux VMs.
+    """
     # Does the thin pool already exist?
     out = run_on(host, f"lvs --noheadings -o lv_name {VG_NAME} 2>/dev/null || true",
                  check=False)
@@ -73,10 +76,9 @@ def _ensure_thin_pool(host: str, size_gb: int = 20):
     vg_out = run_on(host, f"vgs --noheadings -o vg_name 2>/dev/null || true", check=False)
     if VG_NAME not in vg_out.split():
         # Create a loop-backed VG for testing
-        print(f"  Creating loop-backed VG on {host}...")
+        print(f"  Creating loop-backed VG on {host} ({size_gb} GB sparse)...")
         run_on(host, f"""
-            dd if=/dev/zero of=/var/lib/bedrock-vg.img bs=1 count=0 seek=20G 2>/dev/null || \\
-              truncate -s 60G /var/lib/bedrock-vg.img
+            truncate -s {size_gb}G /var/lib/bedrock-vg.img
             LOOP=$(losetup --find --show /var/lib/bedrock-vg.img)
             pvcreate -f -y $LOOP >/dev/null
             vgcreate {VG_NAME} $LOOP >/dev/null

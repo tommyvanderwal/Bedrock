@@ -1179,7 +1179,7 @@ def _ensure_thinpool(host: str, vg_name: str = "almalinux", pool: str = "thinpoo
     vg_out = ssh_cmd(host, f"vgs --noheadings -o vg_name 2>/dev/null || true")
     if vg_name not in vg_out.split():
         ssh_cmd(host,
-            "truncate -s 60G /var/lib/bedrock-vg.img && "
+            "truncate -s 80G /var/lib/bedrock-vg.img && "
             "LOOP=$(losetup --find --show /var/lib/bedrock-vg.img) && "
             f"pvcreate -f -y $LOOP >/dev/null && vgcreate {vg_name} $LOOP >/dev/null",
             timeout=30)
