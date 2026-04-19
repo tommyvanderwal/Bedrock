@@ -87,15 +87,24 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
     # download. Harmless for Linux installs — ignored by the installer.
     virtio_win = iso_dir / "virtio-win.iso"
     if not virtio_win.exists():
+        # Prefer the LAN-cached copy (dev box repo); fall back to upstream on
+        # first-ever install where the dev box hasn't cached it yet.
         print("  Fetching virtio-win.iso (~750 MB, one-time)...")
-        r = subprocess.run(
-            f"curl -fsSL -o {virtio_win}.tmp "
+        sources = [
+            f"{repo}/binaries/virtio-win.iso",
             "https://fedorapeople.org/groups/virt/virtio-win/"
             "direct-downloads/stable-virtio/virtio-win.iso",
-            shell=True)
-        if r.returncode == 0:
-            (iso_dir / "virtio-win.iso.tmp").rename(virtio_win)
-        else:
+        ]
+        ok = False
+        for url in sources:
+            r = subprocess.run(
+                f"curl -fsSL --connect-timeout 5 -o {virtio_win}.tmp '{url}'",
+                shell=True)
+            if r.returncode == 0:
+                (iso_dir / "virtio-win.iso.tmp").rename(virtio_win)
+                ok = True
+                break
+        if not ok:
             print("  WARN: virtio-win.iso download failed; Windows installs "
                   "will need the driver ISO attached manually.")
     run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)

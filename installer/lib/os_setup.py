@@ -41,6 +41,20 @@ def configure_base(hw: dict):
             "    UserKnownHostsFile /root/.ssh/known_hosts\n")
         cfg.chmod(0o600)
 
+    # Per-node SSH identity + self-trust. The mgmt dashboard uses paramiko to
+    # SSH to every cluster node (including itself) for virsh/drbdadm/lvs. The
+    # key mesh is extended to peers at `bedrock join` time; for now every node
+    # at minimum can SSH to itself.
+    key = ssh_dir / "id_ed25519"
+    if not key.exists():
+        run(f"ssh-keygen -t ed25519 -N '' -q -f {key}")
+    pub = (ssh_dir / "id_ed25519.pub").read_text().strip()
+    authz = ssh_dir / "authorized_keys"
+    existing_authz = authz.read_text() if authz.exists() else ""
+    if pub not in existing_authz:
+        authz.write_text(existing_authz.rstrip() + "\n" + pub + "\n")
+        authz.chmod(0o600)
+
 
 def configure_bridge(hw: dict):
     """Create br0 bridge on the primary NIC if not already bridged.

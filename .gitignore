@@ -14,6 +14,9 @@ node_modules/
 testbed/state/
 testbed/images/
 
+# Repo-cached virtio-win ISO (~750 MB, fetched from upstream on first run)
+installer/binaries/virtio-win.iso
+
 # Playwright MCP session artefacts
 .playwright-mcp/
 
