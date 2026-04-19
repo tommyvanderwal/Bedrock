@@ -21,17 +21,26 @@
 	let replicaCount = $derived(vm?.defined_on?.length ?? 1);
 	let isPet = $derived(replicaCount >= 2);  // drives Migrate button enabled/disabled
 
-	async function deleteVM() {
-		const name = vmName;
-		if (!confirm(`Delete ${name}?\n\nThis stops the VM, tears down any DRBD resource, and removes the disk LVs on every node. This cannot be undone.`)) return;
-		const confirmed = prompt(`Type the VM name to confirm:`, '');
-		if (confirmed !== name) {
-			if (confirmed !== null) alert('Name did not match. Cancelled.');
-			return;
-		}
+	// Delete confirmation — Proxmox-style modal. Click Delete → modal shows
+	// the VM name; operator types "delete" (literal word) to enable the
+	// final Delete button. No upfront confirm() popup.
+	let deleteModalOpen = $state(false);
+	let deleteTyped = $state('');
+
+	function openDeleteModal() {
+		deleteTyped = '';
+		deleteModalOpen = true;
+	}
+	function closeDeleteModal() {
+		deleteModalOpen = false;
+		deleteTyped = '';
+	}
+	async function confirmDelete() {
+		if (deleteTyped !== 'delete') return;
+		deleteModalOpen = false;
 		converting = true;
 		try {
-			await vmDelete(name);
+			await vmDelete(vmName);
 			goto('/vms');
 		} catch (e: any) {
 			actionStatus = `Delete failed: ${e.message}`;
@@ -156,7 +165,7 @@
 			<a href="/vm/{vmName}/settings" class="btn settings">Settings</a>
 			<button class="btn delete" disabled={converting}
 				title="Stop, tear down DRBD, remove LVs, drop from inventory"
-				onclick={deleteVM}>Delete VM</button>
+				onclick={openDeleteModal}>Delete VM</button>
 		</div>
 	</div>
 </div>
@@ -176,6 +185,32 @@
 
 {:else}
 <p>VM not found: {vmName}</p>
+{/if}
+
+{#if deleteModalOpen}
+	<div class="modal-bg" role="presentation" onclick={closeDeleteModal}>
+		<div class="modal" role="dialog" aria-modal="true"
+			onclick={(e) => e.stopPropagation()}
+			onkeydown={(e) => { if (e.key === 'Escape') closeDeleteModal(); }}>
+			<h3>Delete VM</h3>
+			<p class="del-vm-name">{vmName}</p>
+			<p class="del-warn">
+				Stops the VM, tears down any DRBD resource, and removes the disk LVs
+				on every node. This cannot be undone.
+			</p>
+			<label class="del-label">
+				Type <code>delete</code> to confirm:
+				<input type="text" bind:value={deleteTyped} autocomplete="off"
+					autofocus
+					onkeydown={(e) => { if (e.key === 'Enter' && deleteTyped === 'delete') confirmDelete(); }} />
+			</label>
+			<div class="del-actions">
+				<button class="btn" onclick={closeDeleteModal}>Cancel</button>
+				<button class="btn btn-danger" disabled={deleteTyped !== 'delete'}
+					onclick={confirmDelete}>Delete</button>
+			</div>
+		</div>
+	</div>
 {/if}
 
 <style>
@@ -219,4 +254,41 @@
 	.ha-check .hint { font-style: italic; color: #8b949e; font-size: 11px; }
 	.ha-note { font-size: 11px; color: #8b949e; margin: 8px 0 0; }
 	.ha-note code { background: #21262d; padding: 1px 6px; border-radius: 3px; color: #e6edf3; }
+
+	/* Delete confirmation modal (Proxmox-style) */
+	.modal-bg {
+		position: fixed; inset: 0; background: #0008; backdrop-filter: blur(2px);
+		display: flex; align-items: center; justify-content: center; z-index: 1000;
+	}
+	.modal {
+		background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+		padding: 24px; min-width: 420px; max-width: 560px;
+	}
+	.modal h3 {
+		font-size: 16px; color: #e6edf3; text-transform: none; letter-spacing: 0;
+		margin: 0 0 8px;
+	}
+	.del-vm-name {
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 18px; font-weight: 600; color: #e6edf3;
+		background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+		padding: 8px 12px; margin: 4px 0 12px;
+	}
+	.del-warn {
+		font-size: 13px; color: #d29922; background: #d2992211;
+		border-left: 3px solid #d29922; padding: 8px 12px; margin: 0 0 16px;
+	}
+	.del-label { display: block; font-size: 13px; color: #c9d1d9; margin-bottom: 12px; }
+	.del-label code { background: #21262d; padding: 1px 6px; border-radius: 3px; color: #f85149; font-weight: 600; }
+	.del-label input {
+		display: block; width: 100%; margin-top: 6px;
+		background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+		padding: 8px 12px; color: #e6edf3; font-size: 14px;
+		font-family: ui-monospace, SFMono-Regular, monospace;
+	}
+	.del-label input:focus { outline: none; border-color: #58a6ff; }
+	.del-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+	.btn-danger { border-color: #f85149; color: #fff; background: #da3633; }
+	.btn-danger:hover:not(:disabled) { background: #f85149; }
+	.btn-danger:disabled { background: #30363d; color: #6e7681; border-color: #30363d; }
 </style>
