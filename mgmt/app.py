@@ -1885,19 +1885,21 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
 
                 src_size = _lv_bytes(src["host"], src_lv)
                 size_mb = (src_size + 1024*1024 - 1) // (1024*1024)
-                # DRBD 9 external metadata size: a 4 MB LV is enough for
-                # the superblock + bitmap of a TINY data disk (say < 2 GB)
-                # with max-peers=7, but on a 40 GB disk the bitmap alone
-                # needs ~10 MB per peer. An undersized meta LV doesn't
-                # error out — DRBD silently TRUNCATES the effective device
-                # size (/dev/drbdN reads as shorter than the backing LV),
-                # which then makes virsh blockcopy --pivot fail with
-                # "Copy failed" at 0 %.
-                # Rule of thumb: 32 MB base + 1 MB per GB of data covers
-                # max-peers=7 with plenty of headroom. Meta is thin on the
-                # same pool, so only actually-used blocks allocate.
+                # DRBD 9 external metadata size (max-peers=7):
+                #   superblock   = 4 KB
+                #   bitmap       = 1 bit per 4 KB of data × max_peers
+                #                ≈ 1.5 MB per GB of data at max_peers=7
+                #   activity log = 32 MB (default)
+                #   safety       = 2× headroom
+                # Formula: 32 MB base + 2 MB per GB of data. Thin-provisioned
+                # so only actually-used meta blocks allocate.
+                # Note: DRBD doesn't error on an undersized meta LV — it
+                # silently truncates /dev/drbdN to whatever fits. The
+                # silent-truncation guard after `drbdadm up` asserts
+                # /dev/drbdN size == backing LV size before blockcopy runs,
+                # so any future regression here fails loud, pre-pivot.
                 size_gb = (src_size + (1 << 30) - 1) >> 30
-                meta_mb = max(32, 32 + size_gb)
+                meta_mb = max(32, 32 + size_gb * 2)
 
                 step_prefix = f"disk{i} ({target_dev})"
                 if task: task.step_start(f"{step_prefix}: create meta LV on source")
@@ -2047,9 +2049,9 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
             meta_lv_name = f"{lv_name}-meta"
             size_mb = (existing["size_bytes"] + 1024*1024 - 1) // (1024*1024)
             # Meta LV sized to match the other peers — see _vm_convert_upgrade
-            # cattle→pet path for why 4 MB is too small for real data disks.
+            # cattle→pet path for the formula derivation.
             size_gb = (existing["size_bytes"] + (1 << 30) - 1) >> 30
-            meta_mb = max(32, 32 + size_gb)
+            meta_mb = max(32, 32 + size_gb * 2)
 
             step_prefix = f"disk{i} ({resource})"
             if task: task.step_start(f"{step_prefix}: LVs on new peer {new_peer}")

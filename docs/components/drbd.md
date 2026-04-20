@@ -41,16 +41,29 @@ that reverted to internal meta) before re-trying.
 
 Every resource has a **separate** small thin LV holding DRBD metadata,
 referenced as `meta-disk /dev/<vg>/vm-<name>-disk0-meta`. Allocation
-scales with data size:
+scales with data size from the DRBD-documented formula:
 
 ```
-  meta_mb = max(32, 32 + data_gb)
+  superblock   = 4 KB
+  bitmap       = 1 bit per 4 KB of data × max_peers
+               ≈ 1.5 MB per GB of data (max_peers = 7)
+  activity log = 32 MB (default)
+  safety       = 2× headroom
+
+  meta_mb = max(32, 32 + data_gb × 2)
 ```
 
-i.e. 32 MB baseline + 1 MB per GB of data. A 40 GB disk gets a 72 MB
-meta LV; a 10 GB disk gets 42 MB. Meta LVs are thin-provisioned on the
-same pool so the actual block footprint is a few MB — the size just
-defines the *ceiling*.
+i.e. 32 MB baseline + 2 MB per GB of data. A 40 GB disk gets a 112 MB
+meta LV; a 1 TB disk gets a 2080 MB meta LV. Meta LVs are
+thin-provisioned on the same pool so the actual block footprint is a
+few MB — the allocated size just defines the *ceiling*, and the
+runtime silent-truncation guard above asserts DRBD got the full device
+before any data movement starts.
+
+DRBD itself does not expose a user-facing "calculate required meta
+size" tool, so the formula lives in code with the assertion guarding
+it. If the formula needs tightening later, the assertion will catch a
+regression the moment DRBD truncates.
 
 Why: DRBD internal metadata (the default) eats ~128 KB from the tail of
 the underlying data LV, making `/dev/drbdN` strictly smaller than the
