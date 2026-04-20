@@ -7,6 +7,36 @@ grow and shrink peers online without full resync.
 
 ## Key configuration choices
 
+### ⚠ Silent-truncation hazard (read this first)
+
+DRBD's most dangerous failure mode is **silent device truncation**.
+If the external meta-disk is too small for the data size × max-peers,
+DRBD does **not** error; it quietly shrinks the effective `/dev/drbdN`
+to whatever the meta can index. `blockdev --getsize64 /dev/drbdN`
+then returns *less* than the backing LV. `virsh blockcopy --pivot`
+fails with `Copy failed` at 0 % because destination < source.
+
+Seen in the wild on this project: a 40 GB backing LV produced an
+18.13 GB `/dev/drbdN` because the meta LV was 4 MB (fine for ≤ 2 GB
+data). The code change fixing this is the sizing formula below; the
+code change ensuring **a future regression can never be silent** is a
+runtime assertion in `_vm_convert_upgrade` right after `drbdadm up`:
+
+```python
+drbd_bytes = _lv_bytes(src["host"], f"/dev/drbd{minor}")
+if drbd_bytes != src_size:
+    raise HTTPException(500,
+        f"DRBD silent-truncation guard tripped on {resource}: "
+        f"/dev/drbd{minor} = {drbd_bytes} bytes, backing LV = {src_size} "
+        f"bytes (delta {src_size - drbd_bytes} bytes). Meta LV almost "
+        f"certainly too small — check meta_mb formula.")
+```
+
+If this assertion ever trips, **stop**. The conversion will have been
+aborted before any data movement; nothing has been corrupted. Fix the
+root cause (most likely the meta-LV sizing formula or a regression
+that reverted to internal meta) before re-trying.
+
 ### External meta-disk
 
 Every resource has a **separate** small thin LV holding DRBD metadata,

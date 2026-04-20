@@ -1950,6 +1950,29 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                         timeout=30)
                 if task: task.step_done(f"{step_prefix}: create-md + up")
 
+                # SILENT-TRUNCATION GUARD.
+                # DRBD silently shrinks the effective /dev/drbdN if the meta
+                # LV is too small, if internal meta is used by mistake, or on
+                # any other failure path we haven't anticipated. No error,
+                # just a shorter device — the blockcopy pivot would then fail
+                # with "Copy failed" at 0 % (destination < source). Assert
+                # equality HERE so a mismatch is caught before blockcopy
+                # touches anything, and with the real byte counts in the log
+                # so operators see exactly what went wrong.
+                if task: task.step_start(f"{step_prefix}: assert /dev/drbd{minor} == backing LV")
+                drbd_bytes = _lv_bytes(src["host"], f"/dev/drbd{minor}")
+                if drbd_bytes != src_size:
+                    msg = (f"DRBD silent-truncation guard tripped on {resource}: "
+                           f"/dev/drbd{minor} = {drbd_bytes} bytes, "
+                           f"backing LV = {src_size} bytes (delta "
+                           f"{src_size - drbd_bytes} bytes). Meta LV almost "
+                           f"certainly too small — check meta_mb formula.")
+                    if task: task.step_fail(
+                        f"{step_prefix}: assert /dev/drbd{minor} == backing LV", msg)
+                    raise HTTPException(500, msg)
+                if task: task.step_done(
+                    f"{step_prefix}: assert /dev/drbd{minor} == backing LV")
+
                 if task: task.step_start(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
                 # Belt-and-braces: clear any stale libvirt blockjob state on
                 # this disk before we start. No-op if nothing is pending.
