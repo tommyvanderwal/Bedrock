@@ -1389,7 +1389,11 @@ def api_vm_poweroff(vm_name: str):
 @app.post("/api/vms/{vm_name}/convert")
 async def api_vm_convert(vm_name: str, req: ConvertRequest):
     """Fire-and-forget. Returns task_id immediately; the dashboard reads
-    progress from /api/tasks (WS 'task' channel)."""
+    progress from /api/tasks (WS 'task' channel).
+
+    All validation happens synchronously BEFORE creating the task, so
+    clearly-invalid requests fail with a proper 4xx — they don't get a
+    200 / task_id + async task-fail, which would mislead the caller."""
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm: raise HTTPException(404, f"VM {vm_name} not found")
@@ -1406,6 +1410,25 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
     )
     if current_type == req.target_type:
         return {"status": "no-op", "current": current_type}
+    # Upgrade (cattle/pet → pet/vipet): require enough peers up front so
+    # an empty peer_nodes list errors before we burn a task on it.
+    rank = {"cattle": 0, "pet": 1, "vipet": 2}
+    if rank[req.target_type] > rank[current_type]:
+        need_peers = {"pet": 1, "vipet": 2}[req.target_type]
+        chosen = req.peer_nodes or [n for n in nodes_cfg if n != src_name]
+        # Filter to only nodes we don't already have on this resource
+        if current_type == "pet" and req.target_type == "vipet":
+            existing = _parse_drbd_res(nodes_cfg[src_name]["host"],
+                                       vm["drbd_resource"]) or {}
+            chosen = [n for n in chosen if n not in existing.get("peers", [])]
+            need_peers = 1
+        else:
+            chosen = [n for n in chosen if n != src_name]
+        chosen = chosen[:need_peers]
+        if len(chosen) < need_peers:
+            raise HTTPException(400,
+                f"{req.target_type} needs {need_peers} peer node(s), "
+                f"found {len(chosen)} usable")
 
     task = task_registry().create(
         "vm.convert", f"VM {vm_name}: {current_type} → {req.target_type}",
@@ -1431,7 +1454,35 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
 @app.post("/api/vms/create")
 async def api_vm_create(req: VMCreateRequest):
     """Fire-and-forget: returns {task_id} immediately. Create can take 1-2
-    minutes for VMs with a big ISO or many disks; we don't block the UI."""
+    minutes for VMs with a big ISO or many disks; we don't block the UI.
+
+    All input validation happens sync up-front so a bad name or ISO path
+    returns 4xx immediately — not a 200 / task_id followed by an async
+    task-fail (which would mislead the caller)."""
+    if not _VM_NAME_RE.match(req.name):
+        raise HTTPException(400,
+            "VM name: 3-32 chars, lowercase letters/digits/dashes, "
+            "start with a letter")
+    if req.priority not in _VALID_PRIORITIES:
+        raise HTTPException(400, f"priority must be one of {_VALID_PRIORITIES}")
+    if req.vcpus < 1 or req.vcpus > 32:
+        raise HTTPException(400, "vcpus must be 1-32")
+    if req.ram_mb < 128 or req.ram_mb > 131072:
+        raise HTTPException(400, "ram_mb must be 128-131072")
+    if req.disk_gb < 1 or req.disk_gb > 2048:
+        raise HTTPException(400, "disk_gb must be 1-2048")
+    for i, d in enumerate(req.extra_disks or []):
+        if d.size_gb < 1 or d.size_gb > 8192:
+            raise HTTPException(400,
+                f"extra_disks[{i}].size_gb must be 1-8192")
+    if req.iso:
+        iso_name = Path(req.iso).name
+        if not (ISO_DIR / iso_name).exists():
+            raise HTTPException(400, f"ISO not found: {iso_name}")
+    # Existing VM?
+    if req.name in build_cluster_state()["vms"]:
+        raise HTTPException(409, f"VM {req.name} already exists")
+
     disk_count = 1 + len(req.extra_disks or [])
     task = task_registry().create(
         "vm.create",
