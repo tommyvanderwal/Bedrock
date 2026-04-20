@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -1780,21 +1781,49 @@ def _find_vm_disk(host: str, vm_name: str) -> dict:
     raise HTTPException(500, f"Cannot find block disk for {vm_name}")
 
 
+# Process-local reservation set for DRBD minors chosen by in-flight
+# converts that haven't yet created their /dev/drbdN. Without this, two
+# parallel converts both query `ls /dev/drbd*`, both see "nothing here in
+# the target range", both pick the same minor, and one fails at
+# `drbdadm create-md` / `up`. The lock below serialises the pick+reserve.
+_drbd_minor_lock = threading.Lock()
+_drbd_minor_reserved: set[int] = set()
+
+
 def _next_drbd_minor(hosts: list) -> int:
-    """Pick an unused minor number (1000+) across all hosts."""
-    used = set()
-    for h in hosts:
-        out = ssh_cmd(h, "ls /dev/drbd* 2>/dev/null | grep -oE '[0-9]+$' || true")
-        for n in out.split():
-            try: used.add(int(n))
-            except ValueError: pass
-    for i in range(1000, 1900):
-        if i not in used: return i
+    """Pick + atomically reserve an unused minor number (1000+) across all
+    hosts. The reservation lives until `_release_drbd_minor` is called
+    (after the resource is fully up, or on rollback)."""
+    with _drbd_minor_lock:
+        used = set(_drbd_minor_reserved)
+        for h in hosts:
+            out = ssh_cmd(h, "ls /dev/drbd* 2>/dev/null | grep -oE '[0-9]+$' || true")
+            for n in out.split():
+                try: used.add(int(n))
+                except ValueError: pass
+        for i in range(1000, 1900):
+            if i not in used:
+                _drbd_minor_reserved.add(i)
+                return i
     raise HTTPException(500, "No free DRBD minor")
 
 
+def _release_drbd_minor(minor: int):
+    """Drop the in-process reservation. Called after the DRBD device is up
+    (the ssh-ls check will now see /dev/drbdN directly) OR on rollback."""
+    with _drbd_minor_lock:
+        _drbd_minor_reserved.discard(minor)
+
+
 def _lv_bytes(host: str, lv_path: str) -> int:
-    return int(ssh_cmd(host, f"blockdev --getsize64 {lv_path}"))
+    """Block device size in bytes. Returns 0 if the device doesn't exist
+    or blockdev returned nothing — callers (e.g. the silent-truncation
+    guard) treat a zero result as "something is wrong, fail loud"."""
+    out = ssh_cmd(host, f"blockdev --getsize64 {lv_path} 2>/dev/null || echo 0")
+    try:
+        return int(out.strip() or "0")
+    except (ValueError, AttributeError):
+        return 0
 
 
 def _gen_drbd_res(resource: str, minor: int, peers: list) -> str:
@@ -1919,6 +1948,11 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                     rm_paths = " ".join(p for p in (lv, meta) if p and "-meta" in (meta or ""))
                     if rm_paths:
                         ssh_cmd_rc(h, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
+                # Release the minor reservation so another concurrent convert
+                # can use it (or its number — this one). Safe regardless of
+                # whether the create-md / up calls even ran.
+                if "minor" in c:
+                    _release_drbd_minor(c["minor"])
 
         t_start = time.time()
         try:
@@ -1990,6 +2024,9 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
 
                 if task: task.step_start(f"{step_prefix}: generate DRBD res")
                 minor = _next_drbd_minor(all_hosts)
+                # Record the minor on the `created` entry so _unwind can
+                # release the reservation on failure.
+                created[-1]["minor"] = minor
                 res_text = _gen_drbd_res(resource, minor, peers_info)
                 _write_drbd_res(all_hosts, resource, res_text)
                 if task: task.step_done(f"{step_prefix}: generate DRBD res")
@@ -2048,6 +2085,9 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                 if task: task.step_done(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
                 converted_disks.append({"index": i, "target": target_dev,
                                         "resource": resource, "minor": minor})
+                # DRBD device is now live cluster-wide; future ssh-ls checks
+                # will see /dev/drbd{minor} directly — drop the reservation.
+                _release_drbd_minor(minor)
 
             # After all disks succeed: define VM on peers so migration works.
             if task: task.step_start("define VM on peers")
