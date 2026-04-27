@@ -29,3 +29,4 @@ installer/binaries/virtio-win.iso
 .idea/
 *.swp
 .DS_Store
+.claude/
