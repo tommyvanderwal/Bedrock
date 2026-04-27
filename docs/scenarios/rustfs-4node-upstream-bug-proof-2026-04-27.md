@@ -328,13 +328,139 @@ the duration of the in-memory leak (until full cluster restart). The
 bug is real, the patch fixes both reproducers, and the operator
 exposure is non-trivial.
 
+## Patched-image result on the same 4-node cluster
+
+The single-patch fork (`fix/shared-lock-stale-writers-waiting`,
+HEAD `e3f2dbe4`) was deployed to all 4 sim nodes by tarring the
+locally-built image (`docker.io/library/rustfs:patched-3node-readq`),
+`scp`'ing to each node, `podman load`-ing, and patching the systemd
+unit's `ExecStart` to point at the new image reference. `RUSTFS_*`
+env vars and storage layout were unchanged. After cluster start, the
+bucket was emptied and re-populated with 100 fresh 5-MiB random
+objects (`obj2.bin..obj101.bin`).
+
+### Reproducer A (kill -9), patched, four tries
+
+Same kill-9 reproducer as the stock test, repeated with each of the
+4 nodes as the victim in turn (so every node gets to be the "killed"
+peer once, and every other node gets to be the read-survivor):
+
+```
+=== run kill-9, victim = sim-2 (10.99.0.11) ===
+  endpoint 192.168.2.187 (sim-1):  100/100 ok, 0 fail
+  endpoint 192.168.2.185 (sim-3):  100/100 ok, 0 fail
+  endpoint 192.168.2.186 (sim-4):  100/100 ok, 0 fail
+
+=== run kill-9, victim = sim-3 (10.99.0.12) ===
+  endpoint 192.168.2.187 (sim-1):  100/100 ok, 0 fail
+  endpoint 192.168.2.184 (sim-2):  100/100 ok, 0 fail
+  endpoint 192.168.2.186 (sim-4):  100/100 ok, 0 fail
+
+=== run kill-9, victim = sim-4 (10.99.0.13) ===
+  endpoint 192.168.2.187 (sim-1):  100/100 ok, 0 fail
+  endpoint 192.168.2.184 (sim-2):  100/100 ok, 0 fail
+  endpoint 192.168.2.185 (sim-3):  100/100 ok, 0 fail
+
+=== run kill-9, victim = sim-1 (10.99.0.10) ===
+  endpoint 192.168.2.184 (sim-2):  100/100 ok, 0 fail
+  endpoint 192.168.2.185 (sim-3):  100/100 ok, 0 fail
+  endpoint 192.168.2.186 (sim-4):  100/100 ok, 0 fail
+
+  TOTAL across 4 trials × 3 endpoints × 100 keys = 1200/1200 ok (100 %)
+```
+
+Stock 4-node kill-9: **35 %** failure rate (Reproducer A above).
+Patched 4-node kill-9, four different victim positions: **0 %**.
+
+The recovery between trials is also clean — after each kill, the
+victim's `rustfs.service` was restarted (`systemctl restart rustfs`)
+and the cluster re-formed in ~10 s. The next trial then ran from a
+healthy 4-node baseline. Every read after recovery succeeded.
+
+### Reproducer B (virsh destroy), patched, one try
+
+```
+=== run virsh-destroy, victim = sim-2 (bedrock-sim-2 @ 10.99.0.11) ===
+  endpoint 192.168.2.187 (sim-1):  99/100 ok, 1 fail (obj7)
+  endpoint 192.168.2.185 (sim-3):  100/100 ok, 0 fail
+  endpoint 192.168.2.186 (sim-4):  100/100 ok, 0 fail
+
+  TOTAL: 299/300 ok (99.67 %)
+```
+
+Stock 4-node virsh-destroy: **5.3 %** failure rate (16/300).
+Patched 4-node virsh-destroy: **0.33 %** failure rate (1/300) — a
+16× reduction.
+
+The single residual failure (`obj7` from `sim-1`'s endpoint) was not
+reproducible in subsequent attempts and is most consistent with one
+of:
+
+- A read-timeout coincidence (8 s `--cli-read-timeout` is tight
+  during the post-destroy 12 s settle window when peers are still
+  marking the dead node down).
+- A stale partial overwrite on disk for `obj7` left over from the
+  earlier stock-image test runs on the same persistent volume —
+  which cleanly maps to the `obj1.bin` symptom we hit during repop
+  (a single key whose on-disk meta from a prior interrupted PUT
+  blocks a subsequent fresh PUT until manual delete-and-recreate).
+  The patch addresses the in-memory `WRITERS_WAITING` leak; it does
+  not heal pre-existing on-disk state from prior unpatched runs.
+
+We did not run a second virsh-destroy trial: each `virsh destroy`
+also corrupts the destroyed VM's `/boot/efi` and `/boot/xfs` UUID
+state under the qemu/cloud-init setup, leaving the VM in
+emergency-mode after restart and requiring a `qemu-nbd`-mounted
+fstab patch to recover. That's a *sim* fragility, not an applicable
+production failure mode (real Bedrock nodes don't qcow2-back their
+boot partitions), but it makes 4-node virsh-destroy more expensive
+to repeat than a kill-9. The kill-9 trial set is the harder case
+anyway — kill-9 produced 35 % failure on stock vs 5.3 % for destroy,
+because kill-9 emits TCP RSTs that synchronise survivor cancellations.
+
+### Ancillary finding — fstab needs `nofail` on data mounts
+
+While running these 4-node tests we hit a separate fragility: the
+`storage_install.py` provisioner produced fstab entries without
+`nofail` for `/var/lib/rustfs/data` and `/var/lib/garage/data`. When
+the abrupt VM power-off left the thin-LV in a state systemd refused
+to auto-mount, the missing `nofail` cascaded into emergency-mode
+boot, making the node SSH-unreachable. Fixed in
+`installer/lib/storage_install.py` by adding `nofail` to those
+fstab entries; rustfs.service already has
+`RequiresMountsFor=/var/lib/rustfs/data` so it now fails loudly with
+a clear mount-missing error instead of taking the host down.
+
+Lesson: every Bedrock data-mount fstab entry must use `nofail` so
+host boot survives FS corruption; the consuming service still gets
+a hard dependency via `RequiresMountsFor=`. Operator can SSH in to
+recover; rustfs/garage degrade visibly.
+
+## Verdict
+
+The patch is the minimal surgical fix for the cancellation-safety
+leak, and at the maintainer-blessed 4-node EC:2 set=4 cluster size
+it lifts the 1-node-loss read availability from:
+
+| reproducer        | stock alpha.99 | patched              | reduction |
+|-------------------|----------------|----------------------|-----------|
+| kill -9 (process) | 35 % fail      | 0 % fail (4 trials)  | →0        |
+| virsh destroy (VM)| 5.3 % fail     | 0.33 % fail (1 trial)| 16×       |
+
+Patched kill-9 across all four possible victim positions × 100 keys
+× 3 surviving endpoints = **1200/1200 successful reads, no failures
+of any kind**. That's the proof.
+
 ## Open follow-ups
 
-- Build the patched image at 4 nodes and confirm the same reproducer
-  produces 100 % success on the patched image.
 - File an upstream issue / PR with this document and the patch.
 - Add a unit test to upstream that exercises the cancellation
   pathway: spawn a slow-path writer, abort its task with
   `JoinHandle::abort()`, then assert a subsequent shared lock
   acquisition succeeds within sub-millisecond. None of the existing
   64 tests exercises this code path.
+- Re-run virsh-destroy a few more times once the sim cluster's
+  fstab is hardened (boot/efi/xfs `nofail,x-systemd.device-timeout=`
+  applied to the golden image cloud-init, so survivor recovery is
+  cheap), to nail down whether the 1/300 residual is a flake or a
+  rare edge case the patch leaves uncovered.
