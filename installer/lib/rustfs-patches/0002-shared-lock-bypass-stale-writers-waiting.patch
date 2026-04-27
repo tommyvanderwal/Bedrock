@@ -1,0 +1,94 @@
+From 156a58fd109fb86269559a98a5e3ad5cd7c3bbcc Mon Sep 17 00:00:00 2001
+From: Tommy van der Wal <tommy@it-launch.nl>
+Date: Mon, 27 Apr 2026 14:07:07 +0200
+Subject: [PATCH] lock/fast: shared lock fast-path bypasses stale
+ writers-waiting flag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A second 3-node EC:1 failure mode surfaces after the dsync read-quorum
+fix: even with read_quorum=1, individual shared-lock attempts on
+specific objects time out at the 5 s acquire_timeout. Both surviving
+lock clients (including the **local** one on the requesting node)
+return `LockResult::Timeout` for the slow path.
+
+Root cause: a stale `WRITERS_WAITING_MASK` bit in the local atomic
+lock state, left over by a slow-path exclusive-lock waiter whose
+parent task was cancelled (typically because the peer that initiated
+the lock RPC died mid-flight). The cancellation skips
+`dec_writers_waiting()` at shard.rs:194-195, so the counter never
+returns to zero. Subsequent shared-lock attempts on that object see
+"writers waiting", fail their fast path, queue behind the phantom
+writer, and time out.
+
+The fix lets the shared-lock fast path proceed when only the
+WRITERS_WAITING bit is set (no actual exclusive holder). Shared locks
+are mutually compatible with each other by design — multiple readers
+are an explicit invariant of the API — so accepting concurrent
+readers ahead of a queued writer does not change the meaning of the
+shared/exclusive contract. The exclusive-lock acquire path is
+unchanged: writers still require a fully-unlocked state
+(COMPLETELY_UNLOCKED).
+
+Trade-off accepted: writer fairness on hot objects under sustained
+read load. Acceptable for the small-cluster, mostly-read tier this
+lock is on; the proper upstream fix should address the leak at the
+slow-path waiter cancellation site (always dec_writers_waiting on
+Drop).
+
+Validated: 360 reads + 10 writes across all 6 victim/endpoint
+permutations on a 3-node sim cluster, every node taken down in turn,
+== 100 % success. Pre-patch: ~91 % (4 hard failures clustering on
+specific objects whose lock state had stale writer-waiting flags).
+
+This bug is NOT 3-node-specific in nature — same leak path exists
+upstream on 4+ node clusters; it's just less likely to manifest
+because more peers stay healthy and reconverge faster.
+
+Companion to the dsync read-quorum patch (commit c1686a3).
+
+Signed-off-by: Tommy van der Wal <tommy@it-launch.nl>
+---
+ crates/lock/src/fast_lock/state.rs | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/crates/lock/src/fast_lock/state.rs b/crates/lock/src/fast_lock/state.rs
+index 2896ead..1fcf0ed 100644
+--- a/crates/lock/src/fast_lock/state.rs
++++ b/crates/lock/src/fast_lock/state.rs
+@@ -66,8 +66,11 @@ impl AtomicLockState {
+         let state = self.state.load(Ordering::Relaxed); // Use Relaxed for better performance
+         match mode {
+             LockMode::Shared => {
+-                // No writer and no waiting writers
+-                (state & NO_WRITER_AND_NO_WAITING_WRITERS) == 0
++                // Only block on an actual writer holding the lock. Stale
++                // "writer waiting" flags from dead peers are deliberately
++                // ignored here — see try_acquire_shared() for the full
++                // rationale. Shared locks are mutually compatible.
++                (state & WRITER_FLAG_MASK) == 0
+             }
+             LockMode::Exclusive => {
+                 // Completely unlocked
+@@ -83,8 +86,15 @@ impl AtomicLockState {
+         loop {
+             let current = self.state.load(Ordering::Acquire);
+ 
+-            // Fast path check - cannot acquire if there's a writer or writers waiting
+-            if (current & NO_WRITER_AND_NO_WAITING_WRITERS) != 0 {
++            // Fast path check - cannot acquire if there's an actual writer holding
++            // the lock. We deliberately do NOT block on WRITERS_WAITING here:
++            // shared locks are mutually compatible (multiple readers allowed by
++            // design), and stale "writer waiting" flags from a peer that died
++            // without releasing would otherwise pin the resource until cleanup
++            // (default 30 s). Writer starvation under sustained read load is
++            // possible but acceptable for the small-cluster, mostly-read tier
++            // this lock is on.
++            if (current & WRITER_FLAG_MASK) != 0 {
+                 return false;
+             }
+ 
+-- 
+2.34.1
+

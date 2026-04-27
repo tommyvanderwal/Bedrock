@@ -7,9 +7,19 @@ RustFS releases new versions.
 
 ## Current patch set (against `rustfs/rustfs@main` ≥ 1.0.0-alpha.99)
 
-| # | file | branch | rationale |
-|---|---|---|---|
-| 0001 | `0001-relax-read-quorum-for-small-clusters.patch` | [`fix/dsync-read-quorum-3node`](https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node) | dsync read-quorum collapses to majority at N≤3, blocking 1-node-loss reads. Lower it to 1 for shared/read locks when `clients.len() <= 3`. Writes unchanged. Validated to lift success rate from 70-93 % to 97-100 % on a 3-node EC:1 cluster. See `docs/scenarios/rustfs-3node-trial-2026-04-27.md`. |
+Two patches, both on the same branch and applied in order:
+
+| # | file | rationale |
+|---|---|---|
+| 0001 | `0001-relax-read-quorum-for-small-clusters.patch` | dsync read-quorum collapses to majority at N≤3, blocking 1-node-loss reads. Lower it to 1 for shared/read locks when `clients.len() <= 3`. Writes unchanged. |
+| 0002 | `0002-shared-lock-bypass-stale-writers-waiting.patch` | Shared-lock fast path was blocking on `WRITERS_WAITING_MASK`, which leaks when a peer dies mid-acquire (slow-path waiter task cancelled before `dec_writers_waiting()`). Make shared locks only block on actual exclusive holder. **This is an upstream bug, not a 3-node-specific issue** — see `docs/scenarios/rustfs-shared-lock-leak-2026-04-27.md` for the full bug analysis + safety audit. |
+
+Branch: [`fix/dsync-read-quorum-3node`](https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node)
+
+Combined effect on the 3-node EC:1 trial: 70-93 % → **100 % (370/370)**
+read+write success across all victim/endpoint permutations under
+1-node-loss. See `docs/scenarios/rustfs-3node-trial-2026-04-27.md` for
+the layered validation.
 
 ## How to rebase onto a new RustFS release
 
