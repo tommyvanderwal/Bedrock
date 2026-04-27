@@ -1,0 +1,21 @@
+{
+    "Buckets": [
+        {
+            "Name": "bulk",
+            "CreationDate": "2026-04-27T00:17:39.078Z"
+        },
+        {
+            "Name": "critical",
+            "CreationDate": "2026-04-27T00:17:38.767Z"
+        },
+        {
+            "Name": "vmdisk1",
+            "CreationDate": "2026-04-27T00:23:27.950Z"
+        }
+    ],
+    "Owner": {
+        "DisplayName": "rustfs",
+        "ID": "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66"
+    },
+    "Prefix": null
+}

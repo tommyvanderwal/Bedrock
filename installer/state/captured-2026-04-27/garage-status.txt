@@ -1,0 +1,6 @@
+==== HEALTHY NODES ====
+ID                Hostname                     Address          Tags  Zone  Capacity  DataAvail         Version
+18146099572a7126  bedrock-sim-4.bedrock.local  10.99.0.13:3901  []    dc1   18.6 GiB  23.1 GiB (94.7%)  v2.3.0
+9b64664fbd63e8d2  bedrock-sim-2.bedrock.local  10.99.0.11:3901  []    dc1   18.6 GiB  23.1 GiB (94.5%)  v2.3.0
+cd72bd970346f2cf  bedrock-sim-1.bedrock.local  10.99.0.10:3901  []    dc1   18.6 GiB  23.1 GiB (94.6%)  v2.3.0
+d5ecc5ccb5668334  bedrock-sim-3.bedrock.local  10.99.0.12:3901  []    dc1   18.6 GiB  23.1 GiB (94.6%)  v2.3.0

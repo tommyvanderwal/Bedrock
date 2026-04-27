@@ -1,0 +1,17 @@
+[Unit]
+Description=RustFS distributed object store (podman)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/rustfs/data
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/podman rm -f rustfs
+ExecStart=/usr/bin/podman run --rm --name rustfs --network host --env-file /etc/default/rustfs -v /var/lib/rustfs/data:/data:Z -v /var/log/rustfs:/var/log/rustfs:Z docker.io/rustfs/rustfs:latest
+ExecStop=/usr/bin/podman stop -t 10 rustfs
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

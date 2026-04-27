@@ -1,0 +1,17 @@
+{
+    "Buckets": [
+        {
+            "Name": "templates",
+            "CreationDate": "2026-04-27T00:55:45.247Z"
+        },
+        {
+            "Name": "scratch",
+            "CreationDate": "2026-04-27T00:20:34.588Z"
+        }
+    ],
+    "Owner": {
+        "DisplayName": "scratch-key",
+        "ID": "GK1f51ed63e333a1e7ac0b4f3c"
+    },
+    "Prefix": null
+}

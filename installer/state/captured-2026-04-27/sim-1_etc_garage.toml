@@ -1,0 +1,19 @@
+metadata_dir = "/var/lib/garage/meta"
+data_dir     = "/var/lib/garage/data"
+db_engine    = "lmdb"
+
+replication_factor = 1
+rpc_secret      = "54eec6f9adcf201b7681c6673fec4deb40687991aff26c5c0c0875f60d3ec25e"
+rpc_bind_addr   = "[::]:3901"
+rpc_public_addr = "10.99.0.10:3901"
+
+block_size = 10485760
+
+[s3_api]
+api_bind_addr = "[::]:3900"
+s3_region     = "garage"
+root_domain   = ".s3.scratch.local"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token   = "eaa346891a87bfc457313a57c4742f32331102c9ca575ebfea9f3a464bd58c6d"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Garage S3-compatible store (scratch tier)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/garage/data
+
+[Service]
+User=garage
+Group=garage
+Environment=RUST_LOG=garage=info RUST_BACKTRACE=1
+ExecStart=/usr/local/bin/garage server
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
