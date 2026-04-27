@@ -116,7 +116,10 @@ def provision_thin_lv(s: Ssh, lv_name: str, size_gb: int, mount_point: str,
     s.run(f"mkfs.ext4 -F -L {lv_name} -E lazy_itable_init=0,lazy_journal_init=0 "
           f"/dev/{VG}/{lv_name}")
     s.run(f"mkdir -p {mount_point}")
-    fstab = f"/dev/{VG}/{lv_name} {mount_point} ext4 defaults,discard 0 0"
+    # nofail: a corrupt thin-LV after power-loss must NOT drop the host into
+    # emergency mode — let the rustfs/garage service fail loudly instead so
+    # the node stays SSH-able for recovery.
+    fstab = f"/dev/{VG}/{lv_name} {mount_point} ext4 defaults,nofail,discard 0 0"
     s.run(f"grep -q '{lv_name}' /etc/fstab || echo '{fstab}' >> /etc/fstab")
     s.run(f"mount {mount_point} 2>/dev/null || true")
     if owner_uid:
@@ -344,7 +347,7 @@ def install_s3fs_templates(s: Ssh, drbd_ip: str, access_key: str,
     s.put("/etc/passwd-s3fs", f"{access_key}:{secret_key}\n", mode=0o600)
     s.run(f"mkdir -p {TEMPLATES_MOUNT}")
     fstab_line = (f"templates {TEMPLATES_MOUNT} fuse.s3fs "
-                   f"_netdev,allow_other,umask=0022,sigv4,endpoint=garage,"
+                   f"_netdev,nofail,allow_other,umask=0022,sigv4,endpoint=garage,"
                    f"use_path_request_style,url=http://{drbd_ip}:{GARAGE_S3_PORT},"
                    "passwd_file=/etc/passwd-s3fs 0 0")
     s.run(f"grep -q ' {TEMPLATES_MOUNT} ' /etc/fstab || "
