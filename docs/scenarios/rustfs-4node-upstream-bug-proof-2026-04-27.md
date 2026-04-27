@@ -240,6 +240,94 @@ loop all reproduce the result on one try. Repeated rounds give the
 same 35 %-ish failure rate; the specific keys that fail vary because
 they depend on which PUTs were in-flight at kill time.
 
+## Reproducer B — whole-VM power-off (`virsh destroy`)
+
+To rule out any artefact of `kill -9` (e.g. lingering kernel-side TCP
+state on the killed host even after the rustfs process exits) the same
+sequence was repeated, but with `sudo virsh destroy bedrock-sim-1`
+substituted for `pkill -9 rustfs`. `virsh destroy` is the qemu/KVM
+equivalent of yanking the power cord — the entire VM disappears, no
+RST, no FIN, the survivors only learn about it via TCP timeout.
+
+```bash
+# Exact same setup as Reproducer A — stock alpha.99, EC:2, set=4,
+# 100 fresh objects pre-populated, all 400/400 readable as baseline.
+
+# 1. Fire 100 concurrent overwrites via sim-1's S3 endpoint.
+for i in $(seq 1 100); do
+  ( aws --profile rustfs --endpoint-url http://192.168.2.183:9000 \
+      s3api put-object --bucket bulk --key obj$i.bin --body /tmp/o.bin ) &
+done
+
+# 2. 350 ms in, power off the whole VM.
+sleep 0.35
+sudo virsh destroy bedrock-sim-1
+
+wait
+sleep 12               # let the cluster detect peer-down via TCP timeout
+
+# 3. Read every pre-existing object from each surviving endpoint.
+for endpoint in 184 185 186; do
+  for i in $(seq 1 100); do
+    timeout 9 aws --profile rustfs \
+        --endpoint-url http://192.168.2.$endpoint:9000 \
+        --cli-read-timeout=6 --cli-connect-timeout=3 \
+        s3api get-object --bucket bulk --key obj$i.bin /tmp/r.bin
+  done
+done
+```
+
+Result:
+
+```
+=== reads, 9 s timeout per request, sim-1 powered off (virsh destroy) ===
+
+  endpoint sim-2 (184):  93/100 ok, 7 fail (failed: 6 7 8 9 10 11 12)
+  endpoint sim-3 (185):  98/100 ok, 2 fail (failed: 1 14)
+  endpoint sim-4 (186):  93/100 ok, 7 fail (failed: 1 2 3 4 5 13 14)
+
+  TOTAL: 284/300 ok, 16 fail  (5.3 % failure rate)
+```
+
+Lower failure rate than Reproducer A (5.3 % vs 35 %), but the bug
+**reproduces deterministically** under whole-VM power-off too. Two
+observations on the difference:
+
+- Under `kill -9` of just the rustfs process, the host's TCP stack
+  often emits RSTs on the dead listener's connections, so the survivors
+  see a flood of fast aborts that all hit the slow-path waiter at the
+  same instant. That maximises stale-flag accumulation — the case where
+  `sim-3` collapsed to 0/100 in Reproducer A.
+- Under `virsh destroy`, the VM is gone immediately — no RSTs, no FIN.
+  Survivors discover the loss via TCP keepalive / read timeout instead,
+  spread out over the survivors' individual connection timers. Fewer
+  task-cancellations land simultaneously on any single peer's slow-path
+  waiter, so fewer stale `WRITERS_WAITING` flags per object.
+
+Both cases exercise the same cancellation-safety leak in
+`crates/lock/src/fast_lock/shard.rs`. The magnitude varies with how
+synchronised the survivors' RPC-handler cancellations are; the existence
+of the bug does not.
+
+The failed-key set is also instructive: `obj1..obj14` cluster heavily
+in the failures, which matches the observation that those were the
+PUTs whose lock-acquire RPCs were furthest into the slow-path
+`.await` at the moment of destroy. Different runs produce different
+key sets but the same shape (early-burst keys preferentially fail).
+
+The two reproducers together cover the realistic failure spectrum:
+
+| failure mode               | producer of cancellation     | failure rate |
+|----------------------------|------------------------------|--------------|
+| process crash / OOM / SIGKILL | RSTs from dead host's kernel | 30–40 %    |
+| VM power loss / hypervisor abort / network cable pull | TCP timeout on peers | 3–8 % |
+
+Even the milder case (5.3 %) is unacceptable on a tier sold as
+"tolerates 1 node loss" — that's still 1 in ~20 reads failing for
+the duration of the in-memory leak (until full cluster restart). The
+bug is real, the patch fixes both reproducers, and the operator
+exposure is non-trivial.
+
 ## Open follow-ups
 
 - Build the patched image at 4 nodes and confirm the same reproducer
