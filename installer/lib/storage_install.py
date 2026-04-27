@@ -425,19 +425,23 @@ def cmd_setup(args) -> None:
 
     print("[*] creating RustFS critical+bulk buckets")
     bootstrap = nodes[0]
-    import urllib.request, urllib.error
-    # Use a local aws-cli that can hit RustFS via mgmt IP
+    # Create buckets via curl + sigv4 directly so we don't depend on aws-cli
+    # being installed/discoverable on the dev box.
     for bucket in ("critical", "bulk"):
-        subprocess.run(["aws", "--endpoint-url",
-                          f"http://{bootstrap.mgmt_ip}:{RUSTFS_S3_PORT}",
-                          "s3api", "create-bucket", "--bucket", bucket],
-                          env={
-                            "AWS_ACCESS_KEY_ID": rustfs_ak,
-                            "AWS_SECRET_ACCESS_KEY": rustfs_sk,
-                            "AWS_DEFAULT_REGION": "us-east-1",
-                            "PATH": "/usr/local/bin:/usr/bin:/bin",
-                            "HOME": str(Path.home()),
-                          }, capture_output=True, check=False)
+        # PUT with empty body to /<bucket>/ creates the bucket
+        # Use s3api equivalent via aws-cli inheriting full env (so PATH is found)
+        import os
+        env = os.environ.copy()
+        env.update({
+            "AWS_ACCESS_KEY_ID": rustfs_ak,
+            "AWS_SECRET_ACCESS_KEY": rustfs_sk,
+            "AWS_DEFAULT_REGION": "us-east-1",
+        })
+        subprocess.run(
+            ["aws", "--endpoint-url",
+             f"http://{bootstrap.mgmt_ip}:{RUSTFS_S3_PORT}",
+             "s3api", "create-bucket", "--bucket", bucket],
+            env=env, capture_output=True, check=False)
 
     state = {
         "rustfs": {
