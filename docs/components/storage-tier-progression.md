@@ -232,19 +232,26 @@ the still-alive nodes.
 That's incompatible with the Bulk-tier promise of "tolerates 1 node
 failure" for **all** existing objects.
 
-**Conclusion: at 3 nodes, do NOT use RustFS for tiers that need
-1-node-loss durability.** Adopt Path B.2:
+**Updated conclusion (after patching dsync):** the bottleneck was a
+single function — `read_quorum` in `crates/lock/src/distributed_lock.rs`.
+A 17-line patch lowers the read quorum to 1 when `clients.len() <= 3`,
+leaving write quorum at `(N/2)+1 = 2`. Validated on the rebuilt 3-node
+sim cluster: success rate goes from ~70-93 % under stress to ≥ 97 %
+steady, 100 % under concurrency. Patch shipped at:
 
-- **Bulk** → Garage `replication_factor=2` (50 % efficiency, full 1-node-loss tolerance, dsync-free)
-- **Critical** → Garage `replication_factor=3` (33 % efficiency, 2-node-loss tolerance) or DRBD-3way exposed via s3backer/NBD shim
-- **Scratch** → Garage `replication_factor=1`
+<https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>
 
-RustFS enters the picture only at 4+ nodes, where set_size=4 means
-1-down still leaves 3 peers reachable for dsync quorum (validated in
-the prior 4-node trial).
+mirrored locally at `installer/lib/rustfs-patches/0001-relax-read-quorum-for-small-clusters.patch`.
 
-The 17 percentage-point efficiency gap (Garage rep=2's 50 % vs. RustFS
-EC:1 set=3's 67 %) is a real cost. If a future RustFS / dsync release
-fixes the quorum behavior for N=3, revisit. Patching dsync ourselves
-is possible but a per-fork maintenance burden we should not take on
-prematurely.
+**Adopt Path A** for Bulk + Critical at 3 nodes, on the patched RustFS:
+
+- **Bulk** → RustFS EC:1 set=3 (67 % efficiency, 1-node-loss tolerated for reads via patched dsync; writes need majority, which 2-of-3 satisfies; ~2 % transient failures during convergence window — clients should retry)
+- **Critical** → RustFS EC:2 set=3 (33 % efficiency, 2-of-3 redundancy; not separately tested but expected to inherit the same dsync behaviour)
+- **Scratch** → Garage `replication_factor=1` (unchanged)
+
+Garage rep=2 remains a viable Bulk fallback if RustFS proves unstable
+under longer-soak testing — same redundancy, lower efficiency (50 %),
+but operationally simpler (no patched fork to track).
+
+RustFS at 4+ nodes uses upstream-default quorum (the patch is a no-op
+when `client_count >= 4`).

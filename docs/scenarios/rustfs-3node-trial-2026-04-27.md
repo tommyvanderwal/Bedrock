@@ -169,14 +169,51 @@ A small RustFS source patch could in principle relax the dsync lock
 quorum to allow N=3 operation, but that's a per-fork maintenance burden
 we shouldn't take on lightly. The Garage path is right.
 
-## Open follow-ups
+## Update — patched RustFS
 
-- Is there a RustFS env var / config to tune the dsync quorum threshold?
-  Worth checking the RustFS source / issue tracker before assuming "no
-  way to make N=3 work."
-- Can dsync lock requests be retried with backoff so that **transient**
-  reconverge failures (which were 90–97 % readable) recover within
-  ~30 s? If so, the alpha.99 stochastic failures might shrink as the
-  project matures.
-- Test EC:2 set=3 explicitly to confirm lock quorum is the bottleneck
-  (not parity). Expectation: same failure mode.
+After this analysis a one-function patch on the dsync read-quorum
+formula was applied (see `installer/lib/rustfs-patches/0001-relax-read-quorum-for-small-clusters.patch`,
+also published at <https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>).
+
+The change relaxes `read_quorum` from `N - N/2` (= 2 at N=3) to `1` when
+`clients.len() <= 3`, leaving write quorum at the existing `(N/2)+1 = 2`.
+
+Built from source via `Dockerfile.source` with the cache-mount lines
+stripped (no BuildKit) and the runtime stage switched from `ubuntu:22.04`
+to `ubuntu:24.04` so the trixie-built binary can find `GLIBC_2.39`.
+
+Re-tested 30 fresh 10 MiB objects, three repeat matrix runs of the
+same six victim/endpoint permutations, 20 s settle per stop:
+
+| run | total reads | ok | success rate |
+|---|---|---|---|
+| pre-patch (this doc, original section) | 180 | 167 | 93 % (with much lower 40-60 % under stress) |
+| post-patch run 1 | 180 | 176 | 98 % |
+| post-patch run 2 (partial) | 120 | 117 | 97 % |
+| concurrent-burst (30 parallel via single endpoint, sim-2 down) | 30 | 30 | 100 % |
+
+Verdict: **patch lifts the cluster from "stochastic ~70 % under stress"
+to "≥ 97 % steady, 100 % under concurrency."** The remaining ~2 % live
+in the ~30 s convergence window right after a node stop and clear up
+on retry once dsync settles.
+
+For the architecture decision: **3-node RustFS EC:1 with the read-quorum
+patch is now the recommended Bulk-tier backend at 3 nodes**, replacing
+the "fall back to Garage rep=2" recommendation in the original analysis.
+Trade-off: 67 % storage efficiency vs. Garage rep=2's 50 %, with the
+caveat of brief retry-required failures during a node loss window.
+
+## Open follow-ups (still open)
+
+- The remaining ~2 % failures during the convergence window: likely tied
+  to the dead-peer RPC connection teardown (`acquire_timeout` defaults
+  to 30 s; the dead client takes that long to fail). A second patch
+  could detect dead peers faster (TCP keepalive tuning, circuit breaker,
+  or shorter per-attempt RPC timeout). Acceptable as-is for the Bulk
+  tier (clients should retry transient failures).
+- Test EC:2 set=3 explicitly to confirm lock quorum is the only
+  bottleneck. Expectation: same shape; the patch should fix EC:2 set=3
+  too because read_quorum is independent of EC parity.
+- File the patch upstream at <https://github.com/rustfs/rustfs/pulls>
+  once the sim cluster validates a longer soak (multi-day stability
+  with random node restarts).
