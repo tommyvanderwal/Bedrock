@@ -243,6 +243,41 @@ it: any single network can carry traffic on its own.
 | `virsh vol-list templates` shows `alpine.qcow2` | ✅ |
 | `virsh pool-info templates` reports 64 PiB capacity (s3fs lies about S3-as-infinite) | (note) |
 
+### T8. Stress-during-migration
+
+Continuous host-side write workload (60 writes × 1 MiB at random offsets
+1700–1800 MiB, every 200 ms) running on sim-1 while live-migrating
+vm-hero sim-1 → sim-2.
+
+| step | result |
+|---|---|
+| Migration completed mid-workload | 1.14 s |
+| Total writes attempted | 60 |
+| Unique offsets after dedup | 45 |
+| Read back from sim-2 (post-migration), compared SHA-256 per offset | **45/45 OK, 0 corruption** |
+
+The 15 "fails" before dedup were duplicate offsets — same offset written
+twice during the run, where the older write was overwritten by the newer.
+Both versions were in the writelog; only the latest survives the disk
+state, which is correct.
+
+### T9. RustFS endpoint restart under load
+
+VM running on sim-2; s3backer mount on sim-2 → `192.168.2.168:9000`
+(local RustFS). Continuous write workload (100 writes × 1 MiB, 100 ms
+between writes), then `systemctl restart rustfs.service` issued on sim-2
+mid-workload. Total writer wall-clock ~12 s; restart took 1.16 s.
+
+| step | result |
+|---|---|
+| Writes completed | 100 / 100 |
+| Failures recorded | **0** |
+| Unique offsets verified post-restart | 40 / 40 OK |
+
+s3backer's default retry/backoff absorbs the brief endpoint outage —
+individual block writes pause and resume across the restart, no
+data corruption, no observable failure to the writer.
+
 ## Gotchas worth folding into the installer
 
 1. **RustFS container UID mismatch**: chown host data + log dirs to
