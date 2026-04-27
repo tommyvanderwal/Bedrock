@@ -245,19 +245,49 @@ demanding a deep change to the slow-path state machine.
 
 ## Empirical validation
 
+### End-to-end (functional)
+
 Tested on the 3-node sim cluster (sim-1/2/3 at 192.168.2.183/4/5,
-RustFS 1.0.0-alpha.99 + this patch + the dsync read-quorum patch):
+RustFS 1.0.0-alpha.99 + both patches):
 
 | run | total reads | ok | success rate |
 |---|---|---|---|
 | pre-patch (read-quorum patch only) | 360 | ~328 | ~91 % |
-| **post-patch (both patches)** — matrix run 1 | 180 | **180** | **100 %** |
-| post-patch — matrix run 2 (stability) | 180 | **180** | **100 %** |
-| post-patch — writes during 1-down (10 PUTs via sim-1, sim-2 down) | 10 | **10** | **100 %** |
+| post-patch — matrix run 1 (debug build) | 180 | 180 | 100 % |
+| post-patch — matrix run 2 (debug build) | 180 | 180 | 100 % |
+| post-patch — writes during 1-down | 10 | 10 | 100 % |
+| **post-patch — clean image (no debug)** | **180** | **180** | **100 %** |
 
-Total post-patch: **370/370 ok = 100 %**, across all six
+Total post-patch: **550/550 ok = 100 %**, across all six
 victim/endpoint permutations and writes through every alive endpoint
 during a 1-node-down event.
+
+### Upstream test suite (regression)
+
+Ran the upstream `cargo test --package rustfs-lock --lib` test suite
+against the patched source:
+
+```
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured;
+0 filtered out; finished in 0.37s
+```
+
+Notable individually-passing tests, each of which exercises an
+invariant the patches could plausibly break:
+
+- `test_write_lock_excludes_read_lock` — exclusive locks still block shared.
+- `test_read_lock_excludes_write_lock` — shared locks still block exclusive.
+- `test_concurrent_read_locks` — multiple shared holders still permitted.
+- `test_concurrent_write_lock_contention` — exclusive contention semantics intact.
+- `test_lock_priority` — priority queueing not broken.
+- `test_same_owner_reentrant_write_lock` — owner-reentrancy intact.
+- `test_namespace_lock_distributed_multi_node_simulation` — 3-node distributed scenario.
+- `test_namespace_lock_distributed_read_lock_succeeds_with_two_nodes_one_offline` — **the upstream test that maps closest to our fix**; passes both before and after.
+- `test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_offline` — write quorum still required.
+- `test_namespace_lock_distributed_quorum_failure_rolls_back_successful_nodes` — partial-success rollback intact.
+- `test_namespace_lock_distributed_eight_node_write_releases_all_nodes` — 8-node correctness.
+
+All 64 tests pass. **No upstream-defined invariant regresses.**
 
 ## Future-proofing checklist
 
