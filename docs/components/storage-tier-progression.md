@@ -212,13 +212,39 @@ def available_tiers(node_count, rustfs_3node_works=False):
 
 ## Decision after the 3-node empirical test
 
-- If RustFS accepts `set=3`: adopt Path A. Update the doc; ship 3-node
-  Bulk on RustFS EC:1, Critical on RustFS EC:2.
-- If RustFS rejects `set=3`: adopt Path B.2. Bulk on Garage rep=2,
-  Critical on Garage rep=3. Avoid the 2-LV-per-node operational
-  complexity of Path B.1.
+**Tested 2026-04-27** — see [rustfs-3node-trial-2026-04-27.md](../scenarios/rustfs-3node-trial-2026-04-27.md).
 
-The result also informs whether we put effort into a small RustFS source
-patch / fork to relax the minimum-set-size check. That's a real option if
-the path-A efficiency benefit (67 % vs 50 %) is meaningful at our
-expected 3-node scale.
+RustFS at alpha.99 **does** accept `RUSTFS_ERASURE_SET_DRIVE_COUNT=3`
+(contrary to my pre-test hypothesis based on MinIO's set-size rule).
+EC:1 with 2d+1p actually distributes correctly across 3 nodes at 67 %
+efficiency, and steady-state read/write works perfectly with all 3
+nodes alive.
+
+**However**, single-node failure exposes a separate dsync lock-quorum
+bottleneck: each object has a fixed set of nodes that hold its
+distributed-lock metadata, and when one of those happens to be the down
+node, the read fails with `ns_loc: Quorum not reached: required 2,
+achieved 1` until that node returns. In testing, **40–90 %** of
+pre-existing objects remained readable under 1-node-loss — *most* but
+not *all*. New writes after the failure work fine because they hash to
+the still-alive nodes.
+
+That's incompatible with the Bulk-tier promise of "tolerates 1 node
+failure" for **all** existing objects.
+
+**Conclusion: at 3 nodes, do NOT use RustFS for tiers that need
+1-node-loss durability.** Adopt Path B.2:
+
+- **Bulk** → Garage `replication_factor=2` (50 % efficiency, full 1-node-loss tolerance, dsync-free)
+- **Critical** → Garage `replication_factor=3` (33 % efficiency, 2-node-loss tolerance) or DRBD-3way exposed via s3backer/NBD shim
+- **Scratch** → Garage `replication_factor=1`
+
+RustFS enters the picture only at 4+ nodes, where set_size=4 means
+1-down still leaves 3 peers reachable for dsync quorum (validated in
+the prior 4-node trial).
+
+The 17 percentage-point efficiency gap (Garage rep=2's 50 % vs. RustFS
+EC:1 set=3's 67 %) is a real cost. If a future RustFS / dsync release
+fixes the quorum behavior for N=3, revisit. Patching dsync ourselves
+is possible but a per-fork maintenance burden we should not take on
+prematurely.
