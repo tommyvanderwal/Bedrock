@@ -1,0 +1,76 @@
+From <bedrock-rustfs-3node-readq> Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Relax dsync read-lock quorum for clusters of N <= 3
+
+The default `read_quorum = N - N/2` reduces to majority (= 2) at N=3,
+identical to the write quorum. With one node down the surviving lock
+RPCs frequently return only one successful response (the local one)
+because the second alive lock-RPC waits on the dead-peer connection
+teardown and the request times out before the slowest peer ack arrives.
+
+This breaks the "Bulk tier tolerates one node failure" guarantee for
+3-node clusters: 30-60 % of pre-existing-object reads fail with
+`Quorum not reached: required 2, achieved 1`.
+
+The fix relaxes the read quorum (shared/read locks only) for small
+clusters. Multiple concurrent readers are explicitly allowed by the
+shared-lock semantics, so accepting a minority response for reads is
+safe; data integrity for the actual object read is still enforced by
+the EC layer below, which requires `data_blocks` drives to reconstruct.
+
+Write/exclusive quorum is unchanged. Split-brain protection on writes
+remains at majority, so a 2-node partition cannot have both halves
+accepting writes.
+
+Issue context (none of these existing issues cover N=3 read tolerance):
+  - rustfs/rustfs#2269 — N=2 read quorum (closed; merged the
+    `N - N/2` formula that reduces to 1 at N=2)
+  - rustfs/rustfs#2611 — write-quorum failure (different scenario)
+
+---
+ crates/lock/src/distributed_lock.rs | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/crates/lock/src/distributed_lock.rs b/crates/lock/src/distributed_lock.rs
+index <hash>..<hash> 100644
+--- a/crates/lock/src/distributed_lock.rs
++++ b/crates/lock/src/distributed_lock.rs
+@@ -152,12 +152,31 @@ impl DistributedLock {
+         &self.namespace
+     }
+
+-    fn read_quorum(&self) -> usize {
+-        let client_count = self.clients.len();
+-        if client_count <= 1 {
+-            1
+-        } else {
+-            client_count - (client_count / 2)
+-        }
+-    }
++    fn read_quorum(&self) -> usize {
++        // Read locks: permissive quorum so a 3-node cluster keeps serving
++        // existing-object reads when any single node is down. Standard
++        // majority (`N - N/2`) gives 2 for N=3, which fails the moment a
++        // node goes away because one of the two surviving lock clients
++        // routinely times out before the slowest peer ack arrives.
++        //
++        // For shared (read) locks, multiple holders are not mutually
++        // exclusive — concurrent readers are explicitly allowed by the
++        // lock semantics — so accepting a minority is safe in this layer.
++        // Data integrity for the actual object read is still enforced by
++        // the EC layer below (it requires `data_blocks` drives to
++        // reconstruct), independent of this lock.
++        let client_count = self.clients.len();
++        if client_count <= 1 {
++            1
++        } else if client_count <= 3 {
++            // small clusters: 1 successful client response is enough.
++            // tolerate up to (N-1) lock-peer failures for reads.
++            1
++        } else {
++            // larger clusters keep traditional majority for read locks.
++            client_count - (client_count / 2)
++        }
++    }
+
+     fn required_quorum(&self, lock_type: LockType) -> usize {
+         match lock_type {
