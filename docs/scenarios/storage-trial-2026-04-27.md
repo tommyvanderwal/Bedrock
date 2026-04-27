@@ -261,6 +261,41 @@ twice during the run, where the older write was overwritten by the newer.
 Both versions were in the writelog; only the latest survives the disk
 state, which is correct.
 
+### T10. **Live storage migration s3backer ↔ DRBD ↔ s3backer (full round-trip)**
+
+`virsh blockcopy --reuse-external --pivot` works between a FUSE-mounted
+file (s3backer) and a DRBD block device in either direction. Mirror
+phase keeps in-flight VM writes in sync; pivot is atomic.
+
+| phase | from → to | initiated on | duration | integrity 1.5/1.6/1.9 GiB |
+|---|---|---|---|---|
+| Phase 1 | s3backer → DRBD-2way(sim-1+2) | sim-2 (current VM host) | 19.10 s blockcopy + 0.03 s pivot | ✅ all match |
+| Phase 2 | live-migrate sim-2 → sim-1 (both disks pet DRBD) | sim-2 | 1.36 s | ✅ |
+| Phase 3 | DRBD → s3backer | sim-1 (different host) | 13.08 s blockcopy + pivot | ✅ |
+| ViPet up | add sim-3 to boot DRBD (2-way → 3-way) | sim-1 | drbdadm adjust + sync | both UpToDate |
+| Phase 4 | live-migrate sim-1 → sim-3 (4th-host involvement) | sim-1 | 1.40 s | ✅ |
+| Phase 5 | s3backer → DRBD-2way(sim-3+4) | sim-3 | 18.60 s + pivot | ✅ |
+| Phase 6 | DRBD → s3backer (reverse on sim-3+4 pair) | sim-3 | 12.06 s + pivot | ✅ |
+| Phase 7 | live-migrate sim-3 → sim-2 (ViPet boot) | sim-3 | 1.05 s | ✅ |
+
+Hosts touched across the round-trip: **sim-1, sim-2, sim-3, sim-4** (sim-4
+hosted the s3backer mount + DRBD pair as a peer; the VM did not run
+there because boot DRBD is 3-way and our code is gated to 3-way max).
+
+### T11. **Conversion failure paths**
+
+Tested two abort/retry scenarios:
+
+| scenario | result |
+|---|---|
+| Start s3backer → DRBD blockcopy, `virsh blockjob --abort` mid-way | ✅ VM keeps running with original vdb (s3backer); no orphan blockjob; no data loss |
+| Retry the same blockcopy after abort | ✅ runs to 100% in 13.6 s, pivot ok, integrity bit-perfect |
+| Restart RustFS on sim-2 (the VM's local backend) **during** a DRBD → s3backer blockcopy at ~85% progress | ✅ blockcopy continues through ~1.2 s outage, completes, pivots, integrity bit-perfect |
+
+s3backer's HTTP retry/backoff masks RustFS endpoint flaps during a
+blockcopy without any user-visible interruption to the VM or the
+conversion. Aborts return the VM to its original disk source cleanly.
+
 ### T9. RustFS endpoint restart under load
 
 VM running on sim-2; s3backer mount on sim-2 → `192.168.2.168:9000`
