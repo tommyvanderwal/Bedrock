@@ -1,0 +1,22 @@
+{
+  "rustfs": {
+    "endpoint_mgmt": "http://192.168.2.167:9000",
+    "endpoint_drbd": "http://10.99.0.10:9000",
+    "access_key": "rustfsadmin",
+    "secret_key": "rustfssecret123",
+    "buckets": {
+      "critical": {"storage_class": "STANDARD", "ec": "EC:2", "tolerates_loss": 2, "tolerates_writes": 1},
+      "bulk":     {"storage_class": "REDUCED_REDUNDANCY", "ec": "EC:1", "tolerates_loss": 1, "tolerates_writes": 0}
+    }
+  },
+  "garage": {
+    "endpoint_mgmt": "http://192.168.2.167:3900",
+    "endpoint_drbd": "http://10.99.0.10:3900",
+    "access_key": "GK1f51ed63e333a1e7ac0b4f3c",
+    "secret_key": "2384506c5816119803650a8a7e6f149ba62f6f5fa30c9c6d377e85c619fa5787",
+    "buckets": {
+      "scratch": {"replication_factor": 1, "block_size_bytes": 10485760}
+    }
+  },
+  "trial_date": "2026-04-27"
+}

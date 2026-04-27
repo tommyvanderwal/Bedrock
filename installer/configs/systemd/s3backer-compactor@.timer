@@ -1,0 +1,12 @@
+[Unit]
+Description=s3backer compactor schedule for bucket %i
+
+[Timer]
+# Every 15 minutes. Fast enough to reclaim TRIM'd space before users notice;
+# slow enough to not hammer the cluster with full bucket scans.
+OnCalendar=*:0/15
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

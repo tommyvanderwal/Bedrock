@@ -1,0 +1,26 @@
+[Unit]
+Description=s3backer mount for bucket %i
+After=network-online.target rustfs.service
+Wants=network-online.target
+RequiresMountsFor=/etc/s3backer
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/s3backer/%i.env
+# %i = bucket name. Each instance reads /etc/s3backer/<bucket>.env which
+# defines BASE_URL, CREDS_FILE, MOUNT_POINT, SIZE_GB, BLOCK_SIZE_MIB.
+ExecStartPre=/usr/bin/mkdir -p ${MOUNT_POINT}
+ExecStart=/usr/bin/s3backer \
+    --baseURL=${BASE_URL} \
+    --accessFile=${CREDS_FILE} \
+    --no-vhost --sharedDiskMode \
+    --size=${SIZE_GB}G --blockSize=${BLOCK_SIZE_MIB}m \
+    --fileMode=0666 \
+    -f \
+    %i ${MOUNT_POINT}
+ExecStop=/usr/bin/fusermount3 -u ${MOUNT_POINT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

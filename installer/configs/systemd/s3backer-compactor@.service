@@ -1,0 +1,15 @@
+[Unit]
+Description=s3backer trim compactor for bucket %i
+After=network-online.target rustfs.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bedrock/s3backer-creds.env
+ExecStart=/usr/local/bin/python3 /usr/local/lib/bedrock/lib/s3backer_compactor.py \
+    --endpoint ${RUSTFS_ENDPOINT} \
+    --bucket %i \
+    --total-cap-gb ${CLUSTER_CAP_GB} \
+    --threads 8
+StandardOutput=journal
+StandardError=journal
