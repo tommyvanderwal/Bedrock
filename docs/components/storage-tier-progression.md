@@ -232,26 +232,47 @@ the still-alive nodes.
 That's incompatible with the Bulk-tier promise of "tolerates 1 node
 failure" for **all** existing objects.
 
-**Updated conclusion (after patching dsync):** the bottleneck was a
-single function — `read_quorum` in `crates/lock/src/distributed_lock.rs`.
-A 17-line patch lowers the read quorum to 1 when `clients.len() <= 3`,
-leaving write quorum at `(N/2)+1 = 2`. Validated on the rebuilt 3-node
-sim cluster: success rate goes from ~70-93 % under stress to ≥ 97 %
-steady, 100 % under concurrency. Patch shipped at:
+**Updated conclusion (after diagnosis + single-patch fix):** the
+bottleneck wasn't the dsync quorum formula, it was a cancellation-
+safety leak in the *local* `FastObjectLockManager`. When a peer dies
+before its slow-path exclusive-lock waiter task reaches
+`dec_writers_waiting()`, the `WRITERS_WAITING_MASK` counter stays
+positive on the surviving peer's local lock state, which then refuses
+the fast-path shared lock for any subsequent reader of that same
+object. A reader thus sees `achieved 1, required 2` because one of
+the two surviving lock clients (the one with the stale flag) returns
+`Lock acquisition timeout` instead of `success`. The patch makes the
+shared-lock fast path block only on `WRITER_FLAG_MASK` (an actual
+exclusive holder), not on stale waiter counters.
 
-<https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>
+Validated on the rebuilt 3-node sim cluster: 180/180 reads + 10/10
+writes + 10/10 read-after-write = **100 %** across every victim/
+endpoint permutation under 1-node-loss, with **no weakening** of any
+dsync quorum or set-overlap guarantee. All 64 upstream `cargo test
+--package rustfs-lock --lib` tests still pass. Patch shipped at:
 
-mirrored locally at `installer/lib/rustfs-patches/0001-relax-read-quorum-for-small-clusters.patch`.
+<https://github.com/tommyvanderwal/rustfs/tree/fix/shared-lock-stale-writers-waiting>
+
+mirrored locally at `installer/lib/rustfs-patches/0002-shared-lock-bypass-stale-writers-waiting.patch`.
+
+(An earlier iteration carried a second patch — a dsync read-quorum
+relaxation — that was unsafe at N=3 because it broke the lock-overlap
+invariant `Wq + Rq > N`. Once the cancellation-safety fix made the
+upstream `Rq=2` reachable again, that relaxation became unnecessary
+and was reverted. See `docs/scenarios/rustfs-shared-lock-leak-2026-04-27.md`
+for the safety analysis.)
 
 **Adopt Path A** for Bulk + Critical at 3 nodes, on the patched RustFS:
 
-- **Bulk** → RustFS EC:1 set=3 (67 % efficiency, 1-node-loss tolerated for reads via patched dsync; writes need majority, which 2-of-3 satisfies; ~2 % transient failures during convergence window — clients should retry)
-- **Critical** → RustFS EC:2 set=3 (33 % efficiency, 2-of-3 redundancy; not separately tested but expected to inherit the same dsync behaviour)
+- **Bulk** → RustFS EC:1 set=3 (67 % efficiency, 1-node-loss tolerated)
+- **Critical** → RustFS EC:2 set=3 (33 % efficiency, 2-of-3 redundancy; not separately tested but expected to inherit the same fix)
 - **Scratch** → Garage `replication_factor=1` (unchanged)
 
 Garage rep=2 remains a viable Bulk fallback if RustFS proves unstable
 under longer-soak testing — same redundancy, lower efficiency (50 %),
 but operationally simpler (no patched fork to track).
 
-RustFS at 4+ nodes uses upstream-default quorum (the patch is a no-op
-when `client_count >= 4`).
+RustFS at 4+ nodes is unaffected by the patch (the cancellation-safety
+fix is a no-op when no peer ever leaves the writer-waiting flag stale,
+which is rarer at higher N because more healthy peers reconverge
+faster).

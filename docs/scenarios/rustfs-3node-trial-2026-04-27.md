@@ -171,49 +171,62 @@ we shouldn't take on lightly. The Garage path is right.
 
 ## Update — patched RustFS
 
-After this analysis a one-function patch on the dsync read-quorum
-formula was applied (see `installer/lib/rustfs-patches/0001-relax-read-quorum-for-small-clusters.patch`,
-also published at <https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>).
+The eventual single-patch fix lives at:
 
-The change relaxes `read_quorum` from `N - N/2` (= 2 at N=3) to `1` when
-`clients.len() <= 3`, leaving write quorum at the existing `(N/2)+1 = 2`.
+- `installer/lib/rustfs-patches/0002-shared-lock-bypass-stale-writers-waiting.patch`
+- branch: <https://github.com/tommyvanderwal/rustfs/tree/fix/shared-lock-stale-writers-waiting>
+
+The patch fixes a cancellation-safety leak in
+`AtomicLockState`'s slow-path `WRITERS_WAITING` counter: when a peer
+dies before its slow-path exclusive-lock waiter task reaches
+`dec_writers_waiting()`, the counter stays positive and every
+subsequent shared lock acquisition on that object's state fails its
+fast path → enters the slow path → times out at the 5 s
+`acquire_timeout`. The full bug analysis with safety audit is in
+[rustfs-shared-lock-leak-2026-04-27.md](./rustfs-shared-lock-leak-2026-04-27.md).
+
+> **Earlier draft note.** A previous version of this update described
+> a *two-patch* series including a dsync `read_quorum = 1 for clients
+> ≤ 3` relaxation. That second patch was unsafe — it broke the dsync
+> set-overlap invariant `Wq + Rq > N` — and once the cancellation-
+> safety fix above is in place, was unnecessary. It has been removed
+> from the fork. Read the *Revision* section of the bug-analysis doc
+> for the full reasoning. The numbers below reflect the single-patch
+> result.
 
 Built from source via `Dockerfile.source` with the cache-mount lines
 stripped (no BuildKit) and the runtime stage switched from `ubuntu:22.04`
 to `ubuntu:24.04` so the trixie-built binary can find `GLIBC_2.39`.
 
-Re-tested 30 fresh 10 MiB objects, three repeat matrix runs of the
-same six victim/endpoint permutations, 20 s settle per stop:
+Re-tested 30 fresh 10 MiB objects, six victim/endpoint permutations,
+18 s settle per stop, single-patch image:
 
 | run | total reads | ok | success rate |
 |---|---|---|---|
-| pre-patch (this doc, original section) | 180 | 167 | 93 % (with much lower 40-60 % under stress) |
-| post-patch run 1 | 180 | 176 | 98 % |
-| post-patch run 2 (partial) | 120 | 117 | 97 % |
-| concurrent-burst (30 parallel via single endpoint, sim-2 down) | 30 | 30 | 100 % |
+| pre-patch (this doc, original section) | 180 | ~167 | ~93 % |
+| post-patch — matrix run | 180 | **180** | **100 %** |
+| post-patch — writes during 1-down | 10/10 | — | 100 % |
+| post-patch — read-after-write during 1-down | 10 | 10 | 100 % |
 
-Verdict: **patch lifts the cluster from "stochastic ~70 % under stress"
-to "≥ 97 % steady, 100 % under concurrency."** The remaining ~2 % live
-in the ~30 s convergence window right after a node stop and clear up
-on retry once dsync settles.
+Verdict: **patch lifts the cluster from "stochastic ~93 % with hard
+failures on specific objects" to "100 % across all permutations,"**
+without weakening any dsync quorum or set-overlap guarantee.
 
-For the architecture decision: **3-node RustFS EC:1 with the read-quorum
-patch is now the recommended Bulk-tier backend at 3 nodes**, replacing
-the "fall back to Garage rep=2" recommendation in the original analysis.
-Trade-off: 67 % storage efficiency vs. Garage rep=2's 50 %, with the
-caveat of brief retry-required failures during a node loss window.
+For the architecture decision: **3-node RustFS EC:1 with this patch
+is the recommended Bulk-tier backend at 3 nodes**, replacing the
+"fall back to Garage rep=2" recommendation in the original analysis.
+Trade-off: 67 % storage efficiency vs. Garage rep=2's 50 %.
 
 ## Open follow-ups (still open)
 
-- The remaining ~2 % failures during the convergence window: likely tied
-  to the dead-peer RPC connection teardown (`acquire_timeout` defaults
-  to 30 s; the dead client takes that long to fail). A second patch
-  could detect dead peers faster (TCP keepalive tuning, circuit breaker,
-  or shorter per-attempt RPC timeout). Acceptable as-is for the Bulk
-  tier (clients should retry transient failures).
-- Test EC:2 set=3 explicitly to confirm lock quorum is the only
-  bottleneck. Expectation: same shape; the patch should fix EC:2 set=3
-  too because read_quorum is independent of EC parity.
 - File the patch upstream at <https://github.com/rustfs/rustfs/pulls>
   once the sim cluster validates a longer soak (multi-day stability
   with random node restarts).
+- Test EC:2 set=3 explicitly. Expectation: same shape; the patch
+  should fix EC:2 set=3 too because the cancellation-safety leak is
+  independent of EC parity.
+- A "proper" upstream fix would address the leak source — wrap the
+  `inc/dec_writers_waiting()` pair in a Drop guard so the dec fires
+  on cancel — instead of papering over it in the fast path. That's
+  the right long-term direction; this patch is a focused workaround
+  that doesn't require redesigning the slow-path state machine.

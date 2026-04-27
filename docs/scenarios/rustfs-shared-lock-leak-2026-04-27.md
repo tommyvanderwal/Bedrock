@@ -5,6 +5,21 @@
 buggy code is unchanged on the upstream `main` branch as of this writing.
 **Reported as:** internal Bedrock investigation; not yet upstream-filed.
 
+> **Revision note (2026-04-27, later same day):** an earlier draft of
+> this document defended a *two-patch series* — the cancellation-safety
+> fix described below **plus** a dsync `read_quorum = 1` relaxation for
+> `clients ≤ 3`. That second patch was unsafe: it broke the dsync
+> set-overlap invariant `Wq + Rq > N` (at N=3 with `Wq=2, Rq=1` you
+> get `2+1 = 3 = N`, so a writer's lock set `{A,B}` and a reader's
+> `{C}` need not intersect), allowing a reader to bypass an in-flight
+> writer and return stale data. It was also **unnecessary** — the
+> cancellation-safety fix alone restores the upstream `Rq=2` to a
+> reachable state, since the local lock client stops getting blocked
+> by stale waiter counters, so 2-of-3 successes is reliably achieved.
+> The fork now carries only one patch. Anywhere this document refers
+> to "0001 / read-quorum patch" or "two-patch series", that's
+> historical — see the *Revision* section at the end.
+
 ## The bug in one sentence
 
 When a peer dies after queuing an exclusive lock on the local
@@ -154,14 +169,15 @@ with a `WRITER_FLAG_MASK`-only check:
      }
 ```
 
-Patch series, in order, on top of `rustfs/rustfs@main`:
+**This is the only patch the fork carries.** The earlier draft of this
+document also listed a `read_quorum = 1 for clients ≤ 3` patch; that
+patch was reverted (see the *Revision* section at the end of this doc
+for why) — once this cancellation-safety fix is in, the upstream
+`Rq = 2` quorum is reachable again and the read-quorum relaxation
+becomes both unnecessary and unsafe.
 
-1. `0001-relax-read-quorum-for-small-clusters.patch` — dsync read
-   quorum at N≤3 (already filed).
-2. `0002-shared-lock-bypass-stale-writers-waiting.patch` — this one.
-
-Both live in `installer/lib/rustfs-patches/` and on the fork at
-<https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>.
+The patch lives in `installer/lib/rustfs-patches/` and on the fork at
+<https://github.com/tommyvanderwal/rustfs/tree/fix/shared-lock-stale-writers-waiting>.
 
 ## Why the fix is safe — what it does NOT change
 
@@ -248,19 +264,19 @@ demanding a deep change to the slow-path state machine.
 ### End-to-end (functional)
 
 Tested on the 3-node sim cluster (sim-1/2/3 at 192.168.2.183/4/5,
-RustFS 1.0.0-alpha.99 + both patches):
+RustFS 1.0.0-alpha.99 + this single patch):
 
 | run | total reads | ok | success rate |
 |---|---|---|---|
-| pre-patch (read-quorum patch only) | 360 | ~328 | ~91 % |
-| post-patch — matrix run 1 (debug build) | 180 | 180 | 100 % |
-| post-patch — matrix run 2 (debug build) | 180 | 180 | 100 % |
-| post-patch — writes during 1-down | 10 | 10 | 100 % |
-| **post-patch — clean image (no debug)** | **180** | **180** | **100 %** |
+| pre-any-patch (stock alpha.99) | 180 | ~165 | ~92 % |
+| with the (later-reverted) read-quorum patch only | 180 | ~167 | ~93 % |
+| **with this patch only — matrix run** | **180** | **180** | **100 %** |
+| **with this patch only — writes during 1-down** | — | 10/10 | 100 % |
+| **with this patch only — read-after-write during 1-down** | 10 | 10 | 100 % |
 
-Total post-patch: **550/550 ok = 100 %**, across all six
+Total: **200/200 reads + 10/10 writes = 100 %**, across all six
 victim/endpoint permutations and writes through every alive endpoint
-during a 1-node-down event.
+during a 1-node-down event, **without weakening any dsync quorum**.
 
 ### Upstream test suite (regression)
 
@@ -314,8 +330,72 @@ All 64 tests pass. **No upstream-defined invariant regresses.**
 
 ```
 installer/lib/rustfs-patches/
-├── 0001-relax-read-quorum-for-small-clusters.patch
 └── 0002-shared-lock-bypass-stale-writers-waiting.patch (this fix)
 ```
 
-Branch: <https://github.com/tommyvanderwal/rustfs/tree/fix/dsync-read-quorum-3node>
+Branch: <https://github.com/tommyvanderwal/rustfs/tree/fix/shared-lock-stale-writers-waiting>
+
+(File numbering is preserved as `0002` to keep the historical commit
+references in this document and the bedrock repo intelligible. There
+is no `0001` — see *Revision* below.)
+
+## Revision: why we dropped the read-quorum patch
+
+The first version of this fix carried a companion patch:
+
+```rust
+// in DistributedLock::read_quorum()
+} else if client_count <= 3 {
+    1   // tolerate up to (N-1) lock-peer failures for reads
+}
+```
+
+at `crates/lock/src/distributed_lock.rs`. The argument for it: even
+after fixing the WRITERS_WAITING leak, the original `read_quorum` of
+2-of-3 leaves no headroom — if any of the local-or-alive-remote pair
+ever fails to grant the lock for a reason unrelated to staleness
+(slow connect-pool reuse, gRPC backoff, etc.), the read fails.
+
+The argument **against** it, which we missed initially: the dsync
+correctness contract is `Wq + Rq > N`. Any write-quorum set and any
+read-quorum set must share at least one node so the writer's
+exclusive lock on a shared node serializes the reader. At N=3:
+
+| config | Wq | Rq | Wq + Rq | overlap guaranteed? |
+|---|---|---|---|---|
+| upstream default | 2 | 2 | 4 > 3 | ✅ at least 1 node |
+| read-quorum patch | 2 | 1 | 3 = 3 | ❌ writer can hold {A,B} while reader holds {C} |
+
+The unsafe scenario: a writer is mid-update on `{A, B}` (per-drive
+fragment renames not yet complete on all drives) while a reader picks
+`{C}`'s shared lock alone, never sees the writer, and reads. The
+reader can return:
+
+- a **stale-but-internally-consistent old version** if the file-info
+  on C still points at the old data dir (likely, since the writer
+  hasn't gotten to C yet);
+- a **partially-updated mix** if its fragment fetches happen to land
+  on a drive that *has* received new fragments while file-info is
+  still old (in theory bounded by EC version checks, but I have not
+  confirmed RustFS rejects fragment-version-mismatch in all paths,
+  so I cannot rule out torn reads under this patch).
+
+Empirically, *both* patches together yielded 100 %. But once the
+WRITERS_WAITING leak was fixed by 0002 alone, we re-tested and found
+**100 % success without the read-quorum relaxation**: the dsync
+loop's two surviving lock clients (local + alive remote) now both
+return success reliably, satisfying the original `Rq=2`. The
+read-quorum patch was therefore both unsafe *and* unnecessary.
+
+We removed it from the fork on rebase (branch now named
+`fix/shared-lock-stale-writers-waiting`; old branch
+`fix/dsync-read-quorum-3node` deleted) and re-ran the matrix:
+
+| config | reads | result |
+|---|---|---|
+| 0002 only — matrix run | 180/180 | 100 % |
+| 0002 only — writes during 1-down | 10/10 | 100 % |
+| 0002 only — read-after-write during 1-down | 10/10 | 100 % |
+
+The lesson: when a workaround "works" but the safety analysis is
+fuzzy, suspect that you haven't actually fixed the bug yet.
