@@ -348,24 +348,66 @@ def cmd_storage(args):
         if not peer_drbd:
             print(f"ERROR: peer '{peer_name}' has no drbd_ip in cluster.json")
             return 1
+        peer_host = peer_info.get("host", "")
+        if not peer_host:
+            print(f"ERROR: peer '{peer_name}' has no host in cluster.json")
+            return 1
         print(f"Extending tier-critical to 3-way with peer "
               f"{peer_name} ({peer_drbd})...")
         tier_storage.promote_critical_to_3way(
             {"name": peer_name, "drbd_ip": peer_drbd})
-        # The new peer also needs to bring up its end of the DRBD
-        # resource so it can sync. Drive it via SSH.
-        peer_host = peer_info.get("host", "")
-        if peer_host:
-            print(f"Bringing up tier-critical on {peer_name} for initial sync...")
-            import subprocess as _sp
-            _sp.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no",
-                 f"root@{peer_host}",
-                 "drbdadm create-md --max-peers=7 tier-critical "
-                 "</dev/null 2>/dev/null; drbdadm up tier-critical"],
-                check=False)
+        # The new peer needs to:
+        #   1. Unmount its local /var/lib/bedrock/local/critical (DRBD
+        #      can't open the LV as backing while it's mounted).
+        #   2. Drop the fstab line for that mount.
+        #   3. write_drbd_resource + create-md + drbdadm up (== join_drbd_peer).
+        # Drive it via SSH.
+        full_peers = []
+        for n_name in (
+                tier_storage.load_cluster().get("tiers", {})
+                .get("critical", {}).get("peers", [])):
+            n_info = nodes.get(n_name, {})
+            full_peers.append(
+                {"name": n_name, "drbd_ip": n_info.get("drbd_ip", "")})
+        peer_cmd = (
+            f"bedrock storage _peer-join-tier "
+            f"--tier critical "
+            f"--peers '{json.dumps(full_peers)}'"
+        )
+        print(f"Joining tier-critical on {peer_name} ({peer_host})...")
+        import subprocess as _sp
+        rc = _sp.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no",
+             f"root@{peer_host}", peer_cmd]).returncode
+        if rc != 0:
+            print(f"  peer-side join returned {rc}")
+            return 1
         print("3-way promotion staged. Sync will continue in the "
               "background; check `drbdadm status tier-critical`.")
+        return
+
+    if args.action == "_peer-join-tier":
+        # Internal: called from master to drive peer-side tier join.
+        # Idempotent: unmount is best-effort; create-md is --force.
+        from lib import tier_storage as ts
+        from pathlib import Path as _Path
+        tier = args.tier
+        peers = json.loads(args.peers)
+        local_mount = _Path(f"/var/lib/bedrock/local/{tier}")
+        # 1. Unmount + drop fstab line
+        import subprocess as _sp
+        _sp.run(["umount", str(local_mount)], check=False,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        fstab = _Path("/etc/fstab")
+        if fstab.exists():
+            new = []
+            for line in fstab.read_text().splitlines():
+                if str(local_mount) in line and "tier-" in line:
+                    continue
+                new.append(line)
+            fstab.write_text("\n".join(new).rstrip() + "\n")
+        # 2. Run join (writes .res, create-md, drbdadm up)
+        ts.join_drbd_peer(tier, peers)
         return
 
     if args.action == "transfer-mgmt":
@@ -641,6 +683,9 @@ def main():
     p_pp.add_argument("--rpc-secret", required=True)
     p_pp.add_argument("--admin-token", required=True)
     p_pp.add_argument("--peers", required=True)
+    p_pjt = p_st_sub.add_parser("_peer-join-tier", help=argparse.SUPPRESS)
+    p_pjt.add_argument("--tier", required=True)
+    p_pjt.add_argument("--peers", required=True)
     p_ps = p_st_sub.add_parser("_peer-s3fs", help=argparse.SUPPRESS)
     p_ps.add_argument("--ak", required=True)
     p_ps.add_argument("--sk", required=True)

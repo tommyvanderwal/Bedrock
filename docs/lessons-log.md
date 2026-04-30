@@ -701,3 +701,61 @@ since the local destination supports dir mtimes fine.
 - s3fs-fuse — [POSIX limitations](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Limitations)
   (S3 doesn't model directory metadata)
 - `tier_storage.py` migrate_scratch_into_garage step 1.
+
+---
+
+## L27 — Adding a peer to a DRBD tier requires umount + .res + create-md, not just `drbdadm up`
+**2026-04-30** · clean-rerun Phase 3 (N=2 → N=3 critical promote)
+
+**What we thought:** When the CLI verb `bedrock storage promote-critical-3way <peer>`
+calls `promote_critical_to_3way()` on the master, the master writes the
+new .res with the third peer included, distributes it to the existing
+peers, and updates kernel state. For the new peer side, just running
+`drbdadm create-md ...; drbdadm up` over SSH should be enough.
+
+**What we found:** The new peer ends up in `connection:Connecting` on
+the master and `no resources defined!` locally — because:
+
+1. The new peer's `/etc/drbd.d/tier-critical.res` doesn't exist. The
+   master never sent the config to the new peer (the master-side
+   `promote_critical_to_3way()` distributes only to *existing* peers,
+   per its own comment "the new third peer's join_drbd_peer will write
+   its own"). So `drbdadm` on the new peer has no resource to manage.
+2. Even if the .res were copied verbatim, the new peer's local LV
+   `tier-critical` is still mounted at `/var/lib/bedrock/local/critical`
+   (set up by `setup_n1` during `bedrock join`). DRBD `attach` fails
+   with "Can not open backing device (104)" because the kernel won't
+   let DRBD claim a device that's already mounted.
+3. `bedrock storage init` (which sets up local-LV tiers) and `bedrock
+   storage promote-critical-3way` are sequential operations the
+   operator runs, but the latter must do the *unmount* the former
+   left in place — exactly what `transition_to_n2_peer` does for the
+   N=1→N=2 case.
+
+**What we changed:** Added a hidden `bedrock storage _peer-join-tier
+--tier <t> --peers <json>` CLI subcommand. It (a) unmounts
+`/var/lib/bedrock/local/<tier>`, (b) drops the corresponding fstab
+line, (c) calls `tier_storage.join_drbd_peer(tier, peers)` which
+writes the .res, runs `create-md --force --max-peers=7`, and `drbdadm
+up`. The cluster-wide `promote-critical-3way` SSH-fans-out to the
+new peer with this subcommand, passing the full peer list (existing
++ new).
+
+**Bonus brittleness flagged for follow-up:** the new peer's local
+`render_drbd_res` allocates DRBD node-ids fresh from 0 on each peer's
+*own* `cluster.json`. By accident it matches the master's existing
+allocation as long as `peers` is iterated in the same order on both
+sides. If the master ever has a non-monotonic id assignment (because
+of an earlier remove + re-add), the new peer's ids would diverge.
+Real fix: the master should *push* its tier's `drbd_node_ids` map to
+the new peer's cluster.json before `_peer-join-tier` runs. Logged here
+as a future hardening; not load-bearing for v1.0 since the testbed
+flow always grows monotonically.
+
+**Source:**
+- `tier_storage.py:join_drbd_peer` — the function that should be
+  called on every new peer.
+- `tier_storage.py:transition_to_n2_peer:1088-1100` — reference
+  implementation of "unmount local first, then join_drbd_peer".
+- `tier_storage.py:promote_critical_to_3way:1158-1166` — the existing
+  master-side helper that distributes only to existing peers.
