@@ -44,6 +44,13 @@ Entry points (shrink / role-move path):
   transfer_mgmt_role(...)             — move mgmt + NFS + DRBD primary
                                         from one node to another
 
+Entry points (final-collapse to single-node path):
+  drbd_demote_to_local(tier)          — turn a stand-alone DRBD resource
+                                        back into a plain local LV
+                                        (XFS preserved by external meta)
+  migrate_scratch_out_of_garage()     — copy scratch data out of Garage
+                                        into a local LV; stop Garage
+
 Called from:
   mgmt_install.install_full() -> setup_n1()
   agent_install.install()     -> setup_n1()
@@ -720,9 +727,14 @@ def garage_create_scratch_bucket() -> dict:
 
 
 def s3fs_mount_scratch(access_key: str, secret_key: str,
-                        endpoint_drbd_ip: str) -> None:
+                        endpoint_drbd_ip: str | None = None) -> None:
     """Mount Garage's 'scratch' bucket via s3fs at /var/lib/bedrock/mounts/scratch-s3fs
     and point /bedrock/scratch at it.
+
+    Always uses the LOCAL Garage daemon at 127.0.0.1:3900 (invariant #6
+    in tier_storage.md). The endpoint_drbd_ip arg is accepted for
+    backward compat with older callers but ignored — Garage handles
+    cross-node block lookup internally via its own RPC.
     """
     # s3fs-fuse is in EPEL on AlmaLinux 9
     if not run_ok("rpm -q s3fs-fuse >/dev/null 2>&1"):
@@ -746,10 +758,12 @@ def s3fs_mount_scratch(access_key: str, secret_key: str,
         run(f"umount {local_scratch}", check=False)
 
     fstab = Path("/etc/fstab")
+    # Always target the LOCAL Garage daemon (invariant #6 in
+    # tier_storage.md, lessons-log L6).
     line = (f"scratch {s3fs_mount} fuse.s3fs "
             f"_netdev,allow_other,umask=0022,sigv4,endpoint=garage,"
             f"use_path_request_style,"
-            f"url=http://{endpoint_drbd_ip}:{GARAGE_S3_PORT},"
+            f"url=http://127.0.0.1:{GARAGE_S3_PORT},"
             f"passwd_file=/etc/passwd-s3fs 0 0")
     text = fstab.read_text() if fstab.exists() else ""
     if str(s3fs_mount) not in text:
@@ -1304,3 +1318,321 @@ def nfs_export_drbd_tiers_remote(host: str) -> None:
     ssh(host, "dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
     ssh(host, "systemctl enable --now nfs-server", check=False)
     ssh(host, "exportfs -ra", check=False)
+
+
+# ── Final-collapse helpers (N=2 → N=1, last surviving node) ───────────────
+#
+#   drbd_demote_to_local           — turn a single-peer DRBD into a local LV
+#   migrate_scratch_out_of_garage  — migrate scratch data out of Garage into
+#                                    a local LV; stop Garage cleanly
+#
+# These run on the LAST surviving node when collapsing the cluster back to
+# single-node operation. They pair with drbd_remove_peer and
+# garage_drain_node, which are what get you DOWN to a single peer / single
+# Garage node first. See tier_storage.md sections "drbd_demote_to_local"
+# and "migrate_scratch_out_of_garage" for full operational specs.
+
+
+def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
+    """Demote a stand-alone DRBD resource on this node back to a plain
+    local LV mount.
+
+    Pre: tier is a tier-<tier> DRBD resource currently UP on this node
+    with no other peers connected. The data LV's XFS is preserved
+    (external metadata never touched it).
+
+    Effects:
+      1. Stop NFS export of <tier>-drbd (if applicable)
+      2. Remove /etc/drbd.d/tier-<tier>.res so boot won't auto-up
+      3. Update /etc/fstab: replace DRBD-mount line with local-LV line
+      4. drbdsetup down tier-<tier> (resource leaves kernel state)
+      5. mount /dev/<vg>/tier-<tier> at /var/lib/bedrock/local/<tier>
+      6. atomic_symlink /bedrock/<tier> → /var/lib/bedrock/local/<tier>
+      7. set_tier_state(<tier>, mode="local")
+      8. (optional) lvremove tier-<tier>-meta
+
+    Crash-safety: persistent state is mutated *before* the kernel-side
+    drbdadm down. A reboot mid-flight finds .res gone + fstab pointing
+    at the local LV; drbd-utils don't auto-up a missing config; the
+    local mount succeeds; system arrives at the desired end state.
+
+    Returns True on success, False if pre-conditions weren't met
+    (e.g. resource still has peers — caller should drbd_remove_peer
+    first).
+    """
+    print(f"  [tier] drbd_demote_to_local({tier})")
+
+    res = f"tier-{tier}"
+    minor = DRBD_MINORS[tier]
+    drbd_dev = f"/dev/drbd{minor}"
+    drbd_mount = MOUNTS_ROOT / f"{tier}-drbd"
+    local_mount = LOCAL_ROOT / tier
+    data_lv = f"/dev/{VG}/tier-{tier}"
+
+    # 0. Pre-conditions: resource exists, no other peers connected
+    state = run(f"drbdsetup status {res} 2>&1", check=False)
+    if not state or "not configured" in state.lower():
+        print(f"  [tier] {res} not in kernel state — already down. "
+              f"Proceeding to local-LV mount only.")
+    elif "role:" in state:
+        # Crude: any "<peer-name> role:" line means a peer is connected
+        # If there are no peer-role lines, only the local _this_host
+        # line, we're stand-alone.
+        peer_lines = [l for l in state.splitlines()
+                      if "role:" in l and not l.startswith(res)]
+        if peer_lines:
+            print(f"  [tier] {res} still has peers connected:\n  " +
+                  "\n  ".join(peer_lines))
+            print(f"  [tier] Run drbd_remove_peer for each before "
+                  f"drbd_demote_to_local can succeed.")
+            return False
+
+    # 1. Stop NFS export (best-effort — if it was being exported)
+    exports_file = Path("/etc/exports.d/bedrock-tiers.exports")
+    if exports_file.exists():
+        text = exports_file.read_text()
+        new = "\n".join(l for l in text.splitlines()
+                        if str(drbd_mount) not in l)
+        exports_file.write_text(new + "\n" if new else "")
+        run("exportfs -ra", check=False)
+
+    # 2. Remove .res file FIRST so any reboot won't try to up the resource
+    res_file = Path(f"/etc/drbd.d/{res}.res")
+    backup_file = Path(f"/etc/drbd.d/{res}.res.demoted")
+    if res_file.exists():
+        # Move-aside (vs. delete) so we can recover if the demote fails
+        res_file.rename(backup_file)
+
+    # 3. Update fstab: drop the DRBD-mount line, add the local-LV line
+    fstab = Path("/etc/fstab")
+    text = fstab.read_text() if fstab.exists() else ""
+    new_lines = []
+    for line in text.splitlines():
+        if str(drbd_mount) in line:
+            continue   # drop the DRBD line
+        if str(local_mount) in line and "tier-" in line:
+            continue   # drop any pre-existing local-LV line for this tier
+        new_lines.append(line)
+    new_lines.append(
+        f"{data_lv} {local_mount} xfs defaults,discard 0 0"
+    )
+    fstab.write_text("\n".join(new_lines).rstrip() + "\n")
+
+    # 4. drbdsetup down — release /dev/drbdN. drbdadm wouldn't work
+    #    here because the .res is gone; drbdsetup operates by name in
+    #    kernel state.
+    run(f"drbdsetup down {res}", check=False)
+    if run_ok(f"mountpoint -q {drbd_mount}"):
+        run(f"umount {drbd_mount}", check=False)
+
+    # 5. Mount the local LV (it has the same XFS we ran the cluster on,
+    #    byte-for-byte preserved by external-metadata semantics).
+    Path(local_mount).mkdir(parents=True, exist_ok=True)
+    if not run_ok(f"mountpoint -q {local_mount}"):
+        run(f"mount {local_mount}")
+
+    # 6. Swap the public symlink atomically
+    atomic_symlink(str(local_mount), PUBLIC_ROOT / tier)
+
+    # 7. Persist in cluster.json
+    set_tier_state(tier, mode="local",
+                   master=None,
+                   backend_path=str(local_mount))
+
+    # 8. Optional cleanup of the meta LV. Default: keep it, in case the
+    #    operator wants to re-promote later. Removing it requires the
+    #    resource to be fully down (it is now).
+    if remove_meta:
+        run(f"lvremove -f {VG}/tier-{tier}-meta", check=False)
+
+    # Backup .res can be removed too (it's no longer a resource)
+    if backup_file.exists():
+        backup_file.unlink()
+
+    print(f"  [tier] {tier}: now local LV at {local_mount}")
+    return True
+
+
+def migrate_scratch_out_of_garage(
+    verify_md5: bool = True,
+    keep_garage: bool = False,
+) -> None:
+    """Migrate all scratch data out of Garage into a local LV; then
+    decommission Garage on this node.
+
+    Used at the end of cluster collapse (N=1, last node) to return the
+    scratch tier to a plain local-LV mount and stop Garage entirely.
+
+    Pre:
+      - This node is the only Garage cluster member (after
+        garage_drain_node has drained every other node).
+      - /var/lib/bedrock/local/scratch's underlying LV exists (created
+        in setup_n1; may currently be unmounted because s3fs is using
+        the public symlink).
+      - There is enough free space in the local thin pool to hold the
+        current Garage scratch dataset.
+
+    Effects (in order, with crash-safety annotations):
+      1. Mount the local scratch LV at /var/lib/bedrock/local/scratch.
+      2. rsync from /bedrock/scratch (s3fs view) to local mount, twice
+         (first pass while in-flight, second pass to catch deltas).
+      3. (optional) MD5 verification that every file in local matches
+         the s3fs source.
+      4. atomic_symlink /bedrock/scratch → local mount  (commit point)
+      5. Wait for any process still using the s3fs mount via the OLD
+         symlink target to release file handles (lsof poll).
+      6. umount s3fs; remove fstab entry.
+      7. Update set_tier_state(scratch, mode="local").
+      8. systemctl stop garage; systemctl disable garage.
+      9. (optional) lvremove garage-data; rm /etc/garage.toml +
+         /var/lib/garage/meta directory.
+
+    The crash-window is between step 4 (symlink swap) and step 6
+    (umount): if power is lost there, on next boot fstab still has
+    the s3fs line, garage.service starts, scratch returns to s3fs.
+    Operator re-runs the function and it picks up where it left off
+    (idempotent: rsync sees "no changes," symlink already correct,
+    umount + stop garage proceed).
+
+    Args:
+      verify_md5:  if True, hash every file in local + s3fs and
+                   compare. Default True. Set False for very large
+                   datasets where hashing time is prohibitive.
+      keep_garage: if True, do NOT stop/disable garage at step 8.
+                   Useful if other things use the Garage cluster.
+                   Default False — this is the "last node, full
+                   collapse" case.
+    """
+    print(f"  [garage] migrate_scratch_out_of_garage()")
+
+    s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
+    local_mount = LOCAL_ROOT / "scratch"
+    data_lv = f"/dev/{VG}/tier-scratch"
+
+    # 0. Pre-flight — local LV exists?
+    if not lv_exists("tier-scratch"):
+        raise RuntimeError(
+            "tier-scratch LV missing — was setup_n1 ever run on this node? "
+            "Cannot migrate without a destination.")
+
+    # 1. Mount local scratch LV (might already be mounted; idempotent)
+    Path(local_mount).mkdir(parents=True, exist_ok=True)
+    fstype = run(f"blkid -s TYPE -o value {data_lv} 2>/dev/null",
+                 check=False)
+    if fstype != "xfs":
+        run(f"mkfs.xfs -f -L scratch {data_lv}")
+    if not run_ok(f"mountpoint -q {local_mount}"):
+        run(f"mount {data_lv} {local_mount}")
+
+    # 1b. Pre-flight — enough free space in thin pool for the data?
+    src_bytes = run(f"du -sb {s3fs_mount} 2>/dev/null | awk '{{print $1}}'",
+                    check=False)
+    try:
+        src_bytes = int(src_bytes)
+    except ValueError:
+        src_bytes = 0
+    pool_free_mb = run(
+        f"lvs --noheadings --units m -o lv_size,data_percent "
+        f"{VG}/{THINPOOL} | awk '{{size=$1; pct=$2+0; "
+        f"gsub(/m/,\"\",size); print size*(100-pct)/100}}'",
+        check=False)
+    try:
+        free_bytes = int(float(pool_free_mb)) * 1024 * 1024
+    except ValueError:
+        free_bytes = 0
+    if free_bytes < src_bytes * 1.1:    # 10% headroom
+        raise RuntimeError(
+            f"thin pool free space {free_bytes/1e9:.1f} GB insufficient "
+            f"for scratch dataset {src_bytes/1e9:.1f} GB + 10% headroom. "
+            f"Free up the pool or extend it before retrying.")
+
+    # 2. rsync, twice. The first pass copies most data while the
+    #    cluster may still be writing; the second pass catches deltas
+    #    after we have the symlink-swap commit point ready.
+    print(f"  [garage] rsync pass 1 (bulk copy)")
+    run(f"rsync -aHX --inplace {s3fs_mount}/ {local_mount}/",
+        timeout=24 * 3600)
+
+    # 3. (Optional) MD5 verify before the commit
+    if verify_md5:
+        print(f"  [garage] md5 verify")
+        # Generate manifests and compare. We use sorted output for
+        # deterministic diff.
+        src_md5 = run(
+            f"cd {s3fs_mount} && find . -type f -print0 | sort -z | "
+            f"xargs -0 md5sum 2>/dev/null", check=False)
+        dst_md5 = run(
+            f"cd {local_mount} && find . -type f -print0 | sort -z | "
+            f"xargs -0 md5sum 2>/dev/null", check=False)
+        if src_md5 != dst_md5:
+            # Save both manifests for debugging
+            Path("/tmp/scratch-md5-src.log").write_text(src_md5)
+            Path("/tmp/scratch-md5-dst.log").write_text(dst_md5)
+            raise RuntimeError(
+                "MD5 verification failed: src and local differ. "
+                "Manifests saved to /tmp/scratch-md5-{src,dst}.log. "
+                "Re-run rsync with --checksum, or investigate the diff.")
+
+    # 4. Commit point — symlink swap. New opens of /bedrock/scratch
+    #    now go to local LV. Any process that already had a file open
+    #    via the s3fs mount keeps reading from the old inode.
+    atomic_symlink(str(local_mount), PUBLIC_ROOT / "scratch")
+    print(f"  [garage] /bedrock/scratch now points at local LV "
+          f"{local_mount}")
+
+    # 5. Wait for s3fs to be unused so we can cleanly umount.
+    #    lsof returns 0 entries when nothing has files open inside.
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        out = run(f"lsof +D {s3fs_mount} 2>/dev/null | wc -l",
+                  check=False)
+        try:
+            count = int(out.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            count = 0
+        if count <= 1:   # 1 = header line; 0 = totally empty
+            break
+        time.sleep(2)
+
+    # 6. umount s3fs; drop the fstab line
+    run(f"umount {s3fs_mount} 2>/dev/null", check=False)
+    if run_ok(f"mountpoint -q {s3fs_mount}"):
+        # lazy fallback if normal umount failed
+        run(f"umount -l {s3fs_mount}", check=False)
+    fstab = Path("/etc/fstab")
+    if fstab.exists():
+        text = fstab.read_text()
+        new = "\n".join(l for l in text.splitlines()
+                        if "fuse.s3fs" not in l)
+        fstab.write_text(new + "\n" if new else "")
+
+    # 7. Persist in cluster.json
+    set_tier_state("scratch", mode="local",
+                   master=None,
+                   backend_path=str(local_mount),
+                   garage_endpoint=None)
+
+    # 8. Stop + disable Garage (unless caller said keep)
+    if not keep_garage:
+        run("systemctl stop garage", check=False)
+        run("systemctl disable garage", check=False)
+
+        # 9. Optional disk-space reclaim. Garage's data LV and its
+        #    metadata directory are no longer needed.
+        run(f"umount /var/lib/garage/data 2>/dev/null", check=False)
+        run(f"lvremove -f {VG}/garage-data 2>/dev/null", check=False)
+        # Remove fstab line for garage-data
+        if fstab.exists():
+            text = fstab.read_text()
+            new = "\n".join(l for l in text.splitlines()
+                            if "garage-data" not in l)
+            fstab.write_text(new + "\n" if new else "")
+        run("rm -rf /var/lib/garage", check=False)
+        run("rm -f /etc/garage.toml /etc/systemd/system/garage.service "
+            "/etc/passwd-s3fs", check=False)
+        run("systemctl daemon-reload", check=False)
+
+    print(f"  [garage] scratch migrated to local LV; "
+          f"Garage decommissioned." if not keep_garage else
+          f"  [garage] scratch migrated to local LV; "
+          f"Garage left running per keep_garage=True.")

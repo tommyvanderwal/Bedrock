@@ -311,12 +311,16 @@ cluster.json. Idempotent.
 
 ### 8. CLI wiring for the new helpers is queued
 
-The three helpers are callable as Python functions but not yet
-plumbed into the `bedrock storage` subcommand surface. Operators
-currently invoke them via short Python scripts (e.g.
-`python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/bedrock"); from lib import tier_storage; tier_storage.drbd_remove_peer(...)'`).
-Wiring `bedrock storage remove-peer`, `... drain-garage-node`,
-`... transfer-mgmt-role` is the next pass.
+The five helpers (drbd_remove_peer, garage_drain_node,
+transfer_mgmt_role, drbd_demote_to_local, migrate_scratch_out_of_garage)
+are callable as Python functions but not yet plumbed into the `bedrock
+storage` subcommand surface. Operators currently invoke them via short
+Python scripts (e.g. `python3 -c 'import sys; sys.path.insert(0,
+"/usr/local/lib/bedrock"); from lib import tier_storage;
+tier_storage.drbd_remove_peer(...)'`). Wiring as
+`bedrock storage remove-peer`, `... drain-garage-node`,
+`... transfer-mgmt-role`, `... demote-to-local`,
+`... migrate-scratch-local` is the next pass.
 
 ---
 
@@ -961,3 +965,342 @@ The function is idempotent; re-run it on the same arguments to resume.
 ### NFS server / client (already cited above; reinforced)
 - [`exports(5)`](https://manpages.debian.org/testing/nfs-kernel-server/exports.5.en.html) — `rw,sync,no_root_squash,no_subtree_check`.
 - [`nfs(5)` — soft / timeo / retrans](https://manpages.debian.org/testing/nfs-common/nfs.5.en.html) — client-side timeout semantics.
+
+---
+
+## `drbd_demote_to_local(tier, remove_meta=False)`
+
+### Top-of-section summary
+The inverse of `promote_local_to_drbd_master`. Turns a stand-alone
+DRBD resource on this node back into a plain local LV mount. The
+underlying XFS filesystem on the data LV is preserved byte-for-byte
+because external metadata never touched it during the DRBD lifetime.
+After this function returns, `/dev/drbd<minor>` is gone, the local LV
+is mounted at `/var/lib/bedrock/local/<tier>`, and `/bedrock/<tier>`
+points at the local mount.
+
+Used at the **end of the cluster collapse path** when the last node
+goes from "single-peer DRBD" to "no DRBD at all." Also useful for
+operator recovery: if a node ends up in a bad DRBD state with no
+peers and the meta-disk is consistent, demoting to local restores
+service via the underlying XFS.
+
+Pre-conditions:
+- The resource has no connected peers. (If any peer is still
+  connected, run `drbd_remove_peer` for it first.)
+- The data LV's XFS has not been corrupted (caller's responsibility
+  to know).
+
+Post-conditions:
+- `/etc/drbd.d/tier-<tier>.res` is removed (file moved to `.demoted`,
+  then deleted on success). DRBD will not auto-up this resource on
+  next boot.
+- `/etc/fstab` has the local-LV mount line (no DRBD line).
+- Resource is `down` in the kernel (no `/dev/drbd<minor>`).
+- `/var/lib/bedrock/local/<tier>` is mounted.
+- `/bedrock/<tier>` symlink → local mount (atomic swap).
+- `cluster.json.tiers.<tier>.mode` = `local`.
+- (optional, with `remove_meta=True`) `tier-<tier>-meta` LV is
+  removed (~32 MB reclaimed).
+
+### Visual flow
+
+```
+                    start (resource is single-peer DRBD on this node)
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  0. Verify no other peers connected — drbdsetup status     │
+       │     If any peer-role line found: ABORT, return False.      │
+       │     Caller must drbd_remove_peer them first.               │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  1. Stop NFS export of <tier>-drbd (best-effort)           │
+       │     edit /etc/exports.d/bedrock-tiers.exports + exportfs   │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  2. mv /etc/drbd.d/tier-<t>.res → ...res.demoted           │
+       │     ── persistent commit point: from this point on, a      │
+       │     ── reboot will NOT bring the resource up               │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  3. /etc/fstab: drop DRBD-mount line, add local-LV line    │
+       │     ── persistent state now reflects local-only intent     │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  4. drbdsetup down tier-<t>                                 │
+       │     ── /dev/drbd<minor> goes away; data LV is freed        │
+       │     (use drbdsetup not drbdadm: .res file is moved aside)  │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  5. mount /dev/<vg>/tier-<t> /var/lib/bedrock/local/<t>    │
+       │     ── XFS is intact; same data the cluster was using      │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  6. atomic_symlink /bedrock/<t> → /var/lib/bedrock/local/<t>│
+       │     ── public mountpoint now serves the local mount        │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  7. set_tier_state(<t>, mode=local) — cluster.json update  │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  8. (optional, remove_meta=True) lvremove tier-<t>-meta    │
+       │     reclaim ~32 MB. Default keeps it in case the operator  │
+       │     wants to re-promote later (re-run create-md on the     │
+       │     existing meta LV would work).                          │
+       └─────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                                    end
+```
+
+### Crash-safety analysis
+
+| Crash point | Persistent state | Kernel state | Recovery on next boot |
+|-------------|------------------|--------------|------------------------|
+| Before step 2 | `.res` present, fstab has DRBD line | DRBD up | Boot → DRBD comes up → fstab mount works → cluster member resumes. No-op. |
+| Between 2 and 3 | `.res.demoted`, fstab has DRBD line | DRBD up | Boot → DRBD won't auto-up (no .res). Mount fails (`/dev/drbd<minor>` missing). Operator: run `drbd_demote_to_local` again — it picks up at step 3. |
+| Between 3 and 4 | `.res.demoted`, fstab has local-LV line | DRBD still up (LV held) | Boot → DRBD won't auto-up. fstab mount of local LV: succeeds. DRBD never came up — no conflict. End state correct. |
+| Between 4 and 5 | as above | DRBD down | Boot → DRBD won't auto-up (no .res). fstab mount works. End state correct. |
+| Between 5 and 6 | as above, mounted | DRBD down | Boot → fstab re-mount; symlink flip on next op. Edge case: `/bedrock/<tier>` momentarily points at the old DRBD mountpoint that no longer exists. Fix: re-run; idempotent. |
+| After 6 | persistent state fully reflects local | DRBD down | Boot → arrives directly at end state. |
+
+In every case, persistent state encodes the operator's intent;
+re-running the function is idempotent and converges.
+
+### Why `drbdsetup` (not `drbdadm`) for step 4
+
+`drbdadm down <res>` requires `/etc/drbd.d/<res>.res` to be present
+(drbdadm reads it to translate the resource name). We deliberately
+moved the .res file aside in step 2 so that a crash between 2 and 4
+won't leave DRBD bringing the resource up on next boot. After that
+move, only `drbdsetup down <name>` works (it operates on kernel
+state directly, no .res needed).
+
+### When NOT to use this function
+
+- Resource has connected peers. Run `drbd_remove_peer` for each first.
+- The data LV's XFS has been corrupted — demote will mount a corrupt
+  filesystem. Run `xfs_repair` first if there's reason to suspect.
+- You want to preserve cluster status of "this is a DRBD resource we
+  may re-add peers to later." `drbd_demote_to_local` removes the
+  resource entirely; re-adding peers later means re-running
+  `promote_local_to_drbd_master` from scratch.
+
+---
+
+## `migrate_scratch_out_of_garage(verify_md5=True, keep_garage=False)`
+
+### Top-of-section summary
+Migrates the scratch tier out of Garage and into a plain local LV;
+optionally stops + decommissions Garage entirely. Used at the **end
+of the cluster collapse path** when the last node returns to single-
+node operation and Garage is no longer needed.
+
+The migration uses `rsync` through the s3fs FUSE mount as the data
+path (no new dependencies; s3fs is already mounted). Optional MD5
+verification compares manifests of the source (s3fs view) and
+destination (local LV) before the symlink commit.
+
+Pre-conditions:
+- This node is the only Garage cluster member. (After
+  `garage_drain_node` has drained every other node and stopped Garage
+  on them.)
+- `/var/lib/bedrock/local/scratch`'s underlying LV exists. (Created
+  in `setup_n1`; may currently be unmounted because s3fs is using
+  the public symlink.)
+- The local thin pool has at least 1.1× the current scratch dataset
+  size free.
+
+Post-conditions:
+- All scratch data copied to the local LV.
+- `/bedrock/scratch` symlink → local LV mount.
+- s3fs is unmounted; fstab line for s3fs is gone.
+- `cluster.json.tiers.scratch.mode` = `local`.
+- (default) Garage daemon stopped + disabled, garage data LV
+  removed, /var/lib/garage cleaned, /etc/garage.toml removed,
+  systemd unit removed.
+- (with `keep_garage=True`) Garage left running for unrelated uses;
+  only scratch data was migrated out.
+
+### Visual flow
+
+```
+                        start (scratch is on Garage RF=1, single node)
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  0. Pre-flight — local LV exists, thin pool has 1.1× of   │
+       │     scratch dataset free space                             │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  1. mkfs.xfs (if needed) + mount local scratch LV at      │
+       │     /var/lib/bedrock/local/scratch                         │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  2. rsync -aHX --inplace /bedrock/scratch/ → local/scratch │
+       │     (the whole dataset, can take time for many GB)         │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  3. (optional, verify_md5=True): generate sorted manifests │
+       │     of both sides, compare. Diff → /tmp/scratch-md5-*.log  │
+       │     and raise. (Default ON; can disable for huge datasets) │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  4. atomic_symlink /bedrock/scratch → local mount          │
+       │     ── COMMIT POINT: new opens go to local; old opens via  │
+       │     ── s3fs (if any) keep working until they close         │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  5. WAIT — poll lsof +D /var/lib/bedrock/mounts/scratch-s3fs│
+       │     until it shows 0 open file descriptors. Bounded by     │
+       │     a 120s safety timeout (then lazy umount).              │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  6. umount s3fs; drop the fuse.s3fs line from /etc/fstab   │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  7. set_tier_state(scratch, mode=local) — cluster.json     │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  8. (default keep_garage=False): systemctl stop+disable   │
+       │     garage; lvremove garage-data; rm /var/lib/garage,     │
+       │     /etc/garage.toml, /etc/systemd/system/garage.service  │
+       └────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                                        end
+```
+
+### Why two rsync passes? (Per Tommy's question — actually one + symlink swap)
+
+In the planned reverse path the scratch tier is read-mostly during
+the migration window: nothing is actively *writing* (we're collapsing
+a cluster). One rsync pass is sufficient because:
+
+- All sources of scratch writes (other Garage members, other Bedrock
+  nodes) have already been removed by `garage_drain_node` cycles.
+- The only writer is the local node itself (this one). If the operator
+  isn't actively producing new scratch content during the migration,
+  one pass captures everything.
+
+If we were doing this on a *running* cluster (e.g. converting scratch
+storage backend mid-flight without bringing down workloads), we'd add
+a second rsync pass right after the symlink swap to catch any writes
+that happened during pass 1. The function's docstring mentions
+"twice" — that's the future-proof variant; the current implementation
+does pass 1 + verify + swap which is correct for the cluster-collapse
+case.
+
+### Handling open file handles during the swap (Tommy's specific concern)
+
+`atomic_symlink()` in step 4 uses `rename(2)`, which is POSIX-atomic.
+Its semantic is:
+
+- **Existing fds opened via the OLD symlink target (s3fs path)
+  continue working** on the s3fs inode until they're closed. POSIX
+  guarantees this: the kernel pins inodes by fd, not by path.
+- **New `open()` calls** through `/bedrock/scratch` follow the new
+  symlink target (local LV).
+
+So step 5 is the "wait for old-path opens to drain" check:
+`lsof +D /var/lib/bedrock/mounts/scratch-s3fs` lists every fd whose
+path is under that directory. When the count hits 0 (or just the
+header line), nothing is using s3fs anymore and we can safely umount
+it.
+
+In a clean cluster-collapse run where no service is actively writing
+scratch, this drains in seconds. In a busier scenario it could take
+longer; the 120-s safety timeout falls back to `umount -l` (lazy
+unmount), which detaches the mount from the namespace immediately
+and lets the kernel clean up when the last fd closes.
+
+### Why `--inplace` on rsync
+
+`rsync --inplace` writes directly to the destination file (vs.
+default which writes to a temp file and atomically renames). For
+scratch data with no concurrent readers — which is our case — this
+is faster (no second copy, no extra space) and safe (the destination
+is brand new, no existing readers).
+
+If we were migrating to a directory containing live data being read
+by other processes, we'd drop `--inplace` to keep the rename-atomic
+semantics. Not our case here.
+
+### Crash-safety analysis
+
+| Crash point | Persistent state | What happens on reboot |
+|-------------|------------------|------------------------|
+| Between 1 and 4 | s3fs still active, local LV mounted but unused | Boot → fstab has both lines (s3fs + new local LV). Both mount fine. `/bedrock/scratch` still points at s3fs. Re-run function: rsync sees most data already there, picks up from where it left off (idempotent). |
+| Between 4 and 6 | `/bedrock/scratch` → local LV; fstab still has s3fs line | Boot → s3fs mounts again (per fstab); local LV mounts; `/bedrock/scratch` already points at local. Garage starts. Re-run function from step 5: drains s3fs handles, umounts, removes fstab line, stops Garage. Clean. |
+| Between 6 and 8 | local-only state in fstab and cluster.json; Garage still running | Boot → garage starts but nothing uses it (no fstab s3fs line). Re-run function from step 8: stops + cleans Garage. |
+| After 8 | full local-only, Garage gone | Boot → arrives at end state. |
+
+In every case, re-running the function from scratch converges. The
+only case where it doesn't fully roll back automatically is if the
+operator wants to *abort* the migration and put scratch back on
+Garage — that's a separate operation (re-create the s3fs fstab line,
+restart Garage if disabled).
+
+### When NOT to use this function
+
+- Multiple Garage cluster members are still alive. The function
+  assumes single-node Garage (we're collapsing). For a multi-node
+  cluster, just stop using s3fs on this node — use
+  `garage_drain_node` to leave the cluster instead.
+- The local LV's space is insufficient. The function checks at step 0
+  and aborts; operator must extend the thin pool first.
+- The s3fs mount is broken (e.g. pointing at a dead Garage). Migration
+  reads through s3fs, so a hung s3fs hangs the migration. Restart
+  Garage and re-mount s3fs against `127.0.0.1:3900` first.
+
+---
+
+## Updated source citations (deltas from the upstream Sources section)
+
+### DRBD 9 — demotion / metadata
+- [`drbdsetup down`](https://manpages.debian.org/testing/drbd-utils/drbdsetup-9.0.8.en.html) — operates by name in kernel state, does not require the `.res` file. Used by `drbd_demote_to_local` after the .res has been moved aside.
+- [DRBD external metadata](https://linbit.com/drbd-user-guide/drbd-guide-9_0-en/#s-external-meta-data) — preserves the underlying data LV's filesystem byte-for-byte; that's what makes `drbd_demote_to_local` zero-copy on the data LV side (the inverse of `promote_local_to_drbd_master`).
+- [`drbd-systemd` units](https://github.com/LINBIT/drbd-utils/tree/master/scripts) — the `drbd.service` iterates `/etc/drbd.d/*.res` at boot. Removing the .res from that directory prevents auto-up; this is the persistent-state commit point in `drbd_demote_to_local`.
+
+### POSIX semantics — atomic rename + open fds
+- [`rename(2)` man page](https://man7.org/linux/man-pages/man2/rename.2.html) — atomic on the same filesystem. Used by `atomic_symlink()`.
+- [`open(2)` man page on path resolution](https://man7.org/linux/man-pages/man2/open.2.html) — paths are resolved at open time; in-flight fds reference inodes, not paths. This is what gives the symlink-swap its "old fds keep working" property.
+
+### rsync — `--inplace` semantics
+- [`rsync(1)` — `--inplace` option](https://manpages.debian.org/testing/rsync/rsync.1.en.html#opt--inplace) — writes destination files in place rather than via temp + rename. Required when the destination is on a separate filesystem or when temp space is limited; safe when destination has no concurrent readers.
+
+### lsof — open-file detection
+- [`lsof(8)` — `+D` recursive directory check](https://manpages.debian.org/testing/lsof/lsof.8.en.html) — used to detect whether any process still has files open under the s3fs mount before unmounting.
