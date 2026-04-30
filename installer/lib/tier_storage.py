@@ -28,13 +28,21 @@ Quick model:
 External DRBD metadata is essential: it makes local-LV → DRBD-replicated
 promotion zero-copy (the data LV's XFS is preserved byte-for-byte).
 
-Entry points:
+Entry points (growth path):
   setup_n1()                          — single-node setup; idempotent
   transition_to_n2_master(...)        — N=1 -> N=2 master side
   transition_to_n2_peer(...)          — N=1 -> N=2 peer side
   finalize_n2_garage(...)             — Garage cluster formation
   promote_critical_to_3way(...)       — N=2 -> N=3 critical promote
   s3fs_mount_scratch(...)             — FUSE mount Garage scratch bucket
+
+Entry points (shrink / role-move path):
+  drbd_remove_peer(...)               — online DRBD peer removal
+                                        (LINBIT-blessed adjust flow)
+  garage_drain_node(...)              — graceful Garage node decommission
+                                        (RF=1 safe, per-partition resync)
+  transfer_mgmt_role(...)             — move mgmt + NFS + DRBD primary
+                                        from one node to another
 
 Called from:
   mgmt_install.install_full() -> setup_n1()
@@ -329,24 +337,82 @@ def setup_n1() -> None:
 
 # ── DRBD resource config ───────────────────────────────────────────────────
 
+# ── Persistent DRBD node-id assignments ────────────────────────────────────
+#
+# DRBD node-ids are *permanent* for the lifetime of a resource (see invariant
+# #3 in tier_storage.md). We persist {peer_name: node_id} per resource in
+# /etc/bedrock/cluster.json under tiers.<tier>.drbd_node_ids so that adding,
+# removing, or rewriting peers never renumbers existing peers' IDs.
+
+def get_drbd_node_id(resource: str, peer_name: str) -> int:
+    """Return the persistent node-id for `peer_name` in this resource.
+
+    If the peer has never been seen for this resource, allocate the next
+    free integer (smallest non-negative integer not currently in use AND
+    not previously assigned to any peer in this resource), persist it
+    in cluster.json, and return it.
+
+    Freed IDs (peer removed) are NOT reused until they're explicitly
+    cleared via free_drbd_node_id() — which should happen only after
+    drbdsetup forget-peer has cleaned the meta-disk bitmap slot.
+    """
+    c = load_cluster()
+    tiers = c.setdefault("tiers", {})
+    tier = tiers.setdefault(resource, {"mode": "local", "version": 1})
+    assignments = tier.setdefault("drbd_node_ids", {})
+    if peer_name in assignments:
+        return assignments[peer_name]
+    # Allocate next free
+    used = set(assignments.values())
+    nid = 0
+    while nid in used:
+        nid += 1
+    assignments[peer_name] = nid
+    tier["version"] = tier.get("version", 0) + 1
+    save_cluster(c)
+    return nid
+
+
+def free_drbd_node_id(resource: str, peer_name: str) -> int | None:
+    """Mark this peer's node-id as free for re-use. Call only after
+    drbdsetup forget-peer has cleared the bitmap slot, otherwise a
+    later peer reusing the slot would trigger a forced full-resync.
+    Returns the freed id, or None if the peer was not assigned.
+    """
+    c = load_cluster()
+    tiers = c.setdefault("tiers", {})
+    tier = tiers.setdefault(resource, {})
+    assignments = tier.setdefault("drbd_node_ids", {})
+    nid = assignments.pop(peer_name, None)
+    if nid is not None:
+        tier["version"] = tier.get("version", 0) + 1
+        save_cluster(c)
+    return nid
+
+
 def render_drbd_res(resource: str, minor: int,
                     peers: list[dict]) -> str:
-    """Render a DRBD resource file. peers = [{name, drbd_ip}, ...]."""
+    """Render a DRBD resource file. peers = [{name, drbd_ip}, ...].
+
+    Node-ids are PERSISTED (not renumbered): each peer gets its sticky
+    id from cluster.json, allocated on first sight of that peer.
+    """
     on_blocks = []
-    node_id = 0
+    peer_ids = {}  # for the connection-block render below
     for p in peers:
+        nid = get_drbd_node_id(resource, p["name"])
+        peer_ids[p["name"]] = nid
         on_blocks.append(
             f'  on {p["name"]} {{\n'
-            f'    node-id   {node_id};\n'
+            f'    node-id   {nid};\n'
             f'    device    /dev/drbd{minor};\n'
             f'    disk      /dev/{VG}/tier-{resource};\n'
             f'    meta-disk /dev/{VG}/tier-{resource}-meta;\n'
             f'    address   {p["drbd_ip"]}:{7000 + minor};\n'
             f'  }}\n'
         )
-        node_id += 1
 
-    # Connection mesh between every pair
+    # Connection mesh between every pair (full mesh for N>=2)
     conn_blocks = []
     for i in range(len(peers)):
         for j in range(i + 1, len(peers)):
@@ -376,7 +442,9 @@ def render_drbd_res(resource: str, minor: int,
 
 
 def write_drbd_resource(resource: str, peers: list[dict]) -> None:
-    """Write /etc/drbd.d/tier-<resource>.res based on peer list."""
+    """Write /etc/drbd.d/tier-<resource>.res based on peer list.
+    Honors persistent node-id assignments (see get_drbd_node_id).
+    """
     minor = DRBD_MINORS[resource]
     Path("/etc/drbd.d").mkdir(parents=True, exist_ok=True)
     p = Path(f"/etc/drbd.d/tier-{resource}.res")
@@ -804,3 +872,435 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     run("drbdadm adjust tier-critical")
     set_tier_state("critical", mode="drbd-nfs",
                     peers=[p["name"] for p in peers])
+
+
+# ── Decommissioning helpers ────────────────────────────────────────────────
+#
+# These three helpers implement the "shrink the cluster cleanly" path:
+#
+#   drbd_remove_peer    — remove a peer from a running DRBD resource (config-first)
+#   garage_drain_node   — drain a Garage node's data to surviving nodes (RF=1 safe)
+#   transfer_mgmt_role  — move mgmt + NFS server + DRBD primary to a new node
+#
+# Detailed contracts, invariants, command sequences, and source citations
+# live in tier_storage.md (sections "drbd_remove_peer", "garage_drain_node",
+# "transfer_mgmt_role"). Read those before changing this code.
+
+
+def drbd_remove_peer(
+    resource: str,
+    leaving_peer_name: str,
+    surviving_peers: list[dict],
+    surviving_hosts: list[str],
+) -> None:
+    """LINBIT-blessed online peer removal for a DRBD tier resource.
+
+    Service to /dev/drbd<minor> on the surviving primary stays up. The
+    leaving peer is dropped from kernel state on every survivor via
+    `drbdadm adjust` — which reads the (newly-edited) on-disk config
+    and issues `drbdsetup del-peer` for the now-missing peer.
+
+    Args:
+        resource:         tier name (e.g. "bulk" or "critical")
+        leaving_peer_name: peer's hostname as it appears in the .res
+        surviving_peers:  list of {"name": ..., "drbd_ip": ...} for the
+                          peers that REMAIN. Their persistent node-ids
+                          are honored — none of their connections are
+                          touched.
+        surviving_hosts:  list of mgmt-LAN hosts (or any reachable IP)
+                          to SSH into for the per-node operations
+
+    Crash-safety: the on-disk config is rewritten + distributed BEFORE
+    drbdadm adjust applies it. A power loss between distribute and
+    apply leaves persistent state already at the desired end state;
+    `drbdadm up` on next boot reconciles correctly.
+
+    See tier_storage.md "drbd_remove_peer" for the command-by-command
+    breakdown and source citations.
+    """
+    print(f"  [tier] drbd_remove_peer({resource}, leaving={leaving_peer_name})")
+
+    # 1. Render new config WITHOUT the leaving peer; persistent node-ids
+    #    of survivors are preserved (render_drbd_res reads cluster.json).
+    write_drbd_resource(resource, surviving_peers)
+    new_res = Path(f"/etc/drbd.d/tier-{resource}.res").read_text()
+
+    # 2. Distribute identical config to every surviving host. We assume
+    #    sshable as root via id_ed25519 (set up at cluster init).
+    for host in surviving_hosts:
+        # Use base64 to avoid quoting headaches with the resource body
+        import base64
+        b = base64.b64encode(new_res.encode()).decode()
+        ssh(host, f"echo {b} | base64 -d > /etc/drbd.d/tier-{resource}.res")
+
+    # 3. Dry-run on each survivor; abort if adjust would do anything
+    #    other than del-peer for the leaving peer (and possibly
+    #    disconnect, which is implicit in del-peer per drbd-utils).
+    leaving_id = (load_cluster().get("tiers", {}).get(resource, {})
+                  .get("drbd_node_ids", {}).get(leaving_peer_name))
+    for host in surviving_hosts:
+        out = ssh(host, f"drbdadm --dry-run adjust tier-{resource}",
+                  check=False)
+        # Empty output is fine (no changes needed). Non-empty must
+        # only mention del-peer (or disconnect) for the leaving id.
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            allowed = ("del-peer", "disconnect", "del-path", "down")
+            if not any(tok in line for tok in allowed):
+                raise RuntimeError(
+                    f"adjust dry-run on {host} would do unexpected work: "
+                    f"{line!r}. Aborting peer removal — investigate before "
+                    f"forcing.")
+
+    # 4. Apply on each survivor. drbdadm adjust issues del-peer to the
+    #    kernel for any kernel-side connection without a matching
+    #    config entry. /dev/drbdN stays up the whole time.
+    for host in surviving_hosts:
+        ssh(host, f"drbdadm adjust tier-{resource}")
+
+    # 5. Free the meta-disk bitmap slot. Optional but recommended: a
+    #    later distinct peer added to this resource can reuse the
+    #    cleared slot via a bitmap-based resync rather than a full
+    #    sync. Run on every survivor.
+    if leaving_id is not None:
+        for host in surviving_hosts:
+            ssh(host,
+                f"drbdsetup forget-peer tier-{resource} {leaving_id}",
+                check=False)
+        # Drop the persistent assignment so future add can re-allocate
+        free_drbd_node_id(resource, leaving_peer_name)
+
+    # 6. Persist updated peer list in cluster.json
+    set_tier_state(resource, mode="drbd-nfs",
+                   peers=[p["name"] for p in surviving_peers])
+    print(f"  [tier] drbd_remove_peer({resource}): done. "
+          f"{len(surviving_peers)} peers remain.")
+
+
+def garage_drain_node(
+    departing_node_id_short: str,
+    surviving_admin_host: str,
+    departing_node_admin_host: str,
+    poll_seconds: int = 5,
+    max_wait_seconds: int = 7200,
+) -> None:
+    """Garage-blessed online node decommission.
+
+    Drains a Garage node's data to its peers via Garage's own per-
+    partition block-resync worker. Works at any replication factor
+    INCLUDING RF=1 — Garage's resync mechanism is offload-then-delete:
+    blocks are copied to their new owner BEFORE being deleted from
+    the source, so reads stay correct throughout the transition (the
+    multi-version layout history continues to direct reads to the
+    departing node until each block has been copied).
+
+    Args:
+        departing_node_id_short: 16-char short node id of the leaving Garage daemon
+        surviving_admin_host:    mgmt-LAN host of any surviving node
+                                 (used to issue layout commands; Garage
+                                 propagates them)
+        departing_node_admin_host: mgmt-LAN host of the departing node
+                                 (where we observe + speed up the resync
+                                 worker, and ultimately stop the daemon)
+        poll_seconds:           how often to poll worker state
+        max_wait_seconds:       safety timeout
+
+    Pre: surviving_admin_host can ssh to departing_node_admin_host.
+
+    See tier_storage.md "garage_drain_node" for the command-by-command
+    breakdown and source citations to Garage's block_resync worker.
+    """
+    print(f"  [garage] drain {departing_node_id_short}")
+
+    g = "sudo -u garage /usr/local/bin/garage"
+
+    # 1. Stage the layout removal + apply. Garage assigns this node's
+    #    partitions to surviving nodes in the new layout version.
+    ssh(surviving_admin_host, f"{g} layout remove {departing_node_id_short}")
+
+    # Determine the next layout version
+    show = ssh(surviving_admin_host, f"{g} layout show")
+    next_version = 1
+    for line in show.splitlines():
+        if "layout version" in line.lower():
+            try:
+                next_version = int(line.split(":")[1].strip()) + 1
+                break
+            except (IndexError, ValueError):
+                pass
+
+    ssh(surviving_admin_host,
+        f"{g} layout apply --version {next_version}")
+
+    # 2. Speed up the resync workers on the DEPARTING node (where the
+    #    blocks live). Default tranquility throttles for impact-friendly
+    #    operation; for a controlled drain we want it to drain fast.
+    ssh(departing_node_admin_host,
+        f"{g} worker set resync-tranquility 0", check=False)
+    ssh(departing_node_admin_host,
+        f"{g} worker set resync-worker-count 8", check=False)
+
+    # 3. Wait for all "Block resync" workers on the departing node to
+    #    show Idle with Queue=0. This is the indicator that all blocks
+    #    have been copied to their new owners and the source can be
+    #    safely retired.
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        out = ssh(departing_node_admin_host, f"{g} worker list",
+                  check=False)
+        # Parse "Block resync worker #N" lines, check State and Queue
+        # columns. Format (v2.x):
+        #   TID  State  Name                    Tranq  Done  Queue ...
+        all_idle = True
+        any_resync = False
+        for line in out.splitlines():
+            if "Block resync worker" not in line:
+                continue
+            any_resync = True
+            cols = line.split()
+            if len(cols) < 6:
+                continue
+            state = cols[1]
+            queue = cols[5]
+            if state != "Idle" or (queue not in ("0", "-")):
+                all_idle = False
+                break
+        if any_resync and all_idle:
+            break
+        time.sleep(poll_seconds)
+    else:
+        raise RuntimeError(
+            f"garage drain timeout after {max_wait_seconds}s — "
+            f"workers still not Idle. Investigate before stopping the node.")
+
+    # 4. Verify no errored blocks. Any block in the error queue means
+    #    we have a candidate for actual data loss.
+    errs = ssh(departing_node_admin_host, f"{g} block list-errors",
+               check=False)
+    err_lines = [l for l in errs.splitlines() if l.strip()
+                 and not l.startswith("Hash")]
+    if err_lines:
+        raise RuntimeError(
+            f"garage block list-errors not empty on {departing_node_admin_host}: "
+            f"{len(err_lines)} entries. NOT safe to remove node yet.")
+
+    # 5. Run repair on the whole cluster to ensure metadata tables and
+    #    block references are consistent. Garage docs recommend this
+    #    after layout changes. Idempotent.
+    ssh(surviving_admin_host,
+        f"{g} repair --all-nodes --yes tables", check=False)
+    ssh(surviving_admin_host,
+        f"{g} repair --all-nodes --yes blocks", check=False)
+
+    # 6. NOW it is safe to stop Garage on the departing node.
+    ssh(departing_node_admin_host, "systemctl stop garage", check=False)
+    ssh(departing_node_admin_host, "systemctl disable garage",
+        check=False)
+
+    print(f"  [garage] drain complete. Surviving cluster has all data.")
+
+
+def transfer_mgmt_role(
+    old_master_host: str,
+    new_master_host: str,
+    new_master_drbd_ip: str,
+    other_peer_hosts: list[str],
+    old_master_drbd_ip: str | None = None,
+) -> None:
+    """Move the mgmt + NFS-server + DRBD-primary role to a new node.
+
+    Ten-step playbook (see tier_storage.md "transfer_mgmt_role"):
+
+      1. Verify new master's DRBD secondaries are UpToDate (won't
+         promote stale data)
+      2. Stop bedrock-{mgmt,vm,vl} + nfs-server on old master
+      3. Unmount + drbdadm secondary on old master
+      4. drbdadm primary + mount on new master
+      5. rsync /opt/bedrock/{mgmt,iso,data,bin} from old → new
+      6. Copy systemd unit files; daemon-reload on new
+      7. Configure NFS exports + start nfs-server on new
+      8. Start bedrock-vl, bedrock-vm, bedrock-mgmt on new
+      9. SSH-fanout to other peers: replace NFS server IP in fstab,
+         remount NFS clients
+     10. Update /bedrock/<tier> symlinks; update cluster.json on every
+         node to reflect new master
+
+    Crash-safety: each on-disk write (fstab, exports, systemd units,
+    cluster.json) is committed before the kernel-side step that
+    depends on it. A power loss mid-flight leaves persistent state
+    consistent with whichever step had committed by then; running this
+    function again is idempotent and resumes correctly.
+
+    Args:
+        old_master_host:    current master mgmt-LAN address (must be
+                            ssh-reachable for the rsync; can be skipped
+                            if old master is already down — see special
+                            case below)
+        new_master_host:    new master mgmt-LAN address
+        new_master_drbd_ip: new master's IP on the DRBD ring (10.99.0.x)
+        other_peer_hosts:   mgmt-LAN addresses of every OTHER cluster
+                            node (not old master, not new master) — they
+                            need their NFS clients re-pointed
+        old_master_drbd_ip: old master's IP on the DRBD ring; if None,
+                            looked up from cluster.json
+    """
+    print(f"  [mgmt] transfer mgmt+NFS role: {old_master_host} → {new_master_host}")
+
+    # 0. Resolve old master's DRBD ip if not given (needed for fstab sed)
+    if old_master_drbd_ip is None:
+        c = load_cluster()
+        for node in c.get("nodes", {}).values():
+            if node.get("host") == old_master_host:
+                old_master_drbd_ip = node.get("drbd_ip", "")
+                break
+        if not old_master_drbd_ip:
+            raise RuntimeError(
+                f"could not resolve drbd ip for old master {old_master_host}")
+
+    # 1. Verify new master's DRBD secondaries are UpToDate
+    for tier in ("bulk", "critical"):
+        out = ssh(new_master_host, f"drbdadm status tier-{tier}",
+                  check=False)
+        if "disk:UpToDate" not in out:
+            raise RuntimeError(
+                f"new master {new_master_host}'s tier-{tier} is not "
+                f"UpToDate; refusing to promote.\n{out}")
+
+    # 2. Stop services on old master (best-effort: may already be down)
+    ssh(old_master_host,
+        "systemctl stop bedrock-mgmt bedrock-vm bedrock-vl "
+        "mnt-isos.mount nfs-server",
+        check=False)
+
+    # 3. Unmount + secondary on old master
+    for tier in ("bulk", "critical"):
+        ssh(old_master_host,
+            f"umount /var/lib/bedrock/mounts/{tier}-drbd",
+            check=False)
+        ssh(old_master_host, f"drbdadm secondary tier-{tier}", check=False)
+
+    # 4. Promote new master + mount the DRBD-backed XFS
+    for tier in ("bulk", "critical"):
+        ssh(new_master_host, f"drbdadm primary tier-{tier}")
+        minor = DRBD_MINORS[tier]
+        mount = f"/var/lib/bedrock/mounts/{tier}-drbd"
+        ssh(new_master_host, f"mkdir -p {mount}")
+        ssh(new_master_host, f"mount /dev/drbd{minor} {mount}",
+            check=False)
+        # Idempotent fstab line on new master (DRBD device, not NFS)
+        device = f"/dev/drbd{minor}"
+        ssh(new_master_host,
+            f"grep -q '{mount}' /etc/fstab || echo "
+            f"'{device} {mount} xfs defaults,discard,nofail,_netdev 0 0' "
+            f">> /etc/fstab")
+
+    # 5. rsync /opt/bedrock/{mgmt,iso,data,bin} from old → new (via
+    #    new master pulling from old; consistent with our other
+    #    rsync-pull patterns).
+    for sub in ("mgmt", "iso", "data", "bin"):
+        ssh(new_master_host,
+            f"mkdir -p /opt/bedrock/{sub} && "
+            f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
+            f"root@{old_master_host}:/opt/bedrock/{sub}/ "
+            f"/opt/bedrock/{sub}/", check=False)
+    # scrape.yml + any top-level singletons
+    ssh(new_master_host,
+        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+        f"root@{old_master_host}:/opt/bedrock/scrape.yml "
+        f"/opt/bedrock/ 2>/dev/null", check=False)
+
+    # 6. Copy systemd unit files. mnt-isos.mount and the bedrock-*
+    #    units are idempotent if pre-existing (rsync overwrites).
+    for unit in ("bedrock-mgmt.service", "bedrock-vm.service",
+                 "bedrock-vl.service", "mnt-isos.mount"):
+        ssh(new_master_host,
+            f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+            f"root@{old_master_host}:/etc/systemd/system/{unit} "
+            f"/etc/systemd/system/{unit}", check=False)
+    ssh(new_master_host, "systemctl daemon-reload")
+
+    # 7. NFS exports on new master
+    nfs_export_drbd_tiers_remote(new_master_host)
+
+    # 8. Start mgmt + metrics services on new master
+    ssh(new_master_host,
+        "systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt "
+        "mnt-isos.mount", check=False)
+
+    # 9. Re-point NFS clients on every other peer
+    for peer in other_peer_hosts:
+        ssh(peer,
+            f"sed -i 's|{old_master_drbd_ip}:/var/lib/bedrock/mounts/|"
+            f"{new_master_drbd_ip}:/var/lib/bedrock/mounts/|g' /etc/fstab")
+        # Also update the ISO library NFS mount unit if present
+        ssh(peer,
+            f"sed -i 's|{old_master_host}:/opt/bedrock/iso|"
+            f"{new_master_host}:/opt/bedrock/iso|g' "
+            f"/etc/systemd/system/mnt-isos.mount", check=False)
+        ssh(peer, "systemctl daemon-reload", check=False)
+        for tier in ("bulk", "critical"):
+            ssh(peer,
+                f"umount /var/lib/bedrock/mounts/{tier}-nfs", check=False)
+            ssh(peer,
+                f"mount /var/lib/bedrock/mounts/{tier}-nfs", check=False)
+
+    # 10. Symlink swaps: new master goes to local DRBD mount; old
+    #     master (if reachable) goes to NFS-from-new-master.
+    for tier in ("bulk", "critical"):
+        ssh(new_master_host,
+            f"ln -sfn /var/lib/bedrock/mounts/{tier}-drbd /bedrock/{tier}.tmp && "
+            f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
+            check=False)
+        # Old master, if reachable, becomes a peer; symlink to NFS mount
+        ssh(old_master_host,
+            f"mkdir -p /var/lib/bedrock/mounts/{tier}-nfs && "
+            f"grep -q '{tier}-nfs' /etc/fstab || echo "
+            f"'{new_master_drbd_ip}:/var/lib/bedrock/mounts/{tier}-drbd "
+            f"/var/lib/bedrock/mounts/{tier}-nfs nfs "
+            f"rw,nolock,soft,timeo=50,retrans=3,_netdev,nofail 0 0' "
+            f">> /etc/fstab && "
+            f"mount /var/lib/bedrock/mounts/{tier}-nfs && "
+            f"ln -sfn /var/lib/bedrock/mounts/{tier}-nfs /bedrock/{tier}.tmp && "
+            f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
+            check=False)
+
+    # 11. Update cluster.json on the new master + propagate
+    new_master_name = ssh(new_master_host,
+                          "hostname --fqdn 2>/dev/null || hostname",
+                          check=False).strip()
+    for host in [new_master_host] + other_peer_hosts:
+        ssh(host,
+            f"python3 -c 'import json; from pathlib import Path; "
+            f"p=Path(\"/etc/bedrock/cluster.json\"); "
+            f"c=json.loads(p.read_text()) if p.exists() else {{}}; "
+            f"c.setdefault(\"tiers\",{{}}); "
+            f"[c[\"tiers\"].setdefault(t,{{}}).update("
+            f"{{\"master\":\"{new_master_name}\"}}) for t in (\"bulk\",\"critical\")]; "
+            f"p.write_text(json.dumps(c, indent=2))'",
+            check=False)
+
+    print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
+
+
+def nfs_export_drbd_tiers_remote(host: str) -> None:
+    """Set up NFS exports for tier-bulk/critical on a remote host.
+
+    The remote variant of nfs_export_drbd_tiers — used by
+    transfer_mgmt_role. Idempotent.
+    """
+    exports = (
+        "/var/lib/bedrock/mounts/bulk-drbd     "
+        "192.168.2.0/24(rw,sync,no_root_squash,no_subtree_check) "
+        "10.99.0.0/24(rw,sync,no_root_squash,no_subtree_check)\n"
+        "/var/lib/bedrock/mounts/critical-drbd "
+        "192.168.2.0/24(rw,sync,no_root_squash,no_subtree_check) "
+        "10.99.0.0/24(rw,sync,no_root_squash,no_subtree_check)\n"
+    )
+    import base64
+    b = base64.b64encode(exports.encode()).decode()
+    ssh(host, "mkdir -p /etc/exports.d")
+    ssh(host, f"echo {b} | base64 -d > /etc/exports.d/bedrock-tiers.exports")
+    ssh(host, "dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
+    ssh(host, "systemctl enable --now nfs-server", check=False)
+    ssh(host, "exportfs -ra", check=False)

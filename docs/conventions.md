@@ -34,25 +34,52 @@ need a companion `.md`.
 ## Rule 2 — `<module>.md` describes the CURRENT implementation, not the journey
 
 The companion `.md` is a *clean reference* for the code as it stands
-today. A new reviewer should be able to read it and understand:
+today. It will be **significantly longer than the source code itself**
+because the WHY needs as much room as the WHAT. The audience is **4+
+human reviewers AND 4+ LLM-AI reviewers** trying to find bad reachable
+states; both groups benefit from explicit invariants, ASCII diagrams of
+relationships, and traceable citations.
 
-- **What this module does** — high-level purpose
-- **Design invariants** — what each operation must preserve. *This is
-  the section that lets a reviewer reason about "can this reach a bad
-  state?"* Make invariants explicit.
-- **Where state lives** — table of every persistent / runtime state
-  location, who owns it, when it changes
-- **Operations** — per-function contracts: pre-conditions, what it
-  changes, post-conditions, crash-safety properties
-- **Known issues / current limitations** — gaps the reviewer should
-  know about (avoid surprises)
-- **Why each design choice** — rationale for non-obvious calls, with
-  enough context that we can revisit them sensibly later
-- **Sources** — at the bottom, every external claim cited (man pages,
-  vendor docs, source code with file:line, RFCs)
+Required structure:
 
-The `.md` is **revised in place** as the code changes. It must stay
-in sync with the implementation; an out-of-date spec is worse than no
+1. **Top-of-file summary** — read-this-first paragraph that gives a
+   reader everything they need to know to correctly call into / start
+   this module. Entry points, prerequisites, basic operating model.
+   If a caller never reads past the summary, they should still use
+   the module correctly.
+
+2. **ASCII diagrams where they clarify** — relationships,
+   dependencies, control flow, data flow. Diagrams beat prose for
+   "what calls what" and "what state goes where." Use boxes,
+   arrows, indented trees — whatever maps naturally to the structure.
+
+3. **Design invariants** — what each operation must preserve. *This
+   is the section that lets a reviewer reason about "can this reach a
+   bad state?"* Make invariants explicit; one numbered invariant per
+   load-bearing property.
+
+4. **Where state lives** — table of every persistent / runtime state
+   location, who owns it, when it changes.
+
+5. **Operations (functions / CLI commands) explained in detail** —
+   per-entry-point contract: pre-conditions, what it changes, the
+   exact sequence of underlying commands, post-conditions, crash-safety
+   properties. This is where the bulk of the document lives.
+
+6. **Known issues / current limitations** — gaps the reviewer should
+   know about (avoid surprises).
+
+7. **Why each design choice** — rationale for non-obvious calls, with
+   enough context that we can revisit them sensibly later.
+
+8. **Sources** — at the bottom, every external behavioral claim cited
+   to its primary source: man pages, vendor docs (linked to the
+   relevant section), source code with file:line and ideally a
+   permalink, RFCs. *The goal is that any reviewer can independently
+   verify each step against authoritative material.*
+
+The `.md` is **revised in place** as the code changes. It must stay in
+sync with the implementation; an out-of-date spec is worse than no
 spec.
 
 ## Rule 3 — The journey lives in `docs/lessons-log.md` (separate)
@@ -102,11 +129,23 @@ with a citation. Sources go at the bottom of the `.md` under the
 Avoid blog posts and Stack Overflow as primary sources unless they're
 the only available source for a niche behavior.
 
-## Rule 6 — Code comments are *not* a substitute
+## Rule 6 — Code comments stay; they're complementary to the `.md`
 
-Code comments explain local subtleties at the line level. The `.md`
-explains the design at the system level. Don't try to embed system-
-level rationale in inline comments; it doesn't survive refactoring.
+Code comments are valuable and stay in the source. **High-level
+remarks, function-level intent, hints, and short clarifications belong
+in code** — they're what a reader sees first when they jump to a
+function. The `.md` is for the *extensive* explanation: the full
+sequence, every command, every invariant, every citation.
+
+A good rule of thumb:
+
+- A 1–3 line comment above a function explaining intent: yes
+- A short comment beside a non-obvious line: yes
+- A multi-paragraph commentary embedded in the source: no — that
+  belongs in the `.md`
+
+The `.md` and the code comments are aimed at different reading modes
+(skim-the-code vs. study-the-design), and both are valuable.
 
 ## What to do when adding a new Python action module
 

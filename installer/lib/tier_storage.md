@@ -252,17 +252,20 @@ Requires EPEL on AlmaLinux 9 (`s3fs-fuse` is not in stock repos).
 
 ## Known issues / current limitations
 
-### 1. `render_drbd_res()` renumbers node-ids on every call
+### 1. ~~`render_drbd_res()` renumbers node-ids on every call~~  **FIXED**
 
-Currently the function assigns node-ids by `enumerate(peers)` order —
-which means rewriting the config with a different peer set causes every
-peer's node-id to potentially change. This conflicts with invariant #3
-(node-ids are permanent). Symptom: `drbdadm adjust` fails with "peer
-node id cannot be my own node id" and other cryptic errors.
+`render_drbd_res()` now reads persistent assignments from
+`cluster.json.tiers.<tier>.drbd_node_ids` via `get_drbd_node_id()`. New
+peers get the next free integer; existing peers keep their id forever;
+freed slots are not reused until `forget-peer` clears the bitmap (then
+explicit `free_drbd_node_id()` removes from the map).
 
-**Fix queued:** persist `tiers.<tier>.drbd_node_ids = {peer_name: id}` in
-`cluster.json`, pass it into `render_drbd_res()`. New peers get the next
-free integer; existing peers keep their assigned id forever.
+**Caveat for the existing testbed:** any DRBD resource that was created
+*before* this fix may have kernel state with one set of node-ids and a
+new on-disk config with a different set. `drbdadm adjust` will fail on
+those resources. One-time fix: read kernel state via `drbdsetup show
+<res>`, populate `cluster.json.tiers.<tier>.drbd_node_ids` to match,
+then re-render the config.
 
 ### 2. `transition_to_n2_peer` re-uses sim-1's data path mounts
 
@@ -285,24 +288,35 @@ distribute, run `drbdadm --dry-run adjust`, then `drbdadm adjust`. The
 current implementation does this in spirit but doesn't perform the
 dry-run safety check.
 
-### 5. No `drbd_remove_peer()` yet
+### 5. ~~No `drbd_remove_peer()` yet~~  **IMPLEMENTED**
 
-Removing a peer from a running resource is a planned function. Design
-sketch in [`docs/scenarios/storage-tiers-deep-dive-2026-04-30.md`](../../docs/scenarios/storage-tiers-deep-dive-2026-04-30.md).
-Will follow the LINBIT-blessed `drbdadm adjust` flow with `drbdsetup`
-fallback for cases where the on-disk config has already diverged from
-kernel state.
+See section "drbd_remove_peer" below. Uses LINBIT-blessed config-edit
++ `drbdadm --dry-run adjust` + `drbdadm adjust` flow. Aborts on
+unexpected dry-run output.
 
-### 6. No `garage_drain_node()` yet
+### 6. ~~No `garage_drain_node()` yet~~  **IMPLEMENTED**
 
-Removing a Garage node currently requires manual operator steps (layout
-remove + apply + watch worker queue + repair). Should be wrapped as a
-function with proper waiting and verification.
+See section "garage_drain_node" below. Polls `garage worker list`
+until all `Block resync` workers Idle with Queue=0; verifies
+`block list-errors` empty before stopping the daemon; runs
+`garage repair tables` and `... blocks` after.
 
-### 7. No `transfer_mgmt_role()` yet
+### 7. ~~No `transfer_mgmt_role()` yet~~  **IMPLEMENTED**
 
-Failing over the mgmt + NFS-server role between nodes is currently
-manual (rsync /opt/bedrock, copy systemd units, repoint NFS clients).
+See section "transfer_mgmt_role" below. Ten-step playbook: stop
+services on old, demote DRBD, promote on new, mount, rsync mgmt
+files, copy systemd units, configure exports, start services,
+re-point NFS clients on every other peer, swap symlinks, update
+cluster.json. Idempotent.
+
+### 8. CLI wiring for the new helpers is queued
+
+The three helpers are callable as Python functions but not yet
+plumbed into the `bedrock storage` subcommand surface. Operators
+currently invoke them via short Python scripts (e.g.
+`python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/bedrock"); from lib import tier_storage; tier_storage.drbd_remove_peer(...)'`).
+Wiring `bedrock storage remove-peer`, `... drain-garage-node`,
+`... transfer-mgmt-role` is the next pass.
 
 ---
 
@@ -400,3 +414,550 @@ abstraction works at any cluster size with the same client code.
 
 ### Linux atomic operations
 - [`rename(2)` man page](https://man7.org/linux/man-pages/man2/rename.2.html) — atomic across single filesystem; basis for `atomic_symlink()`.
+
+---
+
+## Visual reference — relationships and dependencies
+
+### Overall data plane at N=4
+
+```
+  every node:                                    mgmt+NFS-server (master) only:
+  ┌────────────────────────────────┐             ┌──────────────────────────────────┐
+  │ /bedrock/scratch ─── symlink ──┼─→ s3fs FUSE │ /bedrock/{bulk,critical} symlink │
+  │                                │   to local  │   ── local DRBD-backed XFS mount │
+  │ /bedrock/bulk    ─── symlink ──┼─→ NFS mount │      ↓                           │
+  │ /bedrock/critical── symlink ──┼─→ NFS mount  │   /dev/drbd1100 (tier-bulk)      │
+  │                                │   from      │   /dev/drbd1101 (tier-critical)  │
+  │ Garage daemon  :3900 :3901 :3903│   master    │      ↓ (sync over 10.99.0.x)     │
+  └─────────┬──────────────────────┘             └──────────────────────────────────┘
+            │
+            │ Garage internal RPC (per-partition routing)
+            ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Garage cluster — every node holds its share of partitions (RF=1)       │
+  │  Each block lives on exactly one node; cross-node lookup via RPC.       │
+  └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Where state lives at a glance
+
+```
+ ┌──────────────────── ON DISK (source of truth on reboot) ────────────────────┐
+ │                                                                              │
+ │  /etc/bedrock/cluster.json     ← cluster topology, tier modes,               │
+ │      ├── nodes.<name>.{host,drbd_ip,role,pubkey,...}                        │
+ │      └── tiers.<tier>.                                                       │
+ │              {mode,master,peers,backend_path,version,                        │
+ │               drbd_node_ids:{<peer_name>:<int>}}     ← persistent IDs        │
+ │                                                                              │
+ │  /etc/bedrock/state.json      ← per-node identity (mgmt_url, hardware)      │
+ │  /etc/drbd.d/tier-<t>.res     ← DRBD resource configs (identical on all)    │
+ │  /etc/exports.d/bedrock-tiers.exports  ← NFS exports (master only)          │
+ │  /etc/fstab                   ← mounts (every node, slightly different)     │
+ │  /etc/garage.toml             ← Garage daemon config (identical on all)     │
+ │  /etc/passwd-s3fs             ← s3fs creds (every node)                     │
+ │                                                                              │
+ │  /var/lib/garage/{meta,data}  ← Garage's persistent storage                 │
+ │  /dev/bedrock/tier-<t>        ← XFS data LV (DRBD-backed at N>=2)          │
+ │  /dev/bedrock/tier-<t>-meta   ← DRBD external meta LV                       │
+ └──────────────────────────────────────────────────────────────────────────────┘
+
+ ┌──────────────────── IN MEMORY / KERNEL (rebuilt on boot) ───────────────────┐
+ │                                                                              │
+ │  DRBD kernel state            ← reconciled from /etc/drbd.d/* on `up`       │
+ │      _peer_node_id assignments are PERMANENT once allocated                 │
+ │  NFS kernel state             ← reconciled from /etc/exports.d/* on        │
+ │                                  `exportfs -ra`                              │
+ │  Mount points                 ← reconciled from /etc/fstab on `mount -a`    │
+ │  Garage layout                ← persisted internally by Garage; gossiped    │
+ │                                  cluster-wide                                │
+ │  /bedrock/<tier> symlinks     ← persisted as filesystem objects             │
+ │                                  (atomic_symlink uses rename(2))             │
+ └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Crash-safety invariant in one diagram
+
+```
+            t = 0         t = 1               t = 2 (commit)        t = 3
+            ─────         ─────               ─────                 ─────
+state on    OLD config    NEW config (just    NEW config            NEW config
+disk:                     written)
+                          ─ if power lost     ─ if power lost
+                          here, on next       here, on next
+                          boot the kernel     boot the kernel
+                          will reconcile      will already be
+                          to NEW              consistent
+state in    OLD kernel    OLD kernel          NEW kernel            NEW kernel
+kernel:                   (not yet adjusted)  (drbdadm adjust       (steady state)
+                                               just ran)
+
+                          ──────────────────────────────────────
+                          window where on-disk and kernel disagree,
+                          but persistent state is already correct so
+                          a reboot reaches NEW automatically
+```
+
+This is why every state-changing helper writes to disk first
+(everywhere it needs to land), then runs the kernel-side reconciliation
+command. The reverse ordering would leave a window where a crash
+reverts the kernel to OLD on next boot, undoing the operator's intent.
+
+---
+
+## `drbd_remove_peer(resource, leaving_peer_name, surviving_peers, surviving_hosts)`
+
+### Top-of-section summary
+Online removal of a peer from a running DRBD tier resource. The
+surviving primary's `/dev/drbd<minor>` is **not interrupted** —
+filesystems on top of it continue serving I/O throughout. After this
+function returns, the leaving peer's connection is gone from kernel
+state on every survivor, and its bitmap slot in the meta-disk has been
+cleared so a future *different* peer added to the same resource can
+reuse the slot via a bitmap-based resync rather than a full sync.
+
+Pre-conditions:
+- Caller has identified the peer to remove by its DRBD-config hostname
+  (e.g. `bedrock-sim-1.bedrock.local`)
+- Caller knows the surviving peer set (everything except the leaving
+  one) as `[{"name": ..., "drbd_ip": ...}, ...]`
+- This node and every host in `surviving_hosts` have root SSH set up
+  among them (cluster init handles this)
+- The leaving peer is currently a Secondary (or already gone). It must
+  not be the active Primary — the caller is expected to have
+  live-migrated workloads off first.
+
+Post-conditions:
+- `/etc/drbd.d/tier-<resource>.res` on every surviving host no longer
+  contains the leaving peer
+- Kernel state on every surviving host shows the resource with one
+  fewer peer
+- `cluster.json.tiers.<resource>.drbd_node_ids` has the leaving peer
+  removed (its id is now free for re-assignment)
+- `cluster.json.tiers.<resource>.peers` list is updated
+
+### Visual flow
+
+```
+                          start (resource is N-way, leaving peer present)
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  1. write_drbd_resource(resource, surviving_peers)                 │
+       │     -> /etc/drbd.d/tier-<resource>.res LOCALLY                     │
+       │     -> render_drbd_res reads persistent node-ids,                  │
+       │        survivors keep theirs; leaving peer just isn't in output    │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  2. SSH-fanout: distribute the new .res file to every survivor    │
+       │     (base64-encoded to avoid shell quoting)                       │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  3. drbdadm --dry-run adjust on each survivor                     │
+       │     ABORT if dry-run shows anything other than del-peer (or      │
+       │     disconnect, del-path, down) — protects against subtle config │
+       │     drift triggering an unintended resource cycle                │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  4. drbdadm adjust on each survivor                               │
+       │     -> kernel: del-peer for the leaving id (no /dev/drbd<minor>   │
+       │        interruption, surviving connections untouched)              │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  5. drbdsetup forget-peer <res> <leaving-id> on each survivor     │
+       │     (best-effort) — clears bitmap slot in external meta-disk     │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+       ┌────────────────────────────────────────────────────────────────────┐
+       │  6. cluster.json: drop leaving peer from drbd_node_ids; bump     │
+       │     tier version; persist                                         │
+       └────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                          end (resource is (N-1)-way, leaving peer gone)
+```
+
+### Step-by-step exact commands (for reviewer verification)
+
+For resource `r`, leaving peer named `L`, survivors `[A, B]`, hosts
+`[hostA, hostB]`:
+
+```bash
+# 1. Render new config locally (this node):
+drbdadm dump <r>      # for diff/inspection
+write_drbd_resource(r, [A, B])
+# /etc/drbd.d/tier-r.res now lists only A and B with their stable node-ids
+
+# 2. Distribute via SSH to each survivor:
+ssh root@hostA 'cat > /etc/drbd.d/tier-r.res' < /etc/drbd.d/tier-r.res
+ssh root@hostB 'cat > /etc/drbd.d/tier-r.res' < /etc/drbd.d/tier-r.res
+
+# 3. Dry-run preview on each survivor:
+ssh root@hostA 'drbdadm --dry-run adjust tier-r'
+ssh root@hostB 'drbdadm --dry-run adjust tier-r'
+# expected output: "drbdsetup del-peer tier-r <leaving-id>" (and possibly
+# disconnect on the same id, which is implicit). Anything else = abort.
+
+# 4. Apply on each survivor:
+ssh root@hostA 'drbdadm adjust tier-r'
+ssh root@hostB 'drbdadm adjust tier-r'
+
+# 5. Free the meta-disk bitmap slot (requires connection torn down,
+#    which step 4 did):
+ssh root@hostA 'drbdsetup forget-peer tier-r <leaving-id>'
+ssh root@hostB 'drbdsetup forget-peer tier-r <leaving-id>'
+
+# 6. Persistent state update (this node):
+free_drbd_node_id(r, L)
+set_tier_state(r, peers=[A.name, B.name])
+```
+
+### Crash-safety analysis
+
+| Crash point | Persistent state | Kernel state | Recovery on next boot |
+|-------------|------------------|--------------|------------------------|
+| Before step 1 | OLD config everywhere | OLD (N peers) | Boot → OLD config → OLD kernel state. No-op. |
+| Between 1 and 2 | NEW on this node, OLD elsewhere | OLD everywhere | Boot here → NEW config → adjust on `up` removes leaving peer locally. Other survivors still on OLD until distribute completes. Idempotent retry. |
+| Between 2 and 4 | NEW everywhere | OLD everywhere | Boot → all surviving nodes' DRBD comes up with NEW config → del-peer issued automatically. Same end state. |
+| Between 4 and 5 | NEW everywhere | NEW (peer gone) | Boot → reconcile to NEW. Bitmap slot still holds leaving peer's bitmap (small consequence: future *different* peer added to same id triggers full resync instead of bitmap-based). |
+| After step 5 | NEW everywhere, drbd_node_ids still has leaving | NEW | Boot → consistent. drbd_node_ids cleanup is best-effort cosmetic. |
+
+In every case, persistent state encodes the operator's intent;
+kernel reconciliation on next boot completes the operation.
+
+### Failure modes and what they look like
+
+- **Dry-run shows new-peer or new-path:** indicates the on-disk config
+  has diverged from kernel state in unexpected ways (likely
+  node-id renumbering elsewhere, or a manual config edit).
+  `drbd_remove_peer` aborts. Operator fix: run `drbdsetup show <res>`
+  on every node and reconcile by hand, then retry.
+- **adjust fails on one host but succeeds on others:** partial state.
+  Persistent state on disk is identical everywhere (we distributed
+  before applying). Re-run `drbdadm adjust tier-<resource>` on the
+  failed host to retry; idempotent.
+- **forget-peer fails:** non-fatal. Bitmap slot remains, costing a
+  potential future full-resync. Log and continue.
+
+### When NOT to use this function
+
+- The leaving peer is the current Primary. Move workloads off first
+  via `bedrock vm migrate` and `transfer_mgmt_role`; only then drop
+  it as a DRBD peer.
+- The resource is degraded (a different peer is in `Inconsistent` /
+  `SyncSource` state). Wait for sync to complete; otherwise removing
+  a peer changes quorum math and may invalidate the running primary's
+  ability to commit writes.
+
+---
+
+## `garage_drain_node(departing_node_id_short, surviving_admin_host, departing_node_admin_host, ...)`
+
+### Top-of-section summary
+Graceful, online decommission of a Garage node. Works at any
+replication factor including RF=1, because Garage's `block_resync`
+worker is offload-then-delete: each block is copied from the source
+to its new owner BEFORE being deleted from the source. Reads during
+the transition fall back to the multi-version layout history (Garage
+internally retains old layout versions until `sync_ack_map_min`
+advances past them). After this function returns, the departing
+node's data is fully migrated to surviving nodes, the Garage daemon
+on the departing node is stopped, and the cluster has one fewer
+member.
+
+Pre-conditions:
+- The departing node is currently in the Garage cluster's layout
+- `surviving_admin_host` can reach the cluster's admin API (any node
+  works; the layout commands gossip through the cluster)
+- `departing_node_admin_host` is the mgmt-LAN address of the node
+  whose Garage daemon will be drained and stopped
+- `surviving_admin_host` can SSH (root) to `departing_node_admin_host`
+
+Post-conditions:
+- Departing node has zero blocks owned in the new layout
+- `garage block list-errors` is empty everywhere — no data was lost
+- `garage repair tables` and `garage repair blocks` have run cluster-wide
+- Garage daemon is stopped + disabled on the departing node
+- `garage status` shows the surviving nodes only
+
+### Visual flow
+
+```
+                                start
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  1. garage layout remove <id>     (on a surviving admin host)  │
+        │     -> stages the removal in the layout history                │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  2. garage layout apply --version <next>                       │
+        │     -> commits NEW layout. NEW partitions for departing node's │
+        │        load are now mapped to surviving nodes.                 │
+        │     -> Garage's block_resync worker on the DEPARTING node     │
+        │        starts pushing blocks to their NEW owners.              │
+        │     -> Reads continue working: layout history routes them to   │
+        │        the OLD owner (still alive) until each block has been   │
+        │        copied (rpc_helper.rs:570 falls back to old_versions).  │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  3. garage worker set resync-tranquility 0                     │
+        │     garage worker set resync-worker-count 8                    │
+        │     (on the DEPARTING node — speeds the drain by removing the  │
+        │      throttle that exists for impact-friendly steady state)    │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  4. WAIT — poll `garage worker list` on the departing node     │
+        │     until every "Block resync worker #N" line shows            │
+        │     state=Idle, queue=0. Bounded by max_wait_seconds.          │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  5. garage block list-errors  (on departing node)              │
+        │     MUST be empty. A non-empty list means we have data-loss    │
+        │     candidates — abort, do not stop the node.                  │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  6. garage repair --all-nodes --yes tables                     │
+        │     garage repair --all-nodes --yes blocks                     │
+        │     -> ensures metadata tables and block reference counts are  │
+        │        consistent across the surviving cluster.                │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌────────────────────────────────────────────────────────────────┐
+        │  7. systemctl stop garage   (on departing node)                │
+        │     systemctl disable garage                                    │
+        │     -> the node leaves the cluster cleanly. Surviving cluster  │
+        │        already has all data; no further coordination needed.   │
+        └────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                                end
+```
+
+### Why each step matters
+
+- **Step 2 must run BEFORE step 7.** If garage is stopped on the
+  departing node before the resync has copied its blocks to new
+  owners, those blocks are lost. The layout-history-based read
+  fallback only works as long as the old owner is reachable.
+- **Step 3 is optional but practical.** The default tranquility (~2)
+  paces resync to be unnoticeable in mixed-workload steady state. For
+  a controlled drain we want to finish; tranquility=0 + 8 workers
+  saturates the disk/network.
+- **Step 4 is the critical wait.** No way to skip; the only way to
+  know it's safe to stop the source is that all of its blocks have
+  been pushed to new owners.
+- **Step 5 catches the unhappy case.** If any block failed to copy
+  (network blip, bug, bad disk), it stays in the error queue. We
+  refuse to stop the node — the operator must investigate.
+- **Step 6 reconciles metadata.** Tables and block-ref counters can
+  briefly disagree during layout transitions. The `repair` commands
+  scan and fix; idempotent.
+
+### Failure modes
+
+- **Drain timeout (step 4):** `max_wait_seconds` exceeded with workers
+  still busy. Possible causes: very large dataset on slow links,
+  network partition, repeated transient errors. Function raises;
+  operator can re-run (idempotent — Garage resumes the drain) or
+  investigate per-block via `garage block info <hash>`.
+- **Errored blocks (step 5):** `block list-errors` non-empty.
+  Function raises. Use `garage block retry-now --all` to retry
+  transient errors; investigate persistent ones (often disk-level).
+- **Repair commands fail (step 6):** logged with `check=False`; not
+  fatal because tables eventually re-sync via Merkle gossip. Re-run
+  `garage repair` later if needed.
+
+### When NOT to use this function
+
+- The cluster's RF would be invalidated by the removal. Garage refuses
+  the layout change if the new layout cannot satisfy the configured
+  replication factor (e.g. removing a node from a 3-node RF=3 cluster
+  fails the redundancy check). For Bedrock at RF=1 this never bites
+  (any 1+ node satisfies RF=1).
+- The departing node has stale or corrupt data. `garage repair
+  blocks` should be run BEFORE the drain in that case to surface
+  errors while the source is still in the cluster.
+
+---
+
+## `transfer_mgmt_role(old_master_host, new_master_host, ...)`
+
+### Top-of-section summary
+Move the mgmt + NFS-server + DRBD-primary role from one node to
+another, in a single coordinated handoff. Outage measured during
+testing: ~5–10 s for NFS clients to re-establish; mgmt API briefly
+returns 503 during step 8. This function is idempotent — safe to
+re-run if interrupted.
+
+The role is "the node that holds bulk + critical DRBD primary, runs
+the FastAPI dashboard + Victoria* metrics/logs, and is the NFS-server
+endpoint that other nodes mount from." All three are coupled by
+design (see "Why each design choice" below).
+
+Pre-conditions:
+- New master's DRBD secondaries for tier-bulk and tier-critical are
+  currently `disk:UpToDate` (no in-flight sync to the new master).
+  The function checks this and refuses if not.
+- New master and every other peer are SSH-reachable as root.
+- Old master may be offline (special case: rsync step uses
+  `check=False`; if old master is gone, mgmt files won't be
+  rsynced — operator must have a separate backup or have done
+  the rsync earlier).
+
+Post-conditions:
+- New master is DRBD primary for tier-bulk and tier-critical
+- New master is exporting NFS for both tiers
+- New master is running `bedrock-mgmt`, `bedrock-vm`, `bedrock-vl`
+- Every other peer's `/etc/fstab` has new master's DRBD IP for the
+  NFS mounts; their NFS clients are remounted against new master
+- Every node's `/bedrock/<tier>` symlink points at the right local
+  path (DRBD-direct on new master, NFS-from-new-master on peers)
+- Every node's `cluster.json.tiers.{bulk,critical}.master` field
+  is updated to new master's name
+
+### Visual flow
+
+```
+              ┌─────────────────────────────────────────────────────────┐
+              │                                                         │
+              │  Cluster before:                                        │
+              │                                                         │
+              │  old-master                  peer-A   peer-B            │
+              │  ┌──────────┐                ┌─────┐  ┌─────┐           │
+              │  │ DRBD pri │                │ sec │  │ sec │           │
+              │  │ NFS srv  │ ◀── nfs ──     │     │  │     │           │
+              │  │ mgmt FAPI│                └─────┘  └─────┘           │
+              │  │ V-metrics│                                            │
+              │  │ V-logs   │                                            │
+              │  └──────────┘                                            │
+              │                                                         │
+              └─────────────────────────────────────────────────────────┘
+                                          │
+                            transfer_mgmt_role()
+                                          │
+              ┌─────────────────────────────────────────────────────────┐
+              │                                                         │
+              │  Cluster after:                                         │
+              │                                                         │
+              │  old-master              new-master       peer-B        │
+              │  ┌──────────┐            ┌──────────┐     ┌─────┐      │
+              │  │ DRBD sec │            │ DRBD pri │     │ sec │      │
+              │  │ (no NFS) │  ── nfs ──▶│ NFS srv  │ ◀── │ nfs │      │
+              │  │          │            │ mgmt FAPI│     │mount│      │
+              │  │          │            │ V-metrics│     │     │      │
+              │  │          │            │ V-logs   │     │     │      │
+              │  └──────────┘            └──────────┘     └─────┘      │
+              │                                                         │
+              └─────────────────────────────────────────────────────────┘
+```
+
+### Step-by-step ordered with crash-safety annotations
+
+```
+Step  Action                                         Persistent state changes here
+────  ─────────────────────────────────────────────  ──────────────────────────────
+ 0   Resolve old_master_drbd_ip if not given        — read-only
+ 1   Verify new master DRBD UpToDate                — read-only
+ 2   Stop bedrock-* + nfs-server on old master      — runtime only
+ 3   Unmount + secondary on old master              — runtime only
+ 4   Primary + mount on new master                  fstab ON NEW MASTER
+                                                    (DRBD-mount line added)
+ 5   rsync /opt/bedrock/{mgmt,iso,data,bin}         /opt/bedrock/* on new master
+ 6   Copy systemd unit files                        /etc/systemd/system/* on new master
+ 7   NFS exports on new master                      /etc/exports.d/* on new master
+                                                    + nfs-server enabled
+ 8   Start bedrock-{vm,vl,mgmt} on new master       — runtime only
+ 9   Re-point NFS clients on every other peer       /etc/fstab on each peer
+                                                    (sed in place + remount)
+10   Symlink swaps + cluster.json updates           /bedrock/<tier> symlinks
+                                                    + cluster.json on every node
+```
+
+After step 10, the old master is a "secondary peer" — its NFS
+clients (if any) point at the new master, its DRBD is Secondary, its
+mgmt services are stopped. Operator can reuse it as a normal compute
+peer or decommission it via `drbd_remove_peer` + node removal.
+
+### Failure modes / partial completion
+
+The function is idempotent; re-run it on the same arguments to resume.
+
+- **Step 1 fails (UpToDate check):** the new master's DRBD is not in
+  sync. Function raises. Wait for sync, then retry.
+- **Steps 2–4 partial:** if old master crashes between unmount and
+  the new master's `drbdadm primary`, both could be Secondary
+  briefly. Re-running the function (or just running `drbdadm primary
+  tier-X` + `mount` on new master) recovers.
+- **Step 9 partial:** some peers have new IP in fstab, others still
+  on old. `umount` on the lagging peers fails (server unreachable);
+  `mount` succeeds against new server. Operator should `mount -a`
+  on each peer to converge.
+- **Step 10 partial:** symlinks updated on some nodes, not others.
+  This is the one step where users could see a stale view briefly
+  (e.g. `/bedrock/bulk` on peer-B still points at the OLD nfs mount
+  which is now serverless and hangs). Mitigation: run step 10 after
+  step 9 has succeeded everywhere; operationally the `bedrock
+  storage status` output exposes any drift.
+
+### Why each design choice
+
+- **Why mgmt + NFS server are coupled to one node:** `cluster.json` is
+  the single writable source of truth for cluster topology. The DRBD
+  primary node already mounts the bulk/critical XFS locally; it's
+  the natural NFS-server (NFS-of-the-already-mounted-XFS rather than
+  NFS-of-DRBD-via-different-host). Coupling avoids two-node
+  coordination for "is mgmt and is NFS-server" being out of sync.
+- **Why NFS clients re-point via fstab edit, not DNS / VIP:** Bedrock
+  prefers persistent disk state as the source of truth (Rule L10
+  in lessons-log). A VIP that floats between nodes hides the
+  "which server am I really talking to" — useful during a test, but
+  hard to reason about for crash-safety analysis. fstab is grep-able,
+  predictable, and survives reboot.
+- **Why we don't kill mgmt-clients (browsers) explicitly:** the
+  FastAPI server on old master stops listening, the browser's
+  WebSocket disconnects, the user re-loads with the new master's
+  hostname. Acceptable for the operator-supervised role-transfer
+  scenario.
+
+---
+
+## Updated source citations (deltas from the upstream Sources section)
+
+### DRBD 9 — peer-removal helpers (new)
+- [LINBIT/drbd-utils — `user/v9/drbdadm_adjust.c` line 858–868](https://github.com/LINBIT/drbd-utils/blob/master/user/v9/drbdadm_adjust.c#L858-L868) — `adjust_net()` schedules `del_peer_cmd` for any kernel connection without a config match.
+- [LINBIT/drbd-utils — `user/v9/drbdadm_adjust.c` line ~806](https://github.com/LINBIT/drbd-utils/blob/master/user/v9/drbdadm_adjust.c) — comment `/* disconnect implicit by del-peer */`.
+- [drbdadm-9.0(8) — `--dry-run` documentation](https://manpages.debian.org/testing/drbd-utils/drbdadm-9.0.8.en.html) — recommended pre-flight check before `adjust`.
+- [drbdsetup-9.0(8) — `forget-peer` semantics](https://manpages.debian.org/testing/drbd-utils/drbdsetup-9.0.8.en.html) — "The connection must be taken down before this command may be used. In case the peer re-connects at a later point a bit-map based resync will be turned into a full-sync."
+
+### Garage — graceful drain (new)
+- [Garage source — `src/block/resync.rs` lines 362–510](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/block/resync.rs) — offload-then-delete logic: query `NeedBlockQuery` on new owners, send `PutBlock`, then delete locally.
+- [Garage source — `src/rpc/layout/history.rs` lines 79–115, 270–302](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/rpc/layout/history.rs) — `apply_staged_changes()` pushes new version onto `versions`; old versions retained until `sync_ack_map_min` advances.
+- [Garage source — `src/rpc/rpc_helper.rs` ~line 570](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/rpc/rpc_helper.rs) — `block_read_nodes_of()` falls back to `old_versions` in reverse for blocks not yet at new owner.
+- [Garage Operations — Recovering from failures](https://garagehq.deuxfleurs.fr/documentation/operations/recovering/) — `layout remove` + `layout apply` documented procedure.
+- [Garage Operations — Durability and repairs](https://garagehq.deuxfleurs.fr/documentation/operations/durability-repairs/) — `worker list`, `worker set`, `block list-errors`, `repair tables`, `repair blocks`.
+
+### NFS server / client (already cited above; reinforced)
+- [`exports(5)`](https://manpages.debian.org/testing/nfs-kernel-server/exports.5.en.html) — `rw,sync,no_root_squash,no_subtree_check`.
+- [`nfs(5)` — soft / timeo / retrans](https://manpages.debian.org/testing/nfs-common/nfs.5.en.html) — client-side timeout semantics.
