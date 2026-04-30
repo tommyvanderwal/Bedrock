@@ -399,3 +399,153 @@ For 1 TB at 10 GbE that's ~15 minutes of waiting, well under 5 minutes if
 the data is well-distributed. **No RF bump, no double storage, no
 operational risk** beyond "wait and verify."
 
+
+---
+
+## Update — LINBIT-recommended procedure (research-verified)
+
+I had the right *low-level* commands but the *wrong abstraction layer*. After
+digging into `LINBIT/drbd-utils` source (specifically `user/v9/drbdadm_adjust.c`
+lines 858–868) and the man pages, here is the **officially recommended online
+peer-removal procedure** for DRBD 9:
+
+### The blessed LINBIT path: edit-config-then-`drbdadm adjust`
+
+```
+# On EACH surviving node, in any order:
+
+# 1. Edit /etc/drbd.d/<res>.res — remove the `on <leaving-peer> { ... }`
+#    host section AND every connection / connection-mesh entry that
+#    references the leaving peer. Distribute the same file to every
+#    surviving node (DRBD does not propagate configs).
+
+# 2. Preview what adjust will do (cheap insurance):
+drbdadm --dry-run adjust <res>
+
+# 3. Apply. Service to /dev/drbdN is uninterrupted; quorum stays satisfied
+#    as long as enough peers remain alive:
+drbdadm adjust <res>
+
+# 4. Verify:
+drbdadm status <res>     # leaving peer should be gone
+
+# 5. (Optional, recommended) Free the meta-disk bitmap slot so a future
+#    different peer can be added without a forced full-resync:
+drbdadm forget-peer <res>:<leaving-peer-name>
+#   — OR, if the leaving peer is already removed from the config and
+#     drbdadm can't translate the name:
+drbdsetup forget-peer <res> <node-id>
+
+# On the departing node, at leisure:
+drbdadm down <res>
+# then power off / decommission
+```
+
+### Why this is the right path (and my earlier order was wrong)
+
+The smoking gun is in `drbdadm_adjust.c:858-868`. When `adjust` walks the
+running kernel's connection list and finds a connection that has *no
+matching entry in the parsed config*, it automatically schedules
+`del_peer_cmd`. The comment on line 806 — `/* disconnect implicit by
+del-peer */` — confirms `del-peer` does its own disconnect; you don't
+need a separate step.
+
+So the LINBIT design is: **config is the source of truth, `adjust` is the
+mechanism that reconciles kernel state to config**. That's why the
+config edit must come *first*, not last:
+
+- Edit config → remove peer → distribute → run `drbdadm adjust`
+- `adjust` notices the missing peer in config + its still-present
+  connection in kernel, issues `del-peer` for it, done.
+
+My earlier failures (`drbdadm forget-peer ... peer-name` returning
+"Device is configured!" or "peer node id cannot be my own node id")
+were caused by removing the peer from the config *first* and then trying
+to run `drbdadm` commands that translate name→node-id via the now-empty
+config. Working in node-id space via `drbdsetup disconnect/del-peer`
+**also** works (proven empirically — that's how I cleared the sim-1 ghost
+after the fact), but it's the *fallback* path, not the recommended one.
+
+### Why this makes my "node-id stability" finding even more critical
+
+For `drbdadm adjust` to work cleanly, the on-disk config must already
+agree with the kernel's node-id assignments for surviving peers. If
+`render_drbd_res` renumbers IDs on every config write, `adjust` sees a
+mismatch and either (a) fails with the cryptic "node id cannot be self"
+errors, or (b) tears down and re-creates connections that didn't need
+touching — which DOES interrupt the running primary briefly.
+
+So the final tier_storage code needs to:
+
+1. **Persist `{peer_name → node_id}` per resource** (in `cluster.json` or
+   alongside the `.res` file) so every regeneration reuses the same IDs.
+2. **Always edit the on-disk config first**, distribute via SSH fanout,
+   then run `drbdadm --dry-run adjust` followed by `drbdadm adjust`.
+3. **Drop to `drbdsetup` direct only when `--dry-run adjust` shows
+   confused output** — e.g. when recovering from a manual screw-up
+   where config and kernel have already diverged.
+
+### Updated `tier_storage.drbd_remove_peer()` design
+
+```python
+def drbd_remove_peer(resource: str, leaving_name: str,
+                      surviving_hosts: list[str]) -> None:
+    """Remove a peer from a running DRBD resource using the LINBIT-blessed
+    `drbdadm adjust` path. Service to /dev/drbdN stays up throughout.
+
+    Pre: leaving peer is in current config. Post: it is not, and is
+    removed from kernel state on every surviving host.
+    """
+    # 1. Compute new config — preserving node-ids of survivors!
+    new_peers = read_persistent_assignments(resource)  # dict
+    new_peers.pop(leaving_name, None)
+    new_res_file = render_drbd_res(resource, new_peers)
+
+    # 2. Distribute via SSH
+    for host in surviving_hosts:
+        ssh_put(host, f"/etc/drbd.d/tier-{resource}.res", new_res_file)
+
+    # 3. Dry-run on each survivor — abort on anything weird
+    for host in surviving_hosts:
+        out = ssh(host, f"drbdadm --dry-run adjust tier-{resource}")
+        if "Failure" in out or out.count("del-peer") != 1:
+            raise RuntimeError(f"adjust dry-run unsafe on {host}: {out}")
+
+    # 4. Apply
+    for host in surviving_hosts:
+        ssh(host, f"drbdadm adjust tier-{resource}")
+
+    # 5. Free bitmap slot (best effort — only matters for future peer adds)
+    leaving_id = persisted_assignments[resource][leaving_name]
+    for host in surviving_hosts:
+        ssh(host, f"drbdsetup forget-peer tier-{resource} {leaving_id}",
+            check=False)
+
+    # 6. Persist updated assignments
+    write_persistent_assignments(resource, new_peers)
+```
+
+### Status of each finding after this update
+
+| Finding | Status |
+|---|---|
+| 1. Garage RF=1 needs RF bump first | **Wrong** — empirical proof shows graceful drain works at RF=1; just needs proper waiting + repair |
+| 2. DRBD live peer removal needs `drbdsetup del-peer` | **Partially right** — the *commands* work in node-id space but the LINBIT-recommended path is `drbdadm adjust` after editing the config (which calls del-peer internally) |
+| 3. Node-id renumbering breaks everything | **Right and now even more important** — required for `drbdadm adjust` to behave cleanly |
+| 4. Mgmt/NFS failover is mostly mechanical | **Right** — codify as `bedrock storage transfer-mgmt-role` |
+
+### The cleanly-revised next-session queue
+
+1. Persist DRBD node-id assignments per resource (cluster.json field or
+   sidecar file). Fix `render_drbd_res` to honor them.
+2. `tier_storage.drbd_remove_peer` using config-edit + `drbdadm --dry-run adjust`
+   + `drbdadm adjust` — fallback to `drbdsetup` direct only if dry-run shows
+   confusion.
+3. `tier_storage.garage_drain_node` with proper worker-queue waiting,
+   `garage block list-errors` empty check, and `garage repair --all-nodes
+   tables` + `... blocks` before declaring complete.
+4. `s3fs_mount_scratch` hard-coded to `url=http://127.0.0.1:3900` so each
+   node uses its own local Garage daemon; removes the dead-endpoint
+   coupling we hit.
+5. `bedrock storage transfer-mgmt-role <new-master>` automating the
+   ten-step playbook.
