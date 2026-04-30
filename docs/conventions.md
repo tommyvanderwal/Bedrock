@@ -82,6 +82,27 @@ The `.md` is **revised in place** as the code changes. It must stay in
 sync with the implementation; an out-of-date spec is worse than no
 spec.
 
+### Per-action `.md` files for complex functions
+
+For modules where a few specific functions are complex enough to merit
+their own deep-dive (full ASCII flow, exact command sequences,
+crash-safety table, citations), put each in its own
+`installer/lib/<module>__<function>.md` (note the double underscore
+separator). The parent `<module>.md` then has a short summary section
+for that function plus a relative link to the dedicated file.
+
+Examples:
+- `installer/lib/tier_storage.md` — module overview + invariants +
+  state map; brief summaries for each entry-point with relative links
+  to the detail docs below.
+- `installer/lib/tier_storage__migrate_scratch_into_garage.md` —
+  full deep-dive on that one function.
+- `installer/lib/tier_storage__drbd_remove_peer.md` — same.
+
+This keeps `<module>.md` skimmable as a top-level reference while the
+deep-dive docs stay focused. Cross-reference via relative links so
+GitHub renders them as clickable.
+
 ## Rule 3 — The journey lives in `docs/lessons-log.md` (separate)
 
 When we discover something non-obvious — a wrong assumption, a
@@ -180,7 +201,6 @@ docs as they're substantively changed:
 - `installer/lib/agent_install.py` — joins agent nodes to a cluster
 - `installer/lib/os_setup.py` — base OS configuration (SELinux,
   firewall, br0)
-- `installer/lib/packages.py` — package installation
 - `installer/lib/exporters.py` — Prometheus/VictoriaMetrics exporters
 - `installer/lib/vm.py` — VM lifecycle (cattle / pet / vipet)
 - `installer/lib/storage_install.py` — older RustFS-era storage

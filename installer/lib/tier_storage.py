@@ -64,6 +64,8 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # ── Layout constants ───────────────────────────────────────────────────────
@@ -578,6 +580,103 @@ def nfs_mount_drbd_tiers(master_drbd_ip: str) -> None:
         atomic_symlink(str(nfs_mount), PUBLIC_ROOT / tier)
 
 
+# ── Garage admin API helpers ──────────────────────────────────────────────
+#
+# We talk to Garage via the v2 admin API (http://127.0.0.1:3903) rather than
+# parsing `garage` CLI text tables. Rationale: CLI labels and column layouts
+# drift across releases and a parse miss is silent (we read the wrong value).
+# The admin API returns structured JSON whose schema is in OpenAPI v2 and
+# evolves under semver.
+#
+# See `tier_storage.md` § "Garage admin API" and lessons-log L18 / L24.
+
+GARAGE_ADMIN_BASE = f"http://127.0.0.1:{GARAGE_ADMIN_PORT}"
+
+
+def _garage_admin_token(host: str | None = None) -> str:
+    """Read admin_token from /etc/garage.toml on `host` (None = local).
+
+    Garage has a single shared admin token cluster-wide (written by
+    `install_garage_local` from the value passed to `init`/`join`). Reading
+    it from the same config Garage itself reads keeps caller and server
+    in lockstep — no separate secret to plumb.
+    """
+    cmd = r"""awk -F'"' '/^admin_token/{print $2}' /etc/garage.toml"""
+    out = (run(cmd, check=False) if host is None
+           else ssh(host, cmd, check=False)).strip()
+    if not out:
+        where = host or "local"
+        raise RuntimeError(
+            f"admin_token not found in /etc/garage.toml on {where} — "
+            f"Garage admin API needs it.")
+    return out
+
+
+def _garage_api(method: str, path: str, body=None, *,
+                host: str | None = None,
+                token: str | None = None,
+                check: bool = True,
+                timeout: int = 10):
+    """Call the Garage v2 admin API. Returns parsed JSON (or None when
+    `check=False` and the call fails / response is empty).
+
+    `path` includes leading slash and any query string,
+        e.g. "/v2/GetClusterLayout" or "/v2/ListWorkers?node=self".
+    `body` is a Python value JSON-encoded into the request body, or None.
+    `host` selects which node's admin API to call (None = local).
+
+    Local calls go through stdlib urllib (no shell). Remote calls use
+    `curl` over our `ssh()` helper because the admin port may not be
+    routable cluster-wide and the token lives on each node.
+    """
+    if token is None:
+        token = _garage_admin_token(host)
+    payload = "" if body is None else json.dumps(body)
+    url = f"{GARAGE_ADMIN_BASE}{path}"
+
+    if host is None:
+        try:
+            req = urllib.request.Request(
+                url, method=method,
+                data=payload.encode() if body is not None else None,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    **({"Content-Type": "application/json"}
+                       if body is not None else {}),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode()
+            return json.loads(raw) if raw else None
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                json.JSONDecodeError) as e:
+            if check:
+                raise RuntimeError(
+                    f"Garage API {method} {path} failed: {e}") from e
+            return None
+
+    # Remote: curl over ssh. Bodies we send never contain single quotes
+    # (we control them: bucket names, hex node ids, integers, "tables"/
+    # "blocks"). If that ever changes, switch to a heredoc here.
+    parts = ["curl -fsS", f"-X {method}",
+             f"-H 'Authorization: Bearer {token}'"]
+    if body is not None:
+        parts.append("-H 'Content-Type: application/json'")
+        parts.append(f"-d '{payload}'")
+    parts.append(f"'{url}'")
+    out = ssh(host, " ".join(parts), check=check)
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as e:
+        if check:
+            raise RuntimeError(
+                f"Garage API {method} {path} on {host} returned non-JSON: "
+                f"{out!r}") from e
+        return None
+
+
 # ── Garage installation + cluster formation ───────────────────────────────
 
 def install_garage_local(drbd_ip: str, rpc_secret: str,
@@ -662,67 +761,105 @@ def garage_form_cluster(peers_drbd_ips: list[str],
     """Connect peers + apply cluster layout. Idempotent — re-running just
     bumps the layout version.
 
-    Runs on the local node (typically the master). For the local node's id
-    we read locally; for remote peers we ssh to each.
+    Talks to each peer's admin API directly (read its node id, stage roles,
+    apply layout). Replaces the prior CLI-fanout shape that parsed
+    `garage layout show` text — see lessons-log L24.
     """
     self_ip = _self_drbd_ip()
-    ids: dict[str, str] = {}
-    for ip in peers_drbd_ips:
-        if ip == self_ip:
-            full = run("sudo -u garage /usr/local/bin/garage node id -q",
-                       check=False).strip()
-        else:
-            full = ssh(ip, "sudo -u garage /usr/local/bin/garage node id -q",
-                       check=False).strip()
-        if full:
-            ids[ip] = full
+    token = _garage_admin_token()  # admin_token is shared cluster-wide
 
-    # Connect from this node to each remote peer (skip self)
-    for ip, full_id in ids.items():
-        if ip == self_ip:
+    # Discover each peer's full hex node id and its RPC listen address.
+    ids: dict[str, str] = {}  # drbd_ip -> "<hex>@<addr>"
+    for ip in peers_drbd_ips:
+        host = None if ip == self_ip else ip
+        info = _garage_api("GET", "/v2/GetNodeInfo?node=self",
+                           host=host, token=token, check=False)
+        succ = (info or {}).get("success", {})
+        if not succ:
             continue
-        run(f"sudo -u garage /usr/local/bin/garage node connect '{full_id}'",
-            check=False)
+        my_hex = next(iter(succ.values())).get("nodeId", "")
+        if not my_hex:
+            continue
+        # Cold-start fallback: if the peer hasn't yet learned its addr from
+        # other nodes, GetClusterStatus may not return an addr. Use the DRBD
+        # IP we were called with — Garage's gossip will replace it.
+        addr = f"{ip}:{GARAGE_RPC_PORT}"
+        status = _garage_api("GET", "/v2/GetClusterStatus",
+                             host=host, token=token, check=False) or {}
+        for n in status.get("nodes", []):
+            if n.get("id") == my_hex and n.get("addr"):
+                addr = n["addr"]
+                break
+        ids[ip] = f"{my_hex}@{addr}"
+
+    # Connect from this node to each remote peer (skip self).
+    remote = [v for ip, v in ids.items() if ip != self_ip]
+    if remote:
+        _garage_api("POST", "/v2/ConnectClusterNodes",
+                    body=remote, token=token, check=False)
 
     time.sleep(2)
 
-    # Layout: one zone, equal capacity per node
-    short_ids = [v.split("@")[0][:16] for v in ids.values()]
-    for sid in short_ids:
-        run(f"sudo -u garage /usr/local/bin/garage layout assign "
-            f"-z dc1 -c {capacity_gb}G {sid}", check=False)
+    # Stage one role per node — same zone, equal capacity (in BYTES; the
+    # API takes int64, not the CLI's "12G" suffix).
+    capacity_bytes = capacity_gb * (1024 ** 3)
+    roles = [
+        {"id": v.split("@")[0], "zone": "dc1",
+         "capacity": capacity_bytes, "tags": []}
+        for v in ids.values()
+    ]
+    if roles:
+        _garage_api("POST", "/v2/UpdateClusterLayout",
+                    body={"roles": roles}, token=token, check=False)
 
-    # Bump layout version monotonically (parse from `layout show`)
-    out = run("sudo -u garage /usr/local/bin/garage layout show",
-              check=False)
-    next_version = 1
-    for line in out.splitlines():
-        # Garage 2.x prints "Current cluster layout version: N"
-        if "layout version:" in line.lower():
-            try:
-                next_version = int(line.split(":")[1].strip()) + 1
-            except (IndexError, ValueError):
-                pass
-    run(f"sudo -u garage /usr/local/bin/garage layout apply "
-        f"--version {next_version}", check=False)
+    # Apply: read the current version from the structured response and
+    # bump by 1. Replaces `parsing "Current cluster layout version: N"`.
+    cur = _garage_api("GET", "/v2/GetClusterLayout",
+                      token=token, check=False) or {}
+    next_version = int(cur.get("version", 0)) + 1
+    _garage_api("POST", "/v2/ApplyClusterLayout",
+                body={"version": next_version}, token=token, check=False)
 
 
 def garage_create_scratch_bucket() -> dict:
-    """Create the 'scratch' bucket + key. Returns {access_key, secret_key}."""
-    run("sudo -u garage /usr/local/bin/garage bucket create scratch",
-        check=False)
-    run("sudo -u garage /usr/local/bin/garage key create scratch-key",
-        check=False)
-    out = run("sudo -u garage /usr/local/bin/garage key info scratch-key "
-              "--show-secret")
-    ak, sk = None, None
-    for line in out.splitlines():
-        if "Key ID:" in line:
-            ak = line.split(":", 1)[1].strip()
-        if "Secret key:" in line:
-            sk = line.split(":", 1)[1].strip()
-    run("sudo -u garage /usr/local/bin/garage bucket allow "
-        "--read --write --owner scratch --key scratch-key", check=False)
+    """Create the 'scratch' bucket + key. Returns {access_key, secret_key}.
+
+    Uses CreateBucket / CreateKey / AllowBucketKey directly and reads
+    `accessKeyId` + `secretAccessKey` from the structured CreateKey
+    response — no more regexing 'Key ID:' / 'Secret key:' labels that
+    drift across Garage versions (lessons-log L24).
+    """
+    token = _garage_admin_token()
+
+    # Bucket: create or recover via global-alias lookup if it already exists.
+    bucket = _garage_api("POST", "/v2/CreateBucket",
+                         body={"globalAlias": "scratch"},
+                         token=token, check=False)
+    if not bucket:
+        bucket = _garage_api(
+            "GET", "/v2/GetBucketInfo?globalAlias=scratch", token=token)
+    bucket_id = bucket["id"]
+
+    # Key: create or recover via name search. Fresh CreateKey returns the
+    # secret in the response; GetKeyInfo only does so with showSecretKey=true.
+    key = _garage_api("POST", "/v2/CreateKey",
+                      body={"name": "scratch-key"},
+                      token=token, check=False)
+    if not key or not key.get("secretAccessKey"):
+        key = _garage_api(
+            "GET", "/v2/GetKeyInfo?search=scratch-key&showSecretKey=true",
+            token=token)
+    ak = key["accessKeyId"]
+    sk = key.get("secretAccessKey") or ""
+
+    # Grant the key full perms on the bucket. Idempotent — repeated calls
+    # just re-set the same flags.
+    _garage_api("POST", "/v2/AllowBucketKey", body={
+        "bucketId": bucket_id,
+        "accessKeyId": ak,
+        "permissions": {"read": True, "write": True, "owner": True},
+    }, token=token, check=False)
+
     return {"access_key": ak, "secret_key": sk}
 
 
@@ -1230,85 +1367,68 @@ def garage_drain_node(
     """
     print(f"  [garage] drain {departing_node_id_short}")
 
-    g = "sudo -u garage /usr/local/bin/garage"
+    # All Garage interactions go through the v2 admin API (see
+    # `_garage_api`). The token is shared cluster-wide so we can read it
+    # from any node — survivor + departing both work.
+    surv_token = _garage_admin_token(surviving_admin_host)
+    dep_token  = _garage_admin_token(departing_node_admin_host)
+
+    # The API takes the FULL hex node id, not the short id the CLI
+    # accepts. Resolve via the survivor's GetClusterStatus.
+    status = _garage_api("GET", "/v2/GetClusterStatus",
+                         host=surviving_admin_host, token=surv_token)
+    departing_full = ""
+    for n in status.get("nodes", []):
+        if n.get("id", "").startswith(departing_node_id_short):
+            departing_full = n["id"]
+            break
+    if not departing_full:
+        raise RuntimeError(
+            f"node {departing_node_id_short} not found in cluster status — "
+            f"already removed from layout?")
 
     # 1. Stage the layout removal + apply. Garage assigns this node's
     #    partitions to surviving nodes in the new layout version.
-    ssh(surviving_admin_host, f"{g} layout remove {departing_node_id_short}")
+    _garage_api("POST", "/v2/UpdateClusterLayout",
+                body={"roles": [{"id": departing_full, "remove": True}]},
+                host=surviving_admin_host, token=surv_token)
 
-    # Determine the next layout version
-    show = ssh(surviving_admin_host, f"{g} layout show")
-    next_version = 1
-    for line in show.splitlines():
-        if "layout version" in line.lower():
-            try:
-                next_version = int(line.split(":")[1].strip()) + 1
-                break
-            except (IndexError, ValueError):
-                pass
-
-    ssh(surviving_admin_host,
-        f"{g} layout apply --version {next_version}")
+    # Bump the version monotonically (read structured `version`, no parse).
+    cur = _garage_api("GET", "/v2/GetClusterLayout",
+                      host=surviving_admin_host, token=surv_token) or {}
+    next_version = int(cur.get("version", 0)) + 1
+    _garage_api("POST", "/v2/ApplyClusterLayout",
+                body={"version": next_version},
+                host=surviving_admin_host, token=surv_token)
 
     # 2. Speed up the resync workers on the DEPARTING node (where the
     #    blocks live). Default tranquility throttles for impact-friendly
     #    operation; for a controlled drain we want it to drain fast.
-    ssh(departing_node_admin_host,
-        f"{g} worker set resync-tranquility 0", check=False)
-    ssh(departing_node_admin_host,
-        f"{g} worker set resync-worker-count 8", check=False)
+    for var, val in (("resync-tranquility", "0"),
+                     ("resync-worker-count", "8")):
+        _garage_api("POST", "/v2/SetWorkerVariable?node=self",
+                    body={"variable": var, "value": val},
+                    host=departing_node_admin_host, token=dep_token,
+                    check=False)
 
     # 3. Wait for all "Block resync" workers on the departing node to
-    #    show Idle with Queue=0. This is the indicator that all blocks
-    #    have been copied to their new owners and the source can be
-    #    safely retired.
-    # Use Garage's structured admin API instead of parsing the
-    # `garage worker list` text table. (Lessons-log L18.)
+    #    show idle with queueLength in (0, null). The block_resync worker
+    #    is offload-then-delete, so this is exactly the "data is fully
+    #    re-homed" signal we need before stopping the daemon.
     #
-    # POST /v2/ListWorkers?node=self  →  JSON with per-worker
-    # {state, queueLength, errors, ...}. Drain is complete when all
-    # "Block resync worker #N" entries have state="idle" and
-    # queueLength in (0, null).
-    #
-    # Source: https://garagehq.deuxfleurs.fr/api/garage-admin-v2.json
-    #         https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/src/api/admin/worker.rs
+    # Source: src/block/resync.rs L537 (worker name) + L551 (queueLength)
+    # at https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/
+    # See lessons-log L18 for the original CLI-table-parsing miss.
     deadline = time.time() + max_wait_seconds
-    # The departing node's admin token from its garage.toml.
-    admin_token = ssh(
-        departing_node_admin_host,
-        r"awk -F'\"' '/^admin_token/{print $2}' /etc/garage.toml",
-        check=False).strip()
-    if not admin_token:
-        raise RuntimeError(
-            f"could not read admin_token from {departing_node_admin_host}'s "
-            f"/etc/garage.toml — drain check needs the admin API auth.")
-
     while time.time() < deadline:
-        # Run the API call ON the departing node so 127.0.0.1:3903
-        # resolves to its local Garage daemon, and ?node=self gives
-        # us its workers.
-        api_out = ssh(
-            departing_node_admin_host,
-            f"curl -fsS -X POST "
-            f"-H 'Authorization: Bearer {admin_token}' "
-            f"-H 'Content-Type: application/json' "
-            f"-d '{{}}' "
-            f"'http://127.0.0.1:3903/v2/ListWorkers?node=self'",
-            check=False)
-        try:
-            body = json.loads(api_out)
-        except (json.JSONDecodeError, TypeError):
-            time.sleep(poll_seconds)
-            continue
-        if body.get("error"):
-            time.sleep(poll_seconds)
-            continue
-        success = body.get("success", {})
-        if not success:
+        body = _garage_api("POST", "/v2/ListWorkers?node=self",
+                           body={}, host=departing_node_admin_host,
+                           token=dep_token, check=False)
+        if not body or body.get("error") or not body.get("success"):
             time.sleep(poll_seconds)
             continue
         # success is {<this-node-id-hex>: [worker, worker, ...]}
-        workers = next(iter(success.values()))
+        workers = next(iter(body["success"].values()))
         all_idle = True
         any_resync = False
         for w in workers:
@@ -1329,24 +1449,30 @@ def garage_drain_node(
             f"garage drain timeout after {max_wait_seconds}s — "
             f"workers still not Idle. Investigate before stopping the node.")
 
-    # 4. Verify no errored blocks. Any block in the error queue means
-    #    we have a candidate for actual data loss.
-    errs = ssh(departing_node_admin_host, f"{g} block list-errors",
-               check=False)
-    err_lines = [l for l in errs.splitlines() if l.strip()
-                 and not l.startswith("Hash")]
-    if err_lines:
+    # 4. Verify no errored blocks. ListBlockErrors returns a structured
+    #    array per node — len == 0 is the safety gate. Replaces text-line
+    #    counting that miscounts on header-format changes.
+    errs = _garage_api("GET", "/v2/ListBlockErrors?node=self",
+                       host=departing_node_admin_host, token=dep_token,
+                       check=False) or {}
+    succ = (errs.get("success") or {}) if isinstance(errs, dict) else {}
+    err_list = next(iter(succ.values()), []) if succ else []
+    if err_list:
+        # Show the first few hashes so the operator can investigate.
+        sample = ", ".join(b.get("blockHash", "?") for b in err_list[:3])
         raise RuntimeError(
-            f"garage block list-errors not empty on {departing_node_admin_host}: "
-            f"{len(err_lines)} entries. NOT safe to remove node yet.")
+            f"garage block errors on {departing_node_admin_host}: "
+            f"{len(err_list)} entries (e.g. {sample}). "
+            f"NOT safe to remove node yet.")
 
     # 5. Run repair on the whole cluster to ensure metadata tables and
     #    block references are consistent. Garage docs recommend this
     #    after layout changes. Idempotent.
-    ssh(surviving_admin_host,
-        f"{g} repair --all-nodes --yes tables", check=False)
-    ssh(surviving_admin_host,
-        f"{g} repair --all-nodes --yes blocks", check=False)
+    for repair_type in ("tables", "blocks"):
+        _garage_api("POST", "/v2/LaunchRepairOperation?node=*",
+                    body={"repairType": repair_type},
+                    host=surviving_admin_host, token=surv_token,
+                    check=False)
 
     # 6. NOW it is safe to stop Garage on the departing node.
     ssh(departing_node_admin_host, "systemctl stop garage", check=False)

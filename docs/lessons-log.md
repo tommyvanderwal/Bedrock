@@ -563,3 +563,53 @@ error), they'd diverge silently.
 hosts)` helper that every topology-mutating function calls. Today
 each function reimplements the SSH-fanout + base64-encode dance
 slightly differently; consolidating reduces room for drift.
+
+---
+
+## L24 — Every Garage interaction goes through the admin API, not the CLI
+**2026-04-30** · post-clean-run audit
+
+**What we thought:** The `garage` CLI is fine for most calls — only
+`worker list` parsing was fragile (L18). Bucket create / key info /
+layout assign / etc. all "just work" via the CLI.
+
+**What we found:** Every CLI call we make has the same class of
+problem L18 surfaced: stdout is *human-readable* output the docs
+explicitly say not to parse, and CLI label changes between Garage
+releases would silently break us. Three concrete cases were already
+load-bearing:
+
+1. `garage layout show` parsed for "Current cluster layout version: N"
+   — used to compute the next ApplyClusterLayout version. A label
+   change silently sets next_version=1, which the API rejects but
+   under a confusing error.
+2. `garage key info scratch-key --show-secret` parsed for "Key ID:" /
+   "Secret key:" — a label change leaves us with `ak=None, sk=None`
+   and a non-functional s3fs mount on first boot.
+3. `garage block list-errors` parsed by line-counting (skip the
+   "Hash" header) — a header rename miscounts and could let a drain
+   complete with errored blocks still on the departing node.
+
+The Garage v2 admin API exposes structured JSON for every operation
+we use. There is no CLI-only operation we depend on.
+
+**What we changed:** Added `_garage_api()` + `_garage_admin_token()`
+helpers in `tier_storage.py` and migrated all 13 CLI calls to v2
+admin API endpoints (`GetClusterStatus`, `GetClusterLayout`,
+`UpdateClusterLayout`, `ApplyClusterLayout`, `ConnectClusterNodes`,
+`CreateBucket`, `CreateKey`, `AllowBucketKey`, `GetBucketInfo`,
+`GetKeyInfo`, `SetWorkerVariable`, `ListBlockErrors`, `LaunchRepair-
+Operation`, plus the existing `ListWorkers`). Helper handles both
+local (urllib) and remote (curl-over-ssh) calls. Token is shared
+cluster-wide and read from `/etc/garage.toml` — no separate plumbing.
+
+**General rule:** If a Garage operation has an admin API endpoint,
+use it. The CLI is for interactive operator use, not for orchestration.
+
+**Source:**
+- OpenAPI v2.1.0:
+  https://garagehq.deuxfleurs.fr/api/garage-admin-v2.json
+- Reference manual:
+  https://garagehq.deuxfleurs.fr/documentation/reference-manual/admin-api/
+- Pre-migration research: `/tmp/garage-api-migration-research.md`
+  (per-command classification table)

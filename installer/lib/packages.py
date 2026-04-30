@@ -1,5 +1,8 @@
 """Package installation for Bedrock nodes.
 
+See `packages.md` (next to this file) for the full operational spec —
+invariants, where state lives, design rationale, sources.
+
 Every Bedrock node — whether it's the initial mgmt master or a peer
 that joined via `bedrock join` — gets the FULL package set installed
 here. This includes the Python deps the mgmt FastAPI app needs

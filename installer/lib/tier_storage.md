@@ -94,7 +94,7 @@ on every node.
 | DRBD resource config | `/etc/drbd.d/tier-<tier>.res` | each node locally | Identical content distributed via SSH/rsync |
 | NFS exports | `/etc/exports.d/bedrock-tiers.exports` | mgmt node only | On master role change |
 | NFS client mounts | `/etc/fstab` | each non-master node | On master role change |
-| Garage cluster layout | Garage internal (admin RPC) | one node, replicated by Garage | On `garage layout apply` |
+| Garage cluster layout | Garage internal (admin RPC) | one node, replicated by Garage | On `POST /v2/ApplyClusterLayout` |
 | Garage data | `/var/lib/garage/data/` | each node locally | On block resync |
 
 ---
@@ -202,13 +202,66 @@ admin_token = "<shared cluster-wide>"
 and propagated to every Garage daemon in the cluster. They live in
 `/etc/garage.toml` on every node.
 
+### Garage admin API helpers (`_garage_api`, `_garage_admin_token`)
+
+Every Garage interaction in `tier_storage.py` goes through the v2
+admin API at `http://127.0.0.1:3903`, not through the `garage` CLI.
+The two helpers:
+
+- `_garage_admin_token(host=None)` — `awk` the `admin_token` value out
+  of `/etc/garage.toml` on `host` (None = local). Same value
+  cluster-wide.
+- `_garage_api(method, path, body=None, *, host=None, token=None,
+  check=True)` — issue the request. Local calls go through stdlib
+  `urllib`; remote calls use `curl` over our `ssh()` helper (since
+  the admin port may not be routable cluster-wide). Returns parsed
+  JSON.
+
+Bodies for API endpoints:
+- `POST /v2/UpdateClusterLayout` →
+  `{"roles": [{"id": <full-hex>, "zone": "dc1",
+   "capacity": <bytes>, "tags": []}]}` for assigning,
+  or `{"roles": [{"id": <full-hex>, "remove": true}]}` for removing.
+- `POST /v2/ApplyClusterLayout` → `{"version": <int>}` (version comes
+  from `GET /v2/GetClusterLayout`'s `version` field +1).
+- `POST /v2/ConnectClusterNodes` → `["<id@addr>", ...]` (bare array).
+- `POST /v2/CreateBucket` → `{"globalAlias": "scratch"}`.
+- `POST /v2/CreateKey` → `{"name": "scratch-key"}`. Response includes
+  `accessKeyId` and `secretAccessKey` directly.
+- `POST /v2/AllowBucketKey` → `{"bucketId": <hex>, "accessKeyId":
+  <id>, "permissions": {"read": true, "write": true, "owner": true}}`.
+- `POST /v2/SetWorkerVariable?node=self` → `{"variable": ...,
+  "value": ...}`.
+- `POST /v2/LaunchRepairOperation?node=*` → `{"repairType":
+  "tables"}` (or `"blocks"`).
+- `GET /v2/ListBlockErrors?node=self` → wrapped MultiResponse;
+  drained-clean signal is `len(success.<self>) == 0`.
+- `POST /v2/ListWorkers?node=self` (body `{}`) → wrapped
+  MultiResponse of worker structs; drained-clean signal is every
+  "Block resync worker" entry having `state=="idle"` AND
+  `queueLength in (0, null)`.
+
+Why API, not CLI: see lessons-log
+[L24](../../docs/lessons-log.md#l24). Short version: CLI output is
+human-readable and label-changes between Garage versions silently
+break parsing; the admin API has structured JSON whose schema is in
+the OpenAPI v2 spec.
+
 ### `garage_form_cluster(peers_drbd_ips)`
 
 Run on the bootstrap node (typically the master). For each peer:
-- Get the peer's full node id (locally or via SSH)
-- `garage node connect <full-id>` from this node
-- `garage layout assign -z dc1 -c <capacity-gb>G <short-id>` — same capacity per node
-- `garage layout apply --version <next>`
+- Read the peer's full node id via `GET /v2/GetNodeInfo?node=self` on
+  that node's admin API.
+- Resolve its RPC `<addr>` from `GET /v2/GetClusterStatus` (cold-start
+  fallback: drbd_ip + GARAGE_RPC_PORT).
+- `POST /v2/ConnectClusterNodes` with the array of `<id@addr>` strings.
+- `POST /v2/UpdateClusterLayout` with one `{"id":..,"zone":"dc1",
+  "capacity": <bytes>, "tags": []}` per peer.
+- `POST /v2/ApplyClusterLayout` with `version = current+1` (read from
+  `GET /v2/GetClusterLayout`).
+
+All calls go through `_garage_api()` (see "Garage admin API" below).
+The CLI is *not* used here — see lessons-log L24 for the rationale.
 
 **Why one zone (`dc1`)** even when nodes are physically diverse: Garage's
 "zone redundancy" guarantees only matter at RF≥2 across zones. At RF=1
@@ -233,6 +286,22 @@ client and server agree on region) and `url=http://127.0.0.1:3900`
 (local Garage daemon, never a remote IP).
 
 Requires EPEL on AlmaLinux 9 (`s3fs-fuse` is not in stock repos).
+
+### `migrate_scratch_into_garage(verify_md5=True)` — local LV → Garage bucket
+
+Called from `s3fs_mount_scratch()` at the N=1 → N=2 promotion: copies
+existing local-LV scratch data into the Garage bucket *before* the
+`/bedrock/scratch` symlink swap, so operator data isn't lost during a
+planned topology change. Symmetric counterpart of
+`migrate_scratch_out_of_garage()` at the N=2+ → N=1 collapse.
+
+Same playbook as the reverse direction (rsync via the FUSE/local
+mount, MD5 verify, atomic symlink swap, lsof drain, umount source,
+drop fstab line) — only the direction reversed.
+
+Full deep-dive (visual flow, exact commands, crash-safety table,
+failure modes, sources):
+[`tier_storage__migrate_scratch_into_garage.md`](tier_storage__migrate_scratch_into_garage.md).
 
 ### Top-level transitions
 
@@ -296,10 +365,13 @@ unexpected dry-run output.
 
 ### 6. ~~No `garage_drain_node()` yet~~  **IMPLEMENTED**
 
-See section "garage_drain_node" below. Polls `garage worker list`
-until all `Block resync` workers Idle with Queue=0; verifies
-`block list-errors` empty before stopping the daemon; runs
-`garage repair tables` and `... blocks` after.
+See section "garage_drain_node" below. Polls
+`POST /v2/ListWorkers?node=self` until all `Block resync` workers
+state=idle with queueLength in (0, null); verifies
+`GET /v2/ListBlockErrors?node=self` returns an empty array before
+stopping the daemon; runs `POST /v2/LaunchRepairOperation?node=*`
+for `tables` and `blocks` after. (See lessons-log L24 — every Garage
+interaction is now via the v2 admin API, not the CLI.)
 
 ### 7. ~~No `transfer_mgmt_role()` yet~~  **IMPLEMENTED**
 
@@ -311,10 +383,10 @@ cluster.json. Idempotent.
 
 ### 8. CLI wiring for the new helpers is queued
 
-The five helpers (drbd_remove_peer, garage_drain_node,
-transfer_mgmt_role, drbd_demote_to_local, migrate_scratch_out_of_garage)
-are callable as Python functions but not yet plumbed into the `bedrock
-storage` subcommand surface. Operators currently invoke them via short
+The six helpers (drbd_remove_peer, garage_drain_node,
+transfer_mgmt_role, drbd_demote_to_local, migrate_scratch_out_of_garage,
+migrate_scratch_into_garage) are callable as Python functions but not
+yet plumbed into the `bedrock storage` subcommand surface. Operators currently invoke them via short
 Python scripts (e.g. `python3 -c 'import sys; sys.path.insert(0,
 "/usr/local/lib/bedrock"); from lib import tier_storage;
 tier_storage.drbd_remove_peer(...)'`). Wiring as
@@ -390,11 +462,13 @@ abstraction works at any cluster size with the same client code.
 - [DRBD `--max-peers` documented behavior](https://linbit.com/drbd-user-guide/drbd-guide-9_0-en/#s-max-peers) — set at `create-md` time; changing later requires meta-disk regeneration.
 
 ### Garage
-- [Garage Layout documentation](https://garagehq.deuxfleurs.fr/documentation/operations/layout/) — `layout assign`, `apply`, `remove`.
-- [Garage Recovering from failures](https://garagehq.deuxfleurs.fr/documentation/operations/recovering/) — node decommission procedure (lacks "wait" step).
-- [Garage Durability and repairs](https://garagehq.deuxfleurs.fr/documentation/operations/durability-repairs/) — `worker list`, `worker set`, `block list-errors`, `repair tables`, `repair blocks`.
-- [Garage CLI reference](https://garagehq.deuxfleurs.fr/documentation/reference-manual/cli/) — full command list.
-- [Garage source — `src/block/resync.rs`](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/block/resync.rs) — lines 362–510: per-partition offload-then-delete logic.
+- [Garage admin API v2 reference manual](https://garagehq.deuxfleurs.fr/documentation/reference-manual/admin-api/) — every operation we orchestrate goes through this.
+- [Garage admin API OpenAPI v2.1.0](https://garagehq.deuxfleurs.fr/api/garage-admin-v2.json) — schemas for each request/response (machine-readable).
+- [Garage Layout documentation](https://garagehq.deuxfleurs.fr/documentation/operations/layout/) — concept reference for `UpdateClusterLayout` + `ApplyClusterLayout`.
+- [Garage Recovering from failures](https://garagehq.deuxfleurs.fr/documentation/operations/recovering/) — node decommission procedure (lacks "wait" step; `garage_drain_node` adds it).
+- [Garage Durability and repairs](https://garagehq.deuxfleurs.fr/documentation/operations/durability-repairs/) — concept reference for `ListWorkers`, `SetWorkerVariable`, `ListBlockErrors`, `LaunchRepairOperation`.
+- [Garage source — `src/api/admin/`](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/src/api/admin/) — admin API handlers (per-endpoint Rust code).
+- [Garage source — `src/block/resync.rs`](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/src/block/resync.rs) — line 537 (worker name `Block resync worker #N`) + line 551 (`queueLength` field). Per-partition offload-then-delete logic.
 - [Garage source — `src/rpc/layout/history.rs`](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/rpc/layout/history.rs) — multi-version layout, old versions preserved until `sync_ack_map_min` advances.
 - [Garage source — `src/rpc/rpc_helper.rs`](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/src/rpc/rpc_helper.rs) — `block_read_nodes_of()` (line ~570): tries current layout owners first, falls back to old versions in reverse.
 
@@ -701,13 +775,15 @@ Post-conditions:
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  1. garage layout remove <id>     (on a surviving admin host)  │
+        │  1. POST /v2/UpdateClusterLayout                               │
+        │     body: {"roles":[{"id":<full-hex>,"remove":true}]}          │
+        │     (on a surviving admin host)                                │
         │     -> stages the removal in the layout history                │
         └────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  2. garage layout apply --version <next>                       │
+        │  2. POST /v2/ApplyClusterLayout {"version": cur+1}             │
         │     -> commits NEW layout. NEW partitions for departing node's │
         │        load are now mapped to surviving nodes.                 │
         │     -> Garage's block_resync worker on the DEPARTING node     │
@@ -719,30 +795,33 @@ Post-conditions:
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  3. garage worker set resync-tranquility 0                     │
-        │     garage worker set resync-worker-count 8                    │
+        │  3. POST /v2/SetWorkerVariable?node=self  ×2                   │
+        │     body: {"variable":"resync-tranquility","value":"0"}        │
+        │     body: {"variable":"resync-worker-count","value":"8"}       │
         │     (on the DEPARTING node — speeds the drain by removing the  │
         │      throttle that exists for impact-friendly steady state)    │
         └────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  4. WAIT — poll `garage worker list` on the departing node     │
-        │     until every "Block resync worker #N" line shows            │
-        │     state=Idle, queue=0. Bounded by max_wait_seconds.          │
+        │  4. WAIT — poll POST /v2/ListWorkers?node=self on the          │
+        │     departing node until every "Block resync worker #N"        │
+        │     entry shows state="idle" AND queueLength in (0, null).     │
+        │     Bounded by max_wait_seconds.                               │
         └────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  5. garage block list-errors  (on departing node)              │
-        │     MUST be empty. A non-empty list means we have data-loss    │
-        │     candidates — abort, do not stop the node.                  │
+        │  5. GET /v2/ListBlockErrors?node=self  (on departing node)     │
+        │     The success-array MUST be empty. A non-empty list means    │
+        │     data-loss candidates — abort, do not stop the node.        │
         └────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │  6. garage repair --all-nodes --yes tables                     │
-        │     garage repair --all-nodes --yes blocks                     │
+        │  6. POST /v2/LaunchRepairOperation?node=*  ×2                  │
+        │     body: {"repairType":"tables"}                              │
+        │     body: {"repairType":"blocks"}                              │
         │     -> ensures metadata tables and block reference counts are  │
         │        consistent across the surviving cluster.                │
         └────────────────────────────────────────────────────────────────┘
