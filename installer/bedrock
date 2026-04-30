@@ -493,7 +493,7 @@ def cmd_storage(args):
 
         # 1. Drain Garage (only if scratch is on Garage, i.e. cluster N>=2).
         scratch = cluster.get("tiers", {}).get("scratch", {})
-        if scratch.get("mode") == "garage-s3fs":
+        if scratch.get("mode") == "garage":
             # Find the leaving node's short Garage id from /v2/GetClusterStatus.
             try:
                 token = tier_storage._garage_admin_token()
@@ -594,7 +594,7 @@ def cmd_storage(args):
 
         # 2. Migrate scratch out of Garage (if it's on Garage).
         scratch = cluster.get("tiers", {}).get("scratch", {})
-        if scratch.get("mode") == "garage-s3fs":
+        if scratch.get("mode") == "garage":
             print(f"  [2/2] migrate_scratch_out_of_garage()...")
             tier_storage.migrate_scratch_out_of_garage(
                 verify_md5=not args.skip_md5,

@@ -759,3 +759,46 @@ flow always grows monotonically.
   implementation of "unmount local first, then join_drbd_peer".
 - `tier_storage.py:promote_critical_to_3way:1158-1166` — the existing
   master-side helper that distributes only to existing peers.
+
+---
+
+## L28 — `transfer_mgmt_role` must rsync `/etc/bedrock/cluster.json` from old master to new master
+**2026-04-30** · clean-rerun Phase 4 (transfer-mgmt sim-1 → sim-2)
+
+**What we thought:** `transfer_mgmt_role` rsyncs `/opt/bedrock/{mgmt,
+iso,data,bin}` from the old master to the new master and updates the
+per-tier `master` field in `cluster.json` on every node (step 11).
+That's enough for the new master to take over.
+
+**What we found:** After the role move, the new master's
+`bedrock storage status` reports "Cluster: <none>" and "Nodes: 0"
+even though the storage role move worked correctly (DRBD primary,
+NFS export, sentinels intact, sim-3 NFS-clients re-pointed).
+
+Cause: the *peers'* `/etc/bedrock/cluster.json` files only ever
+contain tier state (modes, drbd_node_ids, peers lists). The canonical
+`cluster_name`, `cluster_uuid`, and the full `nodes` map live only
+on the master — written by `mgmt_install.install_full()` at
+`bedrock init` time. Joiners never get a copy.
+
+When step 11 of `transfer_mgmt_role` ran on sim-2 (the new master),
+it merged the tier `master` field into sim-2's existing
+cluster.json — but that file lacked the `nodes` map that step 11
+*didn't* know to copy. Downstream CLI verbs (`remove-peer`,
+`collapse-to-n1`) need that map to resolve peer-name → drbd_ip and
+SSH-host, so they would also break.
+
+**What we changed:** Added a step 5b in `transfer_mgmt_role` that
+rsyncs `/etc/bedrock/cluster.json` from old → new master *before*
+step 11's per-tier master update runs (so the per-tier override
+applies to the freshly-rsynced full file).
+
+The fix is master-only because the new master is the canonical owner
+of `cluster.json` going forward; peers continue to keep just their
+tier-state subset.
+
+**Source:**
+- `tier_storage.py:transfer_mgmt_role` step 5 (rsync /opt/bedrock/...)
+  was missing /etc/bedrock/cluster.json; new step 5b adds it.
+- `mgmt_install.install_full` writes the canonical cluster.json at
+  init time; agent_install never does.

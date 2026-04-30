@@ -1597,6 +1597,18 @@ def transfer_mgmt_role(
         f"root@{old_master_host}:/opt/bedrock/scrape.yml "
         f"/opt/bedrock/ 2>/dev/null", check=False)
 
+    # 5b. Pull /etc/bedrock/cluster.json from the old master. Peers'
+    #     cluster.json only ever held tier state (the canonical
+    #     cluster_name + cluster_uuid + nodes map lives only on the
+    #     master). Without this rsync the new master's `bedrock storage
+    #     status` shows "Cluster: <none>" and downstream verbs
+    #     (remove-peer, collapse-to-n1) can't resolve peer hostnames
+    #     to drbd_ips. (Lessons-log L28.)
+    ssh(new_master_host,
+        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+        f"root@{old_master_host}:/etc/bedrock/cluster.json "
+        f"/etc/bedrock/cluster.json", check=False)
+
     # 6. Copy systemd unit files. mnt-isos.mount and the bedrock-*
     #    units are idempotent if pre-existing (rsync overwrites).
     for unit in ("bedrock-mgmt.service", "bedrock-vm.service",
@@ -1667,8 +1679,18 @@ def transfer_mgmt_role(
             f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
             check=False)
 
-    # 11. Update cluster.json on the new master + propagate
+    # 11. Update cluster.json on the new master + propagate.
+    #     Two updates per node:
+    #       a) tier.master       — bulk + critical → new_master_name
+    #       b) nodes[*].role     — old master demoted to "compute";
+    #                              new master upgraded to "mgmt+compute".
+    #     Without (b), `bedrock storage remove-peer` would refuse to
+    #     remove the OLD master on the (now-correct) ground that it
+    #     still has the "mgmt" role. (Lessons-log L28.)
     new_master_name = ssh(new_master_host,
+                          "hostname --fqdn 2>/dev/null || hostname",
+                          check=False).strip()
+    old_master_name = ssh(old_master_host,
                           "hostname --fqdn 2>/dev/null || hostname",
                           check=False).strip()
     for host in [new_master_host] + other_peer_hosts:
@@ -1679,6 +1701,10 @@ def transfer_mgmt_role(
             f"c.setdefault(\"tiers\",{{}}); "
             f"[c[\"tiers\"].setdefault(t,{{}}).update("
             f"{{\"master\":\"{new_master_name}\"}}) for t in (\"bulk\",\"critical\")]; "
+            f"nodes=c.setdefault(\"nodes\",{{}}); "
+            f"nodes.setdefault(\"{new_master_name}\",{{}})[\"role\"]=\"mgmt+compute\"; "
+            f"old=nodes.get(\"{old_master_name}\"); "
+            f"old and old.update({{\"role\":\"compute\"}}); "
             f"p.write_text(json.dumps(c, indent=2))'",
             check=False)
 
