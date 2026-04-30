@@ -517,3 +517,49 @@ denied` and aborts with exit code 23, files partially copied.
 -aH --inplace` (no `-X`). Permissions, times, hardlinks are
 preserved; xattrs are not — acceptable for scratch tier where the
 content is regenerable anyway.
+
+---
+
+## L23 — DRBD .res files must be distributed to EVERY participating node
+**2026-04-30** · code review (post clean-run)
+
+**What we thought:** Each helper that adds or removes a DRBD peer
+writes its own .res file locally; that's enough because peers will
+write their own copies via their own helper calls.
+
+**What we found:** `promote_critical_to_3way()` was writing the new
+3-peer config and running `drbdadm adjust` on the local node ONLY.
+It did NOT distribute the new .res to existing peers (sim-2). Those
+peers continued to have a 2-peer config on disk (from their original
+`join_drbd_peer` call) while the kernel picked up the new 3rd peer
+via cluster gossip / explicit drbdadm adjust on the master. **The
+on-disk config on existing peers diverged from kernel state.** This
+would surface on next reboot when DRBD reads the .res to bring the
+resource up: it would only know about 2 peers and the 3rd would be
+"new" again on first contact.
+
+**What we changed:** `promote_critical_to_3way()` now distributes
+the new .res via SSH-fanout to all existing peers and runs `drbdadm
+adjust` on each. Generalizing the rule: **every helper that mutates
+DRBD topology MUST distribute the new .res to every node that
+participates in the resource AND run drbdadm adjust there.**
+`drbd_remove_peer()` already did this; `promote_local_to_drbd_master`
+and `join_drbd_peer` work because they're paired (each side writes
+its own copy with the same peer list, so they end up identical) —
+but if the peer list ever differs between the two calls (operator
+error), they'd diverge silently.
+
+**Audit summary** of every place that mutates `/etc/drbd.d/*.res`:
+
+| Function | Local write? | Distributed? | Notes |
+|---|---|---|---|
+| `promote_local_to_drbd_master` | yes | no | OK at N=1→N=2 (paired with join_drbd_peer); fragile if operator typoed |
+| `join_drbd_peer` | yes | no | Same — relies on master having matching config |
+| `promote_critical_to_3way` | yes | **NOW yes** | was the bug; now distributes via SSH |
+| `drbd_remove_peer` | yes | yes | already correct |
+| `drbd_demote_to_local` | local move-aside only | n/a | resource is going away; no peers to update |
+
+**Future improvement:** add a single `_distribute_drbd_res(full_res,
+hosts)` helper that every topology-mutating function calls. Today
+each function reimplements the SSH-fanout + base64-encode dance
+slightly differently; consolidating reduces room for drift.

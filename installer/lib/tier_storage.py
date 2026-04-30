@@ -727,7 +727,8 @@ def garage_create_scratch_bucket() -> dict:
 
 
 def s3fs_mount_scratch(access_key: str, secret_key: str,
-                        endpoint_drbd_ip: str | None = None) -> None:
+                        endpoint_drbd_ip: str | None = None,
+                        migrate_local_data: bool = True) -> None:
     """Mount Garage's 'scratch' bucket via s3fs at /var/lib/bedrock/mounts/scratch-s3fs
     and point /bedrock/scratch at it.
 
@@ -735,6 +736,16 @@ def s3fs_mount_scratch(access_key: str, secret_key: str,
     in tier_storage.md). The endpoint_drbd_ip arg is accepted for
     backward compat with older callers but ignored — Garage handles
     cross-node block lookup internally via its own RPC.
+
+    If `migrate_local_data` is True (default) and the local scratch LV
+    is currently mounted with content, that content is rsync'd into the
+    Garage bucket BEFORE the symlink swap. This preserves data across
+    the N=1 → N=2 promote (lessons-log L15: data may be lost only on
+    node loss, never on a default migration).
+
+    Set migrate_local_data=False on a freshly-joined peer that doesn't
+    have its own local scratch data to migrate (the local LV exists
+    from setup_n1 but is empty; nothing to copy).
     """
     # s3fs-fuse is in EPEL on AlmaLinux 9
     if not run_ok("rpm -q s3fs-fuse >/dev/null 2>&1"):
@@ -746,16 +757,6 @@ def s3fs_mount_scratch(access_key: str, secret_key: str,
 
     s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
     s3fs_mount.mkdir(parents=True, exist_ok=True)
-
-    # Stop using the local scratch LV — unmount it (keep the LV around for
-    # safety; operator can drop it later via `bedrock storage gc`).
-    local_scratch = LOCAL_ROOT / "scratch"
-    if run_ok(f"mountpoint -q {local_scratch}"):
-        # Move any user data into Garage first — best-effort rsync
-        run(f"sudo -u garage /usr/local/bin/garage bucket info scratch >/dev/null",
-            check=False)
-        # (skip rsync-into-S3 for now; that's a documented operator step)
-        run(f"umount {local_scratch}", check=False)
 
     fstab = Path("/etc/fstab")
     # Always target the LOCAL Garage daemon (invariant #6 in
@@ -769,10 +770,125 @@ def s3fs_mount_scratch(access_key: str, secret_key: str,
     if str(s3fs_mount) not in text:
         fstab.write_text(text.rstrip() + "\n" + line + "\n")
 
+    # Mount s3fs FIRST (before unmounting local) so the migration
+    # has a destination.
     if not run_ok(f"mountpoint -q {s3fs_mount}"):
         run(f"mount {s3fs_mount}", check=False)
 
+    # Migrate any local scratch data into the Garage bucket BEFORE
+    # the symlink swap. (L15: scratch data must be preserved on
+    # default N=1 → N=2 promote.)
+    local_scratch = LOCAL_ROOT / "scratch"
+    if migrate_local_data and run_ok(f"mountpoint -q {local_scratch}"):
+        migrate_scratch_into_garage(verify_md5=True)
+    elif run_ok(f"mountpoint -q {local_scratch}"):
+        # Caller said skip migration — just unmount and swap symlink.
+        run(f"umount {local_scratch}", check=False)
+
     atomic_symlink(str(s3fs_mount), PUBLIC_ROOT / "scratch")
+
+
+def migrate_scratch_into_garage(verify_md5: bool = True) -> None:
+    """Copy any data from the local scratch LV into the Garage scratch
+    bucket via s3fs, atomically swap /bedrock/scratch to point at the
+    Garage mount, then unmount the local LV.
+
+    Symmetric counterpart to `migrate_scratch_out_of_garage()`. Called
+    from `s3fs_mount_scratch()` during N=1 → N=2 promote so the
+    operator's local scratch data is preserved.
+
+    Pre:
+      - local scratch LV is mounted at /var/lib/bedrock/local/scratch
+      - s3fs already mounted at /var/lib/bedrock/mounts/scratch-s3fs
+        (Garage cluster up, scratch bucket created, s3fs operational)
+
+    Post:
+      - all files from local scratch are now objects in the scratch bucket
+      - /bedrock/scratch symlink points at the s3fs mount
+      - local scratch LV is unmounted (LV preserved; operator can
+        lvremove later if disk space is needed)
+      - if verify_md5=True, every file's MD5 was checksummed on both
+        sides before the symlink swap
+
+    Crash-safety:
+      - The rsync runs while /bedrock/scratch still points at the local
+        LV. A crash mid-rsync leaves persistent state at "local mode";
+        re-running converges (rsync skips already-copied files).
+      - The atomic symlink swap is the commit point. After it, new
+        opens go to s3fs; existing fds on the local mount keep
+        working until they close.
+      - The umount happens AFTER the swap, so a crash between commit
+        and umount just leaves the local LV mounted but unused; next
+        boot's fstab won't remount it (we drop the line at the end)
+        and a re-run picks up where it left off.
+    """
+    print(f"  [garage] migrate_scratch_into_garage()")
+
+    s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
+    local_scratch = LOCAL_ROOT / "scratch"
+
+    if not run_ok(f"mountpoint -q {local_scratch}"):
+        # Nothing to migrate
+        return
+    if not run_ok(f"mountpoint -q {s3fs_mount}"):
+        raise RuntimeError(
+            f"s3fs not mounted at {s3fs_mount} — caller must mount "
+            f"the Garage scratch bucket first.")
+
+    # 1. rsync local → s3fs (no -X; xattrs incompatible per L22)
+    print(f"  [garage] rsync pass 1 (local -> Garage)")
+    run(f"rsync -aH --inplace {local_scratch}/ {s3fs_mount}/",
+        timeout=24 * 3600)
+
+    # 2. Optional MD5 verification
+    if verify_md5:
+        print(f"  [garage] md5 verify")
+        src_md5 = run(
+            f"cd {local_scratch} && find . -type f -print0 | sort -z | "
+            f"xargs -0 md5sum 2>/dev/null", check=False)
+        dst_md5 = run(
+            f"cd {s3fs_mount} && find . -type f -print0 | sort -z | "
+            f"xargs -0 md5sum 2>/dev/null", check=False)
+        if src_md5 != dst_md5:
+            Path("/tmp/scratch-into-md5-src.log").write_text(src_md5)
+            Path("/tmp/scratch-into-md5-dst.log").write_text(dst_md5)
+            raise RuntimeError(
+                "MD5 verification failed: local and Garage differ. "
+                "Manifests at /tmp/scratch-into-md5-{src,dst}.log. "
+                "Re-run rsync with --checksum, or investigate the diff.")
+
+    # 3. Atomic symlink swap — commit point
+    atomic_symlink(str(s3fs_mount), PUBLIC_ROOT / "scratch")
+    print(f"  [garage] /bedrock/scratch now points at Garage "
+          f"(via local s3fs)")
+
+    # 4. Wait for any open fds on the local mount to drain so we can
+    #    cleanly umount.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        out = run(f"lsof +D {local_scratch} 2>/dev/null | wc -l",
+                  check=False)
+        try:
+            count = int(out.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            count = 0
+        if count <= 1:
+            break
+        time.sleep(2)
+
+    # 5. Unmount local scratch + drop fstab line
+    run(f"umount {local_scratch} 2>/dev/null", check=False)
+    if run_ok(f"mountpoint -q {local_scratch}"):
+        run(f"umount -l {local_scratch}", check=False)
+
+    fstab = Path("/etc/fstab")
+    if fstab.exists():
+        text = fstab.read_text()
+        new = "\n".join(l for l in text.splitlines()
+                        if str(local_scratch) not in l)
+        fstab.write_text(new + "\n" if new else "")
+
+    print(f"  [garage] local scratch LV unmounted; data now lives in Garage.")
 
 
 # ── Top-level transition orchestration ─────────────────────────────────────
@@ -872,6 +988,14 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     Run on the master. Assumes the resource was created with --max-peers=7
     so adding a peer is just a config update + drbdadm adjust + new node
     runs join_drbd_peer().
+
+    Distributes the new .res to ALL existing peers (master + survivors)
+    so that every node's on-disk config matches its kernel state. The
+    new third peer's join_drbd_peer() will write the same config too,
+    but that's a separate code path; this function ensures the existing
+    peers don't have a stale 2-peer config sitting around. (Lessons-log
+    L23: every operation that mutates DRBD topology must distribute the
+    new .res to every node that participates in the resource.)
     """
     # Update resource config to include third peer
     state_critical = get_tier_state("critical")
@@ -882,8 +1006,28 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     for name in existing_peer_names + [third_peer["name"]]:
         node = nodes.get(name, {})
         peers.append({"name": name, "drbd_ip": node.get("drbd_ip", "")})
+
+    # Local: write new config + adjust kernel.
     write_drbd_resource("critical", peers)
+    new_res = Path(f"/etc/drbd.d/tier-critical.res").read_text()
     run("drbdadm adjust tier-critical")
+
+    # Distribute identical config to every existing peer (the new
+    # third peer's join_drbd_peer will write its own; we don't need
+    # to also push to it). Then drbdadm adjust on each so the kernel
+    # picks up the new peer-3 connection definition.
+    import base64
+    b = base64.b64encode(new_res.encode()).decode()
+    for peer_name in existing_peer_names:
+        if peer_name == nodes.get(state_critical.get("master", ""), {}).get("name", ""):
+            continue   # master already adjusted above
+        peer_host = nodes.get(peer_name, {}).get("host")
+        if not peer_host:
+            continue
+        ssh(peer_host,
+            f"echo {b} | base64 -d > /etc/drbd.d/tier-critical.res")
+        ssh(peer_host, "drbdadm adjust tier-critical", check=False)
+
     set_tier_state("critical", mode="drbd-nfs",
                     peers=[p["name"] for p in peers])
 
@@ -904,82 +1048,129 @@ def promote_critical_to_3way(third_peer: dict) -> None:
 def drbd_remove_peer(
     resource: str,
     leaving_peer_name: str,
-    surviving_peers: list[dict],
     surviving_hosts: list[str],
+    surviving_peers: list[dict] | None = None,
+    new_res_text: str | None = None,
+    bedrock_resource: bool = True,
 ) -> None:
-    """LINBIT-blessed online peer removal for a DRBD tier resource.
+    """Online peer removal for ANY DRBD resource.
 
     Service to /dev/drbd<minor> on the surviving primary stays up. The
     leaving peer is dropped from kernel state on every survivor via
-    `drbdadm adjust` — which reads the (newly-edited) on-disk config
-    and issues `drbdsetup del-peer` for the now-missing peer.
+    `drbdsetup disconnect` + `drbdsetup del-peer` (per lessons-log L20:
+    drbdadm adjust is unreliable shrinking full-mesh resources).
 
     Args:
-        resource:         tier name (e.g. "bulk" or "critical")
+        resource:         FULL DRBD resource name. For tier resources
+                          can be just the short name "bulk" if
+                          `bedrock_resource=True` (default), in which
+                          case "tier-bulk" is the actual resource name.
+                          For VM resources pass the full name like
+                          "vm-web1-disk0" with `bedrock_resource=False`.
         leaving_peer_name: peer's hostname as it appears in the .res
-        surviving_peers:  list of {"name": ..., "drbd_ip": ...} for the
-                          peers that REMAIN. Their persistent node-ids
-                          are honored — none of their connections are
-                          touched.
         surviving_hosts:  list of mgmt-LAN hosts (or any reachable IP)
                           to SSH into for the per-node operations
+        surviving_peers:  list of {"name": ..., "drbd_ip": ...} for the
+                          peers that REMAIN. Required if
+                          `bedrock_resource=True` so we can render the
+                          new tier config. Optional otherwise.
+        new_res_text:     Pre-rendered .res file content to distribute.
+                          If provided, overrides the auto-rendering for
+                          tier resources. For VM resources, callers
+                          render their own config and pass it here.
+                          If None and `bedrock_resource=False`, no
+                          on-disk config update happens (caller is
+                          responsible).
+        bedrock_resource: True for tier-X resources (auto-render via
+                          render_drbd_res); False for VM disks or
+                          other non-tier DRBD resources.
 
-    Crash-safety: the on-disk config is rewritten + distributed BEFORE
-    drbdadm adjust applies it. A power loss between distribute and
-    apply leaves persistent state already at the desired end state;
-    `drbdadm up` on next boot reconciles correctly.
+    Crash-safety: when an on-disk config is provided, it's distributed
+    BEFORE the kernel-state mutation so a power loss leaves persistent
+    state already at the desired end state.
 
     See tier_storage.md "drbd_remove_peer" for the command-by-command
     breakdown and source citations.
     """
-    print(f"  [tier] drbd_remove_peer({resource}, leaving={leaving_peer_name})")
+    # Resolve the actual DRBD resource name for kernel commands and
+    # the .res filename. For tier resources, "bulk" → "tier-bulk".
+    full_res = f"tier-{resource}" if bedrock_resource else resource
 
-    # 1. Render new config WITHOUT the leaving peer; persistent node-ids
-    #    of survivors are preserved (render_drbd_res reads cluster.json).
-    write_drbd_resource(resource, surviving_peers)
-    new_res = Path(f"/etc/drbd.d/tier-{resource}.res").read_text()
+    print(f"  [tier] drbd_remove_peer({full_res}, leaving={leaving_peer_name})")
 
-    # 2. Distribute identical config to every surviving host. We assume
-    #    sshable as root via id_ed25519 (set up at cluster init).
-    for host in surviving_hosts:
-        # Use base64 to avoid quoting headaches with the resource body
+    # 1. Distribute the new on-disk config (if applicable).
+    if bedrock_resource:
+        if surviving_peers is None:
+            raise ValueError(
+                "drbd_remove_peer(bedrock_resource=True) requires "
+                "surviving_peers to render the new tier config.")
+        # render_drbd_res honors persistent node-ids (invariant #3).
+        write_drbd_resource(resource, surviving_peers)
+        new_res_text = Path(f"/etc/drbd.d/{full_res}.res").read_text()
+    if new_res_text:
         import base64
-        b = base64.b64encode(new_res.encode()).decode()
-        ssh(host, f"echo {b} | base64 -d > /etc/drbd.d/tier-{resource}.res")
+        b = base64.b64encode(new_res_text.encode()).decode()
+        for host in surviving_hosts:
+            ssh(host,
+                f"echo {b} | base64 -d > /etc/drbd.d/{full_res}.res")
 
-    # 3. Dry-run on each survivor; abort if adjust would do anything
-    #    other than del-peer for the leaving peer (and possibly
-    #    disconnect, which is implicit in del-peer per drbd-utils).
-    leaving_id = (load_cluster().get("tiers", {}).get(resource, {})
-                  .get("drbd_node_ids", {}).get(leaving_peer_name))
+    # 2. Find the leaving peer's persistent node-id. For tier
+    #    resources, look in cluster.json. For non-tier (e.g. VM)
+    #    resources we fall through to the kernel-state lookup below.
+    leaving_id = None
+    if bedrock_resource:
+        leaving_id = (load_cluster().get("tiers", {}).get(resource, {})
+                      .get("drbd_node_ids", {}).get(leaving_peer_name))
+
+    # 4. Mutate kernel state via drbdsetup direct (per L20 in
+    #    lessons-log: drbdadm adjust is unreliable shrinking full-mesh
+    #    resources because it hits "Combination of local address(port)
+    #    and remote address(port) already in use" when re-establishing
+    #    paths between survivors. drbdsetup disconnect+del-peer
+    #    operates on kernel state directly using the node-id and
+    #    works reliably).
+    if leaving_id is None:
+        # Fall back to reading kernel state to find the id by name —
+        # required for non-tier resources (no cluster.json entry) and
+        # rarely for tier resources where cluster.json missed the entry.
+        for host in surviving_hosts:
+            out = ssh(host,
+                f"drbdsetup show {full_res} 2>&1 | "
+                f"awk '/_peer_node_id/ {{pid=$2; gsub(\";\",\"\",pid)}} "
+                f"/_name.*{leaving_peer_name}/ {{print pid; exit}}'",
+                check=False).strip()
+            if out.isdigit():
+                leaving_id = int(out)
+                break
+        if leaving_id is None:
+            raise RuntimeError(
+                f"could not determine node-id for leaving peer "
+                f"{leaving_peer_name} on resource {full_res}. "
+                f"Inspect cluster.json + drbdsetup show output.")
+
+    # 3. Mutate kernel state via drbdsetup direct (L20: drbdadm adjust
+    #    is unreliable for full-mesh shrink).
     for host in surviving_hosts:
-        out = ssh(host, f"drbdadm --dry-run adjust tier-{resource}",
+        # disconnect → StandAlone; del-peer removes per-peer kernel
+        # config. Both are no-ops if the peer is already gone (host
+        # powered off), so safe to retry.
+        ssh(host, f"drbdsetup disconnect {full_res} {leaving_id}",
+            check=False)
+        ssh(host, f"drbdsetup del-peer {full_res} {leaving_id}",
+            check=False)
+
+    # 4. Optional sanity check via drbdadm adjust dry-run.
+    #    With kernel state already correct, adjust should be a no-op.
+    #    Significant residual ops indicate config drift — log but don't
+    #    fail.
+    for host in surviving_hosts:
+        out = ssh(host, f"drbdadm --dry-run adjust {full_res}",
                   check=False)
-        # Empty output is fine (no changes needed). Non-empty must
-        # only mention del-peer (or disconnect) for the leaving id.
-        for line in out.splitlines():
-            if not line.strip():
-                continue
-            # Allowed verbs: anything that adjust legitimately does
-            # for a full-mesh peer-set change, including new-path /
-            # del-path / change-connection (DRBD may reshuffle paths
-            # on connection-id renumbering even when only removing
-            # one peer). We REJECT only operations that create or
-            # promote resources, which would indicate config
-            # divergence rather than peer-removal.
-            forbidden = ("new-resource", "new-minor",
-                         "primary --force", "create-md")
-            if any(tok in line for tok in forbidden):
-                raise RuntimeError(
-                    f"adjust dry-run on {host} would do unexpected work: "
-                    f"{line!r}. Aborting peer removal — investigate before "
-                    f"forcing.")
-
-    # 4. Apply on each survivor. drbdadm adjust issues del-peer to the
-    #    kernel for any kernel-side connection without a matching
-    #    config entry. /dev/drbdN stays up the whole time.
-    for host in surviving_hosts:
-        ssh(host, f"drbdadm adjust tier-{resource}")
+        if out.strip():
+            print(f"  [tier] note: drbdadm adjust dry-run on {host} "
+                  f"reports residual ops (kernel state already correct):")
+            for line in out.splitlines()[:5]:
+                print(f"    {line}")
 
     # 5. Free the meta-disk bitmap slot. Optional but recommended: a
     #    later distinct peer added to this resource can reuse the
@@ -988,16 +1179,20 @@ def drbd_remove_peer(
     if leaving_id is not None:
         for host in surviving_hosts:
             ssh(host,
-                f"drbdsetup forget-peer tier-{resource} {leaving_id}",
+                f"drbdsetup forget-peer {full_res} {leaving_id}",
                 check=False)
         # Drop the persistent assignment so future add can re-allocate
-        free_drbd_node_id(resource, leaving_peer_name)
+        if bedrock_resource:
+            free_drbd_node_id(resource, leaving_peer_name)
 
-    # 6. Persist updated peer list in cluster.json
-    set_tier_state(resource, mode="drbd-nfs",
-                   peers=[p["name"] for p in surviving_peers])
-    print(f"  [tier] drbd_remove_peer({resource}): done. "
-          f"{len(surviving_peers)} peers remain.")
+    # 6. Persist updated peer list in cluster.json (tier resources only)
+    if bedrock_resource and surviving_peers is not None:
+        set_tier_state(resource, mode="drbd-nfs",
+                       peers=[p["name"] for p in surviving_peers])
+        print(f"  [tier] drbd_remove_peer({full_res}): done. "
+              f"{len(surviving_peers)} peers remain.")
+    else:
+        print(f"  [tier] drbd_remove_peer({full_res}): done.")
 
 
 def garage_drain_node(
@@ -1067,30 +1262,63 @@ def garage_drain_node(
     #    show Idle with Queue=0. This is the indicator that all blocks
     #    have been copied to their new owners and the source can be
     #    safely retired.
+    # Use Garage's structured admin API instead of parsing the
+    # `garage worker list` text table. (Lessons-log L18.)
+    #
+    # POST /v2/ListWorkers?node=self  →  JSON with per-worker
+    # {state, queueLength, errors, ...}. Drain is complete when all
+    # "Block resync worker #N" entries have state="idle" and
+    # queueLength in (0, null).
+    #
+    # Source: https://garagehq.deuxfleurs.fr/api/garage-admin-v2.json
+    #         https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/src/api/admin/worker.rs
     deadline = time.time() + max_wait_seconds
-    # Output format from `garage worker list` (v2.3):
-    #   TID  State  Name                    Tranq  Done  Queue  Errors  Consec  Last
-    #     1  Idle   Block resync worker #1  0      -     0      -       -
-    # Note "Block resync worker #N" spans 4 whitespace-separated tokens —
-    # naive split() puts Queue at index 8 (0-based), NOT index 5.
-    # We extract State and Queue with a regex that locks to the
-    # "Block resync worker #N" anchor.
-    import re
-    worker_re = re.compile(
-        r'^\s*\d+\s+(\S+)\s+Block resync worker #\d+\s+\S+\s+\S+\s+(\S+)'
-    )
+    # The departing node's admin token from its garage.toml.
+    admin_token = ssh(
+        departing_node_admin_host,
+        r"awk -F'\"' '/^admin_token/{print $2}' /etc/garage.toml",
+        check=False).strip()
+    if not admin_token:
+        raise RuntimeError(
+            f"could not read admin_token from {departing_node_admin_host}'s "
+            f"/etc/garage.toml — drain check needs the admin API auth.")
+
     while time.time() < deadline:
-        out = ssh(departing_node_admin_host, f"{g} worker list",
-                  check=False)
+        # Run the API call ON the departing node so 127.0.0.1:3903
+        # resolves to its local Garage daemon, and ?node=self gives
+        # us its workers.
+        api_out = ssh(
+            departing_node_admin_host,
+            f"curl -fsS -X POST "
+            f"-H 'Authorization: Bearer {admin_token}' "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{}}' "
+            f"'http://127.0.0.1:3903/v2/ListWorkers?node=self'",
+            check=False)
+        try:
+            body = json.loads(api_out)
+        except (json.JSONDecodeError, TypeError):
+            time.sleep(poll_seconds)
+            continue
+        if body.get("error"):
+            time.sleep(poll_seconds)
+            continue
+        success = body.get("success", {})
+        if not success:
+            time.sleep(poll_seconds)
+            continue
+        # success is {<this-node-id-hex>: [worker, worker, ...]}
+        workers = next(iter(success.values()))
         all_idle = True
         any_resync = False
-        for line in out.splitlines():
-            m = worker_re.match(line)
-            if not m:
+        for w in workers:
+            if not w.get("name", "").startswith("Block resync worker"):
                 continue
             any_resync = True
-            state, queue = m.group(1), m.group(2)
-            if state != "Idle" or queue not in ("0", "-"):
+            if w.get("state") != "idle":
+                all_idle = False
+                break
+            if (w.get("queueLength") or 0) > 0:
                 all_idle = False
                 break
         if any_resync and all_idle:

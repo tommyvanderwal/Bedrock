@@ -135,8 +135,9 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
     r = subprocess.run(f"curl -fsSL '{mgmt_tar}' -o /tmp/mgmt.tar.gz", shell=True)
     if r.returncode == 0:
         run(f"tar xzf /tmp/mgmt.tar.gz -C {MGMT} --strip-components=1")
-        run("pip3 install -q fastapi uvicorn paramiko websockets pydantic python-multipart 2>&1 | tail -1 || true",
-            check=False)
+        # NOTE: Python deps (fastapi, uvicorn, paramiko, websockets, pydantic,
+        # python-multipart) now installed by packages.install_base() on every
+        # node, not here. (Lessons-log L17 — every node may become master.)
 
     # 5. Prometheus scrape config — mgmt app will rewrite this whenever
     #    nodes register/unregister, so we just seed with this node.
