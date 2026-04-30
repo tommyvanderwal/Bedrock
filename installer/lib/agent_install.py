@@ -53,20 +53,9 @@ def install(witness: str, cluster_info: dict, repo: str):
             if n["state"] == "UP" and n["ip"] and not n["ip"].startswith("10."):
                 mgmt_ip = n["ip"]; break
 
-    # Save state
     existing = cluster_info.get("nodes", [])
-    s.update({
-        "cluster_name": cluster_info.get("cluster_name", "bedrock"),
-        "cluster_uuid": cluster_info.get("cluster_uuid", "unknown"),
-        "role": "compute",
-        "node_id": len(existing),
-        "node_name": hw.get("hostname", f"node{len(existing)+1}"),
-        "witness_host": witness,
-        "mgmt_url": cluster_info.get("mgmt_url") or f"http://{witness}:8080",
-        "mgmt_ip": mgmt_ip,
-        "drbd_ip": drbd_ip,
-    })
-    state.save(s)
+    node_name = hw.get("hostname", f"node{len(existing)+1}")
+    mgmt_url = cluster_info.get("mgmt_url") or f"http://{witness}:8080"
 
     # Deploy exporters first — register makes mgmt rewrite scrape.yml to include us
     print("  Installing exporters...")
@@ -76,9 +65,29 @@ def install(witness: str, cluster_info: dict, repo: str):
     pub_path = Path("/root/.ssh/id_ed25519.pub")
     my_pubkey = pub_path.read_text().strip() if pub_path.exists() else ""
 
-    print(f"  Registering with mgmt at {s['mgmt_url']}...")
-    result = _register(s["mgmt_url"], s["node_name"], mgmt_ip, drbd_ip, my_pubkey)
+    # Register BEFORE saving state. If the master is unreachable we want
+    # to surface the failure cleanly and leave state.json untouched, so
+    # `bedrock join` can be retried on the next attempt instead of
+    # refusing with "Already a member" (the symptom L28 documented when
+    # registration failed mid-flight). Only commit cluster_uuid + the
+    # other cluster-membership fields after register succeeds.
+    print(f"  Registering with mgmt at {mgmt_url}...")
+    result = _register(mgmt_url, node_name, mgmt_ip, drbd_ip, my_pubkey)
     print(f"  Registered. Cluster now has {len(result.get('nodes', []))} nodes.")
+
+    # Now safe to commit state — registration was accepted.
+    s.update({
+        "cluster_name": cluster_info.get("cluster_name", "bedrock"),
+        "cluster_uuid": cluster_info.get("cluster_uuid", "unknown"),
+        "role": "compute",
+        "node_id": len(existing),
+        "node_name": node_name,
+        "witness_host": witness,
+        "mgmt_url": mgmt_url,
+        "mgmt_ip": mgmt_ip,
+        "drbd_ip": drbd_ip,
+    })
+    state.save(s)
 
     # Install every peer's pubkey locally so mgmt + peers can SSH to this node.
     _install_peer_pubkeys(result.get("peer_pubkeys", []))

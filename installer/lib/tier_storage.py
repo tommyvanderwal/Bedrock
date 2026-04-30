@@ -1703,7 +1703,10 @@ def transfer_mgmt_role(
     old_master_name = ssh(old_master_host,
                           "hostname --fqdn 2>/dev/null || hostname",
                           check=False).strip()
-    for host in [new_master_host] + other_peer_hosts:
+    all_hosts = [new_master_host] + other_peer_hosts
+    if old_master_host not in all_hosts:
+        all_hosts.append(old_master_host)
+    for host in all_hosts:
         ssh(host,
             f"python3 -c 'import json; from pathlib import Path; "
             f"p=Path(\"/etc/bedrock/cluster.json\"); "
@@ -1717,6 +1720,37 @@ def transfer_mgmt_role(
             f"old and old.update({{\"role\":\"compute\"}}); "
             f"p.write_text(json.dumps(c, indent=2))'",
             check=False)
+
+    # 12. Update state.json on every node so each one's mgmt_url +
+    #     witness_host point at the new master, and `role` matches the
+    #     new layout. Without this:
+    #       - new master's `bedrock-mgmt` keeps reporting its OLD
+    #         (peer-era) mgmt_url in /cluster-info,
+    #       - peers' `bedrock storage status` shows stale mgmt_ip,
+    #       - subsequent `bedrock join --witness <new>` queries
+    #         /cluster-info, gets back the OLD master's mgmt_url, and
+    #         tries to register against a dead service.
+    #     (Lessons-log L28 follow-up.)
+    new_master_url = f"http://{new_master_host}:8080"
+    for host in all_hosts:
+        is_new_master = (host == new_master_host)
+        new_role = "mgmt+compute" if is_new_master else "compute"
+        # witness_host on the new master is "self" (same convention as
+        # mgmt_install.install_full); on every other node it's the new
+        # master's mgmt-LAN host.
+        new_witness = "self" if is_new_master else new_master_host
+        ssh(host,
+            f"python3 -c 'import json; from pathlib import Path; "
+            f"p=Path(\"/etc/bedrock/state.json\"); "
+            f"s=json.loads(p.read_text()) if p.exists() else {{}}; "
+            f"s[\"mgmt_url\"]={json.dumps(new_master_url)}; "
+            f"s[\"witness_host\"]={json.dumps(new_witness)}; "
+            f"s[\"role\"]={json.dumps(new_role)}; "
+            f"p.write_text(json.dumps(s, indent=2))'",
+            check=False)
+    # bedrock-mgmt caches the cluster info from state.json at startup,
+    # so a restart on the new master picks up the new mgmt_url.
+    ssh(new_master_host, "systemctl restart bedrock-mgmt", check=False)
 
     print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
 

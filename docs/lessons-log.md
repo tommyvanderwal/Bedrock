@@ -803,6 +803,21 @@ tier-state subset.
 - `mgmt_install.install_full` writes the canonical cluster.json at
   init time; agent_install never does.
 
+**Follow-ups (fixed in clean-rerun-2 commit):**
+- `transfer_mgmt_role` step 12: pushes updated `state.json` to every
+  node — `mgmt_url`, `witness_host`, and per-node `role` track the
+  new master. `bedrock-mgmt` on the new master is restarted so its
+  `/cluster-info` endpoint serves the new mgmt_url instead of the
+  stale peer-era one. (Was surfaced in clean-rerun-2 when sim-1
+  tried to re-`bedrock join` against sim-2's witness and got
+  /cluster-info pointing at the long-gone sim-1 master.)
+- `agent_install.install` is now transactional: registers with mgmt
+  *first*, only writes state.json on success. A connection-refused
+  on first join leaves the node fully clean (no stuck `cluster_uuid
+  = "unknown"`) so retrying `bedrock join` works without a manual
+  `bedrock storage _local-reset` in between. Was the second symptom
+  in clean-rerun-2's "Add node1 back" phase.
+
 ---
 
 ## L29 — `_peer-s3fs` must pass `migrate_local_data=False`
