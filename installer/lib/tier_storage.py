@@ -1,23 +1,45 @@
 """Bedrock storage tiers — scratch / bulk / critical.
 
-Stable abstraction: /bedrock/{scratch,bulk,critical}, identical on every node.
-Backend swaps under the symlink as the cluster grows.
+See `tier_storage.md` (next to this file) for the full operational spec:
+  - what each function does, contracts and invariants
+  - where state lives (cluster.json, /etc/drbd.d, /etc/fstab, kernel)
+  - the WHY behind each design choice
+  - the documented sources for every external behavior
+  - known issues and queued fixes
 
-  N=1: /bedrock/<tier> -> /var/lib/bedrock/local/<tier>      (local thin LV)
-  N=2: scratch -> Garage (S3) via s3fs FUSE mount
-       bulk    -> DRBD 2-way + XFS, NFS-exported from master, peer mounts NFS
-       critical-> same as bulk (degenerate at 2 nodes; only differentiates at N>=3)
-  N=3: critical promoted to 3-way DRBD; bulk stays 2-way; scratch Garage extends
-  N=4: same shape; new node joins Garage + NFS clients only
+Reviewers analyzing this module for "can this reach a bad state" should
+read tier_storage.md first — the invariants section enumerates what each
+operation must preserve, with crash-safety reasoning.
 
-The DRBD migration uses external metadata so the underlying LV's filesystem is
-preserved byte-for-byte — no data copy required when promoting a local LV to a
-DRBD-replicated LV (only a brief unmount/remount).
+For the journey of decisions and corrections that led here (wrong turns,
+misdiagnoses, lessons learned), see ../../docs/lessons-log.md.
 
-This module is callable from:
-  - mgmt_install.install_full()  -> calls setup_n1()
-  - agent_install.install()      -> calls setup_n1() then transitions
-  - bedrock storage <subcommand> -> manual operator transitions
+Quick model:
+  /bedrock/<tier> is the stable mountpoint on every node, always valid.
+  Backend behind the symlink swaps as the cluster grows or shrinks.
+
+  N=1: /bedrock/<tier>    -> /var/lib/bedrock/local/<tier>        (local thin LV)
+  N=2: /bedrock/scratch   -> Garage S3 via local s3fs FUSE
+       /bedrock/bulk      -> DRBD 2-way XFS, NFS-served by master
+       /bedrock/critical  -> DRBD 2-way XFS, NFS-served by master
+  N=3: /bedrock/critical  -> DRBD 3-way XFS  (bulk stays 2-way)
+  N=4: same shape; new node = Garage volume + NFS client
+
+External DRBD metadata is essential: it makes local-LV → DRBD-replicated
+promotion zero-copy (the data LV's XFS is preserved byte-for-byte).
+
+Entry points:
+  setup_n1()                          — single-node setup; idempotent
+  transition_to_n2_master(...)        — N=1 -> N=2 master side
+  transition_to_n2_peer(...)          — N=1 -> N=2 peer side
+  finalize_n2_garage(...)             — Garage cluster formation
+  promote_critical_to_3way(...)       — N=2 -> N=3 critical promote
+  s3fs_mount_scratch(...)             — FUSE mount Garage scratch bucket
+
+Called from:
+  mgmt_install.install_full() -> setup_n1()
+  agent_install.install()     -> setup_n1()
+  bedrock storage <cmd>       -> operator-driven transitions
 """
 
 from __future__ import annotations
