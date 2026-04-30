@@ -381,18 +381,37 @@ files, copy systemd units, configure exports, start services,
 re-point NFS clients on every other peer, swap symlinks, update
 cluster.json. Idempotent.
 
-### 8. CLI wiring for the new helpers is queued
+### 8. ~~CLI wiring for the new helpers is queued~~  **WIRED**
 
-The six helpers (drbd_remove_peer, garage_drain_node,
-transfer_mgmt_role, drbd_demote_to_local, migrate_scratch_out_of_garage,
-migrate_scratch_into_garage) are callable as Python functions but not
-yet plumbed into the `bedrock storage` subcommand surface. Operators currently invoke them via short
-Python scripts (e.g. `python3 -c 'import sys; sys.path.insert(0,
-"/usr/local/lib/bedrock"); from lib import tier_storage;
-tier_storage.drbd_remove_peer(...)'`). Wiring as
-`bedrock storage remove-peer`, `... drain-garage-node`,
-`... transfer-mgmt-role`, `... demote-to-local`,
-`... migrate-scratch-local` is the next pass.
+The cluster-wide helpers are exposed as `bedrock storage <verb>`
+subcommands. All of them are *cluster-wide* operations that the
+operator runs from the mgmt master — the helper itself does the
+SSH-fanout to peers as needed:
+
+| Subcommand | Helper(s) called | Where to run | What it does |
+|---|---|---|---|
+| `bedrock storage promote` | `transition_to_n2_master` + `_peer` + `finalize_n2_garage` + `s3fs_mount_scratch` | mgmt master | N=1 → N=2 promotion |
+| `bedrock storage promote-critical-3way <peer>` | `promote_critical_to_3way` | mgmt master | N=2 → N=3 for the critical tier |
+| `bedrock storage transfer-mgmt <new-master>` | `transfer_mgmt_role` | any node with SSH to both | Move mgmt + NFS + DRBD primary |
+| `bedrock storage remove-peer <name>` | `garage_drain_node` + `drbd_remove_peer` × 2 | mgmt master | Drain Garage, remove DRBD from bulk + critical, drop from cluster.json |
+| `bedrock storage collapse-to-n1` | `drbd_demote_to_local` × 2 + `migrate_scratch_out_of_garage` | the last surviving node | Standalone N=1 from a fully-drained cluster |
+
+`migrate_scratch_into_garage` is *not* exposed as a CLI verb — it
+runs automatically from `s3fs_mount_scratch` during `bedrock storage
+promote` (the N=1 → N=2 path). See
+[`tier_storage__migrate_scratch_into_garage.md`](tier_storage__migrate_scratch_into_garage.md).
+
+Per-node setup (`init`, `bootstrap`, `join`, `leave`) is the only
+class of command that runs on the target node itself; everything
+else is cluster-side.
+
+Refusal rules baked into the wiring:
+- `remove-peer` refuses to remove the current mgmt master (operator
+  must `transfer-mgmt` first).
+- `remove-peer` refuses if it would leave the cluster empty
+  (operator should use `collapse-to-n1` instead on the last node).
+- `collapse-to-n1` refuses if `cluster.json` still shows multiple
+  nodes, and refuses if run on a non-surviving node.
 
 ---
 
