@@ -613,3 +613,91 @@ use it. The CLI is for interactive operator use, not for orchestration.
   https://garagehq.deuxfleurs.fr/documentation/reference-manual/admin-api/
 - Pre-migration research: `/tmp/garage-api-migration-research.md`
   (per-command classification table)
+
+---
+
+## L25 — Testbed SSH key lives in `/root/.ssh`, not `~tommy/.ssh`
+**2026-04-30** · clean-rerun setup
+
+**What we thought:** `spawn.py` reads `~/.ssh/id_ed25519` (the user
+running the script) and bakes the matching pubkey into cloud-init.
+So the dev user can `ssh root@<sim-ip>` directly.
+
+**What we found:** `spawn.py` is invoked under `sudo` (it needs root
+for `virsh --connect qemu:///system` and `cloud-localds`). Inside
+sudo, `Path.home()` resolves to `/root`, not `/home/tommy`. So the
+key baked into every sim's cloud-init `ssh_authorized_keys` is
+`/root/.ssh/id_ed25519.pub` (label `root@HP-G1a`). Plain `ssh root@`
+from the `tommy` shell finds no matching identity in
+`/home/tommy/.ssh/`, falls through to password auth, fails.
+
+This wasn't surfaced by `spawn.py ssh <i>` and `spawn.py exec <i>`
+because those subcommands were also typically invoked under sudo (or
+via the e2e script that already used sudo). The breakage shows up
+when a person/agent uses raw `ssh root@<ip>` after spawning.
+
+**What we changed:** Documented as a project rule. From now on, all
+testbed SSH from the dev box uses `sudo ssh root@<sim-ip>` (or
+`spawn.py ssh <i>` / `spawn.py exec <i>`, themselves run with sudo).
+No code change — the `Path.home()` behavior under sudo is *correct*
+for what spawn.py is doing (it owns root's libvirt resources, so
+using root's key is consistent).
+
+Future improvement: have `cmd_prereqs` symlink `/root/.ssh/id_ed25519`
+into `~tommy/.ssh/id_ed25519_testbed` and prepend it via SSH config
+so the dev user can SSH without sudo. Out of scope for v1.0.
+
+**Source:**
+- spawn.py:43-44 — `SSH_KEY = Path.home() / ".ssh" / "id_ed25519"`
+- spawn.py:131 — `pubkey = SSH_PUBKEY.read_text().strip()` baked
+  into cloud-init user-data.
+
+---
+
+## L26 — `rsync` into s3fs needs `--omit-dir-times`
+**2026-04-30** · clean-rerun Phase 2 (N=1 → N=2 promote)
+
+**What we thought:** `migrate_scratch_into_garage()` could mirror the
+`migrate_scratch_out_of_garage()` rsync flags exactly: `-aH --inplace`.
+The two were designed as symmetric counterparts, just direction-
+reversed; if the OUT direction works, the IN direction should too.
+
+**What we found:** First fresh-testbed run of N=1→N=2 fails with:
+
+```
+rsync: [generator] failed to set times on
+  "/var/lib/bedrock/mounts/scratch-s3fs/.": Input/output error (5)
+rsync error: some files/attrs were not transferred (code 23)
+```
+
+`-a` implies `-t` which makes rsync set mtimes on the destination
+*root directory* at the very end of the transfer. s3fs is a FUSE
+bridge to S3, and S3 has no native concept of directory mtime — so
+the FUSE op returns EIO. All file data is already copied successfully
+by the time this fires; only the cosmetic post-transfer dir-mtime
+step fails, but rsync exits non-zero anyway.
+
+The OUT direction (s3fs → local) didn't surface this because the
+*destination* root is a local XFS mount that supports setmtime fine.
+Asymmetric s3fs limitations means the two directions need different
+flag sets even though the data flow is symmetric. (Same pattern as
+L22's `-X` drop.)
+
+**Why it didn't surface earlier:** L15 added `migrate_scratch_into_
+garage` after the prior clean-run; the pre-L15 testbed never ran
+this code path. The 2026-04-30 clean-rerun is the first time it's
+exercised on a fresh testbed. Listed as a backlog item ("re-run
+validation pass on fresh testbed to confirm L15...") — this is what
+re-running surfaces.
+
+**What we changed:** `migrate_scratch_into_garage()` rsync command
+now passes `--omit-dir-times`. File mtimes still preserved (so
+re-run idempotency on size+mtime check is intact); only directory
+mtimes are skipped. `migrate_scratch_out_of_garage()` left alone
+since the local destination supports dir mtimes fine.
+
+**Source:**
+- `rsync(1)` — [`--omit-dir-times`](https://manpages.debian.org/testing/rsync/rsync.1.en.html#opt--omit-dir-times)
+- s3fs-fuse — [POSIX limitations](https://github.com/s3fs-fuse/s3fs-fuse/wiki/Limitations)
+  (S3 doesn't model directory metadata)
+- `tier_storage.py` migrate_scratch_into_garage step 1.

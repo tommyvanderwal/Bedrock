@@ -972,9 +972,15 @@ def migrate_scratch_into_garage(verify_md5: bool = True) -> None:
             f"s3fs not mounted at {s3fs_mount} — caller must mount "
             f"the Garage scratch bucket first.")
 
-    # 1. rsync local → s3fs (no -X; xattrs incompatible per L22)
+    # 1. rsync local → s3fs.
+    #    - no -X: xattrs incompatible per L22.
+    #    - --omit-dir-times: s3fs returns EIO when rsync sets the
+    #      destination root dir's mtime (S3 has no notion of directory
+    #      mtime; FUSE bridge surfaces EIO). File mtimes still preserved
+    #      so re-runs remain idempotent on size+mtime. (L26.)
     print(f"  [garage] rsync pass 1 (local -> Garage)")
-    run(f"rsync -aH --inplace {local_scratch}/ {s3fs_mount}/",
+    run(f"rsync -aH --inplace --omit-dir-times "
+        f"{local_scratch}/ {s3fs_mount}/",
         timeout=24 * 3600)
 
     # 2. Optional MD5 verification

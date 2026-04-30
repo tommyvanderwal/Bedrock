@@ -72,10 +72,13 @@ direction reversed.
                                          │
                                          ▼
        ┌────────────────────────────────────────────────────────────┐
-       │  1. rsync -aH --inplace LOCAL/ → S3FS/                     │
+       │  1. rsync -aH --inplace --omit-dir-times LOCAL/ → S3FS/    │
        │     ── note: NOT -X. s3fs reports SELinux/xattr contexts   │
        │        differently from XFS, breaks rsync mid-copy with    │
        │        "lremovexattr: Permission denied". (See L22.)       │
+       │     ── --omit-dir-times: s3fs returns EIO when rsync sets  │
+       │        the dest-root dir mtime (S3 has no dir mtime).      │
+       │        File mtimes still preserved. (See L26.)             │
        │     ── --inplace: write through to dest file directly      │
        │        (no temp + rename); destination has no concurrent   │
        │        readers in this scenario.                            │
@@ -127,7 +130,7 @@ mountpoint -q /var/lib/bedrock/local/scratch
 mountpoint -q /var/lib/bedrock/mounts/scratch-s3fs
 
 # 1. Bulk copy:
-rsync -aH --inplace \
+rsync -aH --inplace --omit-dir-times \
   /var/lib/bedrock/local/scratch/ \
   /var/lib/bedrock/mounts/scratch-s3fs/
 
@@ -169,9 +172,13 @@ even after a power-loss interruption.
 ## Failure modes
 
 - **rsync exits with code 23** — partial transfer due to permission
-  errors. The most common cause is the `-X` flag we *don't* pass; if
-  someone re-adds it, mismatched SELinux xattrs on s3fs break the
-  copy mid-flight. Solution: keep `-aH --inplace` only.
+  errors. Two known causes, both s3fs limitations:
+  1. The `-X` flag we *don't* pass: if someone re-adds it, mismatched
+     SELinux xattrs on s3fs break the copy mid-flight. (L22.)
+  2. The dest-root dir mtime: rsync's `-a` implies `-t`, and s3fs
+     returns EIO when it tries to set mtime on the bucket root dir.
+     We pass `--omit-dir-times` to skip that step. (L26.)
+  Solution: keep `-aH --inplace --omit-dir-times` exactly.
 - **MD5 verification mismatch** — function raises with paths to
   `/tmp/scratch-into-md5-{src,dst}.log` for inspection. Possible
   causes: sparse files (s3fs may not preserve sparseness), special
