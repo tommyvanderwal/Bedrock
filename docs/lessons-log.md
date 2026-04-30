@@ -281,3 +281,152 @@ references it.
 
 Per-module specs (`tier_storage.md`, etc.) should be revised in place
 to reflect *current* implementation; this log is the journey.
+
+---
+
+## L13 — Cloud-init regenerates SSH host keys after sshd starts
+**2026-04-30** · clean-run Phase 1-2
+
+**What we thought:** Cloud images come with stable SSH host keys; once
+the VM is sshable, the keys are final.
+
+**What we found:** AlmaLinux 9 cloud-init module
+`cc_ssh_genkeytypes` runs *after* sshd has already started. Sshd
+loads the image's pre-baked keys initially; cloud-init then
+regenerates fresh per-VM keys; sshd doesn't see them until it
+reloads. If `bedrock join` runs in this window, its `ssh-keyscan`
+captures pre-regen keys → later actual ssh connections see
+post-regen keys → "host key changed" warnings.
+
+**What we changed:** durable mitigation — every operator script that
+ssh-keyscans testbed nodes runs `cloud-init status --wait` first,
+then proceeds. Built into the new clean-run Phase 1.
+
+**Source:**
+- [`cc_ssh_genkeytypes` cloud-init module](https://cloudinit.readthedocs.io/en/latest/topics/modules.html#ssh)
+
+---
+
+## L14 — `ssh-keygen -R` is the right tool for cleaning hashed known_hosts entries
+**2026-04-30** · clean-run Phase 2
+
+**What we thought:** A `sed -i '/<ip>/d'` would clean stale entries
+for testbed IPs from /root/.ssh/known_hosts.
+
+**What we found:** OpenSSH writes hashed entries by default
+(`HashKnownHosts yes`). Each entry looks like
+`|1|<salted-hash>|<salted-hash> <key-type> <key-data>` — the IP is
+not present in plain text. sed regex matching the IP literal
+silently does nothing. After sed "cleanup," all stale entries are
+still there.
+
+**What we changed:** use `ssh-keygen -f /root/.ssh/known_hosts -R <ip>`
+which knows how to compare against hashed entries and removes the
+right lines.
+
+**Source:**
+- [`ssh-keygen(1)` `-R` flag](https://man7.org/linux/man-pages/man1/ssh-keygen.1.html#CERTIFICATE_AUTHORITY_OPTIONS)
+- [`ssh_config(5)` HashKnownHosts](https://man7.org/linux/man-pages/man5/ssh_config.5.html)
+
+---
+
+## L15 — Local scratch data lost on N=1→N=2 promote (asymmetric with reverse)
+**2026-04-30** · clean-run Phase 2
+
+**What we thought:** Promoting from N=1 to N=2 preserves all tier
+data — bulk and critical do via DRBD external metadata's zero-copy
+trick. We assumed scratch was symmetrical.
+
+**What we found:** `s3fs_mount_scratch()` unmounts the local LV
+without copying data into the new Garage bucket. The tier_storage
+code has a comment "skip rsync-into-S3 for now; that's a documented
+operator step" — but in practice it surprises the operator
+(SENTINEL.txt MD5 disappears mid-run).
+
+**What we changed:** **TODO** — implement
+`migrate_scratch_into_garage()` as the symmetric counterpart of
+`migrate_scratch_out_of_garage()`. Per Tommy: "data may be lost
+ONLY when losing a node, never during a default/normal migration."
+
+**Source:**
+- (the current behavior is in `tier_storage.s3fs_mount_scratch()`
+  around the line `# (skip rsync-into-S3 for now; that's a documented
+  operator step)`)
+
+---
+
+## L16 — `transfer_mgmt_role` NFS-client remount needs `umount -l`
+**2026-04-30** · clean-run Phase 5
+
+**What we thought:** Plain `umount` followed by `mount` would
+re-establish NFS clients against the new master.
+
+**What we found:** when the previous NFS server (old master) has
+just been demoted, the kernel's NFS connection to it is in a stale
+state. Plain `umount` returns success without actually unmounting
+(the NFS client is still trying to talk to the dead server).
+Subsequent `mount` is a no-op (path is "already mounted" in kernel
+state, just to a dead destination). The kernel state stays connected
+to the OLD server while fstab points at the NEW one. Symptom:
+`md5sum /bedrock/bulk/SENTINEL.txt → Input/output error`.
+
+**What we changed:** `transfer_mgmt_role()` now uses `umount -l`
+(lazy unmount) which detaches the mount from the namespace
+immediately and the next `mount` always picks up fresh config from
+fstab.
+
+**Source:**
+- [`umount(8)` `-l` lazy unmount](https://man7.org/linux/man-pages/man8/umount.8.html)
+
+---
+
+## L17 — Mgmt-app Python deps must be installed on EVERY node, not just the initial mgmt
+**2026-04-30** · clean-run Phase 5
+
+**What we thought:** Only the mgmt node needs paramiko, fastapi,
+uvicorn, websockets, pydantic, python-multipart. Peer nodes use
+plain stdlib for their agent code.
+
+**What we found:** When `transfer_mgmt_role` rsyncs `/opt/bedrock/mgmt`
+to the new master and starts `bedrock-mgmt.service`, the service
+fails immediately with `ModuleNotFoundError: No module named 'paramiko'`.
+Agent-installed peers never had the pip deps.
+
+Per Tommy: "any one could in principle become the master" — so the
+right design is to install ALL mgmt deps on every node by default.
+Each node is then ready to take over without runtime pip install.
+
+**What we changed (interim):** `transfer_mgmt_role()` now runs
+pip install on the new master before starting services. Real fix
+queued: move the `pip install` from `mgmt_install.install_full()`
+into `packages.install_base()` so every node gets the deps at
+bootstrap time.
+
+**Source:**
+- (`mgmt_install.install_full()` line ~138 currently does
+  `pip3 install -q fastapi uvicorn paramiko websockets pydantic
+  python-multipart`)
+
+---
+
+## L18 — `garage worker list` parser must handle multi-word worker names
+**2026-04-30** · clean-run Phase 5
+
+**What we thought:** Splitting the `garage worker list` output on
+whitespace and grabbing `cols[5]` would give the Queue value for a
+"Block resync worker #N" row.
+
+**What we found:** "Block resync worker #N" is FOUR
+whitespace-separated tokens, so `cols[5]` is `#N` (part of the name),
+not the Queue value. Real Queue is at `cols[8]`. Result: the
+`garage_drain_node` polling loop saw `queue=#1` (a non-`0`,
+non-`-` value) and never recognized completion → 300 s timeout.
+
+**What we changed:** parser now uses a regex anchored on
+`Block resync worker #\d+` to extract State and Queue
+positionally relative to the worker-name marker, immune to
+column-counting bugs.
+
+**Source:**
+- the actual `garage worker list` output format from
+  v2.3.0 (Garage's `worker_list` admin command)

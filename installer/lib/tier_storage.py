@@ -1060,24 +1060,29 @@ def garage_drain_node(
     #    have been copied to their new owners and the source can be
     #    safely retired.
     deadline = time.time() + max_wait_seconds
+    # Output format from `garage worker list` (v2.3):
+    #   TID  State  Name                    Tranq  Done  Queue  Errors  Consec  Last
+    #     1  Idle   Block resync worker #1  0      -     0      -       -
+    # Note "Block resync worker #N" spans 4 whitespace-separated tokens —
+    # naive split() puts Queue at index 8 (0-based), NOT index 5.
+    # We extract State and Queue with a regex that locks to the
+    # "Block resync worker #N" anchor.
+    import re
+    worker_re = re.compile(
+        r'^\s*\d+\s+(\S+)\s+Block resync worker #\d+\s+\S+\s+\S+\s+(\S+)'
+    )
     while time.time() < deadline:
         out = ssh(departing_node_admin_host, f"{g} worker list",
                   check=False)
-        # Parse "Block resync worker #N" lines, check State and Queue
-        # columns. Format (v2.x):
-        #   TID  State  Name                    Tranq  Done  Queue ...
         all_idle = True
         any_resync = False
         for line in out.splitlines():
-            if "Block resync worker" not in line:
+            m = worker_re.match(line)
+            if not m:
                 continue
             any_resync = True
-            cols = line.split()
-            if len(cols) < 6:
-                continue
-            state = cols[1]
-            queue = cols[5]
-            if state != "Idle" or (queue not in ("0", "-")):
+            state, queue = m.group(1), m.group(2)
+            if state != "Idle" or queue not in ("0", "-"):
                 all_idle = False
                 break
         if any_resync and all_idle:
@@ -1234,6 +1239,15 @@ def transfer_mgmt_role(
             f"/etc/systemd/system/{unit}", check=False)
     ssh(new_master_host, "systemctl daemon-reload")
 
+    # 6b. Install mgmt-app Python deps on the new master. agent_install
+    #     doesn't install these (only mgmt_install.install_full does),
+    #     so a peer becoming the new master needs them now.
+    #     (See lessons-log L17.)
+    ssh(new_master_host,
+        "pip3 install -q fastapi uvicorn paramiko websockets pydantic "
+        "python-multipart 2>&1 | tail -2",
+        check=False, timeout=300)
+
     # 7. NFS exports on new master
     nfs_export_drbd_tiers_remote(new_master_host)
 
@@ -1254,8 +1268,14 @@ def transfer_mgmt_role(
             f"/etc/systemd/system/mnt-isos.mount", check=False)
         ssh(peer, "systemctl daemon-reload", check=False)
         for tier in ("bulk", "critical"):
+            # Use lazy umount: when the old NFS server has just been
+            # demoted, regular umount can return success without
+            # actually unmounting — leaving the kernel state pointing
+            # at the dead server. -l detaches the mount immediately
+            # and the next mount picks up fresh config from fstab.
+            # (See lessons-log L16.)
             ssh(peer,
-                f"umount /var/lib/bedrock/mounts/{tier}-nfs", check=False)
+                f"umount -l /var/lib/bedrock/mounts/{tier}-nfs", check=False)
             ssh(peer,
                 f"mount /var/lib/bedrock/mounts/{tier}-nfs", check=False)
 
