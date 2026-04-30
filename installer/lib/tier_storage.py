@@ -2058,3 +2058,133 @@ def migrate_scratch_out_of_garage(
           f"Garage decommissioned." if not keep_garage else
           f"  [garage] scratch migrated to local LV; "
           f"Garage left running per keep_garage=True.")
+
+
+# ── Clean-leave: node reset to post-bootstrap / pre-init state ────────────
+
+def node_reset_local() -> None:
+    """Bring this node back to its post-`bedrock bootstrap` state.
+
+    Used when a node is being removed from the cluster (called over
+    SSH from `bedrock storage remove-peer`'s cluster-side cleanup) or
+    when an operator manually wants to take this node out of service.
+
+    What this clears:
+      - Stops bedrock services (mgmt/vm/vl/garage/nfs-server/mnt-isos)
+      - Tears down DRBD resources + removes /etc/drbd.d/tier-*.res
+      - Unmounts everything bedrock-related (NFS, s3fs, DRBD, local LVs)
+      - Drops fstab entries for bedrock mounts
+      - Removes NFS exports + garage config + s3fs creds + units
+      - Removes tier LVs from the bedrock VG (data goes away — operator
+        already accepted this by running remove-peer)
+      - Removes /bedrock/* symlinks and /opt/bedrock/{mgmt,iso,data}
+      - Drops /etc/bedrock/cluster.json
+      - Truncates /etc/bedrock/state.json to {hardware, bootstrap_done}
+
+    What this preserves:
+      - OS packages (rpm DB)
+      - DRBD kernel module + persist file
+      - Network bridge (br0) + DRBD ring NIC config
+      - SSH keys and known_hosts
+      - The bedrock VG + thin pool itself (re-init/join skips the
+        slow PV/VG creation)
+
+    After this runs the operator can `bedrock init` (start a new cluster)
+    or `bedrock join` (join one) — same choice as right after bootstrap.
+
+    Idempotent — safe to re-run.
+    """
+    print("  [reset] clearing local cluster state")
+
+    # 1. Stop services. Best-effort — the service might not exist on this node.
+    services = ("bedrock-mgmt", "bedrock-vm", "bedrock-vl",
+                "mnt-isos.mount", "mnt-isos.automount",
+                "nfs-server", "garage")
+    run(f"systemctl stop {' '.join(services)} 2>/dev/null", check=False)
+    run(f"systemctl disable {' '.join(services)} 2>/dev/null", check=False)
+
+    # 2. DRBD resources down + .res cleanup. Best-effort.
+    for tier in ("bulk", "critical"):
+        run(f"drbdadm down tier-{tier} 2>/dev/null", check=False)
+        run(f"drbdsetup down tier-{tier} 2>/dev/null", check=False)
+    run("rm -f /etc/drbd.d/tier-*.res /etc/drbd.d/tier-*.res.removed-* "
+        "2>/dev/null", check=False)
+
+    # 3. Unmount anything bedrock-touched. Two passes (normal then lazy)
+    #    to handle any stuck handles per L16.
+    mounts = (
+        "/var/lib/bedrock/mounts/scratch-s3fs",
+        "/var/lib/bedrock/mounts/bulk-nfs",
+        "/var/lib/bedrock/mounts/critical-nfs",
+        "/var/lib/bedrock/mounts/bulk-drbd",
+        "/var/lib/bedrock/mounts/critical-drbd",
+        "/var/lib/bedrock/local/scratch",
+        "/var/lib/bedrock/local/bulk",
+        "/var/lib/bedrock/local/critical",
+        "/var/lib/garage/data",
+        "/mnt/isos",
+    )
+    for mp in mounts:
+        if run_ok(f"mountpoint -q {mp}"):
+            run(f"umount {mp} 2>/dev/null || umount -l {mp} 2>/dev/null",
+                check=False)
+
+    # 4. Drop fstab lines for anything bedrock-related. Use a token list
+    #    that matches every kind of mount we've ever installed.
+    fstab = Path("/etc/fstab")
+    if fstab.exists():
+        tokens = ("/var/lib/bedrock", "/var/lib/garage",
+                  "scratch-s3fs", "tier-", "garage-data",
+                  "/mnt/isos", " /bedrock/")
+        new = [l for l in fstab.read_text().splitlines()
+               if not any(t in l for t in tokens)]
+        fstab.write_text("\n".join(new).rstrip() + "\n")
+
+    # 5. NFS exports
+    run("rm -f /etc/exports.d/bedrock-*.exports 2>/dev/null", check=False)
+    run("exportfs -ra 2>/dev/null", check=False)
+
+    # 6. Garage config + creds + unit
+    run("rm -f /etc/garage.toml /etc/passwd-s3fs "
+        "/etc/systemd/system/garage.service 2>/dev/null", check=False)
+    run("rm -rf /var/lib/garage 2>/dev/null", check=False)
+
+    # 7. Tier LVs. Lvremove fails harmlessly if the LV is already gone.
+    for lv in ("tier-scratch", "tier-bulk", "tier-critical",
+               "tier-bulk-meta", "tier-critical-meta", "garage-data"):
+        run(f"lvremove -fy bedrock/{lv} 2>/dev/null", check=False)
+
+    # 8. /bedrock/* symlinks
+    for tier in TIERS:
+        link = PUBLIC_ROOT / tier
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+        except OSError:
+            pass
+
+    # 9. Mgmt-side /opt/bedrock/* subdirs that came from mgmt_install
+    for sub in ("mgmt", "iso", "data", "vm", "vl"):
+        run(f"rm -rf /opt/bedrock/{sub} 2>/dev/null", check=False)
+    run("rm -f /opt/bedrock/scrape.yml 2>/dev/null", check=False)
+    # Mgmt systemd units
+    run("rm -f /etc/systemd/system/bedrock-{mgmt,vm,vl}.service "
+        "/etc/systemd/system/mnt-isos.{mount,automount} 2>/dev/null",
+        check=False)
+
+    # 10. cluster.json gone; state.json truncated to bootstrap-only
+    if CLUSTER_JSON.exists():
+        CLUSTER_JSON.unlink()
+    if STATE_JSON.exists():
+        try:
+            s = json.loads(STATE_JSON.read_text())
+        except json.JSONDecodeError:
+            s = {}
+        keep = {k: s[k] for k in ("hardware", "bootstrap_done") if k in s}
+        STATE_JSON.write_text(json.dumps(keep, indent=2))
+
+    # 11. Reload systemd
+    run("systemctl daemon-reload 2>/dev/null", check=False)
+
+    print("  [reset] local state cleared. Run 'bedrock init' or "
+          "'bedrock join'.")

@@ -550,12 +550,35 @@ def cmd_storage(args):
         if peer_name in cluster.get("nodes", {}):
             del cluster["nodes"][peer_name]
             tier_storage.save_cluster(cluster)
-            print(f"  [3/3] cluster.json: dropped {peer_name}")
+            print(f"  [3/4] cluster.json: dropped {peer_name}")
 
-        print(f"Done. {peer_name} is no longer part of the cluster.")
-        print(f"  The leaving node still has stale local state "
-              f"(/etc/drbd.d, /etc/fstab, cluster.json). Re-bootstrap "
-              f"it (`bedrock bootstrap` from a fresh OS) to re-use.")
+        # 4. Reset the leaving node's local state — back to post-bootstrap
+        #    so it can `bedrock init` a new cluster or `bedrock join`
+        #    another. SSH'd over because we're cluster-side; the leaving
+        #    node should not be expected to clean itself up.
+        if peer_host:
+            print(f"  [4/4] resetting {peer_name} to clean state via SSH...")
+            import subprocess as _sp
+            rc = _sp.run(
+                ["ssh", "-o", "StrictHostKeyChecking=no",
+                 f"root@{peer_host}",
+                 "bedrock storage _local-reset"],
+                stdout=_sp.PIPE, stderr=_sp.STDOUT).returncode
+            if rc != 0:
+                print(f"        WARN: remote reset returned {rc}; the "
+                      f"node may have stale state. Re-run "
+                      f"`bedrock storage _local-reset` on it manually.")
+
+        print(f"Done. {peer_name} is no longer part of the cluster and "
+              f"is back to post-bootstrap state — ready to "
+              f"`bedrock init` or `bedrock join`.")
+        return
+
+    if args.action == "_local-reset":
+        # Internal: called over SSH from a master running `remove-peer`,
+        # or manually by an operator who wants to take this node out.
+        # Brings local state back to post-`bedrock bootstrap`.
+        tier_storage.node_reset_local()
         return
 
     if args.action == "collapse-to-n1":
@@ -686,6 +709,7 @@ def main():
     p_pjt = p_st_sub.add_parser("_peer-join-tier", help=argparse.SUPPRESS)
     p_pjt.add_argument("--tier", required=True)
     p_pjt.add_argument("--peers", required=True)
+    p_st_sub.add_parser("_local-reset", help=argparse.SUPPRESS)
     p_ps = p_st_sub.add_parser("_peer-s3fs", help=argparse.SUPPRESS)
     p_ps.add_argument("--ak", required=True)
     p_ps.add_argument("--sk", required=True)
