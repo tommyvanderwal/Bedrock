@@ -318,3 +318,84 @@ solo) is also the **N=2→N=1 transition**, which means:
   (single-node DRBD with no peers — works fine, just no replication).
 
 I'll write the demote-N=2-to-N=1 path next.
+
+---
+
+## Update — empirical proof + the actual s3fs gotcha
+
+After committing the deep-dive doc, ran the proper drain procedure on the
+live testbed (3-node cluster sim-2/3/4, sim-4 chosen as the drainee):
+
+1. Wrote test files to `/bedrock/scratch`:
+   - `DRAIN_TEST.txt` (33 bytes, MD5 c67516ff…)
+   - `DRAIN_BIGFILE.bin` (20 MB random, MD5 430d2d08…)
+2. `garage layout remove <sim-4-id>` and `apply --version 5`
+3. On sim-4: `garage worker set resync-tranquility 0 && set resync-worker-count 8`
+4. Waited for `garage worker list` to show all 8 `Block resync` workers `Idle`
+   with Queue=0 and no errors
+5. `garage block list-errors` → empty
+6. Verified MD5 hashes from sim-2 AND sim-3 (both surviving nodes):
+   **all three files MD5-match the original byte-for-byte.**
+
+**Garage drained 84 partitions from sim-4 to sim-2 (42) + sim-3 (42) without
+any temporary cluster-wide RF bump, no doubled storage, zero errors.** RF=1
+graceful node drain *just works* — the procedure is sound, the
+documentation gap is "wait and verify" not "dual-replicate first."
+
+### The other big finding from the empirical run: **s3fs endpoint hard-pinning**
+
+The `cross-node-via-garage-FINAL` test object that I'd marked "lost during
+sim-1 removal" was actually **fine** — its MD5 came back as the expected
+`9f909473…` once I re-pointed s3fs at a live Garage node.
+
+Root cause: my `s3fs_mount_scratch()` puts a single fixed `url=http://<sim-1-drbd>:3900`
+in fstab. When that one node goes down, every other node's s3fs hangs trying
+to reach a dead endpoint, returning empty bytes / I/O hangs. Garage cluster
+is *fine* — but the s3fs client can't see that.
+
+#### Fix: each node's s3fs targets ITS OWN local Garage endpoint
+
+```python
+# in tier_storage.s3fs_mount_scratch()
+url = f"http://127.0.0.1:{GARAGE_S3_PORT}"  # always local!
+```
+
+This is structurally correct because:
+- Garage is a peer-to-peer cluster: any node serves any object via internal RPC
+- A node's local s3fs only needs the local Garage daemon to be alive — and if
+  *that* node's Garage is down, the rest of the node is presumably also down
+- No cross-node failure cascade — sim-1 going down can't break sim-2/3/4's
+  s3fs view
+- No DNS, no VIP, no load-balancer machinery needed for the storage path
+
+#### Code action item (added to the queue):
+
+```python
+# tier_storage.py
+def s3fs_mount_scratch(access_key: str, secret_key: str) -> None:
+    # No more endpoint_drbd_ip parameter — always local Garage
+    url = f"http://127.0.0.1:{GARAGE_S3_PORT}"
+    ...
+```
+
+### Summary for Tommy's 8→7 node case
+
+```
+For each node-removal step:
+  garage layout remove <node-id>
+  garage layout apply --version N+1
+  garage worker set resync-tranquility 0           # on departing node
+  garage worker set resync-worker-count 8          # on departing node
+  # WAIT
+  while not all "Block resync" workers Idle && Queue==0 on departing:
+      sleep
+  garage block list-errors  # MUST be empty everywhere
+  garage repair --all-nodes --yes tables
+  garage repair --all-nodes --yes blocks
+  # only NOW: systemctl stop garage on departing node, remove
+```
+
+For 1 TB at 10 GbE that's ~15 minutes of waiting, well under 5 minutes if
+the data is well-distributed. **No RF bump, no double storage, no
+operational risk** beyond "wait and verify."
+
