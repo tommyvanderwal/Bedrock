@@ -45,7 +45,7 @@ def get_repo():
         for line in INSTALLER_ENV.read_text().splitlines():
             if line.startswith("BEDROCK_REPO="):
                 return line.split("=", 1)[1].strip()
-    return os.environ.get("BEDROCK_REPO", "http://192.168.2.145:8000")
+    return os.environ.get("BEDROCK_REPO", "http://192.168.100.1:8000")
 
 
 # ── Subcommands ────────────────────────────────────────────────────────────
@@ -210,6 +210,120 @@ def cmd_vm(args):
         vm_mod.delete_vm(state, name=args.name)
 
 
+def cmd_storage(args):
+    """Storage tier subcommands — delegates to lib/tier_storage.py."""
+    from lib import tier_storage
+    import secrets
+
+    if args.action == "init":
+        tier_storage.setup_n1()
+        return
+
+    if args.action == "status":
+        cluster = tier_storage.load_cluster()
+        tiers = cluster.get("tiers", {})
+        nodes = cluster.get("nodes", {})
+        print(f"Cluster: {cluster.get('cluster_name', '<none>')}")
+        print(f"Nodes:   {len(nodes)}")
+        for name, info in nodes.items():
+            print(f"  {name:<12} mgmt={info.get('host','-'):<16} drbd={info.get('drbd_ip','-')}")
+        print()
+        print("Tiers (mountpoint /bedrock/<tier>):")
+        for tier in ("scratch", "bulk", "critical"):
+            t = tiers.get(tier, {"mode": "?"})
+            link = f"/bedrock/{tier}"
+            try:
+                target = os.readlink(link)
+            except OSError:
+                target = "<missing>"
+            print(f"  {tier:<10} mode={t.get('mode','?'):<14} -> {target}")
+        return
+
+    if args.action == "promote":
+        # Promote from N=1 to N=2: requires exactly one peer registered.
+        cluster = tier_storage.load_cluster()
+        nodes = cluster.get("nodes", {})
+        state_local = load_state()
+        self_name = state_local.get("node_name")
+        self_drbd = state_local.get("drbd_ip", "")
+        if not self_drbd:
+            for n in state_local.get("hardware", {}).get("nics", []):
+                if n.get("ip", "").startswith("10.99."):
+                    self_drbd = n["ip"]; break
+        peers = [(n, info) for n, info in nodes.items() if n != self_name]
+        if len(peers) != 1:
+            print(f"promote requires exactly 1 peer; have {len(peers)}.")
+            return 1
+        peer_name, peer_info = peers[0]
+        peer_drbd = peer_info.get("drbd_ip", "")
+        peer_mgmt = peer_info.get("host", "")
+        print(f"Promoting cluster to N=2:")
+        print(f"  master: {self_name} (drbd {self_drbd})")
+        print(f"  peer:   {peer_name} (drbd {peer_drbd})")
+
+        rpc_secret  = secrets.token_hex(32)
+        admin_token = secrets.token_hex(32)
+        peer = {"name": peer_name, "drbd_ip": peer_drbd}
+
+        # 1. Master side
+        result = tier_storage.transition_to_n2_master(
+            self_drbd, peer, rpc_secret, admin_token)
+        peers_full = result["peers"]
+
+        # 2. Peer side via SSH (encode the call to bedrock storage helper)
+        master = {"name": self_name, "drbd_ip": self_drbd}
+        peer_cmd = (
+            f"bedrock storage _peer-promote "
+            f"--master-drbd {self_drbd} "
+            f"--rpc-secret {rpc_secret} "
+            f"--admin-token {admin_token} "
+            f"--peers '{json.dumps(peers_full)}' "
+        )
+        print(f"Running peer transition on {peer_name} ({peer_mgmt})...")
+        import subprocess as _sp
+        rc = _sp.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no",
+             f"root@{peer_mgmt}", peer_cmd]).returncode
+        if rc != 0:
+            print(f"  peer transition returned {rc}")
+
+        # 3. Garage cluster formation (master-side; peer's daemon is up now)
+        print("Forming Garage cluster + creating scratch bucket...")
+        creds = tier_storage.finalize_n2_garage(
+            self_drbd, [self_drbd, peer_drbd])
+
+        # 4. Both sides s3fs-mount scratch
+        tier_storage.s3fs_mount_scratch(
+            creds["access_key"], creds["secret_key"], self_drbd)
+        s3fs_cmd = (
+            f"bedrock storage _peer-s3fs "
+            f"--ak {creds['access_key']} --sk {creds['secret_key']} "
+            f"--endpoint-drbd {self_drbd}"
+        )
+        _sp.run(["ssh", "-o", "StrictHostKeyChecking=no",
+                 f"root@{peer_mgmt}", s3fs_cmd])
+        print("N=2 promotion complete. Run `bedrock storage status` to verify.")
+        return
+
+    if args.action == "_peer-promote":
+        # Internal: called from master to drive the peer's side
+        peers = json.loads(args.peers)
+        state_local = load_state()
+        self_drbd = ""
+        for n in state_local.get("hardware", {}).get("nics", []):
+            if n.get("ip", "").startswith("10.99."):
+                self_drbd = n["ip"]; break
+        master = {"name": "<master>", "drbd_ip": args.master_drbd}
+        tier_storage.transition_to_n2_peer(
+            self_drbd, master, args.rpc_secret, args.admin_token, peers)
+        return
+
+    if args.action == "_peer-s3fs":
+        from lib import tier_storage as ts
+        ts.s3fs_mount_scratch(args.ak, args.sk, args.endpoint_drbd)
+        return
+
+
 # ── argparse ───────────────────────────────────────────────────────────────
 
 def main():
@@ -253,6 +367,22 @@ def main():
     p_vm_delete = p_vm_sub.add_parser("delete")
     p_vm_delete.add_argument("name")
     p_vm.set_defaults(func=cmd_vm)
+
+    p_st = sub.add_parser("storage", help="Storage tier operations")
+    p_st_sub = p_st.add_subparsers(dest="action", required=True)
+    p_st_sub.add_parser("init", help="Idempotent local-LV tier setup (N=1)")
+    p_st_sub.add_parser("status", help="Show tier modes + mountpoints")
+    p_st_sub.add_parser("promote", help="Promote N=1 cluster to N=2 (Garage + DRBD-NFS)")
+    p_pp = p_st_sub.add_parser("_peer-promote", help=argparse.SUPPRESS)
+    p_pp.add_argument("--master-drbd", required=True)
+    p_pp.add_argument("--rpc-secret", required=True)
+    p_pp.add_argument("--admin-token", required=True)
+    p_pp.add_argument("--peers", required=True)
+    p_ps = p_st_sub.add_parser("_peer-s3fs", help=argparse.SUPPRESS)
+    p_ps.add_argument("--ak", required=True)
+    p_ps.add_argument("--sk", required=True)
+    p_ps.add_argument("--endpoint-drbd", required=True)
+    p_st.set_defaults(func=cmd_storage)
 
     args = p.parse_args()
     rc = args.func(args)

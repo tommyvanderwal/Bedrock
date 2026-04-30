@@ -34,7 +34,7 @@ fi
 : "${BEDROCK_REPO:=}"
 if [ -z "$BEDROCK_REPO" ]; then
     # Default test repo — dev box on the LAN
-    BEDROCK_REPO="http://192.168.2.145:8000"
+    BEDROCK_REPO="http://192.168.100.1:8000"
     log "Using default repo: $BEDROCK_REPO (override with BEDROCK_REPO=...)"
 fi
 
@@ -81,6 +81,7 @@ LIB_FILES=(
     agent_install.py
     vm.py
     workload.py
+    tier_storage.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

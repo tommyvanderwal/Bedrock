@@ -17,7 +17,7 @@ from . import workload
 
 
 ALPINE_URL = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2"
-VG_NAME = "almalinux"  # LVM VG for VM disks — matches the physical lab convention
+VG_NAME = "bedrock"  # shares the same VG as the tier storage thinpool
 THIN_POOL = "thinpool"
 
 

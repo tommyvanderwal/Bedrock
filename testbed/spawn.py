@@ -31,11 +31,10 @@ GOLDEN_IMG = IMAGES_DIR / "almalinux-9.qcow2"
 ALMA_URL = "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
 
 MAX_NODES = 4
-NODE_RAM_MB = 16384
+NODE_RAM_MB = 12288
 NODE_VCPUS = 4
-NODE_DISK_GB = 160  # thin qcow2 overlay, actual usage much less — needs
-                    # headroom for 80 GB thin pool + /opt/bedrock imports
-                    # (up to ~20 GB for Windows VHDX + converted qcow2) + OS.
+NODE_DISK_GB = 30   # OS root disk (cloud image is XFS, no LVM)
+NODE_DATA_DISK_GB = 100   # second disk: bedrock VG (thin pool for tiers + DRBD + Garage)
 
 MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"
@@ -173,12 +172,19 @@ def create_node(i: int, all_indices: list[int]):
     node_state = STATE_DIR / hostname
     node_state.mkdir(exist_ok=True)
 
-    # Create thin qcow2 overlay on golden image
+    # Create thin qcow2 overlay on golden image (root disk)
     disk_path = node_state / "root.qcow2"
     if not disk_path.exists():
-        print(f"  Creating {NODE_DISK_GB}GB thin qcow2 for {hostname}...")
+        print(f"  Creating {NODE_DISK_GB}GB root qcow2 for {hostname}...")
         run(f"qemu-img create -f qcow2 -F qcow2 -b {GOLDEN_IMG} "
             f"{disk_path} {NODE_DISK_GB}G", capture=False)
+
+    # Second qcow2: data disk for bedrock VG (tiers + DRBD + Garage)
+    data_path = node_state / "data.qcow2"
+    if not data_path.exists():
+        print(f"  Creating {NODE_DATA_DISK_GB}GB data qcow2 for {hostname}...")
+        run(f"qemu-img create -f qcow2 {data_path} {NODE_DATA_DISK_GB}G",
+            capture=False)
 
     # Generate cloud-init ISO
     iso_path = make_cloud_init(i, all_indices)
@@ -191,6 +197,7 @@ def create_node(i: int, all_indices: list[int]):
          "--vcpus", str(NODE_VCPUS),
          "--cpu", "host-passthrough",
          "--disk", f"path={disk_path},format=qcow2,bus=virtio",
+         "--disk", f"path={data_path},format=qcow2,bus=virtio",
          "--disk", f"path={iso_path},device=cdrom",
          "--network", f"network={MGMT_NET},model=virtio",
          "--network", f"network={DRBD_NET},model=virtio",

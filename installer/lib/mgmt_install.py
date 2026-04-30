@@ -13,7 +13,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
-from . import state, exporters
+from . import state, exporters, tier_storage
 
 
 BEDROCK_BASE = Path("/opt/bedrock")
@@ -239,3 +239,12 @@ WantedBy=multi-user.target
 
     print(f"  Cluster UUID: {s['cluster_uuid']}")
     print(f"  Mgmt URL:     {s['mgmt_url']}")
+
+    # Storage tiers — N=1 single-node setup. Idempotent; safe on re-run.
+    print()
+    print("Setting up storage tiers (N=1: local LV thin)...")
+    try:
+        tier_storage.setup_n1()
+    except Exception as e:
+        print(f"  WARN: tier setup failed: {e}")
+        print(f"  You can re-run with: bedrock storage init")

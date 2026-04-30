@@ -7,7 +7,7 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
-from . import state, exporters
+from . import state, exporters, tier_storage
 
 
 def _register(mgmt_url: str, name: str, host: str, drbd_ip: str, pubkey: str):
@@ -121,6 +121,17 @@ def install(witness: str, cluster_info: dict, repo: str):
     subprocess.run("systemctl enable --now mnt-isos.automount >/dev/null 2>&1",
                    shell=True, check=False)
 
+    # Storage tiers — N=1 setup on this node first (creates local LVs and
+    # /bedrock/<tier> symlinks). Cluster-wide transition to N>=2 (Garage +
+    # DRBD-NFS) is triggered separately via `bedrock storage promote`.
+    print("  Setting up storage tiers (local LVs)...")
+    try:
+        tier_storage.setup_n1()
+    except Exception as e:
+        print(f"  WARN: tier setup failed: {e}")
+
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")
     print(f"  Dashboard: {s['mgmt_url']}")
+    print(f"  Storage:   /bedrock/{{scratch,bulk,critical}} (local LVs)")
+    print(f"  Promote to N>=2 from any node:  bedrock storage promote")

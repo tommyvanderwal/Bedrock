@@ -18,7 +18,7 @@ pass() { echo "${C_G}PASS${C_0} $*"; }
 fail() { echo "${C_R}FAIL${C_0} $*"; exit 1; }
 note() { echo "${C_Y}---${C_0} $*"; }
 
-REPO="http://192.168.2.145:8000"
+REPO="http://192.168.100.1:8000"
 MGMT=""  # will be sim-1 IP after init
 
 wait_ssh() {
