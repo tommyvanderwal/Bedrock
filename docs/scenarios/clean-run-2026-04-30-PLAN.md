@@ -494,3 +494,44 @@ record beyond what's listed? Any phase you want to skip or defer
 
 Once approved, this doc gets a "## Actual run results" section
 appended as we go, and at the end a final "## Summary" section.
+
+## Post-run follow-up items added during execution
+
+- **L15 fix — implement `migrate_scratch_into_garage()`**: symmetric
+  counterpart to `migrate_scratch_out_of_garage()`. Per Tommy:
+  "data may be lost ONLY when losing a node, never during default/
+  normal migration." Add the function + .md section. Wire into
+  `transition_to_n2_master` so the N=1→N=2 promote preserves
+  scratch data automatically.
+
+- **L17 real fix — pip install moves to base**: Move the
+  `pip install fastapi uvicorn paramiko websockets pydantic
+  python-multipart` line from `mgmt_install.install_full()` into
+  `packages.install_base()`. Every node then has the mgmt deps at
+  bootstrap time, ready to take over the master role. Per Tommy:
+  "any one could in principle become the master."
+
+- **drbd_remove_peer generalization**: currently hardcoded to
+  `tier-X` resource names (uses `write_drbd_resource` which only
+  knows tier resources). VM disks (`vm-X-disk0`) follow a
+  different config format (vm.py's `_drbd_2way_conf` /
+  `_drbd_3way_conf`). Generalize so the same online-remove-peer
+  flow works for any DRBD resource.
+
+- **L18 follow-up — research a machine-friendly Garage API**:
+  the current parser regex on `garage worker list` is fragile —
+  any change in column layout breaks it. Investigate what Garage
+  v2.x exposes for *machine-readable* status checks:
+  - Is there a JSON output flag for `worker list` / `stats` /
+    `block list-errors`?
+  - The admin API (port 3903) — does it have endpoints like
+    `GET /v1/health`, `GET /v1/worker?name=block_resync`, or per-
+    node stats that would replace the text-table parsing?
+  - Specifically: a "is the resync queue empty for THIS node"
+    binary check that doesn't require splitting whitespace.
+  - Replace the regex parser with the API call. Document in
+    tier_storage.md "garage_drain_node" with new source citation
+    to whichever Garage admin-API endpoint we end up using.
+
+  This research item is *queued for after the clean-run completes*.
+  Add the result as L19 to the lessons log.

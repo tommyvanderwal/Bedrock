@@ -960,8 +960,16 @@ def drbd_remove_peer(
         for line in out.splitlines():
             if not line.strip():
                 continue
-            allowed = ("del-peer", "disconnect", "del-path", "down")
-            if not any(tok in line for tok in allowed):
+            # Allowed verbs: anything that adjust legitimately does
+            # for a full-mesh peer-set change, including new-path /
+            # del-path / change-connection (DRBD may reshuffle paths
+            # on connection-id renumbering even when only removing
+            # one peer). We REJECT only operations that create or
+            # promote resources, which would indicate config
+            # divergence rather than peer-removal.
+            forbidden = ("new-resource", "new-minor",
+                         "primary --force", "create-md")
+            if any(tok in line for tok in forbidden):
                 raise RuntimeError(
                     f"adjust dry-run on {host} would do unexpected work: "
                     f"{line!r}. Aborting peer removal — investigate before "
@@ -1416,14 +1424,24 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
         exports_file.write_text(new + "\n" if new else "")
         run("exportfs -ra", check=False)
 
-    # 2. Remove .res file FIRST so any reboot won't try to up the resource
+    # 2. drbdadm down with .res still in place. drbdadm orchestrates
+    #    the full teardown (umount→secondary→detach→disconnect→
+    #    del-minor→del-resource) using the .res file. Skipping this
+    #    and using drbdsetup directly leaves the LV chained to a
+    #    half-torn-down DRBD device. (See lessons-log L21.)
+    if run_ok(f"mountpoint -q {drbd_mount}"):
+        run(f"umount {drbd_mount}", check=False)
+    run(f"drbdadm down {res}", check=False)
+
+    # 3. NOW move .res aside. The crash window between (2) and (3) is
+    #    very brief, and even if a reboot lands here drbd-utils won't
+    #    re-up because the resource is already-down at boot.
     res_file = Path(f"/etc/drbd.d/{res}.res")
     backup_file = Path(f"/etc/drbd.d/{res}.res.demoted")
     if res_file.exists():
-        # Move-aside (vs. delete) so we can recover if the demote fails
         res_file.rename(backup_file)
 
-    # 3. Update fstab: drop the DRBD-mount line, add the local-LV line
+    # 4. Update fstab: drop the DRBD-mount line, add the local-LV line
     fstab = Path("/etc/fstab")
     text = fstab.read_text() if fstab.exists() else ""
     new_lines = []
@@ -1437,13 +1455,6 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
         f"{data_lv} {local_mount} xfs defaults,discard 0 0"
     )
     fstab.write_text("\n".join(new_lines).rstrip() + "\n")
-
-    # 4. drbdsetup down — release /dev/drbdN. drbdadm wouldn't work
-    #    here because the .res is gone; drbdsetup operates by name in
-    #    kernel state.
-    run(f"drbdsetup down {res}", check=False)
-    if run_ok(f"mountpoint -q {drbd_mount}"):
-        run(f"umount {drbd_mount}", check=False)
 
     # 5. Mount the local LV (it has the same XFS we ran the cluster on,
     #    byte-for-byte preserved by external-metadata semantics).
@@ -1570,7 +1581,12 @@ def migrate_scratch_out_of_garage(
     #    cluster may still be writing; the second pass catches deltas
     #    after we have the symlink-swap commit point ready.
     print(f"  [garage] rsync pass 1 (bulk copy)")
-    run(f"rsync -aHX --inplace {s3fs_mount}/ {local_mount}/",
+    # NOTE: rsync -X (extended attrs) deliberately omitted here.
+    # s3fs reports SELinux/xattr contexts inconsistently with the
+    # destination XFS, causing "lremovexattr: Permission denied"
+    # mid-copy. Plain -aH preserves what we actually need
+    # (perms, times, hardlinks). See lessons-log L22.
+    run(f"rsync -aH --inplace {s3fs_mount}/ {local_mount}/",
         timeout=24 * 3600)
 
     # 3. (Optional) MD5 verify before the commit

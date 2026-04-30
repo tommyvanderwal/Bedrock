@@ -430,3 +430,90 @@ column-counting bugs.
 **Source:**
 - the actual `garage worker list` output format from
   v2.3.0 (Garage's `worker_list` admin command)
+
+---
+
+## L19 — In-flight code fixes need explicit push to running sim nodes
+**2026-04-30** · clean-run Phase 6
+
+**What we thought:** A `git commit` of a tier_storage.py fix
+makes the fix active on running sim nodes. (False conflation
+between dev-box source tree and sim-node `/usr/local/lib/bedrock/`.)
+
+**What we found:** Sim nodes have their own copy of
+`tier_storage.py` from when they ran `install.sh`. A commit on the
+dev box's tree doesn't update the sim's copy. Helpers continued to
+fail with the original bug after I committed the fix.
+
+**What we changed:** during empirical testing, scp the new file to
+each sim node and `rm -rf /usr/local/lib/bedrock/lib/__pycache__`
+before re-running. Long-term: install.sh + bedrock CLI should
+support a `bedrock self-update` subcommand that pulls the latest
+code from the install repo (or testbed automation re-runs install.sh).
+
+---
+
+## L20 — `drbdadm adjust` shrinking full-mesh resources is unreliable
+**2026-04-30** · clean-run Phase 6
+
+**What we thought:** LINBIT's blessed online peer-removal flow
+(edit config, `drbdadm --dry-run adjust`, `drbdadm adjust`) handles
+all reductions including full-mesh shrink.
+
+**What we found:** when shrinking a 3-way (or 4-way) resource to
+N-1 way by `drbdadm adjust`, the kernel reports
+`Combination of local address(port) and remote address(port) already
+in use` and the adjust fails. The path between the surviving two
+peers is being treated as "new" by adjust even though it already
+exists. This is an adjust bug or edge case for full-mesh shrinks.
+
+**What we changed:** `drbd_remove_peer` already uses
+`drbdsetup disconnect` + `drbdsetup del-peer` as a fallback — but
+this run shows the fallback should probably be the *primary* path
+for tier resources. Real fix queued: change `drbd_remove_peer` to
+prefer `drbdsetup disconnect/del-peer` directly, and use `adjust`
+only as the post-hoc config reconciliation step.
+
+---
+
+## L21 — `drbdsetup down` is not a complete teardown; `drbdadm down` is
+**2026-04-30** · clean-run Phase 7
+
+**What we thought:** `drbdsetup down <res>` fully tears down a DRBD
+resource — kernel state cleared, underlying LV released. `drbdadm`
+is just a wrapper around `drbdsetup`.
+
+**What we found:** `drbdsetup down` does NOT release the underlying
+LV in all cases. After running it, `lsblk /dev/bedrock/tier-bulk`
+still showed `bedrock-tier--bulk → drbd1100` (the device-mapper chain
+was still bound). Subsequent `mount /dev/bedrock/tier-bulk` failed
+with "already mounted or mount point busy."
+
+`drbdadm down` orchestrates the FULL teardown via the .res file:
+umount → secondary → detach → disconnect → del-minor → del-resource.
+`drbdsetup down` only runs `del-resource`, leaving minor and disk
+attached if they were previously attached.
+
+**What we changed:** `drbd_demote_to_local` rewritten to call
+`drbdadm down` (with .res still in place) BEFORE moving the .res
+aside. The crash window between drbdadm-down and mv-aside is brief
+and self-recoverable (drbd-utils don't auto-up an already-down
+resource).
+
+---
+
+## L22 — rsync `-X` (xattrs) breaks s3fs → XFS migration
+**2026-04-30** · clean-run Phase 7
+
+**What we thought:** `rsync -aHX` is the right "preserve everything"
+flag set for migrating data between filesystems.
+
+**What we found:** s3fs reports SELinux/extended-attribute contexts
+inconsistently with what XFS expects. Mid-copy rsync hits
+`lremovexattr("dest/file","security.selinux") failed: Permission
+denied` and aborts with exit code 23, files partially copied.
+
+**What we changed:** `migrate_scratch_out_of_garage` uses `rsync
+-aH --inplace` (no `-X`). Permissions, times, hardlinks are
+preserved; xattrs are not — acceptable for scratch tier where the
+content is regenerable anyway.
