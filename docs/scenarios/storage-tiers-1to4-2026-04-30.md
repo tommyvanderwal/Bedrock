@@ -154,3 +154,40 @@ have only a partial `cluster.json` (just the tier state set by
 - Sim-2 removal (next) — will use this finding to plan ahead
 - Sim-3 removal → final state on sim-4 alone (Garage decommissioned,
   tiers revert to local LV)
+
+## Update — sim-2 removal partially exercised
+
+Same DRBD ghost issue hit when adding sim-4 as 3rd peer to tier-bulk: needed
+the brief-downtime "stop NFS, drbdadm down, recreate metadata, drbdadm up,
+re-mount, restart NFS" play (~30s NFS outage). Likewise for `vm-web1-disk0`:
+stop VM (~5s downtime), recreate metadata, restart on sim-3 — then 2nd live
+migration sim-2 → sim-3 succeeded in 0.84s.
+
+After the brief-downtime cleanup, tier-bulk and vm-web1-disk0 are clean
+3-way (sim-2+sim-3+sim-4). tier-critical still has sim-1 ghost + a fresh
+sim-4 ghost from a failed adjust attempt — same root cause, same fix
+(brief-downtime metadata regenerate).
+
+**Pattern recognised:** every time we add OR remove a peer to an existing
+DRBD resource that was created with `--max-peers=1`, OR has a permanently
+disconnected peer in its kernel state, we need a brief resource-down
+window to regenerate metadata cleanly. The "live grow with --max-peers=7
+from day one" only works when there's no historical baggage in the kernel
+state.
+
+**Action item for the implementation:** wrap this play as a callable
+`tier_storage.regenerate_drbd_resource(resource_name, new_peers, master_ip)`
+that:
+
+1. Stops services holding the resource (NFS server, libvirt VMs)
+2. drbdadm down on all currently-up nodes
+3. Pushes the new resource config to all *new* peer set
+4. drbdadm create-md --force --max-peers=7 on each
+5. drbdadm up on each
+6. Promotes the chosen master to Primary --force
+7. Mounts the filesystem
+8. Restarts services (NFS, optionally start VMs)
+
+Outage window measured during this run: NFS clients briefly hung for ~5–8 s,
+VM was off for ~5 s during a `vm-web1-disk0` regeneration. Acceptable for
+controlled drains.
