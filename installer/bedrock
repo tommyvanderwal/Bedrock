@@ -328,8 +328,16 @@ def cmd_storage(args):
         return
 
     if args.action == "_peer-s3fs":
+        # Joining peer: master's scratch is canonical and was already
+        # migrated into Garage on the master side. The peer's local
+        # scratch is empty/setup_n1-only — never carry it across.
+        # Without `migrate_local_data=False` the peer-side rsync runs
+        # against an empty source while the bucket already has the
+        # master's data, and migrate_scratch_into_garage's MD5 verify
+        # fails (src=empty manifest, dst=master's). (Lessons-log L29.)
         from lib import tier_storage as ts
-        ts.s3fs_mount_scratch(args.ak, args.sk, args.endpoint_drbd)
+        ts.s3fs_mount_scratch(args.ak, args.sk, args.endpoint_drbd,
+                              migrate_local_data=False)
         return
 
     if args.action == "promote-critical-3way":
@@ -495,30 +503,43 @@ def cmd_storage(args):
         scratch = cluster.get("tiers", {}).get("scratch", {})
         if scratch.get("mode") == "garage":
             # Find the leaving node's short Garage id from /v2/GetClusterStatus.
+            # Handle: node may not be in Garage at all (peer joined post-promote
+            # without an extend-garage step), in which case addr can be null
+            # or the node's drbd_ip may simply not match any layout entry.
+            short_id = ""
             try:
                 token = tier_storage._garage_admin_token()
                 status = tier_storage._garage_api(
                     "GET", "/v2/GetClusterStatus", token=token) or {}
-                short_id = ""
                 for n in status.get("nodes", []):
-                    if n.get("addr", "").startswith(peer_drbd + ":"):
-                        short_id = n.get("id", "")[:16]
+                    addr = n.get("addr") or ""
+                    if addr.startswith(peer_drbd + ":"):
+                        short_id = (n.get("id") or "")[:16]
                         break
-                if short_id:
-                    print(f"  [1/3] Draining Garage data from {peer_name} "
+            except Exception as e:
+                print(f"  [1/4] WARN: could not query Garage layout: {e}")
+                print(f"        Skipping Garage drain. If {peer_name} was a "
+                      f"Garage member, sharded data may be lost; otherwise "
+                      f"this is harmless.")
+                short_id = ""
+
+            if short_id:
+                try:
+                    print(f"  [1/4] Draining Garage data from {peer_name} "
                           f"(id {short_id})...")
                     tier_storage.garage_drain_node(
                         departing_node_id_short=short_id,
                         surviving_admin_host=surv_admin,
                         departing_node_admin_host=peer_host,
                     )
-                else:
-                    print(f"  [1/3] Garage: {peer_name} not in cluster status — "
-                          f"skipping drain (already gone?)")
-            except Exception as e:
-                print(f"  [1/3] WARN: Garage drain failed: {e}")
-                print(f"        Continue with DRBD removal? Ctrl-C to abort.")
-                input("        Press Enter to continue: ")
+                except Exception as e:
+                    print(f"  [1/4] WARN: Garage drain failed: {e}")
+                    print(f"        Continuing with DRBD removal. Investigate "
+                          f"the Garage state on the survivors before "
+                          f"running {peer_name} again as a peer.")
+            else:
+                print(f"  [1/4] Garage: {peer_name} not in cluster layout "
+                      f"(addr-match miss) — skipping drain.")
 
         # 2. DRBD: remove from each tier the peer participates in.
         tiers = cluster.get("tiers", {})
@@ -534,7 +555,7 @@ def cmd_storage(args):
             host_for_tier = [nodes[p["name"]].get("host", "")
                               for p in survivors_for_tier
                               if nodes.get(p["name"], {}).get("host")]
-            print(f"  [2/3] DRBD remove peer from tier-{tier}...")
+            print(f"  [2/4] DRBD remove peer from tier-{tier}...")
             tier_storage.drbd_remove_peer(
                 resource=tier,
                 leaving_peer_name=peer_name,

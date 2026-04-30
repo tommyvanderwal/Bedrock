@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -134,9 +135,18 @@ def run_ok(cmd: str) -> bool:
 
 
 def ssh(host: str, cmd: str, check: bool = True, timeout: int = 600) -> str:
-    """Run a command on a peer via root ssh."""
+    """Run a command on a peer via root ssh.
+
+    Uses shlex.quote to wrap `cmd` for the local shell. Critical: the
+    local shell parses our double-quoted ssh command before handing it
+    to ssh, and inside double quotes the local shell expands `$VAR`
+    (incl. positional `$1`/`$2`/...). Anything we pass for awk or
+    inline shell on the remote side that uses `$N` would be silently
+    mangled. Single-quoting via shlex.quote preserves the cmd verbatim
+    so awk/sed/etc. see exactly what we wrote. (Lessons-log L31.)
+    """
     full = (f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"-o ConnectTimeout=8 root@{host} {json.dumps(cmd)}")
+            f"-o ConnectTimeout=8 root@{host} {shlex.quote(cmd)}")
     return run(full, check=check, timeout=timeout)
 
 

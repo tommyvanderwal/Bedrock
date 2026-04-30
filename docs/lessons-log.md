@@ -802,3 +802,184 @@ tier-state subset.
   was missing /etc/bedrock/cluster.json; new step 5b adds it.
 - `mgmt_install.install_full` writes the canonical cluster.json at
   init time; agent_install never does.
+
+---
+
+## L29 — `_peer-s3fs` must pass `migrate_local_data=False`
+**2026-04-30** · clean-rerun-2 Phase 2 (N=1 → N=2 promote, second pass)
+
+**What we thought:** After L26's fix to `migrate_scratch_into_garage`,
+the N=1 → N=2 promote should run end-to-end without manual
+intervention. The master's data migrates into Garage; the peer just
+s3fs-mounts the bucket.
+
+**What we found:** The master side worked. The peer side failed inside
+`bedrock storage _peer-s3fs` with:
+
+```
+RuntimeError: MD5 verification failed: local and Garage differ.
+```
+
+Cause: `s3fs_mount_scratch(..., migrate_local_data=True)` (the default)
+runs `migrate_scratch_into_garage()` on the peer too. The peer's
+`/var/lib/bedrock/local/scratch` is empty (only the bare
+filesystem from `setup_n1`), but the Garage bucket already has the
+*master's* SENTINEL. rsync from empty source is a no-op (no `--delete`),
+then MD5 verify compares empty src manifest to non-empty dst manifest —
+mismatch, RuntimeError, peer's symlink swap never happens, peer's
+`/bedrock/scratch` stays pointing at the local LV.
+
+The "skip migration on peer side" path was already coded as
+`s3fs_mount_scratch(... migrate_local_data=False)` — I had used it by
+hand last run when manually resuming after L26. The bug is that the
+CLI's `_peer-s3fs` subcommand never passed the flag, so the peer
+defaulted to `True`.
+
+**Why it didn't bite the prior clean-run:** that run died at L26
+*before* reaching the peer-side s3fs call. Manual recovery passed
+`migrate_local_data=False` explicitly. The peer-side path was never
+exercised end-to-end through the CLI before this rerun.
+
+**What we changed:** `bedrock storage _peer-s3fs` now passes
+`migrate_local_data=False`. The peer's `s3fs_mount_scratch` skips the
+migration entirely — the master's data is the canonical scratch
+content; a joining peer's local scratch is never carried across.
+
+If a future workflow ever requires merging peer-local data into a
+shared bucket (e.g. data-only-on-this-node disaster recovery), the
+operator can call `migrate_scratch_into_garage()` directly with the
+appropriate flags.
+
+**Source:**
+- `tier_storage.py:s3fs_mount_scratch` — has `migrate_local_data`
+  param defaulting to True.
+- `tier_storage.py:transition_to_n2_peer` — only unmounts bulk +
+  critical, leaves scratch alone (so peer's local scratch is whatever
+  setup_n1 left). Confirms the peer has no data worth migrating.
+
+---
+
+## L30 — There is no CLI verb yet to extend Garage to a new peer
+**2026-04-30** · clean-rerun-2 Phase 4 (attempted transfer-mgmt → sim-3)
+
+**What we thought:** When `transfer-mgmt` is asked to move the master
+role to a node that's *only* a critical-tier peer (e.g. sim-3 was
+added via `promote-critical-3way` but never extended into Garage),
+the CLI's pre-flight check would reject it cleanly.
+
+**What we found:** It does — `transfer_mgmt_role` refuses with
+"new master 192.168.100.205's tier-bulk is not UpToDate; refusing
+to promote." That's correct behavior.
+
+But the deeper issue: there's no CLI verb to *extend* an existing
+N-peer tier to a new peer. We have:
+- `bedrock storage promote-critical-3way <peer>` — extends critical
+  from 2-peer to 3-peer specifically.
+- Nothing for bulk extension, nothing for arbitrary N+1.
+- Nothing for extending the Garage cluster to a new node.
+
+For tier-bulk, the same pattern as `promote_critical_to_3way` works
+when applied manually (write_drbd_resource + adjust + ssh-fanout +
+join_drbd_peer on the new peer). For Garage, joining the layout
+works but the new peer's S3 endpoint rejects pre-existing access
+keys with "Forbidden: No such key" even though the admin API
+returns the key correctly. Likely a Garage key-table replication
+quirk for keys created before the new peer joined; symptom is
+opaque (`Forbidden: No such key`), root cause needs more
+investigation. (We saw it after: `garage_form_cluster` from sim-3
+with all 3 IPs, layout v1 applied with 3 roles, repair tables
+succeeded on all 3, but sim-3's S3 GET still 403'd.)
+
+**What we changed:** Nothing in code yet — this is logged as a
+v1.0 follow-up. Workaround for v1.0: don't promote-mgmt-to /
+collapse-to a node that wasn't part of the cluster's storage from
+the start. Use `transfer-mgmt` only to nodes already participating
+in *all* the tiers you'll need on the surviving node.
+
+For the clean-rerun-2 scenario we ended the shrink at sim-2 (which
+has bulk + critical + Garage from N=2 promote) instead of sim-3.
+
+**Backlog items added:**
+1. CLI: `bedrock storage extend-tier <tier> <peer>` for bulk +
+   critical generically (replaces promote-critical-3way as the
+   single way to extend any DRBD tier).
+2. CLI: `bedrock storage extend-garage <peer>` to install Garage on
+   a peer + extend layout + ImportKey existing scratch-key (needs
+   research on the right way to replicate keys to a new joiner).
+3. Until those exist: agent_install must not lie about scratch
+   tier mode — joining an N≥2 cluster should leave scratch in
+   "local" mode on the new peer until extend-garage is called,
+   not show up as already-Garage in cluster.json.
+
+**Source:**
+- `tier_storage.py:transfer_mgmt_role:1543-1554` — pre-flight
+  refusal logic (works correctly).
+- `tier_storage.py:agent_install.install` — only calls setup_n1, no
+  cluster-wide tier extension.
+- Garage table replication for keys: needs research; the admin API's
+  `ListKeys` shows the key on the new node, but the S3 server's key
+  cache rejects it.
+
+---
+
+## L31 — `ssh()` quoting via `json.dumps` exposes `$N` to the local shell
+**2026-04-30** · clean-rerun-2 Phase 5 (remove-peer with cross-node Garage drain)
+
+**What we thought:** `ssh(host, cmd)` is safe for arbitrary command
+strings — `json.dumps(cmd)` produces a properly-quoted shell argument
+that round-trips through SSH.
+
+**What we found:** A `remove-peer` that needed to drain Garage from a
+*different* host failed with curl 22 / HTTP 403. The Bearer header
+contained the literal `admin_token   = "47cb..."` line, not the token
+value.
+
+Cause: `_garage_admin_token(host=peer)` runs
+
+```bash
+awk -F'"' '/^admin_token/{print $2}' /etc/garage.toml
+```
+
+over `ssh()`. The helper wraps that string with `json.dumps()`, which
+emits valid JSON (escaping the embedded `"` as `\"`) but NOT the `$`.
+The full local shell command then looks like
+
+```bash
+ssh ... root@host "awk -F'\"' '/^admin_token/{print $2}' ..."
+```
+
+Inside double quotes, the LOCAL bash expands `$2` — to the local
+shell's positional parameter $2, which is empty. So the cmd actually
+reaching the remote awk is `print` (no field), which awk interprets as
+`print $0` (the whole line). Token extraction returns the full
+`admin_token = "47cb..."` line, which then goes verbatim into the
+Bearer header → "No such key" / 403.
+
+The bug existed since `ssh()` was first written, but only manifests
+when the SSH'd command uses shell `$N`. Most of our SSH-fanout
+commands don't (they use absolute paths, no shell variables).
+`_garage_admin_token` and any future awk/sed on remote sides would
+all silently break the same way.
+
+**Why it didn't bite the prior clean-run:** that run never exercised
+a *cross-node* `_garage_admin_token` call against a working multi-node
+Garage cluster. Drain happened from a single-node Garage (sim-1
+removed when only sim-1+sim-2 had Garage), and `surviving_admin_host`
+was the local node so the call went via `run(cmd)` not `ssh(host, cmd)`.
+
+**What we changed:** `ssh()` now uses `shlex.quote(cmd)` instead of
+`json.dumps(cmd)`. shlex.quote single-quotes the command for the local
+shell, so nothing is expanded — the remote shell receives the
+command verbatim.
+
+`json.dumps` was structurally wrong for shell quoting; it's a JSON
+encoder, not a shell encoder. shlex.quote is the right tool. The
+swap is one line and protects every existing and future SSH'd cmd.
+
+**Source:**
+- `tier_storage.py:ssh` before/after.
+- Python stdlib [`shlex.quote`](https://docs.python.org/3/library/shlex.html#shlex.quote)
+  — proper shell quoting.
+- bash(1) "Double Quotes": `$`, ``\``, `"`, `\` are special inside
+  double quotes; `\$N` would have escaped, but better not to lay
+  the trap.
