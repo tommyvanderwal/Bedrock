@@ -650,6 +650,34 @@ def register_node(req: NodeRegister):
     push_log(f"Node {req.name} ({req.host}) registered with cluster",
              node="mgmt", app="bedrock-mgmt", level="info")
 
+    # L48 fix: dual-write the registration to the bedrock-rust log so
+    # the snapshot's `nodes` dict reflects the new member. Without
+    # this, downstream operations (maintenance mode, transfer-mgmt,
+    # witness arbitration) all see an empty cluster from the
+    # snapshot's perspective.
+    try:
+        from pathlib import Path as _P
+        if _P("/run/bedrock-rust.sock").exists():
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rust_ipc as _ipc, log_entries as _le
+            with _ipc.Daemon() as d:
+                # cluster_init only on the very first registration —
+                # afterwards we keep the same cluster_name + uuid.
+                if len(cluster.get("nodes", {})) == 1:
+                    d.append(_le.cluster_init(
+                        name=cluster.get("cluster_name", "bedrock"),
+                        uuid=cluster.get("cluster_uuid", ""),
+                    ))
+                d.append(_le.node_register(
+                    node_name=req.name, host=req.host,
+                    drbd_ip=req.drbd_ip or "",
+                    role="compute",
+                    pubkey=req.pubkey or "",
+                ))
+    except Exception as e:
+        log.warning(f"node_register log-append skipped: {e}")
+
     # Return all peer IPs so the joining node can pre-populate known_hosts
     # for virsh migrate / DRBD SSH over both mgmt and replication networks.
     peer_ips = []
@@ -1507,6 +1535,44 @@ async def api_vm_create(req: VMCreateRequest):
         raise HTTPException(409, f"VM {req.name} already exists")
 
     disk_count = 1 + len(req.extra_disks or [])
+
+    # SYNCHRONOUSLY commit the intent to the log BEFORE returning the
+    # task_id. The log idx is the durable record of "this VM is being
+    # created on this node". Crash mid-create: on restart, the
+    # vm_create_intent entry has no matching vm_created OR
+    # vm_create_failed entry, so the recovery path knows to either
+    # resume or roll back. Without this, a power loss between API
+    # accept and the async creator's first write is invisible to
+    # the cluster.
+    intent_idx = None
+    intent_hash = None
+    try:
+        from pathlib import Path as _P
+        if _P("/run/bedrock-rust.sock").exists():
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rust_ipc as _ipc, log_entries as _le
+            with _ipc.Daemon() as d:
+                home_node = (build_cluster_state().get("nodes") or {})
+                # Best-effort: pick this node's name as the home node.
+                # Real placement logic stays in _vm_create.
+                home = next(iter(home_node.keys()), "")
+                intent_idx, intent_hash = d.append(
+                    _le.vm_create_intent(
+                        name=req.name,
+                        vm_type="cattle",   # TODO: infer from priority/replicas
+                        host=home,
+                        ram_mb=int(req.ram_mb),
+                        disk_gb=int(req.disk_gb),
+                        requested_by=os.environ.get("USER", "api"),
+                    )
+                )
+    except Exception as e:
+        # Daemon unreachable → fall through. Existing async path still
+        # creates the VM; we just don't get crash-recovery semantics
+        # for this run. v1 is permissive; v2 should make this fatal.
+        log.warning(f"vm_create_intent log-append skipped: {e}")
+
     task = task_registry().create(
         "vm.create",
         f"Create VM {req.name} ({req.vcpus} vCPU, {req.ram_mb} MB, "
@@ -1521,13 +1587,49 @@ async def api_vm_create(req: VMCreateRequest):
             task.step_done("provision + virt-install")
             task.log(f"created: {result}")
             task.succeed()
+            # Settle the intent: append vm_created.
+            try:
+                from pathlib import Path as _P
+                if _P("/run/bedrock-rust.sock").exists():
+                    import sys as _sys
+                    _sys.path.insert(0, "/usr/local/lib/bedrock")
+                    from lib import rust_ipc as _ipc, log_entries as _le
+                    with _ipc.Daemon() as d:
+                        home_node = (build_cluster_state().get("nodes") or {})
+                        home = next(iter(home_node.keys()), "")
+                        d.append(_le.vm_created(
+                            name=req.name, vm_type="cattle", host=home,
+                            ram_mb=int(req.ram_mb), disk_gb=int(req.disk_gb)))
+            except Exception as e:
+                log.warning(f"vm_created log-append skipped: {e}")
         except HTTPException as e:
             task.fail(f"{e.status_code}: {e.detail}")
+            _log_create_failed(req.name, f"{e.status_code}: {e.detail}")
         except Exception as e:
             task.fail(str(e))
+            _log_create_failed(req.name, str(e))
 
     asyncio.create_task(_runner())
-    return {"status": "accepted", "task_id": task.id, "name": req.name}
+    return {"status": "accepted", "task_id": task.id, "name": req.name,
+            "intent_log_index": intent_idx,
+            "intent_log_hash": intent_hash.hex() if intent_hash else None}
+
+
+def _log_create_failed(vm_name: str, reason: str) -> None:
+    """Settle a vm_create_intent with vm_create_failed when the async
+    creator throws. Best-effort — logging shouldn't mask the original
+    failure path."""
+    try:
+        from pathlib import Path as _P
+        if not _P("/run/bedrock-rust.sock").exists():
+            return
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import rust_ipc as _ipc, log_entries as _le
+        with _ipc.Daemon() as d:
+            d.append(_le.vm_create_failed(name=vm_name, reason=reason))
+    except Exception as e:
+        log.warning(f"vm_create_failed log-append skipped: {e}")
 
 
 @app.delete("/api/vms/{vm_name}")

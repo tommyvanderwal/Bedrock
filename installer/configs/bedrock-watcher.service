@@ -1,0 +1,18 @@
+[Unit]
+Description=Bedrock per-node config watcher (log → daemon.toml)
+After=network-online.target bedrock-rust.service
+Wants=bedrock-rust.service
+# bedrock-rust must be up so IPC is reachable; if rust restarts the
+# watcher reconnects on the next poll.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bedrock-watcher
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

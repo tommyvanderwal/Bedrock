@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""bedrock-watcher — per-node log-driven config watcher.
+
+Polls /run/bedrock-rust.sock for the current log latest_index.
+On change, rebuilds the materialised snapshot from the log, projects
+it deterministically into /etc/bedrock/daemon.toml, and restarts
+bedrock-rust if the config differs.
+
+This is the per-node side of "log-driven config propagation". The
+master appends a log entry (witness add, maintenance set, mgmt
+master change, …); replication carries it to every peer; each
+peer's watcher detects the new index, rebuilds, and reconfigures
+its local daemon. No SSH between nodes; the log IS the propagation.
+
+Idempotent. Safe to start any time.
+"""
+from __future__ import annotations
+import hashlib
+import os
+import sys
+import time
+from pathlib import Path
+
+# Importable from the installer's lib dir on every node.
+sys.path.insert(0, "/usr/local/lib/bedrock")
+
+from lib import view_builder, daemon_setup, state as state_mod, rust_ipc
+
+POLL_INTERVAL_S = 2.0
+DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
+
+
+def daemon_toml_hash() -> bytes:
+    if not DAEMON_TOML.exists():
+        return b""
+    return hashlib.sha256(DAEMON_TOML.read_bytes()).digest()
+
+
+def main() -> None:
+    last_log_idx: int | None = None
+    last_toml_hash = daemon_toml_hash()
+    print("bedrock-watcher: polling every "
+          f"{POLL_INTERVAL_S}s, daemon-toml at {DAEMON_TOML}", flush=True)
+
+    while True:
+        time.sleep(POLL_INTERVAL_S)
+        try:
+            with rust_ipc.Daemon() as d:
+                status = d.status()
+                cur_idx = status["latest_index"]
+        except Exception as e:
+            # Daemon down or IPC down — wait for it.
+            print(f"watcher: ipc unreachable: {e}", flush=True)
+            continue
+
+        if cur_idx == last_log_idx:
+            continue   # nothing changed
+
+        # Log advanced — rebuild snapshot, project to TOML, compare.
+        try:
+            self_name = state_mod.load().get("node_name", "")
+            snapshot = view_builder.rebuild(this_node=self_name)
+            daemon_setup.render_from_snapshot(snapshot, self_name)
+            new_hash = daemon_toml_hash()
+            if new_hash != last_toml_hash:
+                print(f"watcher: log idx {last_log_idx} → {cur_idx}; "
+                      f"daemon.toml changed; restarting bedrock-rust",
+                      flush=True)
+                daemon_setup.restart()
+                last_toml_hash = new_hash
+            else:
+                # Log advanced but config unchanged (e.g. a tier_state
+                # entry that doesn't affect our daemon's view of the
+                # cluster topology). No restart needed.
+                pass
+            last_log_idx = cur_idx
+        except Exception as e:
+            print(f"watcher: rebuild/restart failed: {e}", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

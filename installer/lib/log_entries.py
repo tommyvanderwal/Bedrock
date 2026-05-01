@@ -46,10 +46,17 @@ WITNESS_REGISTER      = "witness_register"
 WITNESS_UNREGISTER    = "witness_unregister"
 PARAM_CHANGE          = "param_change"
 
+# Maintenance mode (planned downtime). When a node is in maintenance,
+# its peers treat its silence as expected — surviving node keeps
+# running without witness arbitration. Reverse on `off`.
+NODE_MAINTENANCE      = "node_maintenance_set"
+
 # VM task lifecycle (L47). Facts/events: append history, sequence
 # matters. After a crash these let "what was running here when it
 # went down?" be answered from the log alone.
+VM_CREATE_INTENT      = "vm_create_intent"
 VM_CREATED            = "vm_created"
+VM_CREATE_FAILED      = "vm_create_failed"
 VM_DESTROYED          = "vm_destroyed"
 VM_MIGRATED           = "vm_migrated"
 VM_STATE_CHANGE       = "vm_state_change"
@@ -137,6 +144,16 @@ def param_change(key: str, value) -> bytes:
     return encode(PARAM_CHANGE, key=key, value=value)
 
 
+def vm_create_intent(name: str, vm_type: str, host: str, ram_mb: int,
+                     disk_gb: int, requested_by: str = "") -> bytes:
+    return encode(VM_CREATE_INTENT, name=name, vm_type=vm_type, host=host,
+                  ram_mb=ram_mb, disk_gb=disk_gb, requested_by=requested_by)
+
+
+def vm_create_failed(name: str, reason: str) -> bytes:
+    return encode(VM_CREATE_FAILED, name=name, reason=reason)
+
+
 def vm_created(name: str, vm_type: str, host: str, ram_mb: int, disk_gb: int) -> bytes:
     return encode(VM_CREATED, name=name, vm_type=vm_type, host=host,
                   ram_mb=ram_mb, disk_gb=disk_gb)
@@ -153,3 +170,7 @@ def vm_migrated(name: str, src_host: str, dst_host: str) -> bytes:
 def vm_state_change(name: str, host: str, state: str) -> bytes:
     """state: 'running', 'shut off', 'paused', etc. — verbatim libvirt label."""
     return encode(VM_STATE_CHANGE, name=name, host=host, state=state)
+
+
+def node_maintenance(node_name: str, on: bool) -> bytes:
+    return encode(NODE_MAINTENANCE, node_name=node_name, on=bool(on))

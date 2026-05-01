@@ -231,7 +231,13 @@ fn print_status_list(raw: &[u8], cluster_key: &[u8; 32]) -> Result<()> {
 // ── Lease loop + self-fence (Phase 4) ────────────────────────────────────
 
 /// Default location for the fence marker.
-pub const FENCE_MARKER_PATH: &str = "/run/bedrock-rust.fence";
+///
+/// `/tmp` is tmpfs, cleared on reboot — exactly the clean recovery
+/// point we want. Reboot is also where DRBD + VMs should NOT auto-
+/// start at boot today; bedrock-mgmt must come up first and bring
+/// resources online in a safe order. (Documented in the v1 plan;
+/// concrete boot-order work is a follow-up.)
+pub const FENCE_MARKER_PATH: &str = "/tmp/bedrock-rust.fence";
 
 /// One witness peer. Multiple of these can be configured (Phase 9):
 /// single-witness (Vec of length 1) is the canonical setup and works
@@ -269,6 +275,10 @@ pub struct LeaseConfig {
     /// design discussion: "If the nodes see each other they NEVER
     /// need a witness; witness is only critical for unplanned downtime."
     pub peer_liveness: crate::peer::PeerLiveness,
+    /// Peer is intentionally offline (operator-marked maintenance
+    /// mode). Witness silence + peer silence is now expected; we
+    /// keep running solo and never self-fence on lease TTL alone.
+    pub peer_in_maintenance: bool,
 }
 
 /// Election rules at a glance (design §6 / §9):
@@ -339,6 +349,13 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
     let mut sessions: Vec<Option<WitnessSession>> = cfg.witnesses.iter().map(|_| None).collect();
     let mut last_ok = Instant::now();
     let mut last_election = Election::Unknown;
+    // L49: don't trip TTL until we've had at least one successful
+    // heartbeat OR seen the peer alive. A daemon that starts up
+    // during a witness blip would otherwise self-fence within ttl_ms
+    // even on a healthy cluster — the TTL clock should only count
+    // *gaps* between successes, not the startup-to-first-success
+    // gap.
+    let mut had_success = false;
     // Fence-marker auto-clear (L44). If the daemon comes up with the
     // marker present, election forces Follower regardless of state —
     // safe under the design. We track consecutive healthy ticks and
@@ -395,6 +412,7 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
         }
 
         if any_ok {
+            had_success = true;
             last_ok = Instant::now();
             // Track healthy-tick count for fence auto-clear (L44).
             let peer_recent = peer_seen_ago_ms(&cfg.peer_liveness) < cfg.ttl_ms;
@@ -458,6 +476,19 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
             if peer_fresh {
                 // Reset the witness clock — peer keeps us alive.
                 last_ok = Instant::now();
+            } else if cfg.peer_in_maintenance {
+                // Peer is intentionally down; witness silence is OK.
+                // Don't self-fence — surviving node keeps running solo.
+                if elapsed >= Duration::from_millis(cfg.ttl_ms) {
+                    log::warn!(
+                        "lease: witness TTL exhausted but peer in maintenance — keeping running solo"
+                    );
+                }
+                last_ok = Instant::now();
+            } else if !had_success {
+                // L49: daemon hasn't had a single successful heartbeat
+                // yet — startup-during-witness-blip is not fatal.
+                log::info!("lease: still waiting for first witness contact (startup grace)");
             } else if elapsed >= Duration::from_millis(cfg.ttl_ms) {
                 log::error!(
                     "lease: TTL exhausted on every witness AND peer silent ({}ms); self-fence",

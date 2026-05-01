@@ -43,6 +43,11 @@ pub struct DaemonConfig {
     pub cluster_key_file: Option<PathBuf>,
     /// Starting role hint. Election overrides once witness data is in.
     pub role: Option<String>,
+    /// True when our peer is intentionally offline (operator put it
+    /// in maintenance mode). Treat peer silence as expected; witness
+    /// arbitration is NOT required to keep running solo.
+    #[serde(default)]
+    pub peer_in_maintenance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

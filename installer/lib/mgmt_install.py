@@ -275,5 +275,27 @@ WantedBy=multi-user.target
         )
         daemon_setup.restart()
         print(f"  bedrock-rust running, IPC at /run/bedrock-rust.sock")
+
+        # L48 fix: cluster_init + master node_register entries so the
+        # snapshot's nodes dict has the master from the start.
+        # Subsequent maintenance/transfer/witness operations all need
+        # the snapshot to know about every node.
+        try:
+            import time as _t
+            _t.sleep(1)   # daemon needs a moment to bind IPC
+            from . import rust_ipc as _ipc, log_entries as _le
+            with _ipc.Daemon() as d:
+                d.append(_le.cluster_init(
+                    name=cluster_name, uuid=s["cluster_uuid"]))
+                d.append(_le.node_register(
+                    node_name=s["node_name"],
+                    host=s["mgmt_ip"],
+                    drbd_ip=drbd_ip,
+                    role="mgmt+compute",
+                    pubkey="",   # filled in on rotation
+                ))
+                d.append(_le.mgmt_master(node_name=s["node_name"]))
+        except Exception as e:
+            print(f"  WARN: master node_register log-append skipped: {e}")
     except Exception as e:
         print(f"  WARN: bedrock-rust setup failed: {e}")

@@ -445,6 +445,9 @@ fn run_daemon(
     }
 
     let lease_handle = if !witnesses.is_empty() {
+        let peer_in_maintenance = cfg_file.as_ref()
+            .map(|c| c.peer_in_maintenance)
+            .unwrap_or(false);
         let cfg = witness::LeaseConfig {
             witnesses,
             sender_id,
@@ -453,6 +456,7 @@ fn run_daemon(
             heartbeat_ms,
             fence_interfaces,
             peer_liveness: std::sync::Arc::clone(&peer_liveness),
+            peer_in_maintenance,
         };
         Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))
     } else {

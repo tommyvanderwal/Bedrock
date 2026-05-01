@@ -142,14 +142,34 @@ def fold(entries: list[dict]) -> dict:
         elif kind == le.PARAM_CHANGE:
             out["params"][payload["key"]] = payload["value"]
 
-        elif kind == le.VM_CREATED:
+        elif kind == le.VM_CREATE_INTENT:
+            # Intent is pre-create. Record it as state="creating" so
+            # crash recovery can find unfinished creates and decide
+            # whether to resume or roll back. A subsequent VM_CREATED
+            # or VM_CREATE_FAILED entry settles the outcome.
             out["vms"][payload["name"]] = {
                 "vm_type": payload.get("vm_type", "cattle"),
                 "host":    payload.get("host", ""),
                 "ram_mb":  payload.get("ram_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
-                "state":   "created",
+                "state":   "creating",
+                "intent_index": entry["index"],
             }
+
+        elif kind == le.VM_CREATED:
+            vm = out["vms"].setdefault(payload["name"], {})
+            vm.update({
+                "vm_type": payload.get("vm_type", vm.get("vm_type", "cattle")),
+                "host":    payload.get("host", vm.get("host", "")),
+                "ram_mb":  payload.get("ram_mb", vm.get("ram_mb", 0)),
+                "disk_gb": payload.get("disk_gb", vm.get("disk_gb", 0)),
+                "state":   "created",
+            })
+
+        elif kind == le.VM_CREATE_FAILED:
+            vm = out["vms"].setdefault(payload["name"], {})
+            vm["state"] = "create_failed"
+            vm["fail_reason"] = payload.get("reason", "")
 
         elif kind == le.VM_DESTROYED:
             out["vms"].pop(payload["name"], None)
@@ -165,6 +185,11 @@ def fold(entries: list[dict]) -> dict:
                 vm["state"] = payload.get("state", vm.get("state"))
                 if payload.get("host"):
                     vm["host"] = payload["host"]
+
+        elif kind == le.NODE_MAINTENANCE:
+            n = out["nodes"].get(payload["node_name"])
+            if n is not None:
+                n["maintenance"] = bool(payload.get("on", False))
 
         # Bootstrap entry, free-form payloads, and unknown kinds are
         # ignored — they just record history without affecting the
