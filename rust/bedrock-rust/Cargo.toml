@@ -1,0 +1,48 @@
+[package]
+name = "bedrock-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bedrock cluster-protocol daemon — append-only hash-chained log + Echo witness client"
+
+[[bin]]
+name = "bedrock-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Echo witness wire format + crypto. Pulled as a path dep so we can iterate
+# on the protocol crate locally; will be a git or registry dep once stable.
+bedrock-echo-proto = { path = "../../../../Bedrock-Echo/crates/bedrock-echo-proto" }
+
+# Hash chain
+sha2 = "0.10"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Encoding for log payloads (matches design doc §8: MessagePack with version envelope)
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# UUID for cluster bootstrap
+uuid = { version = "1", features = ["v4"] }
+
+# Hex for CLI display
+hex = "0.4"
+
+# OS RNG for ephemeral X25519 keypairs (BOOTSTRAP)
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+
+[dev-dependencies]
+tempfile = "3"

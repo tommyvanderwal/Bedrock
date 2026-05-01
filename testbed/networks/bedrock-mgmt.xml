@@ -1,8 +1,11 @@
 <network>
   <name>bedrock-mgmt</name>
-  <!-- Bridged onto br0 (which masters enp2s0) — sim nodes appear on the
-       real 192.168.2.x LAN, get DHCP from MikroTik, accessible from the
-       whole network (including laptop browsing the dashboard). -->
+  <!-- Bridged onto br0 (which masters the dev box's physical LAN NIC) —
+       sim nodes appear on the real 192.168.2.x LAN, DHCP from the home
+       router, accessible from any device on the network including the
+       operator's laptop browsing the dashboard. The host bridge itself
+       is created at install time by the host-bridge.sh helper (see
+       installer/setup-host-bridge.sh). -->
   <forward mode='bridge'/>
   <bridge name='br0'/>
 </network>
