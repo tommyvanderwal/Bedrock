@@ -40,16 +40,16 @@ MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"
 DRBD_PREFIX = "10.99.0"  # node i gets DRBD_PREFIX + .{10+i-1}
 
-# Static LAN IPs for the sims (br0). Reserve these on the home router
-# to avoid DHCP collisions; the sims do NOT request leases. Only the
-# home router is a DHCP server on the LAN.
-MGMT_PREFIX = "192.168.2"      # node i gets MGMT_PREFIX + .{50+i-1}
+# Static LAN IPs for the sims (br0). The home router's DHCP pool ends
+# at .200, so .201-.210 is collision-safe. Sims do NOT request DHCP
+# leases — the home router stays the only DHCP server on the LAN.
+MGMT_PREFIX = "192.168.2"      # node i gets MGMT_PREFIX + .{200+i}
 MGMT_GATEWAY = "192.168.2.254"
 MGMT_DNS = "192.168.2.254"
 
 
 def mgmt_ip(i: int) -> str:
-    return f"{MGMT_PREFIX}.{50 + i - 1}"
+    return f"{MGMT_PREFIX}.{200 + i}"
 
 SSH_KEY = Path.home() / ".ssh" / "id_ed25519"
 SSH_PUBKEY = Path.home() / ".ssh" / "id_ed25519.pub"

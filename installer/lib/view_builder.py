@@ -29,6 +29,22 @@ CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON = Path("/etc/bedrock/state.json")
 
 
+def empty_snapshot() -> dict:
+    """The starting shape of a snapshot — keep callers from forgetting
+    a key when they fold incrementally."""
+    return {
+        "cluster_name": None,
+        "cluster_uuid": None,
+        "nodes": {},
+        "tiers": {},
+        "witnesses": {},
+        "params": {},
+        "mgmt_master": None,
+        "vms": {},
+        "log_index": 0,
+    }
+
+
 def fold(entries: list[dict]) -> dict:
     """Fold an ordered list of decoded log-entry payloads into a
     cluster-shaped dict. Pure function — easy to unit-test.
@@ -46,20 +62,21 @@ def fold(entries: list[dict]) -> dict:
             "log_index": int,    # index of the last folded entry
         }
     """
-    out: dict[str, Any] = {
-        "cluster_name": None,
-        "cluster_uuid": None,
-        "nodes": {},
-        "tiers": {},
-        "witnesses": {},
-        "params": {},
-        "mgmt_master": None,
-        # VM task ledger (L47). Keyed by vm name. Each entry tracks
-        # current host and last-seen state. After-crash recovery uses
-        # this to answer "what was running here when we went down".
-        "vms": {},
-        "log_index": 0,
-    }
+    return fold_into(empty_snapshot(), entries)
+
+
+def fold_into(out: dict, entries: list[dict]) -> dict:
+    """Same as fold(), but folds new entries onto an EXISTING snapshot
+    in place (and returns it). The watcher uses this to keep an
+    in-memory snapshot up to date on every poll without replaying
+    the entire log — only the entries since `out['log_index']` are
+    folded. O(new_entries), not O(log_size).
+
+    Caller is responsible for passing entries in strictly-increasing
+    index order and only entries newer than `out['log_index']`. The
+    fold itself is idempotent on re-fold of the same entry, but
+    duplicate folds waste cycles.
+    """
     for entry in entries:
         payload = le.decode(entry["payload"])
         kind = payload.get("t")
