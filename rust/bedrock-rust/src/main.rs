@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod config;
 mod ipc;
 mod log_store;
 mod payload;
@@ -36,6 +37,11 @@ struct Cli {
 enum Cmd {
     /// Run the long-lived daemon: log + IPC + (later) lease loop + peer.
     Daemon {
+        /// Read settings from a TOML config file. Any CLI flag still
+        /// overrides the file. The systemd unit uses
+        /// `--config /etc/bedrock/daemon.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Peer addresses to connect to. Repeat for multiple paths
         /// (per design §7: ≥1 cable, ideally 2 — RJ45 + USB4 — for
         /// orthogonality. The system stays operational with as few as
@@ -163,6 +169,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Daemon {
+            config,
             peer: peer_addr,
             peer_listen,
             role,
@@ -178,6 +185,7 @@ fn main() -> Result<()> {
             heartbeat_ms,
             fence_interfaces,
         } => run_daemon(
+            config,
             cli.log_dir,
             cli.ipc_sock,
             peer_addr,
@@ -304,29 +312,80 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_daemon(
+    config_path: Option<PathBuf>,
     log_dir: PathBuf,
     ipc_sock: PathBuf,
-    peer_addr: Vec<String>,
-    peer_listen: Vec<String>,
-    role: peer::Role,
-    cluster_key: Option<String>,
-    cluster_key_file: Option<PathBuf>,
-    witness_host: Option<String>,
-    witness_port: u16,
-    witness_pubkey: Option<String>,
-    witness_pubkey_file: Option<PathBuf>,
-    sender_id: u8,
-    peer_sender_id: Option<u8>,
-    lease_ttl_ms: u64,
-    heartbeat_ms: u64,
-    fence_interfaces: String,
+    cli_peer: Vec<String>,
+    cli_peer_listen: Vec<String>,
+    cli_role: peer::Role,
+    cli_cluster_key: Option<String>,
+    cli_cluster_key_file: Option<PathBuf>,
+    cli_witness_host: Option<String>,
+    cli_witness_port: u16,
+    cli_witness_pubkey: Option<String>,
+    cli_witness_pubkey_file: Option<PathBuf>,
+    cli_sender_id: u8,
+    cli_peer_sender_id: Option<u8>,
+    cli_lease_ttl_ms: u64,
+    cli_heartbeat_ms: u64,
+    cli_fence_interfaces: String,
 ) -> Result<()> {
+    // Merge config-file values with CLI flags. Rule: any CLI value that
+    // was supplied overrides the file. We can tell "supplied" only for
+    // Option<>-typed flags; for Vec<> CLI we let "non-empty" mean
+    // "supplied"; for the always-defaulted scalars (witness_port,
+    // sender_id, ttl, heartbeat) the CLI wins always — these have
+    // sensible defaults from clap.
+    let cfg_file = if let Some(p) = config_path.as_ref() {
+        Some(config::DaemonConfig::load(p).with_context(|| format!("read {}", p.display()))?)
+    } else {
+        None
+    };
+
+    let log_dir = cfg_file.as_ref()
+        .and_then(|c| c.log_dir.clone())
+        .filter(|_| log_dir == PathBuf::from(DEFAULT_LOG_DIR))
+        .unwrap_or(log_dir);
+    let ipc_sock = cfg_file.as_ref()
+        .and_then(|c| c.ipc_sock.clone())
+        .filter(|_| ipc_sock == PathBuf::from(DEFAULT_IPC_SOCK))
+        .unwrap_or(ipc_sock);
+
+    let peer_addr = if !cli_peer.is_empty() {
+        cli_peer
+    } else {
+        cfg_file.as_ref().map(|c| c.peer.clone()).unwrap_or_default()
+    };
+    let peer_listen = if !cli_peer_listen.is_empty() {
+        cli_peer_listen
+    } else {
+        cfg_file.as_ref().map(|c| c.peer_listen.clone()).unwrap_or_default()
+    };
+    let sender_id = cfg_file.as_ref()
+        .and_then(|c| c.sender_id)
+        .filter(|_| cli_sender_id == 0)
+        .unwrap_or(cli_sender_id);
+    let peer_sender_id = cli_peer_sender_id.or_else(|| {
+        cfg_file.as_ref().and_then(|c| c.peer_sender_id)
+    });
+    let lease_ttl_ms = cfg_file.as_ref()
+        .and_then(|c| c.lease_ttl_ms)
+        .filter(|_| cli_lease_ttl_ms == 5_000)
+        .unwrap_or(cli_lease_ttl_ms);
+    let heartbeat_ms = cfg_file.as_ref()
+        .and_then(|c| c.heartbeat_ms)
+        .filter(|_| cli_heartbeat_ms == 1_000)
+        .unwrap_or(cli_heartbeat_ms);
+    let fence_interfaces: Vec<String> = if cli_fence_interfaces.is_empty() {
+        cfg_file.as_ref().map(|c| c.fence_interfaces.clone()).unwrap_or_default()
+    } else {
+        cli_fence_interfaces.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    };
+
     let log = log_store::Log::open(&log_dir).context("log open failed")?;
     let server = ipc::Server::new(ipc_sock.clone(), log);
     let log_handle = std::sync::Arc::clone(&server.log);
 
-    // Peer transport (Phases 3 + 7). Default to one listener if the
-    // operator didn't specify any.
     let listen_addrs = if peer_listen.is_empty() {
         vec!["0.0.0.0:8200".to_string()]
     } else {
@@ -336,39 +395,70 @@ fn run_daemon(
         log: std::sync::Arc::clone(&log_handle),
         listen_addrs,
         connect_to: peer_addr,
-        role,
+        role: cli_role,
     })?;
 
-    // Lease loop (Phase 4) — only spins up if we have a witness configured.
-    let lease_handle = if let Some(host) = witness_host {
-        let cluster_key = read_key32(cluster_key, cluster_key_file, "cluster-key")?;
-        let witness_pubkey = read_key32(witness_pubkey, witness_pubkey_file, "witness-pubkey")?;
-        let cfg = witness::LeaseConfig {
+    // Witness configuration. Resolve from the config file when present;
+    // fall back to the legacy single-witness CLI flags otherwise.
+    let mut witnesses: Vec<witness::WitnessSpec> = Vec::new();
+    if let Some(c) = cfg_file.as_ref() {
+        let cluster_key = read_key32_from_cfg(c)?;
+        for w in &c.witness {
+            witnesses.push(witness::WitnessSpec {
+                id: w.id.clone(),
+                host: w.host.clone(),
+                port: w.port,
+                cluster_key,
+                witness_pubkey: hex::decode(&w.pubkey_hex)
+                    .with_context(|| format!("witness {}: bad pubkey hex", w.id))?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("witness {}: pubkey must be 32 bytes", w.id))?,
+            });
+        }
+    }
+    if let Some(host) = cli_witness_host {
+        let cluster_key = read_key32(cli_cluster_key, cli_cluster_key_file, "cluster-key")?;
+        let witness_pubkey = read_key32(cli_witness_pubkey, cli_witness_pubkey_file, "witness-pubkey")?;
+        witnesses.push(witness::WitnessSpec {
+            id: format!("{}:{}", host, cli_witness_port),
             host,
-            port: witness_port,
+            port: cli_witness_port,
             cluster_key,
             witness_pubkey,
+        });
+    }
+
+    let lease_handle = if !witnesses.is_empty() {
+        let cfg = witness::LeaseConfig {
+            witnesses,
             sender_id,
             peer_sender_id,
             ttl_ms: lease_ttl_ms,
             heartbeat_ms,
-            fence_interfaces: fence_interfaces
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect(),
+            fence_interfaces,
         };
         Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))
     } else {
-        log::info!("daemon: no --witness-host; lease loop disabled (standalone mode)");
+        log::info!("daemon: no witnesses configured; lease loop disabled (standalone mode)");
         None
     };
-
     let _lease = lease_handle;
 
     log::info!("bedrock-rust daemon: log_dir={} ipc={}",
                log_dir.display(), ipc_sock.display());
     server.serve()
+}
+
+fn read_key32_from_cfg(c: &config::DaemonConfig) -> Result<[u8; 32]> {
+    if let Some(h) = c.cluster_key_hex.as_ref() {
+        return read_key32(Some(h.clone()), None, "cluster-key");
+    }
+    let path = c.cluster_key_file.clone()
+        .unwrap_or_else(|| PathBuf::from("/etc/bedrock/cluster.key"));
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("reading cluster-key file {}", path.display()))?;
+    bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("cluster-key file must be exactly 32 bytes"))
 }
 
 fn read_key32(

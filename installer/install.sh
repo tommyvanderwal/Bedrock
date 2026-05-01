@@ -68,6 +68,20 @@ log "Downloading bedrock CLI..."
 curl -fsSL "${BEDROCK_REPO}/bedrock" -o "${INSTALL_DIR}/bedrock"
 chmod +x "${INSTALL_DIR}/bedrock"
 
+log "Downloading bedrock-rust daemon..."
+curl -fsSL "${BEDROCK_REPO}/binaries/bedrock-rust" -o "${INSTALL_DIR}/bedrock-rust"
+chmod +x "${INSTALL_DIR}/bedrock-rust"
+
+log "Installing bedrock-rust systemd unit..."
+mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock/log
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rust.service" \
+    -o /etc/systemd/system/bedrock-rust.service
+systemctl daemon-reload
+# Enabled but NOT started — `bedrock init` / `bedrock join` writes
+# /etc/bedrock/daemon.toml first, then starts the service. Starting
+# it without a config file would just fail-loop.
+systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
+
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(
     __init__.py
@@ -82,6 +96,10 @@ LIB_FILES=(
     vm.py
     workload.py
     tier_storage.py
+    daemon_setup.py
+    log_entries.py
+    rust_ipc.py
+    view_builder.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

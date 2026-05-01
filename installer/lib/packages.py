@@ -51,6 +51,8 @@ MGMT_PYTHON_PACKAGES = [
     "websockets",
     "pydantic",
     "python-multipart",
+    # bedrock-rust IPC + log_entries / view_builder typed payloads
+    "msgpack",
 ]
 
 

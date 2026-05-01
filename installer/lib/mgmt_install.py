@@ -13,7 +13,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
-from . import state, exporters, tier_storage
+from . import state, exporters, tier_storage, daemon_setup
 
 
 BEDROCK_BASE = Path("/opt/bedrock")
@@ -249,3 +249,27 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"  WARN: tier setup failed: {e}")
         print(f"  You can re-run with: bedrock storage init")
+
+    # bedrock-rust daemon setup. Generates the cluster's 32-byte AEAD
+    # key (saved at /etc/bedrock/cluster.key), initialises the log with
+    # the cluster_uuid as bootstrap entry, writes daemon.toml, and
+    # starts the systemd service. Standalone mode at init — peer +
+    # witness entries are added via cluster transitions later.
+    print()
+    print("Starting bedrock-rust daemon...")
+    try:
+        daemon_setup.write_cluster_key()
+        daemon_setup.init_log_if_needed(s["cluster_uuid"])
+        daemon_setup.render_daemon_toml(
+            sender_id=0,
+            peer_sender_id=None,
+            peer_listen=["0.0.0.0:8200"],
+            peer=[],
+            fence_interfaces=[],
+            witnesses=[],   # added later; see `bedrock witness add`
+            role="standalone",
+        )
+        daemon_setup.restart()
+        print(f"  bedrock-rust running, IPC at /run/bedrock-rust.sock")
+    except Exception as e:
+        print(f"  WARN: bedrock-rust setup failed: {e}")

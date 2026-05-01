@@ -1,0 +1,20 @@
+[Unit]
+Description=Bedrock cluster-protocol daemon (Rust)
+After=network-online.target
+Wants=network-online.target
+# bedrock-mgmt depends on the IPC socket from this daemon to be up.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bedrock-rust --log-dir /var/lib/bedrock/log --ipc-sock /run/bedrock-rust.sock daemon --config /etc/bedrock/daemon.toml
+Restart=on-failure
+RestartSec=5
+# Daemon does ip-link manipulation, fence-marker writes to /run, and
+# may need to reboot the system on lease loss. Run as root.
+User=root
+Group=root
+# Avoid log noise from RUST_BACKTRACE on every restart.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

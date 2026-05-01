@@ -116,6 +116,39 @@ CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON   = Path("/etc/bedrock/state.json")
 
 
+# ── Log-or-direct dual-write hook (Phase 5 cutover) ──────────────────────
+#
+# When the bedrock-rust daemon IPC socket exists, every cluster-state
+# mutation in this module also appends a typed log entry. The log is
+# canonical — the existing JSON files are now caches that the
+# view_builder regenerates from the log on every node identically.
+# This is what obsoletes L27 (drbd_node_ids race) and L28 (mgmt_master
+# propagation).
+#
+# Falls back gracefully to direct-write-only when the daemon isn't
+# running (e.g. bedrock storage subcommands during install before the
+# daemon comes up). The fallback is harmless because the next time
+# the daemon's view_builder runs it'll see the JSON it already
+# matched and no-op the rewrite.
+
+def _log_append_typed(payload_bytes):
+    """Append a typed log entry via IPC. Returns (idx, hash) or None
+    if the daemon isn't reachable. Never raises — best-effort dual-write
+    so an offline daemon doesn't block cluster operations."""
+    try:
+        from . import rust_ipc
+        if not Path(rust_ipc.DEFAULT_SOCK).exists():
+            return None
+        with rust_ipc.Daemon() as d:
+            return d.append(payload_bytes)
+    except Exception as e:
+        # Daemon down, msgpack missing on a partially-installed peer,
+        # IPC frame error — none of these should stop a tier op. Log
+        # for visibility and fall through to the direct write.
+        print(f"  [log] append skipped: {e}")
+        return None
+
+
 # ── Shell helpers ──────────────────────────────────────────────────────────
 
 def run(cmd: str, check: bool = True, timeout: int = 600) -> str:
@@ -182,6 +215,20 @@ def set_tier_state(tier: str, **kv) -> None:
     cur.update(kv)
     cur["version"] = cur.get("version", 0) + 1
     save_cluster(c)
+    # Phase 5 cutover: shadow the tier-state mutation as a typed log
+    # entry. view_builder folds it identically on every peer.
+    try:
+        from . import log_entries as _le
+        _log_append_typed(_le.tier_state(
+            tier=tier,
+            mode=cur.get("mode", "local"),
+            master=cur.get("master"),
+            peers=cur.get("peers"),
+            backend_path=cur.get("backend_path"),
+            garage_endpoint=cur.get("garage_endpoint"),
+        ))
+    except ImportError:
+        pass
 
 
 # ── Atomic symlink swap (POSIX rename) ─────────────────────────────────────
@@ -389,6 +436,16 @@ def get_drbd_node_id(resource: str, peer_name: str) -> int:
     assignments[peer_name] = nid
     tier["version"] = tier.get("version", 0) + 1
     save_cluster(c)
+    # Phase 5 cutover: also persist this assignment as a typed log
+    # entry. When peers replicate the log, their view_builder folds the
+    # same drbd_node_id into their cluster.json — no fresh-allocation
+    # race per L27. Best-effort; falls back to direct-write-only if the
+    # daemon isn't running yet.
+    try:
+        from . import log_entries as _le
+        _log_append_typed(_le.drbd_node_id_assigned(resource, peer_name, nid))
+    except ImportError:
+        pass
     return nid
 
 
@@ -1751,6 +1808,17 @@ def transfer_mgmt_role(
     # bedrock-mgmt caches the cluster info from state.json at startup,
     # so a restart on the new master picks up the new mgmt_url.
     ssh(new_master_host, "systemctl restart bedrock-mgmt", check=False)
+
+    # Phase 5 cutover: append a typed `mgmt_master` log entry. The
+    # bedrock-rust daemon replicates it to every peer; each peer's
+    # view_builder then folds it into its own cluster.json identically.
+    # This is what makes L28's manual rsync of cluster.json + role
+    # rewrite unnecessary going forward — the log IS the propagation.
+    try:
+        from . import log_entries as _le
+        _log_append_typed(_le.mgmt_master(new_master_name))
+    except ImportError:
+        pass
 
     print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
 

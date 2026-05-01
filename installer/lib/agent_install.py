@@ -7,7 +7,7 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
-from . import state, exporters, tier_storage
+from . import state, exporters, tier_storage, daemon_setup
 
 
 def _register(mgmt_url: str, name: str, host: str, drbd_ip: str, pubkey: str):
@@ -138,6 +138,35 @@ def install(witness: str, cluster_info: dict, repo: str):
         tier_storage.setup_n1()
     except Exception as e:
         print(f"  WARN: tier setup failed: {e}")
+
+    # bedrock-rust daemon setup. The master's cluster_key + cluster_uuid
+    # come down via the register response (see _register additions). We
+    # write our local copy, init the log with the same uuid (so the
+    # bootstrap entry's hash matches), then daemon-dial the master so
+    # log replication catches us up.
+    print("  Starting bedrock-rust daemon...")
+    try:
+        master_key_hex = result.get("cluster_key_hex")
+        if master_key_hex:
+            daemon_setup.write_cluster_key(bytes.fromhex(master_key_hex))
+        else:
+            print("  WARN: master did not send cluster_key_hex; daemon will start without witness auth")
+            daemon_setup.write_cluster_key()  # fresh, won't match master
+        daemon_setup.init_log_if_needed(s["cluster_uuid"])
+        master_drbd = result.get("master_drbd_ip", witness)
+        daemon_setup.render_daemon_toml(
+            sender_id=int(s["node_id"]) + 1,  # 0 reserved for the original master
+            peer_sender_id=0,                 # the original master is sender_id 0
+            peer_listen=["0.0.0.0:8200"],
+            peer=[f"{master_drbd}:8200"],
+            fence_interfaces=[],
+            witnesses=[],
+            role="follower",
+        )
+        daemon_setup.restart()
+        print(f"  bedrock-rust running as follower, dialing {master_drbd}:8200")
+    except Exception as e:
+        print(f"  WARN: bedrock-rust setup failed: {e}")
 
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")

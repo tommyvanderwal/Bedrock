@@ -219,20 +219,35 @@ fn print_status_list(raw: &[u8], cluster_key: &[u8; 32]) -> Result<()> {
 /// Default location for the fence marker.
 pub const FENCE_MARKER_PATH: &str = "/run/bedrock-rust.fence";
 
-#[derive(Clone)]
-pub struct LeaseConfig {
+/// One witness peer. Multiple of these can be configured (Phase 9):
+/// single-witness (Vec of length 1) is the canonical setup and works
+/// perfectly; multi-witness gives operational hygiene at internet scale
+/// without changing protocol guarantees.
+#[derive(Clone, Debug)]
+pub struct WitnessSpec {
+    pub id: String,
     pub host: String,
     pub port: u16,
+    /// Per-cluster shared secret used as the AEAD key with this
+    /// witness. v0.1 reuses the same cluster key across all witnesses;
+    /// design §10 calls for per-witness keys (each encrypted under
+    /// the cluster's shared key) and that lands in v1.1.
     pub cluster_key: [u8; 32],
+    /// X25519 pubkey, pinned via DISCOVER → INIT verification.
     pub witness_pubkey: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct LeaseConfig {
+    pub witnesses: Vec<WitnessSpec>,
     pub sender_id: u8,
+    /// If set: query each witness's STATUS_DETAIL on this sender_id
+    /// every heartbeat to inform leader election. When None, the
+    /// daemon uses the role passed on the CLI as-is.
+    pub peer_sender_id: Option<u8>,
     pub ttl_ms: u64,
     pub heartbeat_ms: u64,
     pub fence_interfaces: Vec<String>,
-    /// If set: query the witness for STATUS_DETAIL on this sender_id
-    /// every heartbeat to inform leader election (Phase 8). When None,
-    /// the daemon uses the role passed on the CLI as-is.
-    pub peer_sender_id: Option<u8>,
 }
 
 /// Election rules at a glance (design §6 / §9):
@@ -291,66 +306,85 @@ pub fn start_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> JoinHandle<()
 
 fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
     log::info!(
-        "lease: witness={}:{} ttl={}ms heartbeat={}ms peer_sender_id={:?}",
-        cfg.host, cfg.port, cfg.ttl_ms, cfg.heartbeat_ms, cfg.peer_sender_id,
+        "lease: {} witness(es) ttl={}ms heartbeat={}ms peer_sender_id={:?}",
+        cfg.witnesses.len(), cfg.ttl_ms, cfg.heartbeat_ms, cfg.peer_sender_id,
     );
-    let mut session: Option<WitnessSession> = None;
+    for w in &cfg.witnesses {
+        log::info!("  witness[{}]: {}:{}", w.id, w.host, w.port);
+    }
+
+    // One session slot per witness. None means "needs re-establishing"
+    // — happens on first iteration and after any I/O error.
+    let mut sessions: Vec<Option<WitnessSession>> = cfg.witnesses.iter().map(|_| None).collect();
     let mut last_ok = Instant::now();
     let mut last_election = Election::Unknown;
 
     loop {
-        let result = (|| -> Result<()> {
-            if session.is_none() {
-                session = Some(WitnessSession::establish(&cfg)?);
+        let (latest_index, latest_hash) = {
+            let lg = log.lock().unwrap();
+            lg.latest()
+        };
+        let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
+        let target = cfg.peer_sender_id.unwrap_or(QUERY_LIST_SENTINEL);
+
+        // Heartbeat + (optionally) detail-query each witness this tick.
+        // The freshest peer-state across witnesses wins for election —
+        // a peer is "seen at last_index L" if ANY witness reports it.
+        let mut any_ok = false;
+        let mut max_peer_idx: Option<u64> = None;
+        for (i, w) in cfg.witnesses.iter().enumerate() {
+            let result = (|| -> Result<Option<u64>> {
+                if sessions[i].is_none() {
+                    sessions[i] = Some(WitnessSession::establish(w, cfg.sender_id)?);
+                }
+                let sess = sessions[i].as_mut().unwrap();
+                let reply = sess.heartbeat_full(&payload, target)?;
+                if cfg.peer_sender_id.is_some() {
+                    Ok(parse_peer_last_index(&reply, &w.cluster_key))
+                } else {
+                    Ok(None)
+                }
+            })();
+            match result {
+                Ok(peer_last) => {
+                    any_ok = true;
+                    if let Some(p) = peer_last {
+                        max_peer_idx = Some(max_peer_idx.map_or(p, |m| m.max(p)));
+                    }
+                }
+                Err(e) => {
+                    sessions[i] = None;
+                    log::warn!("lease: witness[{}] heartbeat failed: {}", w.id, e);
+                }
             }
-            let sess = session.as_mut().unwrap();
-            let (latest_index, latest_hash) = {
-                let lg = log.lock().unwrap();
-                lg.latest()
-            };
-            let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
-            // If election is configured, ask DETAIL on the peer so we
-            // learn its last_index — STATUS_DETAIL serves the most
-            // recent payload the peer left at the witness, which is
-            // exactly the (epoch, last_index, last_hash) we packed for
-            // our own heartbeat.
-            let target = cfg.peer_sender_id.unwrap_or(QUERY_LIST_SENTINEL);
-            let reply = sess.heartbeat_full(&payload, target)?;
+        }
+
+        if any_ok {
+            last_ok = Instant::now();
             if let Some(peer_id) = cfg.peer_sender_id {
-                let peer_last = parse_peer_last_index(&reply, &cfg.cluster_key);
                 let fence = fence_marker_present();
-                let next = elect(fence, latest_index, cfg.sender_id, peer_last, peer_id);
+                let next = elect(fence, latest_index, cfg.sender_id, max_peer_idx, peer_id);
                 if next != last_election {
                     log::info!(
-                        "election: {:?} → {:?} (us=idx{}, peer={:?})",
-                        last_election, next, latest_index, peer_last
+                        "election: {:?} → {:?} (us=idx{}, peer_max={:?})",
+                        last_election, next, latest_index, max_peer_idx
                     );
                     last_election = next;
                 }
             }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                last_ok = Instant::now();
-            }
-            Err(e) => {
-                // Re-establish on next iteration.
-                session = None;
-                let elapsed = last_ok.elapsed();
-                log::warn!("lease: heartbeat failed (ttl elapsed {}ms / {}ms): {}",
-                           elapsed.as_millis(), cfg.ttl_ms, e);
-                if elapsed >= Duration::from_millis(cfg.ttl_ms) {
-                    log::error!("lease: TTL exhausted; entering self-fence");
-                    self_fence(&cfg.fence_interfaces)?;
-                    // self_fence exits the process at the end (or, in dev
-                    // mode, returns and we just stop heartbeating). Either
-                    // way, exit the loop.
-                    return Ok(());
-                }
+        } else {
+            let elapsed = last_ok.elapsed();
+            log::warn!(
+                "lease: no witness reachable (ttl elapsed {}ms / {}ms)",
+                elapsed.as_millis(), cfg.ttl_ms
+            );
+            if elapsed >= Duration::from_millis(cfg.ttl_ms) {
+                log::error!("lease: TTL exhausted on every witness; entering self-fence");
+                self_fence(&cfg.fence_interfaces)?;
+                return Ok(());
             }
         }
+
         thread::sleep(Duration::from_millis(cfg.heartbeat_ms));
     }
 }
@@ -365,10 +399,10 @@ struct WitnessSession {
 }
 
 impl WitnessSession {
-    fn establish(cfg: &LeaseConfig) -> Result<Self> {
-        let addr = (cfg.host.as_str(), cfg.port)
+    fn establish(w: &WitnessSpec, sender_id: u8) -> Result<Self> {
+        let addr = (w.host.as_str(), w.port)
             .to_socket_addrs()
-            .with_context(|| format!("resolving {}:{}", cfg.host, cfg.port))?
+            .with_context(|| format!("resolving {}:{}", w.host, w.port))?
             .next()
             .context("no socket address")?;
         let sock = UdpSocket::bind("0.0.0.0:0").context("bind")?;
@@ -377,15 +411,15 @@ impl WitnessSession {
 
         // DISCOVER → INIT
         let mut buf = [0u8; MTU_CAP];
-        let n = msg::encode_discover(&mut buf, cfg.sender_id, now_ms(), 0)
+        let n = msg::encode_discover(&mut buf, sender_id, now_ms(), 0)
             .map_err(|e| anyhow::anyhow!("encode_discover: {:?}", e))?;
         sock.send(&buf[..n])?;
         let mut reply = [0u8; MTU_CAP];
         let n = sock.recv(&mut reply)?;
         let init = msg::decode_init(&reply[..n])
             .map_err(|e| anyhow::anyhow!("decode_init: {:?}", e))?;
-        if init.witness_pubkey != &cfg.witness_pubkey {
-            bail!("witness_pubkey mismatch — possible MITM");
+        if init.witness_pubkey != &w.witness_pubkey {
+            bail!("witness[{}]: pubkey mismatch — possible MITM", w.id);
         }
         let cookie = *init.cookie;
 
@@ -393,21 +427,21 @@ impl WitnessSession {
         let (eph_priv, _) = generate_eph_keypair();
         let mut buf = [0u8; MTU_CAP];
         let n = msg::encode_bootstrap(
-            &mut buf, cfg.sender_id, now_ms(),
-            &cfg.cluster_key, &cfg.witness_pubkey, &eph_priv, &cookie,
+            &mut buf, sender_id, now_ms(),
+            &w.cluster_key, &w.witness_pubkey, &eph_priv, &cookie,
         )
         .map_err(|e| anyhow::anyhow!("encode_bootstrap: {:?}", e))?;
         sock.send(&buf[..n])?;
         let mut reply = [0u8; MTU_CAP];
         let n = sock.recv(&mut reply)?;
-        let _ack = msg::decode_bootstrap_ack(&mut reply[..n], &cfg.cluster_key)
+        let _ack = msg::decode_bootstrap_ack(&mut reply[..n], &w.cluster_key)
             .map_err(|e| anyhow::anyhow!("decode_bootstrap_ack: {:?}", e))?;
 
         Ok(Self {
             sock,
-            sender_id: cfg.sender_id,
-            cluster_key: cfg.cluster_key,
-            witness_pubkey: cfg.witness_pubkey,
+            sender_id,
+            cluster_key: w.cluster_key,
+            witness_pubkey: w.witness_pubkey,
         })
     }
 
