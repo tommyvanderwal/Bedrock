@@ -1,2 +1,4 @@
 rust/target
 **/*.rs.bk
+**/__pycache__/
+testbed/images/

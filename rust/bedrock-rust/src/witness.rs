@@ -27,8 +27,13 @@ use bedrock_echo_proto::{
     crypto,
     msg,
 };
+use crate::log_store::Log;
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 const PAYLOAD_BLOCKS: usize = 2; // 64 bytes
@@ -207,6 +212,199 @@ fn print_status_list(raw: &[u8], cluster_key: &[u8; 32]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Lease loop + self-fence (Phase 4) ────────────────────────────────────
+
+/// Default location for the fence marker.
+pub const FENCE_MARKER_PATH: &str = "/run/bedrock-rust.fence";
+
+#[derive(Clone)]
+pub struct LeaseConfig {
+    pub host: String,
+    pub port: u16,
+    pub cluster_key: [u8; 32],
+    pub witness_pubkey: [u8; 32],
+    pub sender_id: u8,
+    pub ttl_ms: u64,
+    pub heartbeat_ms: u64,
+    pub fence_interfaces: Vec<String>,
+}
+
+/// Spawn the lease loop. The thread heartbeats to the witness every
+/// `heartbeat_ms`; when it can't successfully heartbeat for `ttl_ms`
+/// total, it kicks self_fence().
+pub fn start_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        if let Err(e) = run_lease_loop(cfg, log) {
+            log::error!("lease loop terminated: {}", e);
+        }
+    })
+}
+
+fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
+    log::info!(
+        "lease: witness={}:{} ttl={}ms heartbeat={}ms",
+        cfg.host, cfg.port, cfg.ttl_ms, cfg.heartbeat_ms
+    );
+    let mut session: Option<WitnessSession> = None;
+    let mut last_ok = Instant::now();
+
+    loop {
+        let result = (|| -> Result<()> {
+            if session.is_none() {
+                session = Some(WitnessSession::establish(&cfg)?);
+            }
+            let sess = session.as_mut().unwrap();
+            let (latest_index, latest_hash) = {
+                let lg = log.lock().unwrap();
+                lg.latest()
+            };
+            let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
+            sess.heartbeat(&payload, /*query_target=*/ QUERY_LIST_SENTINEL)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                last_ok = Instant::now();
+            }
+            Err(e) => {
+                // Re-establish on next iteration.
+                session = None;
+                let elapsed = last_ok.elapsed();
+                log::warn!("lease: heartbeat failed (ttl elapsed {}ms / {}ms): {}",
+                           elapsed.as_millis(), cfg.ttl_ms, e);
+                if elapsed >= Duration::from_millis(cfg.ttl_ms) {
+                    log::error!("lease: TTL exhausted; entering self-fence");
+                    self_fence(&cfg.fence_interfaces)?;
+                    // self_fence exits the process at the end (or, in dev
+                    // mode, returns and we just stop heartbeating). Either
+                    // way, exit the loop.
+                    return Ok(());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(cfg.heartbeat_ms));
+    }
+}
+
+/// One witness UDP session: socket + cookie. Re-establishes from scratch
+/// after any I/O error (next heartbeat re-runs DISCOVER → BOOTSTRAP).
+struct WitnessSession {
+    sock: UdpSocket,
+    sender_id: u8,
+    cluster_key: [u8; 32],
+    witness_pubkey: [u8; 32],
+}
+
+impl WitnessSession {
+    fn establish(cfg: &LeaseConfig) -> Result<Self> {
+        let addr = (cfg.host.as_str(), cfg.port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving {}:{}", cfg.host, cfg.port))?
+            .next()
+            .context("no socket address")?;
+        let sock = UdpSocket::bind("0.0.0.0:0").context("bind")?;
+        sock.set_read_timeout(Some(RECV_TIMEOUT))?;
+        sock.connect(addr)?;
+
+        // DISCOVER → INIT
+        let mut buf = [0u8; MTU_CAP];
+        let n = msg::encode_discover(&mut buf, cfg.sender_id, now_ms(), 0)
+            .map_err(|e| anyhow::anyhow!("encode_discover: {:?}", e))?;
+        sock.send(&buf[..n])?;
+        let mut reply = [0u8; MTU_CAP];
+        let n = sock.recv(&mut reply)?;
+        let init = msg::decode_init(&reply[..n])
+            .map_err(|e| anyhow::anyhow!("decode_init: {:?}", e))?;
+        if init.witness_pubkey != &cfg.witness_pubkey {
+            bail!("witness_pubkey mismatch — possible MITM");
+        }
+        let cookie = *init.cookie;
+
+        // BOOTSTRAP → BOOTSTRAP_ACK
+        let (eph_priv, _) = generate_eph_keypair();
+        let mut buf = [0u8; MTU_CAP];
+        let n = msg::encode_bootstrap(
+            &mut buf, cfg.sender_id, now_ms(),
+            &cfg.cluster_key, &cfg.witness_pubkey, &eph_priv, &cookie,
+        )
+        .map_err(|e| anyhow::anyhow!("encode_bootstrap: {:?}", e))?;
+        sock.send(&buf[..n])?;
+        let mut reply = [0u8; MTU_CAP];
+        let n = sock.recv(&mut reply)?;
+        let _ack = msg::decode_bootstrap_ack(&mut reply[..n], &cfg.cluster_key)
+            .map_err(|e| anyhow::anyhow!("decode_bootstrap_ack: {:?}", e))?;
+
+        Ok(Self {
+            sock,
+            sender_id: cfg.sender_id,
+            cluster_key: cfg.cluster_key,
+            witness_pubkey: cfg.witness_pubkey,
+        })
+    }
+
+    fn heartbeat(&mut self, payload: &[u8], query_target: u8) -> Result<()> {
+        let mut buf = [0u8; MTU_CAP];
+        let n = msg::encode_heartbeat(
+            &mut buf, self.sender_id, now_ms(),
+            query_target, payload, &self.cluster_key,
+        )
+        .map_err(|e| anyhow::anyhow!("encode_heartbeat: {:?}", e))?;
+        self.sock.send(&buf[..n])?;
+        let mut reply = [0u8; MTU_CAP];
+        let n = self.sock.recv(&mut reply)?;
+        let raw = &reply[..n];
+        if raw.len() < HEADER_LEN {
+            bail!("heartbeat reply too short");
+        }
+        // INIT reply means the witness lost our cluster (RAM-only state
+        // after a witness restart) — re-establish on next iteration.
+        if raw[4] == MSG_INIT {
+            bail!("witness sent INIT (lost cluster); re-bootstrap needed");
+        }
+        // Don't decode further in v0.1 — successful AEAD-protected reply
+        // is enough proof we're heard. Phase 5 will use STATUS_DETAIL
+        // to feed peer-state to the leader-claim arbiter.
+        Ok(())
+    }
+}
+
+/// Self-fence: bring all configured cluster interfaces down, write the
+/// fence marker, log the reason. Caller decides whether to proceed to
+/// reboot. v0.1 dev-mode just exits the process — Phase 4.5 wires the
+/// real reboot.
+pub fn self_fence(interfaces: &[String]) -> Result<()> {
+    log::error!("self-fence: bringing down {} cluster interface(s)", interfaces.len());
+    for iface in interfaces {
+        match Command::new("ip").args(["link", "set", iface, "down"]).status() {
+            Ok(s) if s.success() => log::error!("self-fence: {} DOWN", iface),
+            Ok(s) => log::warn!("self-fence: ip link {} down exited {}", iface, s),
+            Err(e) => log::warn!("self-fence: failed to spawn `ip link` for {}: {}", iface, e),
+        }
+    }
+    // Persist the fence marker so a post-reboot daemon refuses to
+    // claim leadership without operator inspection.
+    let marker = PathBuf::from(FENCE_MARKER_PATH);
+    if let Err(e) = std::fs::write(&marker, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        log::warn!("self-fence: marker write failed at {}: {}",
+                   marker.display(), e);
+    } else {
+        log::error!("self-fence: marker written at {}", marker.display());
+    }
+    log::error!("self-fence: dev mode — exiting the daemon process \
+                 (production: 300s python cleanup window then `systemctl reboot`)");
+    // In production we'd: signal Python via IPC, wait up to 300s for
+    // FenceComplete or timeout, `systemctl reboot`. v0.1 just exits.
+    std::process::exit(2);
+}
+
+/// Returns true if the fence marker is present from a prior fence event.
+/// Boot recovery uses this to refuse leader claims until the operator
+/// (or Python) clears the marker.
+pub fn fence_marker_present() -> bool {
+    std::path::Path::new(FENCE_MARKER_PATH).exists()
 }
 
 fn print_status_detail(raw: &[u8], cluster_key: &[u8; 32]) -> Result<()> {

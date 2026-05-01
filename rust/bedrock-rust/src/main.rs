@@ -7,12 +7,16 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod ipc;
 mod log_store;
 mod payload;
+mod peer;
 mod witness;
 
 /// Default location for the cluster log on disk.
 const DEFAULT_LOG_DIR: &str = "/var/lib/bedrock/log";
+/// Default location for the IPC socket.
+const DEFAULT_IPC_SOCK: &str = "/run/bedrock-rust.sock";
 
 #[derive(Parser)]
 #[command(name = "bedrock-rust", version, about = "Bedrock cluster-protocol daemon")]
@@ -20,6 +24,9 @@ struct Cli {
     /// Path to the log directory (segment files live here).
     #[arg(long, global = true, default_value = DEFAULT_LOG_DIR)]
     log_dir: PathBuf,
+    /// Path to the IPC Unix socket.
+    #[arg(long, global = true, default_value = DEFAULT_IPC_SOCK)]
+    ipc_sock: PathBuf,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -27,6 +34,48 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the long-lived daemon: log + IPC + (later) lease loop + peer.
+    Daemon {
+        /// Optional peer to connect to as a follower.
+        #[arg(long)]
+        peer: Option<String>,
+        /// TCP listen address for incoming peer connections (host:port).
+        #[arg(long, default_value = "0.0.0.0:8200")]
+        peer_listen: String,
+        /// This node's role at startup. v0.1 takes the role explicitly;
+        /// auto-election from witness state lands in phase 4.
+        #[arg(long, value_enum, default_value_t = peer::Role::Standalone)]
+        role: peer::Role,
+        /// 32-byte cluster key, hex (peer auth + witness AEAD).
+        #[arg(long)]
+        cluster_key: Option<String>,
+        #[arg(long)]
+        cluster_key_file: Option<PathBuf>,
+        /// Optional witness host (for the lease loop).
+        #[arg(long)]
+        witness_host: Option<String>,
+        #[arg(long, default_value_t = 12321)]
+        witness_port: u16,
+        /// Witness X25519 pubkey for pinning.
+        #[arg(long)]
+        witness_pubkey: Option<String>,
+        #[arg(long)]
+        witness_pubkey_file: Option<PathBuf>,
+        /// This node's sender_id (0..0xFE).
+        #[arg(long, default_value_t = 0)]
+        sender_id: u8,
+        /// Lease TTL in milliseconds; the leader is fenced if it can't
+        /// renew within this window. Direct-cable default 5000ms.
+        #[arg(long, default_value_t = 5_000)]
+        lease_ttl_ms: u64,
+        /// Heartbeat interval in milliseconds.
+        #[arg(long, default_value_t = 1_000)]
+        heartbeat_ms: u64,
+        /// Cluster interfaces to bring down on self-fence (comma list).
+        /// Optional in dev — empty means "log + exit, don't touch network".
+        #[arg(long, default_value = "")]
+        fence_interfaces: String,
+    },
     /// Log management subcommands.
     Log {
         #[command(subcommand)]
@@ -105,6 +154,37 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
+        Cmd::Daemon {
+            peer,
+            peer_listen,
+            role,
+            cluster_key,
+            cluster_key_file,
+            witness_host,
+            witness_port,
+            witness_pubkey,
+            witness_pubkey_file,
+            sender_id,
+            lease_ttl_ms,
+            heartbeat_ms,
+            fence_interfaces,
+        } => run_daemon(
+            cli.log_dir,
+            cli.ipc_sock,
+            peer,
+            peer_listen,
+            role,
+            cluster_key,
+            cluster_key_file,
+            witness_host,
+            witness_port,
+            witness_pubkey,
+            witness_pubkey_file,
+            sender_id,
+            lease_ttl_ms,
+            heartbeat_ms,
+            fence_interfaces,
+        ),
         Cmd::Log { op } => match op {
             LogCmd::Init { cluster_uuid } => {
                 let uuid = cluster_uuid
@@ -207,6 +287,69 @@ fn main() -> Result<()> {
             }
         },
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_daemon(
+    log_dir: PathBuf,
+    ipc_sock: PathBuf,
+    peer_addr: Option<String>,
+    peer_listen: String,
+    role: peer::Role,
+    cluster_key: Option<String>,
+    cluster_key_file: Option<PathBuf>,
+    witness_host: Option<String>,
+    witness_port: u16,
+    witness_pubkey: Option<String>,
+    witness_pubkey_file: Option<PathBuf>,
+    sender_id: u8,
+    lease_ttl_ms: u64,
+    heartbeat_ms: u64,
+    fence_interfaces: String,
+) -> Result<()> {
+    let log = log_store::Log::open(&log_dir).context("log open failed")?;
+    let server = ipc::Server::new(ipc_sock.clone(), log);
+    let log_handle = std::sync::Arc::clone(&server.log);
+
+    // Peer transport (Phase 3).
+    let (peer_rx, peer_tx) = peer::start(peer::Config {
+        log: std::sync::Arc::clone(&log_handle),
+        listen_addr: peer_listen,
+        connect_to: peer_addr,
+        role,
+    })?;
+
+    // Lease loop (Phase 4) — only spins up if we have a witness configured.
+    let lease_handle = if let Some(host) = witness_host {
+        let cluster_key = read_key32(cluster_key, cluster_key_file, "cluster-key")?;
+        let witness_pubkey = read_key32(witness_pubkey, witness_pubkey_file, "witness-pubkey")?;
+        let cfg = witness::LeaseConfig {
+            host,
+            port: witness_port,
+            cluster_key,
+            witness_pubkey,
+            sender_id,
+            ttl_ms: lease_ttl_ms,
+            heartbeat_ms,
+            fence_interfaces: fence_interfaces
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))
+    } else {
+        log::info!("daemon: no --witness-host; lease loop disabled (standalone mode)");
+        None
+    };
+
+    // (peer_rx/peer_tx are kept alive to keep the threads running)
+    let _peer_handles = (peer_rx, peer_tx);
+    let _lease = lease_handle;
+
+    log::info!("bedrock-rust daemon: log_dir={} ipc={}",
+               log_dir.display(), ipc_sock.display());
+    server.serve()
 }
 
 fn read_key32(
