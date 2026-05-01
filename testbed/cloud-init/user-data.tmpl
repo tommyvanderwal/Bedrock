@@ -14,6 +14,43 @@ ssh_pwauth: true
 disable_root: false
 
 write_files:
+  # br0 takes the LAN address directly (no DHCP) — the home router is
+  # the only DHCP server on the network. Static + reserved-by-design
+  # makes spawn.py's IP discovery deterministic and avoids LAN
+  # collisions. eth0 is the bridge port (no IP of its own).
+  - path: /etc/NetworkManager/system-connections/br0.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=br0
+      type=bridge
+      interface-name=br0
+      autoconnect=true
+
+      [bridge]
+      stp=false
+
+      [ipv4]
+      method=manual
+      addresses={MGMT_IP}/24
+      gateway={MGMT_GATEWAY}
+      dns={MGMT_DNS}
+      dns-search=
+
+      [ipv6]
+      method=disabled
+
+  - path: /etc/NetworkManager/system-connections/br0-eth0.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=br0-eth0
+      type=ethernet
+      interface-name=eth0
+      master=br0
+      slave-type=bridge
+      autoconnect=true
+
   - path: /etc/NetworkManager/system-connections/bedrock-drbd.nmconnection
     permissions: '0600'
     content: |
@@ -41,6 +78,8 @@ runcmd:
   - nmcli con delete "Wired connection 1" 2>/dev/null || true
   - systemctl restart NetworkManager
   - sleep 2
+  - nmcli con up br0 || true
+  - nmcli con up br0-eth0 || true
   - nmcli con up bedrock-drbd || true
   - setenforce 0 || true
   - sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config

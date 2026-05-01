@@ -40,6 +40,17 @@ MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"
 DRBD_PREFIX = "10.99.0"  # node i gets DRBD_PREFIX + .{10+i-1}
 
+# Static LAN IPs for the sims (br0). Reserve these on the home router
+# to avoid DHCP collisions; the sims do NOT request leases. Only the
+# home router is a DHCP server on the LAN.
+MGMT_PREFIX = "192.168.2"      # node i gets MGMT_PREFIX + .{50+i-1}
+MGMT_GATEWAY = "192.168.2.254"
+MGMT_DNS = "192.168.2.254"
+
+
+def mgmt_ip(i: int) -> str:
+    return f"{MGMT_PREFIX}.{50 + i - 1}"
+
 SSH_KEY = Path.home() / ".ssh" / "id_ed25519"
 SSH_PUBKEY = Path.home() / ".ssh" / "id_ed25519.pub"
 
@@ -145,6 +156,9 @@ def make_cloud_init(node_idx: int, all_indices: list[int]) -> Path:
                  .replace("{ROOT_PASSWD_HASH}", passwd_hash)
                  .replace("{SSH_PUBKEY}", pubkey)
                  .replace("{DRBD_IP}", drbd_ip(node_idx))
+                 .replace("{MGMT_IP}", mgmt_ip(node_idx))
+                 .replace("{MGMT_GATEWAY}", MGMT_GATEWAY)
+                 .replace("{MGMT_DNS}", MGMT_DNS)
                  .replace("{HOSTS_ENTRIES}", hosts_entries))
 
     meta_data_tmpl = (CLOUD_INIT_DIR / "meta-data.tmpl").read_text()
@@ -307,12 +321,15 @@ def cmd_reset(args):
 def get_mgmt_ip(i: int) -> str | None:
     """Get the bedrock-mgmt IP of a sim node.
 
-    Works for both NAT (libvirt DHCP) and bridged (external DHCP) networks —
-    falls back to MAC-based ARP/neighbour lookup when libvirt can't see the lease.
+    With cloud-init pinning a static IP per index, we can return it
+    directly once the VM exists. The agent-based fallback below is kept
+    for the no-static-IP edge case (image without our cloud-init).
     """
     hostname = node_name(i)
     if not node_exists(i):
         return None
+    # Static IP per node index — set by cloud-init from MGMT_PREFIX.
+    return mgmt_ip(i)
 
     # Try virsh domifaddr (works for NAT)
     out, _ = virsh("domifaddr", hostname)
