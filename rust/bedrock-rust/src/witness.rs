@@ -331,25 +331,31 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
         // The freshest peer-state across witnesses wins for election —
         // a peer is "seen at last_index L" if ANY witness reports it.
         let mut any_ok = false;
-        let mut max_peer_idx: Option<u64> = None;
+        let mut peer_obs: Option<PeerObs> = None;
         for (i, w) in cfg.witnesses.iter().enumerate() {
-            let result = (|| -> Result<Option<u64>> {
+            let result = (|| -> Result<Option<PeerObs>> {
                 if sessions[i].is_none() {
                     sessions[i] = Some(WitnessSession::establish(w, cfg.sender_id)?);
                 }
                 let sess = sessions[i].as_mut().unwrap();
                 let reply = sess.heartbeat_full(&payload, target)?;
                 if cfg.peer_sender_id.is_some() {
-                    Ok(parse_peer_last_index(&reply, &w.cluster_key))
+                    Ok(parse_peer_obs(&reply, &w.cluster_key))
                 } else {
                     Ok(None)
                 }
             })();
             match result {
-                Ok(peer_last) => {
+                Ok(po) => {
                     any_ok = true;
-                    if let Some(p) = peer_last {
-                        max_peer_idx = Some(max_peer_idx.map_or(p, |m| m.max(p)));
+                    if let Some(p) = po {
+                        // Among witnesses, prefer the one with the
+                        // freshest seen_ms_ago — it has the most
+                        // recent picture of the peer.
+                        peer_obs = match peer_obs {
+                            Some(cur) if cur.seen_ms_ago <= p.seen_ms_ago => Some(cur),
+                            _ => Some(p),
+                        };
                     }
                 }
                 Err(e) => {
@@ -363,11 +369,29 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
             last_ok = Instant::now();
             if let Some(peer_id) = cfg.peer_sender_id {
                 let fence = fence_marker_present();
-                let next = elect(fence, latest_index, cfg.sender_id, max_peer_idx, peer_id);
+                // Treat the peer as ABSENT (Election::Leader candidate) when
+                // its last heartbeat at the witness is older than the
+                // takeover threshold — peer-down detection per design §6.
+                // Threshold: ttl_ms × 2 so a single missed-heartbeat
+                // jitter doesn't trip a takeover, but a real peer-down
+                // is detected within 2× ttl.
+                let takeover_threshold_ms = cfg.ttl_ms.saturating_mul(2) as u32;
+                let effective_peer = match peer_obs {
+                    Some(p) if p.seen_ms_ago <= takeover_threshold_ms => Some(p.last_index),
+                    Some(p) => {
+                        log::info!(
+                            "lease: peer last seen at witness {}ms ago > takeover threshold {}ms — treating as down",
+                            p.seen_ms_ago, takeover_threshold_ms
+                        );
+                        None
+                    }
+                    None => None,
+                };
+                let next = elect(fence, latest_index, cfg.sender_id, effective_peer, peer_id);
                 if next != last_election {
                     log::info!(
-                        "election: {:?} → {:?} (us=idx{}, peer_max={:?})",
-                        last_election, next, latest_index, max_peer_idx
+                        "election: {:?} → {:?} (us=idx{}, peer_obs={:?})",
+                        last_election, next, latest_index, peer_obs
                     );
                     last_election = next;
                 }
@@ -474,12 +498,16 @@ impl WitnessSession {
     }
 }
 
-/// Decode the witness's STATUS_DETAIL reply for our peer and pull out
-/// the last_committed_index field from `peer_payload`. Returns None if:
-///  - reply is STATUS_LIST (we asked LIST), or
-///  - status_and_blocks says peer not found, or
-///  - peer_payload is shorter than 16 bytes.
-fn parse_peer_last_index(raw: &[u8], cluster_key: &[u8; 32]) -> Option<u64> {
+/// One observation of a peer at the witness: what its log was at the
+/// time of its last heartbeat, and how long ago that was. Returned
+/// from STATUS_DETAIL replies.
+#[derive(Debug, Clone, Copy)]
+struct PeerObs {
+    last_index: u64,
+    seen_ms_ago: u32,
+}
+
+fn parse_peer_obs(raw: &[u8], cluster_key: &[u8; 32]) -> Option<PeerObs> {
     if raw.len() < HEADER_LEN {
         return None;
     }
@@ -492,7 +520,10 @@ fn parse_peer_last_index(raw: &[u8], cluster_key: &[u8; 32]) -> Option<u64> {
         return None;
     }
     let last_index = u64::from_be_bytes(r.peer_payload[8..16].try_into().ok()?);
-    Some(last_index)
+    Some(PeerObs {
+        last_index,
+        seen_ms_ago: r.peer_seen_ms_ago,
+    })
 }
 
 /// Self-fence: bring all configured cluster interfaces down, write the

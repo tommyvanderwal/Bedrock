@@ -391,11 +391,25 @@ fn run_daemon(
     } else {
         peer_listen
     };
+    // Resolve role: CLI value wins if it's anything other than the
+    // default Standalone; otherwise use what daemon.toml says.
+    let role = if cli_role != peer::Role::Standalone {
+        cli_role
+    } else if let Some(r) = cfg_file.as_ref().and_then(|c| c.role.as_ref()) {
+        match r.as_str() {
+            "leader" => peer::Role::Leader,
+            "follower" => peer::Role::Follower,
+            _ => peer::Role::Standalone,
+        }
+    } else {
+        cli_role
+    };
+    log::info!("role: {:?}", role);
     let _peer = peer::start(peer::Config {
         log: std::sync::Arc::clone(&log_handle),
         listen_addrs,
         connect_to: peer_addr,
-        role: cli_role,
+        role,
     })?;
 
     // Witness configuration. Resolve from the config file when present;

@@ -656,10 +656,32 @@ def register_node(req: NodeRegister):
     for n in cluster["nodes"].values():
         if n.get("host"): peer_ips.append(n["host"])
         if n.get("drbd_ip"): peer_ips.append(n["drbd_ip"])
+    # Cluster key + master's DRBD-ring IP, so the joining node's
+    # bedrock-rust daemon comes up with a matching AEAD key and knows
+    # which peer to dial. Without these, joiners would generate a fresh
+    # cluster_key (witness AEAD wouldn't validate cross-node) and have
+    # no peer to replicate from. Phase 5 cutover prerequisite.
+    cluster_key_hex = ""
+    try:
+        from pathlib import Path as _P
+        ck = _P("/etc/bedrock/cluster.key")
+        if ck.exists():
+            cluster_key_hex = ck.read_bytes().hex()
+    except Exception:
+        pass
+    master_drbd_ip = ""
+    for n_name, n in cluster.get("nodes", {}).items():
+        if "mgmt" in n.get("role", "") and n.get("drbd_ip"):
+            master_drbd_ip = n["drbd_ip"]
+            break
+
     return {"status": "registered", "cluster": cluster.get("cluster_name"),
+            "cluster_uuid": cluster.get("cluster_uuid", ""),
             "nodes": list(cluster["nodes"].keys()),
             "peer_ips": sorted(set(peer_ips)),
-            "peer_pubkeys": peer_pubkeys}
+            "peer_pubkeys": peer_pubkeys,
+            "cluster_key_hex": cluster_key_hex,
+            "master_drbd_ip": master_drbd_ip}
 
 
 @app.get("/api/nodes")
