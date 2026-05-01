@@ -26,9 +26,27 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Monotonic-ish wall-clock ms shared between peer.rs and witness.rs:
+/// peer bumps `last_peer_seen_ms` on every received frame; the lease
+/// loop reads it to decide whether the cluster is "alive via peer"
+/// (witness liveness becomes optional for self-fence in that case).
+pub type PeerLiveness = Arc<AtomicU64>;
+
+pub fn new_peer_liveness() -> PeerLiveness {
+    Arc::new(AtomicU64::new(0))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Role {
@@ -42,6 +60,11 @@ pub struct Config {
     pub listen_addrs: Vec<String>,
     pub connect_to: Vec<String>,
     pub role: Role,
+    /// Shared with witness.rs lease loop. Bumped on every received
+    /// peer frame so the lease loop can decide whether the cluster
+    /// is alive without the witness. See design discussion §6:
+    /// "If the nodes see each other they NEVER need a witness."
+    pub liveness: PeerLiveness,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,12 +108,14 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
         log::info!("peer: listening on {}", addr);
         let log_handle = Arc::clone(&cfg.log);
         let role = cfg.role;
+        let liveness = Arc::clone(&cfg.liveness);
         let addr = addr.clone();
         handles.push(thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let lg = Arc::clone(&log_handle);
+                        let lv = Arc::clone(&liveness);
                         let listen_addr = addr.clone();
                         thread::spawn(move || {
                             let peer_addr = s
@@ -98,7 +123,7 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
                                 .map(|a| a.to_string())
                                 .unwrap_or_else(|_| "<unknown>".to_string());
                             log::info!("peer: link[{}] inbound from {}", listen_addr, peer_addr);
-                            if let Err(e) = handle_stream(s, lg, role, true) {
+                            if let Err(e) = handle_stream(s, lg, role, true, lv) {
                                 log::warn!("peer: link[{}] inbound from {}: {}", listen_addr, peer_addr, e);
                             }
                         });
@@ -112,12 +137,13 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
     for target in &cfg.connect_to {
         let log_handle = Arc::clone(&cfg.log);
         let role = cfg.role;
+        let liveness = Arc::clone(&cfg.liveness);
         let target = target.clone();
         handles.push(thread::spawn(move || loop {
             match TcpStream::connect(&target) {
                 Ok(s) => {
                     log::info!("peer: link[{}] outbound connected", target);
-                    if let Err(e) = handle_stream(s, Arc::clone(&log_handle), role, false) {
+                    if let Err(e) = handle_stream(s, Arc::clone(&log_handle), role, false, Arc::clone(&liveness)) {
                         log::warn!("peer: link[{}] outbound: {}", target, e);
                     }
                 }
@@ -147,6 +173,7 @@ fn handle_stream(
     log: Arc<Mutex<Log>>,
     role: Role,
     inbound: bool,
+    liveness: PeerLiveness,
 ) -> anyhow::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(TICK_MS)))?;
     write_frame(
@@ -168,7 +195,9 @@ fn handle_stream(
     loop {
         match read_frame(&mut stream) {
             Ok(None) => return Ok(()), // peer closed
-            Ok(Some(frame)) => match frame {
+            Ok(Some(frame)) => {
+                liveness.store(now_ms(), Ordering::Relaxed);
+                match frame {
                 PeerFrame::Identify { node_role } => {
                     log::info!("peer: link identified peer as {}", node_role);
                 }
@@ -195,7 +224,7 @@ fn handle_stream(
                 PeerFrame::Ack { up_to_index } => {
                     log::debug!("peer: link ack up_to={}", up_to_index);
                 }
-            },
+            }},
             Err(e) if is_timeout(&e) => {
                 // No inbound frame this tick — that's fine, fall through
                 // to the leader-tail-push below.

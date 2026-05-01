@@ -28,12 +28,26 @@ use bedrock_echo_proto::{
     msg,
 };
 use crate::log_store::Log;
+use crate::peer::PeerLiveness;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn peer_seen_ago_ms(liveness: &PeerLiveness) -> u64 {
+    let last = liveness.load(Ordering::Relaxed);
+    if last == 0 {
+        return u64::MAX;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last)
+}
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 const PAYLOAD_BLOCKS: usize = 2; // 64 bytes
@@ -248,6 +262,13 @@ pub struct LeaseConfig {
     pub ttl_ms: u64,
     pub heartbeat_ms: u64,
     pub fence_interfaces: Vec<String>,
+    /// Shared with peer.rs: monotonic ms timestamp of the most recent
+    /// frame received from any peer link. The lease loop uses this to
+    /// decide whether the cluster is "alive via peer" — when peer is
+    /// recent, witness loss is NOT a self-fence trigger. Per the
+    /// design discussion: "If the nodes see each other they NEVER
+    /// need a witness; witness is only critical for unplanned downtime."
+    pub peer_liveness: crate::peer::PeerLiveness,
 }
 
 /// Election rules at a glance (design §6 / §9):
@@ -318,6 +339,14 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
     let mut sessions: Vec<Option<WitnessSession>> = cfg.witnesses.iter().map(|_| None).collect();
     let mut last_ok = Instant::now();
     let mut last_election = Election::Unknown;
+    // Fence-marker auto-clear (L44). If the daemon comes up with the
+    // marker present, election forces Follower regardless of state —
+    // safe under the design. We track consecutive healthy ticks and
+    // clear the marker once the cluster has been stably-OK for a
+    // recovery window. Real faults keep the marker; transient blips
+    // that already healed don't lock the operator out forever.
+    const HEALTHY_TICKS_TO_CLEAR_MARKER: u32 = 30; // ~30s at 1Hz heartbeat
+    let mut healthy_ticks: u32 = 0;
 
     loop {
         let (latest_index, latest_hash) = {
@@ -367,6 +396,23 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
 
         if any_ok {
             last_ok = Instant::now();
+            // Track healthy-tick count for fence auto-clear (L44).
+            let peer_recent = peer_seen_ago_ms(&cfg.peer_liveness) < cfg.ttl_ms;
+            if peer_recent {
+                healthy_ticks = healthy_ticks.saturating_add(1);
+                if healthy_ticks >= HEALTHY_TICKS_TO_CLEAR_MARKER && fence_marker_present() {
+                    if let Err(e) = std::fs::remove_file(FENCE_MARKER_PATH) {
+                        log::warn!("lease: failed to auto-clear fence marker: {}", e);
+                    } else {
+                        log::warn!(
+                            "lease: cluster healthy for {} ticks (witness+peer both OK) — auto-cleared fence marker {}",
+                            healthy_ticks, FENCE_MARKER_PATH
+                        );
+                    }
+                }
+            } else {
+                healthy_ticks = 0;
+            }
             if let Some(peer_id) = cfg.peer_sender_id {
                 let fence = fence_marker_present();
                 // Treat the peer as ABSENT (Election::Leader candidate) when
@@ -398,12 +444,25 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
             }
         } else {
             let elapsed = last_ok.elapsed();
+            // Peer reachability inhibits witness-TTL self-fence: as
+            // long as we're talking to the peer, the cluster is alive
+            // and the witness is just an unavailable tiebreaker, not
+            // a liveness gate. Only when peer is ALSO silent does
+            // witness loss become fatal.
+            let peer_seen_ms_ago = peer_seen_ago_ms(&cfg.peer_liveness);
+            let peer_fresh = peer_seen_ms_ago < cfg.ttl_ms;
             log::warn!(
-                "lease: no witness reachable (ttl elapsed {}ms / {}ms)",
-                elapsed.as_millis(), cfg.ttl_ms
+                "lease: no witness reachable (witness-elapsed {}ms / {}ms; peer last seen {}ms ago, fresh={})",
+                elapsed.as_millis(), cfg.ttl_ms, peer_seen_ms_ago, peer_fresh,
             );
-            if elapsed >= Duration::from_millis(cfg.ttl_ms) {
-                log::error!("lease: TTL exhausted on every witness; entering self-fence");
+            if peer_fresh {
+                // Reset the witness clock — peer keeps us alive.
+                last_ok = Instant::now();
+            } else if elapsed >= Duration::from_millis(cfg.ttl_ms) {
+                log::error!(
+                    "lease: TTL exhausted on every witness AND peer silent ({}ms); self-fence",
+                    peer_seen_ms_ago,
+                );
                 self_fence(&cfg.fence_interfaces)?;
                 return Ok(());
             }

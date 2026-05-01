@@ -219,6 +219,115 @@ def cmd_vm(args):
         vm_mod.delete_vm(state, name=args.name)
 
 
+def cmd_witness(args):
+    """Manage cluster witnesses. add/rm/list. Each add/rm:
+       1) appends a typed log entry on this node (master),
+       2) lets the leader's tail-push replicate to all peers (~150ms),
+       3) regenerates /etc/bedrock/daemon.toml on every node,
+       4) restarts bedrock-rust on every node.
+
+    The daemon is restart-safe by design — the log is canonical, so
+    nothing in RAM is load-bearing. Peer connections + witness
+    sessions reconnect within seconds of the restart.
+    """
+    from lib import log_entries as le, rust_ipc, view_builder, daemon_setup
+    import subprocess as _sp
+
+    if args.action == "list":
+        v = view_builder.fold(list(_read_log()))
+        ws = v.get("witnesses", {}) or {}
+        if not ws:
+            print("(no witnesses configured)")
+            return
+        for wid, w in ws.items():
+            print(f"  {wid:<20} {w.get('addr','')}  pubkey={w.get('witness_pubkey','')[:16]}…")
+        return
+
+    if args.action == "add":
+        host_port = args.host_port
+        if ":" in host_port:
+            host, port_s = host_port.rsplit(":", 1)
+            port = int(port_s)
+        else:
+            host, port = host_port, 12321
+        with rust_ipc.Daemon() as d:
+            idx, h = d.append(le.witness_register(
+                witness_id=args.id,
+                addr=f"{host}:{port}",
+                witness_pubkey_hex=args.pubkey,
+                # v0.1: cluster_key is shared per-cluster; per-witness
+                # encrypted keys (design §10) are deferred. Emit empty
+                # string so the schema slot exists.
+                encrypted_witness_key_hex="",
+            ))
+            print(f"  appended idx={idx} witness_register({args.id})")
+        _propagate_daemon_config(args.id)
+        return
+
+    if args.action == "rm":
+        with rust_ipc.Daemon() as d:
+            idx, h = d.append(le.witness_unregister(args.id))
+            print(f"  appended idx={idx} witness_unregister({args.id})")
+        _propagate_daemon_config(args.id)
+        return
+
+    if args.action == "_local-regen":
+        _local_regen()
+        return
+
+
+def _read_log():
+    """Helper: yield every log entry via IPC."""
+    from lib import rust_ipc
+    with rust_ipc.Daemon() as d:
+        for e in d.read(from_index=1):
+            yield e
+
+
+def _propagate_daemon_config(reason: str) -> None:
+    """Regenerate daemon.toml on master + every peer (from each node's
+    replicated snapshot), then restart each daemon. The log entry has
+    already been committed; this step makes the on-disk config the
+    deterministic projection of the snapshot on every node."""
+    import subprocess as _sp
+    from lib import daemon_setup, view_builder, state as _state
+
+    s = _state.load()
+    self_name = s.get("node_name", "")
+    snapshot = view_builder.rebuild(this_node=self_name)
+    daemon_setup.render_from_snapshot(snapshot, self_name)
+    daemon_setup.restart()
+    print(f"  [{reason}] {self_name}: daemon.toml regenerated from snapshot, daemon restarted")
+
+    # SSH-fanout: each peer rebuilds from its own replicated log
+    # (snapshot is identical by construction; render is deterministic).
+    for nm, n in (snapshot.get("nodes") or {}).items():
+        if nm == self_name:
+            continue
+        host = n.get("host")
+        if not host:
+            continue
+        try:
+            _sp.run(["ssh", "-o", "StrictHostKeyChecking=no", f"root@{host}",
+                     "bedrock witness _local-regen"],
+                    timeout=30, check=False)
+            print(f"  [{reason}] {nm}: regenerated via SSH")
+        except Exception as e:
+            print(f"  [{reason}] {nm}: SSH regen failed: {e}")
+
+
+def _local_regen() -> None:
+    """Hidden subcommand: rebuild snapshot from local (replicated) log
+    and re-render daemon.toml. Called over SSH by the master after a
+    witness add/rm so every node's config follows the snapshot."""
+    from lib import view_builder, daemon_setup, state as _state
+    s = _state.load()
+    self_name = s.get("node_name", "")
+    snapshot = view_builder.rebuild(this_node=self_name)
+    daemon_setup.render_from_snapshot(snapshot, self_name)
+    daemon_setup.restart()
+
+
 def cmd_storage(args):
     """Storage tier subcommands — delegates to lib/tier_storage.py."""
     from lib import tier_storage
@@ -695,6 +804,18 @@ def main():
     p_vm_delete = p_vm_sub.add_parser("delete")
     p_vm_delete.add_argument("name")
     p_vm.set_defaults(func=cmd_vm)
+
+    p_w = sub.add_parser("witness", help="Manage cluster witnesses (Echo)")
+    p_w_sub = p_w.add_subparsers(dest="action", required=True)
+    p_w_sub.add_parser("list", help="List configured witnesses")
+    p_w_add = p_w_sub.add_parser("add", help="Add a witness (commit-then-restart)")
+    p_w_add.add_argument("id", help="friendly id (e.g. 'office-mikrotik')")
+    p_w_add.add_argument("host_port", metavar="host[:port]", help="UDP endpoint (default port 12321)")
+    p_w_add.add_argument("pubkey", help="X25519 pubkey hex (64 chars / 32 bytes)")
+    p_w_rm = p_w_sub.add_parser("rm", help="Remove a witness (commit-then-restart)")
+    p_w_rm.add_argument("id", help="witness id from `bedrock witness list`")
+    p_w_sub.add_parser("_local-regen", help=argparse.SUPPRESS)
+    p_w.set_defaults(func=cmd_witness)
 
     p_st = sub.add_parser("storage", help="Storage tier operations")
     p_st_sub = p_st.add_subparsers(dest="action", required=True)

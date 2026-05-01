@@ -405,11 +405,13 @@ fn run_daemon(
         cli_role
     };
     log::info!("role: {:?}", role);
+    let peer_liveness = peer::new_peer_liveness();
     let _peer = peer::start(peer::Config {
         log: std::sync::Arc::clone(&log_handle),
         listen_addrs,
         connect_to: peer_addr,
         role,
+        liveness: std::sync::Arc::clone(&peer_liveness),
     })?;
 
     // Witness configuration. Resolve from the config file when present;
@@ -450,6 +452,7 @@ fn run_daemon(
             ttl_ms: lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
+            peer_liveness: std::sync::Arc::clone(&peer_liveness),
         };
         Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))
     } else {

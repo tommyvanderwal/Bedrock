@@ -54,6 +54,10 @@ def fold(entries: list[dict]) -> dict:
         "witnesses": {},
         "params": {},
         "mgmt_master": None,
+        # VM task ledger (L47). Keyed by vm name. Each entry tracks
+        # current host and last-seen state. After-crash recovery uses
+        # this to answer "what was running here when we went down".
+        "vms": {},
         "log_index": 0,
     }
     for entry in entries:
@@ -137,6 +141,30 @@ def fold(entries: list[dict]) -> dict:
 
         elif kind == le.PARAM_CHANGE:
             out["params"][payload["key"]] = payload["value"]
+
+        elif kind == le.VM_CREATED:
+            out["vms"][payload["name"]] = {
+                "vm_type": payload.get("vm_type", "cattle"),
+                "host":    payload.get("host", ""),
+                "ram_mb":  payload.get("ram_mb", 0),
+                "disk_gb": payload.get("disk_gb", 0),
+                "state":   "created",
+            }
+
+        elif kind == le.VM_DESTROYED:
+            out["vms"].pop(payload["name"], None)
+
+        elif kind == le.VM_MIGRATED:
+            vm = out["vms"].get(payload["name"])
+            if vm is not None:
+                vm["host"] = payload.get("dst_host", vm.get("host"))
+
+        elif kind == le.VM_STATE_CHANGE:
+            vm = out["vms"].get(payload["name"])
+            if vm is not None:
+                vm["state"] = payload.get("state", vm.get("state"))
+                if payload.get("host"):
+                    vm["host"] = payload["host"]
 
         # Bootstrap entry, free-form payloads, and unknown kinds are
         # ignored — they just record history without affecting the

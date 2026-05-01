@@ -90,6 +90,77 @@ def _toml_str_list(xs: list[str]) -> str:
     return "[" + ", ".join(f'"{x}"' for x in xs) + "]"
 
 
+def render_from_snapshot(snapshot: dict, this_node: str,
+                          fence_interfaces=None,
+                          lease_ttl_ms: int = 5_000,
+                          heartbeat_ms: int = 1_000) -> None:
+    """Regenerate /etc/bedrock/daemon.toml as a deterministic projection
+    of the cluster's materialised snapshot (the view_builder.fold output).
+
+    The snapshot is the source of truth; daemon.toml is an output that
+    can be regenerated at any time from a snapshot. Callers are:
+      - mgmt_install / agent_install at first install
+      - `bedrock witness add` / `rm` after the log entry replicates
+      - any future operation that mutates anything daemon.toml depends on
+
+    Picks roles based on snapshot["mgmt_master"] (master = leader,
+    others = follower). Picks sender_ids by index into the sorted
+    nodes map (deterministic across nodes — same algorithm runs on
+    every node's view_builder, so every regenerated daemon.toml
+    agrees on who's sender_id 1, 2, 3…).
+    """
+    nodes = snapshot.get("nodes", {})
+    name_list = sorted(nodes.keys())   # deterministic order
+
+    if this_node in name_list:
+        my_idx = name_list.index(this_node) + 1
+    else:
+        my_idx = 1
+    # First other node we encounter is our peer for election (single-
+    # peer election is the v0.1 surface; multi-peer election arrives
+    # with majority quorum at N>=3).
+    peers_drbd = []
+    peer_sender = None
+    for nm in name_list:
+        if nm == this_node:
+            continue
+        n = nodes[nm]
+        if n.get("drbd_ip"):
+            peers_drbd.append(f"{n['drbd_ip']}:8200")
+        if peer_sender is None:
+            peer_sender = name_list.index(nm) + 1
+
+    witnesses = []
+    for wid, w in (snapshot.get("witnesses") or {}).items():
+        addr = w.get("addr", "")
+        if ":" in addr:
+            host, _, port_s = addr.rpartition(":")
+            port = int(port_s) if port_s.isdigit() else 12321
+        else:
+            host, port = addr, 12321
+        witnesses.append({
+            "id": wid,
+            "host": host,
+            "port": port,
+            "pubkey_hex": w.get("witness_pubkey", ""),
+        })
+
+    master = snapshot.get("mgmt_master")
+    role = "leader" if master == this_node or master is None else "follower"
+
+    render_daemon_toml(
+        sender_id=my_idx,
+        peer_sender_id=peer_sender,
+        peer_listen=["0.0.0.0:8200"],
+        peer=peers_drbd,
+        fence_interfaces=fence_interfaces or [],
+        witnesses=witnesses,
+        role=role,
+        lease_ttl_ms=lease_ttl_ms,
+        heartbeat_ms=heartbeat_ms,
+    )
+
+
 def restart() -> None:
     """systemctl restart bedrock-rust. Idempotent — fine if it was stopped."""
     subprocess.run(["systemctl", "daemon-reload"], check=False)

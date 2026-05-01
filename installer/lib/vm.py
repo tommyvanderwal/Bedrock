@@ -148,6 +148,24 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
         _create_vipet(nodes, home_node_name, peers, name, ram, disk)
     print(f"  VM {name} created. Status: bedrock vm list")
 
+    # L47: append a typed log entry so view_builder's `vms` dict tracks
+    # this. On crash recovery: "what was running here?" → answered
+    # from the log alone. Best-effort — daemon down is non-fatal.
+    try:
+        from . import log_entries as _le, rust_ipc as _ipc
+        from pathlib import Path as _P
+        if _P(_ipc.DEFAULT_SOCK).exists():
+            with _ipc.Daemon() as d:
+                d.append(_le.vm_created(
+                    name=name, vm_type=vm_type, host=home_node_name,
+                    ram_mb=int(ram), disk_gb=int(disk),
+                ))
+                d.append(_le.vm_state_change(
+                    name=name, host=home_node_name, state="running",
+                ))
+    except Exception as e:
+        print(f"  [log] vm_created append skipped: {e}")
+
 
 def _download_alpine_on_node(host: str):
     """Download the Alpine cloud image to the node (once). Cached at /var/lib/bedrock/."""
@@ -374,6 +392,20 @@ def migrate_vm(state, name: str, target: str):
         print(f"Migration: {result}")
     except Exception as e:
         print(f"ERROR: {e}")
+        return
+    # L47: log the migration. src_host is "best effort" — the API
+    # response is the source of truth; here we just record what we
+    # asked for.
+    try:
+        from . import log_entries as _le, rust_ipc as _ipc
+        from pathlib import Path as _P
+        if _P(_ipc.DEFAULT_SOCK).exists():
+            with _ipc.Daemon() as d:
+                d.append(_le.vm_migrated(
+                    name=name, src_host="?", dst_host=target or "?",
+                ))
+    except Exception as e:
+        print(f"  [log] vm_migrated append skipped: {e}")
 
 
 def delete_vm(state, name: str):
@@ -404,3 +436,13 @@ def delete_vm(state, name: str):
         run_on(host, f"lvremove -f {VG_NAME}/vm-{name}-disk0 2>/dev/null", check=False)
 
     print(f"VM {name} deleted.")
+
+    # L47: log the destruction so the view_builder's vms dict drops it.
+    try:
+        from . import log_entries as _le, rust_ipc as _ipc
+        from pathlib import Path as _P
+        if _P(_ipc.DEFAULT_SOCK).exists():
+            with _ipc.Daemon() as d:
+                d.append(_le.vm_destroyed(name=name))
+    except Exception as e:
+        print(f"  [log] vm_destroyed append skipped: {e}")

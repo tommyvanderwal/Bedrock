@@ -261,13 +261,17 @@ WantedBy=multi-user.target
         daemon_setup.write_cluster_key()
         daemon_setup.init_log_if_needed(s["cluster_uuid"])
         daemon_setup.render_daemon_toml(
-            sender_id=0,
-            peer_sender_id=None,
+            sender_id=1,
+            peer_sender_id=None,    # filled in when first peer joins
             peer_listen=["0.0.0.0:8200"],
             peer=[],
             fence_interfaces=[],
-            witnesses=[],   # added later; see `bedrock witness add`
-            role="standalone",
+            witnesses=[],           # added later; see `bedrock witness add`
+            # Master at init advertises Leader so a future joiner
+            # attaches as Follower without a manual reconfigure step.
+            # The lease loop's witness-based election still has the
+            # final say once the peer + witness are both up.
+            role="leader",
         )
         daemon_setup.restart()
         print(f"  bedrock-rust running, IPC at /run/bedrock-rust.sock")

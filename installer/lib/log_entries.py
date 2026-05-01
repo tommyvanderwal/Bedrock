@@ -46,6 +46,14 @@ WITNESS_REGISTER      = "witness_register"
 WITNESS_UNREGISTER    = "witness_unregister"
 PARAM_CHANGE          = "param_change"
 
+# VM task lifecycle (L47). Facts/events: append history, sequence
+# matters. After a crash these let "what was running here when it
+# went down?" be answered from the log alone.
+VM_CREATED            = "vm_created"
+VM_DESTROYED          = "vm_destroyed"
+VM_MIGRATED           = "vm_migrated"
+VM_STATE_CHANGE       = "vm_state_change"
+
 
 def encode(t: str, **fields) -> bytes:
     """Encode a typed entry payload."""
@@ -127,3 +135,21 @@ def witness_unregister(witness_id: str) -> bytes:
 
 def param_change(key: str, value) -> bytes:
     return encode(PARAM_CHANGE, key=key, value=value)
+
+
+def vm_created(name: str, vm_type: str, host: str, ram_mb: int, disk_gb: int) -> bytes:
+    return encode(VM_CREATED, name=name, vm_type=vm_type, host=host,
+                  ram_mb=ram_mb, disk_gb=disk_gb)
+
+
+def vm_destroyed(name: str) -> bytes:
+    return encode(VM_DESTROYED, name=name)
+
+
+def vm_migrated(name: str, src_host: str, dst_host: str) -> bytes:
+    return encode(VM_MIGRATED, name=name, src_host=src_host, dst_host=dst_host)
+
+
+def vm_state_change(name: str, host: str, state: str) -> bytes:
+    """state: 'running', 'shut off', 'paused', etc. — verbatim libvirt label."""
+    return encode(VM_STATE_CHANGE, name=name, host=host, state=state)
