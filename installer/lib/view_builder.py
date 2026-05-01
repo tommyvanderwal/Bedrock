@@ -61,8 +61,17 @@ def fold(entries: list[dict]) -> dict:
         kind = payload.get("t")
         out["log_index"] = entry["index"]
 
-        if kind == le.CLUSTER_INIT:
+        if kind == le.BOOTSTRAP:
+            # First entry in every log; carries the cluster's permanent
+            # uuid. cluster_name is set by a later cluster_init entry.
+            out["cluster_uuid"] = payload["uuid"]
+
+        elif kind == le.CLUSTER_INIT:
             out["cluster_name"] = payload["name"]
+            # Update uuid only if it differs from the bootstrap one
+            # (it shouldn't, but the explicit cluster_init entry exists
+            # so an operator can rename a cluster without rewriting
+            # every node's bootstrap).
             out["cluster_uuid"] = payload["uuid"]
 
         elif kind == le.NODE_REGISTER:

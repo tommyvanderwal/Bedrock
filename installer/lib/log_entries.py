@@ -29,6 +29,13 @@ import msgpack
 
 # ── entry types ──
 
+# The bootstrap entry is the first entry in every log (index 1). Its
+# `uuid` field is the cluster_uuid the cluster identifies itself by;
+# the entry's hash chains every other entry in the cluster's history.
+# Per design §4: a re-initialised cluster is distinguishable from a
+# continued one because the bootstrap entry's hash includes the new
+# uuid → the chain forks at index 1.
+BOOTSTRAP             = "bootstrap"
 CLUSTER_INIT          = "cluster_init"
 NODE_REGISTER         = "node_register"
 NODE_UNREGISTER       = "node_unregister"
@@ -67,6 +74,10 @@ def decode(payload: bytes) -> dict:
 
 
 # ── constructors ──
+
+def bootstrap(uuid: str) -> bytes:
+    return encode(BOOTSTRAP, uuid=uuid)
+
 
 def cluster_init(name: str, uuid: str) -> bytes:
     return encode(CLUSTER_INIT, name=name, uuid=uuid)

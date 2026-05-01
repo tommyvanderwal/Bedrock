@@ -1,0 +1,13 @@
+<network>
+  <name>bedrock-cluster-link2</name>
+  <!-- Second isolated cluster path between sim nodes — simulates a
+       second cable. Per design §7: ≥1 direct cable, ideally 2 (RJ45 +
+       USB4) for orthogonality across PHY/driver/connector. The Rust
+       daemon treats each cable as an independent transport; heartbeat
+       fans out, replication picks one with fallback on TCP error. The
+       cluster stays operational with as few as one working link.
+
+       2 nodes feels like a direct cable (host-only bridge with no
+       switch loop). For 3+ nodes this can become a real switch. -->
+  <bridge name='br-bedlink2' stp='on' delay='0'/>
+</network>

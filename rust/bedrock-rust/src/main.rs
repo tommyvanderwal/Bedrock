@@ -36,14 +36,18 @@ struct Cli {
 enum Cmd {
     /// Run the long-lived daemon: log + IPC + (later) lease loop + peer.
     Daemon {
-        /// Optional peer to connect to as a follower.
+        /// Peer addresses to connect to. Repeat for multiple paths
+        /// (per design §7: ≥1 cable, ideally 2 — RJ45 + USB4 — for
+        /// orthogonality. The system stays operational with as few as
+        /// one working path).
         #[arg(long)]
-        peer: Option<String>,
-        /// TCP listen address for incoming peer connections (host:port).
-        #[arg(long, default_value = "0.0.0.0:8200")]
-        peer_listen: String,
-        /// This node's role at startup. v0.1 takes the role explicitly;
-        /// auto-election from witness state lands in phase 4.
+        peer: Vec<String>,
+        /// TCP listen addresses for incoming peer connections. Repeat
+        /// for multiple paths. Defaults to a single 0.0.0.0:8200.
+        #[arg(long)]
+        peer_listen: Vec<String>,
+        /// This node's role at startup. Phase 8 auto-elects from
+        /// witness state when set to `auto`.
         #[arg(long, value_enum, default_value_t = peer::Role::Standalone)]
         role: peer::Role,
         /// 32-byte cluster key, hex (peer auth + witness AEAD).
@@ -64,6 +68,10 @@ enum Cmd {
         /// This node's sender_id (0..0xFE).
         #[arg(long, default_value_t = 0)]
         sender_id: u8,
+        /// The peer's sender_id, used to drive witness-based leader
+        /// election (Phase 8). Omit for standalone / single-node.
+        #[arg(long)]
+        peer_sender_id: Option<u8>,
         /// Lease TTL in milliseconds; the leader is fenced if it can't
         /// renew within this window. Direct-cable default 5000ms.
         #[arg(long, default_value_t = 5_000)]
@@ -155,7 +163,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Daemon {
-            peer,
+            peer: peer_addr,
             peer_listen,
             role,
             cluster_key,
@@ -165,13 +173,14 @@ fn main() -> Result<()> {
             witness_pubkey,
             witness_pubkey_file,
             sender_id,
+            peer_sender_id,
             lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
         } => run_daemon(
             cli.log_dir,
             cli.ipc_sock,
-            peer,
+            peer_addr,
             peer_listen,
             role,
             cluster_key,
@@ -181,6 +190,7 @@ fn main() -> Result<()> {
             witness_pubkey,
             witness_pubkey_file,
             sender_id,
+            peer_sender_id,
             lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
@@ -230,7 +240,10 @@ fn main() -> Result<()> {
                                 hex::encode(&e.hash[..6]),
                                 e.payload.len()
                             );
-                            if matches!(payload::Kind::from_u8(e.kind), Some(payload::Kind::Bootstrap | payload::Kind::Opaque)) {
+                            // Print the payload as text only if it's
+                            // free-form — typed (msgpack) entries are
+                            // best inspected via the Python view-builder.
+                            if matches!(payload::Kind::from_u8(e.kind), Some(payload::Kind::Opaque)) {
                                 if let Ok(s) = std::str::from_utf8(&e.payload) {
                                     if !s.is_empty() {
                                         println!("    text: {}", s);
@@ -293,8 +306,8 @@ fn main() -> Result<()> {
 fn run_daemon(
     log_dir: PathBuf,
     ipc_sock: PathBuf,
-    peer_addr: Option<String>,
-    peer_listen: String,
+    peer_addr: Vec<String>,
+    peer_listen: Vec<String>,
     role: peer::Role,
     cluster_key: Option<String>,
     cluster_key_file: Option<PathBuf>,
@@ -303,6 +316,7 @@ fn run_daemon(
     witness_pubkey: Option<String>,
     witness_pubkey_file: Option<PathBuf>,
     sender_id: u8,
+    peer_sender_id: Option<u8>,
     lease_ttl_ms: u64,
     heartbeat_ms: u64,
     fence_interfaces: String,
@@ -311,10 +325,16 @@ fn run_daemon(
     let server = ipc::Server::new(ipc_sock.clone(), log);
     let log_handle = std::sync::Arc::clone(&server.log);
 
-    // Peer transport (Phase 3).
-    let (peer_rx, peer_tx) = peer::start(peer::Config {
+    // Peer transport (Phases 3 + 7). Default to one listener if the
+    // operator didn't specify any.
+    let listen_addrs = if peer_listen.is_empty() {
+        vec!["0.0.0.0:8200".to_string()]
+    } else {
+        peer_listen
+    };
+    let _peer = peer::start(peer::Config {
         log: std::sync::Arc::clone(&log_handle),
-        listen_addr: peer_listen,
+        listen_addrs,
         connect_to: peer_addr,
         role,
     })?;
@@ -329,6 +349,7 @@ fn run_daemon(
             cluster_key,
             witness_pubkey,
             sender_id,
+            peer_sender_id,
             ttl_ms: lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces: fence_interfaces
@@ -343,8 +364,6 @@ fn run_daemon(
         None
     };
 
-    // (peer_rx/peer_tx are kept alive to keep the threads running)
-    let _peer_handles = (peer_rx, peer_tx);
     let _lease = lease_handle;
 
     log::info!("bedrock-rust daemon: log_dir={} ipc={}",

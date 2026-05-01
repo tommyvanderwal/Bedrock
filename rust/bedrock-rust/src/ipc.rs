@@ -88,7 +88,7 @@ pub struct EntryWire {
 /// `bin`. Without this, serde defaults to a tuple/sequence representation
 /// which Python's msgpack-Python emits as a list — wire-incompat with
 /// Rust's `Vec<u8>` and surprising on the wire.
-mod serde_bytes_array {
+pub(crate) mod serde_bytes_array {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

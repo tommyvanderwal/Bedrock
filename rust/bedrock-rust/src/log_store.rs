@@ -101,10 +101,49 @@ fn segment_path(dir: &Path) -> PathBuf {
     dir.join("00000001.log")
 }
 
+/// Encode the bootstrap entry payload as MessagePack: a 2-key map
+/// `{"t": "bootstrap", "uuid": <cluster_uuid>}`. Hand-rolled (rather
+/// than going through serde) because we want this byte-for-byte
+/// stable and the only fields involved are tiny strings.
+fn encode_bootstrap_payload(uuid: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    // map of 2 entries → fixmap header 0x82
+    buf.push(0x82);
+    write_msgpack_str(&mut buf, "t");
+    write_msgpack_str(&mut buf, "bootstrap");
+    write_msgpack_str(&mut buf, "uuid");
+    write_msgpack_str(&mut buf, uuid);
+    buf
+}
+
+fn write_msgpack_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n <= 31 {
+        // fixstr 0xa0..0xbf
+        buf.push(0xa0 | (n as u8));
+    } else if n <= u8::MAX as usize {
+        buf.push(0xd9);
+        buf.push(n as u8);
+    } else if n <= u16::MAX as usize {
+        buf.push(0xda);
+        buf.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        buf.push(0xdb);
+        buf.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    buf.extend_from_slice(bytes);
+}
+
 impl Log {
-    /// Initialise a fresh log at `dir`. Writes the bootstrap entry at index 1
-    /// with payload `b"Hello World! <cluster-uuid>"` (per design §4).
-    /// Refuses if the segment file already exists.
+    /// Initialise a fresh log at `dir`. Writes the bootstrap entry at
+    /// index 1 with the typed payload `{"t": "bootstrap", "uuid":
+    /// <cluster_uuid>}` (msgpack), so the view builder can fold it
+    /// like any other entry. The hash of this entry chains the rest of
+    /// the cluster's history — re-initialising with a different uuid
+    /// produces a different hash, distinguishing a re-init from a
+    /// continuation (design §4). Refuses if the segment file already
+    /// exists.
     pub fn init(dir: &Path, cluster_uuid: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let segment = segment_path(dir);
@@ -121,7 +160,7 @@ impl Log {
             dir: dir.to_path_buf(),
             latest: (0, [0u8; 32]),
         };
-        let payload = format!("Hello World! {}", cluster_uuid).into_bytes();
+        let payload = encode_bootstrap_payload(cluster_uuid);
         log.append(Kind::Bootstrap, &payload)?;
         Ok(log)
     }
@@ -332,16 +371,29 @@ mod tests {
     }
 
     #[test]
-    fn init_writes_hello_world() {
+    fn init_writes_typed_bootstrap_entry() {
         let d = tmpdir();
         let log = Log::init(d.path(), "test-uuid").unwrap();
         let (idx, _) = log.latest();
         assert_eq!(idx, 1);
         let e = log.read(1).unwrap().unwrap();
         assert_eq!(e.kind, Kind::Bootstrap as u8);
-        assert_eq!(e.payload, b"Hello World! test-uuid");
         assert_eq!(e.prev_hash, [0u8; 32]);
         assert_eq!(e.epoch, 1);
+        // Payload is MessagePack {"t":"bootstrap","uuid":"test-uuid"}.
+        // Spot-check the structure rather than the exact bytes — the
+        // view builder is what unfolds it.
+        assert_eq!(e.payload[0], 0x82, "expected fixmap of 2 entries");
+        // "t" → "bootstrap"
+        assert_eq!(e.payload[1], 0xa1); // fixstr len 1
+        assert_eq!(e.payload[2], b't');
+        assert_eq!(e.payload[3], 0xa9); // fixstr len 9 ("bootstrap")
+        assert_eq!(&e.payload[4..13], b"bootstrap");
+        // "uuid" → "test-uuid"
+        assert_eq!(e.payload[13], 0xa4); // fixstr len 4
+        assert_eq!(&e.payload[14..18], b"uuid");
+        assert_eq!(e.payload[18], 0xa9); // fixstr len 9 ("test-uuid")
+        assert_eq!(&e.payload[19..28], b"test-uuid");
     }
 
     #[test]

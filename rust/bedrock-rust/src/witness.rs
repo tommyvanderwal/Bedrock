@@ -229,6 +229,53 @@ pub struct LeaseConfig {
     pub ttl_ms: u64,
     pub heartbeat_ms: u64,
     pub fence_interfaces: Vec<String>,
+    /// If set: query the witness for STATUS_DETAIL on this sender_id
+    /// every heartbeat to inform leader election (Phase 8). When None,
+    /// the daemon uses the role passed on the CLI as-is.
+    pub peer_sender_id: Option<u8>,
+}
+
+/// Election rules at a glance (design §6 / §9):
+///
+/// ```
+///   fence marker present? → ELECTED_FOLLOWER (refuse leader regardless)
+///   no peer entry at witness? → ELECTED_LEADER  (we're the only one talking)
+///   our last_index > peer's? → ELECTED_LEADER
+///   our last_index < peer's? → ELECTED_FOLLOWER
+///   equal? → lower sender_id wins → ELECTED_LEADER (us) / ELECTED_FOLLOWER (peer)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Election {
+    Leader,
+    Follower,
+    /// Peer can be reached / hasn't been heard from yet — keep current role.
+    Unknown,
+}
+
+/// Pure decision function — easy to unit test.
+pub fn elect(
+    fence_marker: bool,
+    our_last_index: u64,
+    our_sender_id: u8,
+    peer_last_index: Option<u64>,
+    peer_sender_id: u8,
+) -> Election {
+    if fence_marker {
+        return Election::Follower;
+    }
+    match peer_last_index {
+        None => Election::Leader,
+        Some(theirs) if our_last_index > theirs => Election::Leader,
+        Some(theirs) if our_last_index < theirs => Election::Follower,
+        Some(_) => {
+            // Tie — deterministic by sender_id.
+            if our_sender_id <= peer_sender_id {
+                Election::Leader
+            } else {
+                Election::Follower
+            }
+        }
+    }
 }
 
 /// Spawn the lease loop. The thread heartbeats to the witness every
@@ -244,11 +291,12 @@ pub fn start_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> JoinHandle<()
 
 fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
     log::info!(
-        "lease: witness={}:{} ttl={}ms heartbeat={}ms",
-        cfg.host, cfg.port, cfg.ttl_ms, cfg.heartbeat_ms
+        "lease: witness={}:{} ttl={}ms heartbeat={}ms peer_sender_id={:?}",
+        cfg.host, cfg.port, cfg.ttl_ms, cfg.heartbeat_ms, cfg.peer_sender_id,
     );
     let mut session: Option<WitnessSession> = None;
     let mut last_ok = Instant::now();
+    let mut last_election = Election::Unknown;
 
     loop {
         let result = (|| -> Result<()> {
@@ -261,7 +309,25 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                 lg.latest()
             };
             let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
-            sess.heartbeat(&payload, /*query_target=*/ QUERY_LIST_SENTINEL)?;
+            // If election is configured, ask DETAIL on the peer so we
+            // learn its last_index — STATUS_DETAIL serves the most
+            // recent payload the peer left at the witness, which is
+            // exactly the (epoch, last_index, last_hash) we packed for
+            // our own heartbeat.
+            let target = cfg.peer_sender_id.unwrap_or(QUERY_LIST_SENTINEL);
+            let reply = sess.heartbeat_full(&payload, target)?;
+            if let Some(peer_id) = cfg.peer_sender_id {
+                let peer_last = parse_peer_last_index(&reply, &cfg.cluster_key);
+                let fence = fence_marker_present();
+                let next = elect(fence, latest_index, cfg.sender_id, peer_last, peer_id);
+                if next != last_election {
+                    log::info!(
+                        "election: {:?} → {:?} (us=idx{}, peer={:?})",
+                        last_election, next, latest_index, peer_last
+                    );
+                    last_election = next;
+                }
+            }
             Ok(())
         })();
 
@@ -346,6 +412,12 @@ impl WitnessSession {
     }
 
     fn heartbeat(&mut self, payload: &[u8], query_target: u8) -> Result<()> {
+        self.heartbeat_full(payload, query_target).map(|_| ())
+    }
+
+    /// Send a HEARTBEAT, return the raw reply bytes for the caller to
+    /// decode (used by leader election to read peer's STATUS_DETAIL).
+    fn heartbeat_full(&mut self, payload: &[u8], query_target: u8) -> Result<Vec<u8>> {
         let mut buf = [0u8; MTU_CAP];
         let n = msg::encode_heartbeat(
             &mut buf, self.sender_id, now_ms(),
@@ -355,7 +427,7 @@ impl WitnessSession {
         self.sock.send(&buf[..n])?;
         let mut reply = [0u8; MTU_CAP];
         let n = self.sock.recv(&mut reply)?;
-        let raw = &reply[..n];
+        let raw = reply[..n].to_vec();
         if raw.len() < HEADER_LEN {
             bail!("heartbeat reply too short");
         }
@@ -364,11 +436,29 @@ impl WitnessSession {
         if raw[4] == MSG_INIT {
             bail!("witness sent INIT (lost cluster); re-bootstrap needed");
         }
-        // Don't decode further in v0.1 — successful AEAD-protected reply
-        // is enough proof we're heard. Phase 5 will use STATUS_DETAIL
-        // to feed peer-state to the leader-claim arbiter.
-        Ok(())
+        Ok(raw)
     }
+}
+
+/// Decode the witness's STATUS_DETAIL reply for our peer and pull out
+/// the last_committed_index field from `peer_payload`. Returns None if:
+///  - reply is STATUS_LIST (we asked LIST), or
+///  - status_and_blocks says peer not found, or
+///  - peer_payload is shorter than 16 bytes.
+fn parse_peer_last_index(raw: &[u8], cluster_key: &[u8; 32]) -> Option<u64> {
+    if raw.len() < HEADER_LEN {
+        return None;
+    }
+    if raw[4] != MSG_STATUS_DETAIL {
+        return None;
+    }
+    let mut buf = raw.to_vec();
+    let r = msg::decode_status_detail_into(&mut buf, cluster_key).ok()?;
+    if !r.found || r.peer_payload.len() < 16 {
+        return None;
+    }
+    let last_index = u64::from_be_bytes(r.peer_payload[8..16].try_into().ok()?);
+    Some(last_index)
 }
 
 /// Self-fence: bring all configured cluster interfaces down, write the
@@ -405,6 +495,37 @@ pub fn self_fence(interfaces: &[String]) -> Result<()> {
 /// (or Python) clears the marker.
 pub fn fence_marker_present() -> bool {
     std::path::Path::new(FENCE_MARKER_PATH).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fence_marker_forces_follower() {
+        // Even if our log is ahead and peer is gone, fence marker
+        // wins and we refuse to claim leader.
+        assert_eq!(elect(true, 100, 1, None, 2), Election::Follower);
+    }
+
+    #[test]
+    fn peer_absent_means_we_lead() {
+        assert_eq!(elect(false, 5, 1, None, 2), Election::Leader);
+    }
+
+    #[test]
+    fn higher_index_wins() {
+        assert_eq!(elect(false, 10, 1, Some(5), 2), Election::Leader);
+        assert_eq!(elect(false, 5, 1, Some(10), 2), Election::Follower);
+    }
+
+    #[test]
+    fn tie_resolved_by_lower_sender_id() {
+        // sender_id 1 wins over 2.
+        assert_eq!(elect(false, 7, 1, Some(7), 2), Election::Leader);
+        // sender_id 2 loses to 1.
+        assert_eq!(elect(false, 7, 2, Some(7), 1), Election::Follower);
+    }
 }
 
 fn print_status_detail(raw: &[u8], cluster_key: &[u8; 32]) -> Result<()> {

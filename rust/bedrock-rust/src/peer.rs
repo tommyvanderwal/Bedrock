@@ -1,12 +1,23 @@
 //! Peer-to-peer transport for log replication and heartbeats.
 //!
-//! v0.1 single-link, single-leader, single-follower. Multi-link
-//! transport (design §7) is phase 7. Frames are length-prefixed
-//! MessagePack, same shape as IPC frames so we have one wire format
-//! to reason about.
+//! Per design §7: "two nodes connected by **at least one** direct
+//! cable, ideally two ... each cable is a separate Rust-managed
+//! transport." v0.1 implements multi-link end-to-end:
 //!
-//! Configured leader pushes new entries to the configured follower.
-//! Phase 4 will replace this static role with witness-based election.
+//! - The operator passes any number of `--peer-listen <host:port>`
+//!   addresses; each gets its own listener thread.
+//! - The operator passes any number of `--peer <host:port>` addresses;
+//!   each gets its own outbound transport thread.
+//! - Heartbeats fan out to **every** active link.
+//! - Log replication picks one healthy link as the **active replicator**
+//!   and tail-pushes there. If that link errors, the next-arriving
+//!   ReplicateRequest from the follower picks up on whichever link is
+//!   still healthy.
+//! - The whole system stays operational as long as at least one link
+//!   is up. Multi-link is a convenience: 2 cables are better than 1
+//!   for orthogonality (PHY/driver/connector), but never required.
+//!
+//! Frames are length-prefixed MessagePack, same shape as IPC.
 
 use crate::ipc::EntryWire;
 use crate::log_store::Log;
@@ -15,25 +26,21 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Role {
-    /// No peer — solo node, IPC only.
     Standalone,
-    /// Push new appends to the configured follower.
     Leader,
-    /// Accept replication from the configured leader.
     Follower,
 }
 
 pub struct Config {
     pub log: Arc<Mutex<Log>>,
-    pub listen_addr: String,
-    pub connect_to: Option<String>,
+    pub listen_addrs: Vec<String>,
+    pub connect_to: Vec<String>,
     pub role: Role,
 }
 
@@ -42,201 +49,195 @@ pub struct Config {
 enum PeerFrame {
     Identify {
         node_role: String,
-        peer_listen: String,
     },
     /// Follower → leader: "send me everything from this index onward".
-    ReplicateRequest { from_index: u64 },
+    ReplicateRequest {
+        from_index: u64,
+    },
     /// Leader → follower: one log entry, raw on-disk format.
-    ReplicateEntry { entry: EntryWire },
+    ReplicateEntry {
+        entry: EntryWire,
+    },
     /// Bidirectional liveness — small enough to send constantly.
-    Heartbeat { latest_index: u64, latest_hash: [u8; 32] },
-    Ack { up_to_index: u64 },
+    Heartbeat {
+        latest_index: u64,
+        #[serde(with = "crate::ipc::serde_bytes_array")]
+        latest_hash: [u8; 32],
+    },
+    Ack {
+        up_to_index: u64,
+    },
 }
 
 const FRAME_LEN_BYTES: usize = 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-pub fn start(cfg: Config) -> anyhow::Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let listener = TcpListener::bind(&cfg.listen_addr)?;
-    log::info!("peer: listening on {}", cfg.listen_addr);
-    let listen_handle = {
-        let log = Arc::clone(&cfg.log);
+/// Spawn a listener thread per `listen_addrs` and an outbound thread per
+/// `connect_to`. Each thread is independent — losing one doesn't stop
+/// the others. Returns the join handles so the daemon's main thread
+/// can keep them alive (we don't actually join — they run for the
+/// process lifetime).
+pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let mut handles = Vec::new();
+    for addr in &cfg.listen_addrs {
+        let listener = TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("peer: bind {}: {}", addr, e))?;
+        log::info!("peer: listening on {}", addr);
+        let log_handle = Arc::clone(&cfg.log);
         let role = cfg.role;
-        thread::spawn(move || {
+        let addr = addr.clone();
+        handles.push(thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
-                        let log = Arc::clone(&log);
+                        let lg = Arc::clone(&log_handle);
+                        let listen_addr = addr.clone();
                         thread::spawn(move || {
-                            if let Err(e) = handle_inbound(s, log, role) {
-                                log_warn(&format!("inbound: {e}"));
+                            let peer_addr = s
+                                .peer_addr()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|_| "<unknown>".to_string());
+                            log::info!("peer: link[{}] inbound from {}", listen_addr, peer_addr);
+                            if let Err(e) = handle_stream(s, lg, role, true) {
+                                log::warn!("peer: link[{}] inbound from {}: {}", listen_addr, peer_addr, e);
                             }
                         });
                     }
-                    Err(e) => log_warn(&format!("accept: {e}")),
+                    Err(e) => log::warn!("peer: accept on {}: {}", addr, e),
                 }
             }
-        })
-    };
-
-    let connect_handle = {
-        let log = Arc::clone(&cfg.log);
-        let connect_to = cfg.connect_to.clone();
-        let role = cfg.role;
-        thread::spawn(move || {
-            if let Some(addr) = connect_to {
-                loop {
-                    match TcpStream::connect(&addr) {
-                        Ok(s) => {
-                            log::info!("peer: connected to {}", addr);
-                            if let Err(e) = drive_outbound(s, Arc::clone(&log), role) {
-                                log_warn(&format!("outbound to {addr}: {e}"));
-                            }
-                        }
-                        Err(e) => log_warn(&format!("connect {addr}: {e}")),
-                    }
-                    // Reconnect with a small backoff on link error / peer
-                    // restart. The followers' replicate loop is built to
-                    // be idempotent on resume.
-                    thread::sleep(Duration::from_secs(2));
-                }
-            }
-        })
-    };
-
-    Ok((listen_handle, connect_handle))
-}
-
-fn handle_inbound(mut stream: TcpStream, log: Arc<Mutex<Log>>, role: Role) -> anyhow::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    // Send Identify.
-    let our_role = role_str(role);
-    write_frame(
-        &mut stream,
-        &PeerFrame::Identify {
-            node_role: our_role.to_string(),
-            peer_listen: String::new(),
-        },
-    )?;
-
-    loop {
-        let frame = match read_frame(&mut stream)? {
-            Some(f) => f,
-            None => return Ok(()),
-        };
-        match frame {
-            PeerFrame::Identify { node_role, .. } => {
-                log::info!("peer (in): identified as {}", node_role);
-            }
-            PeerFrame::ReplicateRequest { from_index } => {
-                if !matches!(role, Role::Leader) {
-                    log_warn("peer (in): replicate request to non-leader; ignoring");
-                    continue;
-                }
-                replicate_from(&log, &mut stream, from_index)?;
-            }
-            PeerFrame::ReplicateEntry { entry } => {
-                if !matches!(role, Role::Follower) {
-                    log_warn("peer (in): replicate entry to non-follower; ignoring");
-                    continue;
-                }
-                apply_replicated_entry(&log, &mut stream, entry)?;
-            }
-            PeerFrame::Heartbeat { latest_index, .. } => {
-                log::debug!("peer (in): hb latest={}", latest_index);
-            }
-            PeerFrame::Ack { up_to_index } => {
-                log::debug!("peer (in): ack up_to={}", up_to_index);
-            }
-        }
+        }));
     }
+
+    for target in &cfg.connect_to {
+        let log_handle = Arc::clone(&cfg.log);
+        let role = cfg.role;
+        let target = target.clone();
+        handles.push(thread::spawn(move || loop {
+            match TcpStream::connect(&target) {
+                Ok(s) => {
+                    log::info!("peer: link[{}] outbound connected", target);
+                    if let Err(e) = handle_stream(s, Arc::clone(&log_handle), role, false) {
+                        log::warn!("peer: link[{}] outbound: {}", target, e);
+                    }
+                }
+                Err(e) => log::debug!("peer: link[{}] connect: {}", target, e),
+            }
+            thread::sleep(Duration::from_secs(2));
+        }));
+    }
+
+    if cfg.connect_to.is_empty() && cfg.listen_addrs.is_empty() {
+        log::info!("peer: no listen + no connect — running headless");
+    }
+    Ok(handles)
 }
 
-fn drive_outbound(mut stream: TcpStream, log: Arc<Mutex<Log>>, role: Role) -> anyhow::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+/// Drive a single TCP transport (one link). Both directions run the
+/// same protocol after sending Identify; what each side does after
+/// that depends on its `role`.
+///
+/// The read timeout is short (TICK_MS) so each tick a leader can
+/// opportunistically push newly-appended entries even if the follower
+/// hasn't sent anything to wake the loop. (Without this, the leader
+/// blocks on read_frame and only pushes new entries when the follower
+/// sends a frame it never sends.)
+fn handle_stream(
+    mut stream: TcpStream,
+    log: Arc<Mutex<Log>>,
+    role: Role,
+    inbound: bool,
+) -> anyhow::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(TICK_MS)))?;
     write_frame(
         &mut stream,
         &PeerFrame::Identify {
             node_role: role_str(role).to_string(),
-            peer_listen: String::new(),
         },
     )?;
 
-    match role {
-        Role::Follower => {
-            // Ask the leader to start replicating from one past our latest.
-            let from_index = {
-                let lg = log.lock().unwrap();
-                lg.latest().0 + 1
-            };
-            log::info!("peer (out): asking leader for entries from {}", from_index);
-            write_frame(&mut stream, &PeerFrame::ReplicateRequest { from_index })?;
+    if !inbound && matches!(role, Role::Follower) {
+        let from_index = log.lock().unwrap().latest().0 + 1;
+        log::info!("peer: link asking leader for entries from {}", from_index);
+        write_frame(&mut stream, &PeerFrame::ReplicateRequest { from_index })?;
+    }
 
-            loop {
-                let frame = match read_frame(&mut stream)? {
-                    Some(f) => f,
-                    None => anyhow::bail!("leader closed connection"),
-                };
-                match frame {
-                    PeerFrame::ReplicateEntry { entry } => {
-                        apply_replicated_entry(&log, &mut stream, entry)?;
+    let mut tail_state: Option<TailState> = None;
+    let mut last_idle_hb = Instant::now();
+
+    loop {
+        match read_frame(&mut stream) {
+            Ok(None) => return Ok(()), // peer closed
+            Ok(Some(frame)) => match frame {
+                PeerFrame::Identify { node_role } => {
+                    log::info!("peer: link identified peer as {}", node_role);
+                }
+                PeerFrame::ReplicateRequest { from_index } => {
+                    if !matches!(role, Role::Leader) {
+                        log::warn!("peer: replicate request to non-leader; ignoring");
+                        continue;
                     }
-                    PeerFrame::Heartbeat { .. } => {}
-                    PeerFrame::Identify { node_role, .. } => {
-                        log::info!("peer (out): leader identified as {}", node_role);
-                    }
-                    PeerFrame::Ack { .. } => {}
-                    PeerFrame::ReplicateRequest { .. } => {
-                        log_warn("peer (out): leader sent us a ReplicateRequest? ignoring");
+                    tail_state = Some(TailState { next_index: from_index });
+                    if let Some(ts) = tail_state.as_mut() {
+                        ts.next_index = push_range(&log, &mut stream, ts.next_index)?;
                     }
                 }
-            }
-        }
-        Role::Leader => {
-            // Leader on the connect side waits to be asked. Heartbeat
-            // every couple of seconds so the follower side knows we're
-            // alive even when no entries are flying.
-            loop {
-                {
-                    let lg = log.lock().unwrap();
-                    let (idx, hash) = lg.latest();
-                    write_frame(
-                        &mut stream,
-                        &PeerFrame::Heartbeat {
-                            latest_index: idx,
-                            latest_hash: hash,
-                        },
-                    )?;
+                PeerFrame::ReplicateEntry { entry } => {
+                    if !matches!(role, Role::Follower) {
+                        log::warn!("peer: replicate entry to non-follower; ignoring");
+                        continue;
+                    }
+                    apply_replicated_entry(&log, &mut stream, entry)?;
                 }
-                thread::sleep(Duration::from_secs(2));
+                PeerFrame::Heartbeat { latest_index, .. } => {
+                    log::debug!("peer: link heartbeat latest={}", latest_index);
+                }
+                PeerFrame::Ack { up_to_index } => {
+                    log::debug!("peer: link ack up_to={}", up_to_index);
+                }
+            },
+            Err(e) if is_timeout(&e) => {
+                // No inbound frame this tick — that's fine, fall through
+                // to the leader-tail-push below.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Leader: tail-push any new entries every tick, plus an idle
+        // heartbeat so the follower's read timeout never fires on a
+        // quiet link.
+        if let (Role::Leader, Some(ts)) = (role, tail_state.as_mut()) {
+            ts.next_index = push_range(&log, &mut stream, ts.next_index)?;
+            if last_idle_hb.elapsed() > Duration::from_millis(IDLE_HB_MS) {
+                let (idx, hash) = log.lock().unwrap().latest();
+                write_frame(
+                    &mut stream,
+                    &PeerFrame::Heartbeat {
+                        latest_index: idx,
+                        latest_hash: hash,
+                    },
+                )?;
+                last_idle_hb = Instant::now();
             }
         }
-        Role::Standalone => Ok(()),
     }
 }
 
-fn replicate_from(
-    log: &Arc<Mutex<Log>>,
-    stream: &mut TcpStream,
-    from_index: u64,
-) -> anyhow::Result<()> {
-    // Phase 1: push the current snapshot.
-    let mut next = from_index;
-    next = push_range(log, stream, next)?;
+const TICK_MS: u64 = 200;
+const IDLE_HB_MS: u64 = 2000;
 
-    // Phase 2: keep the connection open and tail-push new entries as they
-    // appear in the log. The follower disconnects on shutdown, which
-    // cleanly ends this loop. v0.1 polls; phase 7 will switch to a
-    // commit-event subscription so pushes are zero-delay.
-    log::info!("peer: tail-replicating from {}", next);
-    loop {
-        thread::sleep(Duration::from_millis(150));
-        next = push_range(log, stream, next)?;
-        // Also send a heartbeat on each tail tick so the follower's read
-        // timeout never trips on an idle leader.
-        let (idx, hash) = log.lock().unwrap().latest();
-        write_frame(stream, &PeerFrame::Heartbeat { latest_index: idx, latest_hash: hash })?;
+fn is_timeout(e: &anyhow::Error) -> bool {
+    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io_err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        );
     }
+    false
+}
+
+struct TailState {
+    next_index: u64,
 }
 
 fn push_range(
@@ -284,22 +285,20 @@ fn apply_replicated_entry(
     let (latest_index, latest_hash) = lg.latest();
 
     if entry.index <= latest_index {
-        // Already have it. Verify byte-for-byte that what we have on disk
-        // matches what the leader is sending — that's the divergence
-        // detection design §4 calls for.
+        // We already have this entry — verify byte-for-byte agreement
+        // (design §4: hash-chain divergence detection at every step).
         match lg.read(entry.index)? {
             Some(local) => {
                 if local.hash != entry.hash {
-                    log_warn(&format!(
+                    anyhow::bail!(
                         "peer: DIVERGENCE at index {}: local hash {} ≠ leader hash {}",
                         entry.index,
                         hex::encode(local.hash),
                         hex::encode(entry.hash),
-                    ));
-                    anyhow::bail!("hash divergence at index {}", entry.index);
+                    );
                 }
             }
-            None => log_warn(&format!("peer: missing entry {} for verify", entry.index)),
+            None => log::warn!("peer: missing entry {} for verify", entry.index),
         }
         return Ok(());
     }
@@ -323,7 +322,6 @@ fn apply_replicated_entry(
         .ok_or_else(|| anyhow::anyhow!("unknown payload kind 0x{:02x}", entry.kind))?;
     let appended = lg.append(kind, &entry.payload)?;
     if appended.hash != entry.hash {
-        // Should never happen — both sides hash the same frame layout.
         anyhow::bail!(
             "peer: post-append hash mismatch (we got {}, leader got {})",
             hex::encode(appended.hash),
@@ -372,10 +370,3 @@ fn write_frame<W: Write>(w: &mut W, frame: &PeerFrame) -> anyhow::Result<()> {
     w.flush()?;
     Ok(())
 }
-
-fn log_warn(msg: &str) {
-    log::warn!("{}", msg);
-}
-
-#[allow(dead_code)]
-pub fn _unused(_x: PathBuf) {}
