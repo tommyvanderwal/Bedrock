@@ -64,16 +64,8 @@ pub enum LogError {
         expected: String,
         actual: String,
     },
-    #[error("entry {index}: hash mismatch (frame hashes to {actual}, but chain expects {expected})")]
-    HashMismatch {
-        index: u64,
-        expected: String,
-        actual: String,
-    },
     #[error("entry indices not contiguous (saw {prev} then {got})")]
     IndexGap { prev: u64, got: u64 },
-    #[error("frame header: unknown payload_kind 0x{0:02x}")]
-    UnknownKind(u8),
 }
 
 pub type Result<T> = std::result::Result<T, LogError>;

@@ -145,6 +145,12 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
             ids = t.setdefault("drbd_node_ids", {})
             ids[payload["node_name"]] = payload["node_id"]
 
+        elif kind == le.DRBD_NODE_ID_FREED:
+            tier = payload["tier"]
+            t = out["tiers"].get(tier)
+            if t is not None:
+                t.get("drbd_node_ids", {}).pop(payload["node_name"], None)
+
         elif kind == le.WITNESS_REGISTER:
             wid = payload["witness_id"]
             out["witnesses"][wid] = {

@@ -368,6 +368,14 @@ fn run_daemon(
     let peer_sender_id = cli_peer_sender_id.or_else(|| {
         cfg_file.as_ref().and_then(|c| c.peer_sender_id)
     });
+    // Build the peer_sender_ids list: prefer the new daemon.toml
+    // `peer_sender_ids` array; fall back to the legacy single
+    // `peer_sender_id` for compat with pre-quorum-vote configs.
+    let peer_sender_ids: Vec<u8> = cfg_file
+        .as_ref()
+        .map(|c| c.peer_sender_ids.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| peer_sender_id.into_iter().collect());
     let lease_ttl_ms = cfg_file.as_ref()
         .and_then(|c| c.lease_ttl_ms)
         .filter(|_| cli_lease_ttl_ms == 5_000)
@@ -383,7 +391,13 @@ fn run_daemon(
     };
 
     let log = log_store::Log::open(&log_dir).context("log open failed")?;
-    let server = ipc::Server::new(ipc_sock.clone(), log);
+    // Shared between IPC (PeerStatus surface, CommitNotifier) and peer
+    // transport (per-link bookkeeping, on_commit). Both must point at
+    // the same instances or the watcher would never wake on replicated
+    // commits and `_wait_replicated` would always look empty.
+    let registry = peer::new_peer_registry();
+    let commit = ipc::CommitNotifier::new();
+    let server = ipc::Server::new(ipc_sock.clone(), log, registry.clone(), commit.clone());
     let log_handle = std::sync::Arc::clone(&server.log);
 
     let listen_addrs = if peer_listen.is_empty() {
@@ -412,6 +426,8 @@ fn run_daemon(
         connect_to: peer_addr,
         role,
         liveness: std::sync::Arc::clone(&peer_liveness),
+        registry: registry.clone(),
+        on_commit: commit.clone(),
     })?;
 
     // Witness configuration. Resolve from the config file when present;
@@ -451,11 +467,12 @@ fn run_daemon(
         let cfg = witness::LeaseConfig {
             witnesses,
             sender_id,
-            peer_sender_id,
+            peer_sender_ids: peer_sender_ids.clone(),
             ttl_ms: lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
             peer_liveness: std::sync::Arc::clone(&peer_liveness),
+            peer_registry: registry.clone(),
             peer_in_maintenance,
         };
         Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))

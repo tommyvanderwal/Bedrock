@@ -42,6 +42,7 @@ NODE_UNREGISTER       = "node_unregister"
 MGMT_MASTER           = "mgmt_master"
 TIER_STATE            = "tier_state"
 DRBD_NODE_ID          = "drbd_node_id_assigned"
+DRBD_NODE_ID_FREED    = "drbd_node_id_freed"
 WITNESS_REGISTER      = "witness_register"
 WITNESS_UNREGISTER    = "witness_unregister"
 PARAM_CHANGE          = "param_change"
@@ -104,8 +105,13 @@ def node_register(node_name: str, host: str, drbd_ip: str, role: str = "compute"
                   drbd_ip=drbd_ip, role=role, pubkey=pubkey)
 
 
-def node_unregister(node_name: str) -> bytes:
-    return encode(NODE_UNREGISTER, node_name=node_name)
+def node_unregister(node_name: str, reason: str = "") -> bytes:
+    """Mark a node as removed from the cluster. `reason` is operator-
+    facing context (e.g. "leave", "decommission", "remove-peer drain")
+    captured for the journal — fold drops the node from the snapshot
+    regardless. Empty string is allowed for backward-compatible
+    invocations."""
+    return encode(NODE_UNREGISTER, node_name=node_name, reason=reason)
 
 
 def mgmt_master(node_name: str) -> bytes:
@@ -128,6 +134,15 @@ def drbd_node_id_assigned(tier: str, node_name: str, node_id: int) -> bytes:
     return encode(DRBD_NODE_ID, tier=tier, node_name=node_name, node_id=node_id)
 
 
+def drbd_node_id_freed(tier: str, node_name: str, node_id: int,
+                       reason: str = "") -> bytes:
+    """Released node-id slot, written when a peer is removed (e.g.
+    via remove-peer or node leave). Fold drops the assignment from the
+    snapshot's drbd_node_ids map. `reason` is operator-facing."""
+    return encode(DRBD_NODE_ID_FREED, tier=tier, node_name=node_name,
+                  node_id=node_id, reason=reason)
+
+
 def witness_register(witness_id: str, addr: str,
                      witness_pubkey_hex: str,
                      encrypted_witness_key_hex: str) -> bytes:
@@ -136,8 +151,8 @@ def witness_register(witness_id: str, addr: str,
                   encrypted_witness_key=encrypted_witness_key_hex)
 
 
-def witness_unregister(witness_id: str) -> bytes:
-    return encode(WITNESS_UNREGISTER, witness_id=witness_id)
+def witness_unregister(witness_id: str, reason: str = "") -> bytes:
+    return encode(WITNESS_UNREGISTER, witness_id=witness_id, reason=reason)
 
 
 def param_change(key: str, value) -> bytes:
@@ -159,8 +174,8 @@ def vm_created(name: str, vm_type: str, host: str, ram_mb: int, disk_gb: int) ->
                   ram_mb=ram_mb, disk_gb=disk_gb)
 
 
-def vm_destroyed(name: str) -> bytes:
-    return encode(VM_DESTROYED, name=name)
+def vm_destroyed(name: str, reason: str = "") -> bytes:
+    return encode(VM_DESTROYED, name=name, reason=reason)
 
 
 def vm_migrated(name: str, src_host: str, dst_host: str) -> bytes:

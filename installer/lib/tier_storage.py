@@ -131,10 +131,36 @@ STATE_JSON   = Path("/etc/bedrock/state.json")
 # the daemon's view_builder runs it'll see the JSON it already
 # matched and no-op the rewrite.
 
+def _is_mgmt_master() -> bool:
+    """True if this node currently holds the mgmt role.
+
+    Per design §3 the cluster log is a single-writer chain — only the
+    master appends; replication carries entries to followers. Two nodes
+    appending at the same index would fork the hash chain (caught by
+    peer.rs DIVERGENCE detection, but blocks all further replication).
+    `_log_append_typed` consults this to decide append-vs-skip.
+    """
+    try:
+        s = json.loads(STATE_JSON.read_text()) if STATE_JSON.exists() else {}
+    except Exception:
+        return False
+    return "mgmt" in (s.get("role") or "")
+
+
 def _log_append_typed(payload_bytes):
-    """Append a typed log entry via IPC. Returns (idx, hash) or None
-    if the daemon isn't reachable. Never raises — best-effort dual-write
-    so an offline daemon doesn't block cluster operations."""
+    """Append a typed log entry via IPC — MASTER ONLY. Returns (idx, hash)
+    on success, None otherwise (daemon down, not the master, etc.).
+
+    Followers must NOT call this — they'd fork the chain. Followers
+    write the same direct-JSON state they always have; the master's
+    log entry replicates over and view_builder produces an identical
+    cluster.json on every node, so the deterministic state ends up
+    matching regardless of which side wrote first.
+
+    Never raises — append failures should not block cluster operations.
+    """
+    if not _is_mgmt_master():
+        return None
     try:
         from . import rust_ipc
         if not Path(rust_ipc.DEFAULT_SOCK).exists():
@@ -449,11 +475,16 @@ def get_drbd_node_id(resource: str, peer_name: str) -> int:
     return nid
 
 
-def free_drbd_node_id(resource: str, peer_name: str) -> int | None:
+def free_drbd_node_id(resource: str, peer_name: str,
+                      reason: str = "") -> int | None:
     """Mark this peer's node-id as free for re-use. Call only after
     drbdsetup forget-peer has cleared the bitmap slot, otherwise a
     later peer reusing the slot would trigger a forced full-resync.
     Returns the freed id, or None if the peer was not assigned.
+
+    Master-only writes a `drbd_node_id_freed` log entry so view_builder
+    folds the same state on every peer (the assignment disappears
+    deterministically from cluster.json across the cluster).
     """
     c = load_cluster()
     tiers = c.setdefault("tiers", {})
@@ -463,6 +494,12 @@ def free_drbd_node_id(resource: str, peer_name: str) -> int | None:
     if nid is not None:
         tier["version"] = tier.get("version", 0) + 1
         save_cluster(c)
+        try:
+            from . import log_entries as _le
+            _log_append_typed(_le.drbd_node_id_freed(
+                resource, peer_name, nid, reason=reason))
+        except ImportError:
+            pass
     return nid
 
 

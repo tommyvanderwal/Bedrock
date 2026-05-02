@@ -193,6 +193,8 @@ def cmd_node(args):
         _cmd_node_list()
     elif args.action == "maintenance":
         _cmd_node_maint(args.target, args.mode)
+    elif args.action == "leave":
+        _cmd_node_leave(args.target, getattr(args, "reason", "leave") or "leave")
 
 
 def _cmd_node_list():
@@ -210,6 +212,73 @@ def _cmd_node_list():
         m = "yes" if n.get("maintenance") else ""
         print(f"{nm:<35} {n.get('host',''):<18} {n.get('drbd_ip',''):<14} "
               f"{n.get('role',''):<14} {m}")
+
+
+def _cmd_node_leave(target: str, reason: str):
+    """Cleanly remove `target` from the cluster. Run on the master.
+
+    The master appends node_unregister to the log; replication carries
+    it to every peer; each peer's view_builder folds the entry → the
+    target's row disappears from cluster.json on every node and from
+    every node's daemon.toml peer_sender_ids list. Followers regen +
+    restart their bedrock-rust automatically.
+
+    The TARGET node is then asked (via SSH) to shut down its own
+    bedrock services so it stops heartbeating to the witness — the
+    witness's STATUS_LIST entry for that sender_id ages out within
+    the takeover threshold and the cluster never sees it again.
+
+    Idempotent: removing a node that's already gone is a no-op append
+    plus a no-op SSH (best-effort).
+    """
+    from lib import log_entries as le, rust_ipc, view_builder, state as _state
+    s = _state.load()
+    self_name = s.get("node_name", "")
+    if target == self_name:
+        print(f"ERROR: cannot leave-from-self. Run `bedrock node leave {target}` from another node.")
+        return 1
+    snapshot = view_builder.rebuild(this_node=self_name)
+    target_info = (snapshot.get("nodes") or {}).get(target)
+    if not target_info:
+        print(f"  {target}: not in cluster snapshot — nothing to do")
+        return 0
+
+    # 1. Master appends node_unregister. Single-writer log contract:
+    #    only the mgmt master writes; replication carries.
+    with rust_ipc.Daemon() as d:
+        idx, _h = d.append(le.node_unregister(node_name=target, reason=reason))
+        print(f"  appended idx={idx} node_unregister({target}, reason={reason!r})")
+
+    # 2. Master regenerates its own daemon.toml from the new snapshot
+    #    so its peer_sender_ids drops the leaving node immediately.
+    _propagate_daemon_config(f"leave:{target}")
+
+    # 3. Best-effort: ask the leaving node to stop its bedrock
+    #    services. Failure is non-fatal — the cluster has already
+    #    forgotten about it; the leaving node will just stop being
+    #    seen at the witness within takeover_threshold.
+    target_host = target_info.get("host")
+    if target_host:
+        import subprocess as _sp
+        rc = _sp.run([
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            f"root@{target_host}",
+            "systemctl stop bedrock-rust bedrock-watcher bedrock-mgmt 2>/dev/null; "
+            "rm -f /tmp/bedrock-rust.fence; "
+            "true",
+        ]).returncode
+        if rc != 0:
+            print(f"  warn: SSH stop on {target} returned {rc} (host unreachable; "
+                  f"witness will age out the entry naturally)")
+        else:
+            print(f"  {target}: bedrock services stopped")
+    else:
+        print(f"  {target}: no host on record — caller must shut it down manually")
+    print(f"  cluster reduced to {len(snapshot.get(chr(110)+chr(111)+chr(100)+chr(101)+chr(115), {})) - 1} nodes")
+    return 0
 
 
 def _cmd_node_maint(target: str, mode: str):
@@ -310,23 +379,52 @@ def _read_log():
 
 
 def _wait_replicated(target_index: int, timeout_s: float = 10.0) -> bool:
-    """Wait until peer-replication has caught every connected peer up
-    to `target_index`. Returns True on success, False on timeout.
+    """Wait until every connected peer host has acked `target_index`.
 
-    v0.1 implementation: polls Daemon.status() locally. The peer-side
-    last-acked-index is exposed via a future PeerStatus IPC op
-    (placeholder for now). For the immediate run we rely on the
-    leader's tail-push being fast enough that a 1-2 s wait is plenty.
+    Each peer is reachable over ≥1 TCP link (per design §7: ≥1 cable,
+    ideally 2). Acks only flow on the link that's actively replicating;
+    the other links sit idle reporting last_acked_index=0. So we group
+    links by remote host (IP) and require ANY link per host to have
+    acked >= target — that means the peer node has the entry, regardless
+    of which cable carried it.
+
+    No peer links → trivially satisfied (single-node cluster: local
+    append is its own commit).
+
+    Returns True on success, False on timeout. Timeout is non-fatal
+    upstream — the entry is in the local log and will replicate
+    eventually; the caller just can't yet promise "every peer has it."
     """
     import time as _t
+    from lib import rust_ipc
     deadline = _t.time() + timeout_s
-    # Placeholder: today we just sleep briefly. Real per-peer ACK
-    # tracking lives in peer.rs's heartbeat frame and surfaces via
-    # IPC PeerStatus — wired in the next iteration.
-    while _t.time() < deadline:
-        _t.sleep(0.5)
-        return True   # short wait + return; true ACK polling is queued
-    return False
+    while True:
+        try:
+            with rust_ipc.Daemon() as d:
+                links = d.peer_status()
+        except Exception as e:
+            if _t.time() >= deadline:
+                print(f"  warn: peer_status unreachable: {e}")
+                return False
+            _t.sleep(0.2)
+            continue
+        if not links:
+            return True
+        # Group max-acked by peer host (everything before the last :PORT).
+        per_host: dict[str, int] = {}
+        for l in links:
+            addr = l.get("address", "")
+            host = addr.rsplit(":", 1)[0] if ":" in addr else addr
+            cur = per_host.get(host, 0)
+            per_host[host] = max(cur, int(l.get("last_acked_index", 0)))
+        worst_host_idx = min(per_host.values()) if per_host else 0
+        if worst_host_idx >= target_index:
+            return True
+        if _t.time() >= deadline:
+            print(f"  warn: replication timeout — worst host acked={worst_host_idx} "
+                  f"< target={target_index} (hosts={list(per_host.items())})")
+            return False
+        _t.sleep(0.2)
 
 
 def _propagate_daemon_config(reason: str) -> None:
@@ -825,6 +923,13 @@ def main():
     p_node_maint = p_node_sub.add_parser("maintenance")
     p_node_maint.add_argument("target")
     p_node_maint.add_argument("mode", choices=["on", "off"])
+    p_node_leave = p_node_sub.add_parser(
+        "leave",
+        help="Remove a node from the cluster (master appends node_unregister)")
+    p_node_leave.add_argument("target",
+        help="cluster.json node name to remove")
+    p_node_leave.add_argument("--reason", default="leave",
+        help="operator-facing context recorded in the log entry")
     p_node.set_defaults(func=cmd_node)
 
     p_vm = sub.add_parser("vm", help="VM operations")

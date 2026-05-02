@@ -108,6 +108,7 @@ LIB_FILES=(
     log_entries.py
     rust_ipc.py
     view_builder.py
+    dashboard_install.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

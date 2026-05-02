@@ -128,16 +128,13 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
     run("systemctl daemon-reload", check=False)
     run("systemctl enable --now mnt-isos.mount >/dev/null 2>&1", check=False)
 
-    # 4. FastAPI + Svelte dashboard files
+    # 4. FastAPI + Svelte dashboard files. Same helper runs on
+    # followers too — the dashboard is reachable from ANY node.
+    # NOTE: Python deps (fastapi, uvicorn, paramiko, websockets, pydantic,
+    # python-multipart) installed by packages.install_base() on every
+    # node, not here. (Lessons-log L17 — every node may become master.)
     print("  Installing dashboard application...")
-    # Fetch a tarball of the mgmt app (pre-packaged on repo)
-    mgmt_tar = f"{repo}/mgmt.tar.gz"
-    r = subprocess.run(f"curl -fsSL '{mgmt_tar}' -o /tmp/mgmt.tar.gz", shell=True)
-    if r.returncode == 0:
-        run(f"tar xzf /tmp/mgmt.tar.gz -C {MGMT} --strip-components=1")
-        # NOTE: Python deps (fastapi, uvicorn, paramiko, websockets, pydantic,
-        # python-multipart) now installed by packages.install_base() on every
-        # node, not here. (Lessons-log L17 — every node may become master.)
+    from . import dashboard_install as _di
 
     # 5. Prometheus scrape config — mgmt app will rewrite this whenever
     #    nodes register/unregister, so we just seed with this node.
@@ -161,7 +158,11 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
     # 6. Install node_exporter + vm_exporter (this node is mgmt+compute)
     exporters.install(repo)
 
-    # 7. Systemd units
+    # 7. Systemd units — bedrock-vm + bedrock-vl run on the master only
+    # (single VictoriaMetrics + VictoriaLogs instance per cluster).
+    # bedrock-mgmt (FastAPI + Svelte UI) is installed by dashboard_install,
+    # which also runs on followers so the dashboard is reachable on every
+    # node.
     _write_systemd("bedrock-vm", f"""[Unit]
 Description=Bedrock VictoriaMetrics
 After=network.target
@@ -184,22 +185,11 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 """)
-    _write_systemd("bedrock-mgmt", f"""[Unit]
-Description=Bedrock Management Dashboard
-After=network.target bedrock-vm.service bedrock-vl.service
 
-[Service]
-WorkingDirectory={MGMT}
-ExecStart=/usr/bin/python3 {MGMT}/app.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-""")
-
-    # Start services
-    print("  Starting services...")
-    run("systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt", check=False)
+    print("  Starting metrics + logs services...")
+    run("systemctl enable --now bedrock-vm bedrock-vl", check=False)
+    print("  Installing + starting dashboard service (with metrics)...")
+    _di.install_dashboard(repo, with_metrics=True)
 
     if not witness_host:
         witness_host = "self"

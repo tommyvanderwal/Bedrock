@@ -51,5 +51,11 @@ once_cell = "1"
 # Daemon config file
 toml = "0.8"
 
+# Aggressive TCP keepalive on peer links so iptables/cable-cut partitions
+# tear down within ~15s instead of the default ~2h Linux keepalive timer.
+# (Without this, peer.rs's PeerRegistry would still report a dead peer
+# as connected, fooling the weighted-vote quorum count.)
+socket2 = { version = "0.5", features = ["all"] }
+
 [dev-dependencies]
 tempfile = "3"

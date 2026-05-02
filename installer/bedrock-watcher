@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """bedrock-watcher — per-node log-driven config watcher.
 
-Polls /run/bedrock-rust.sock for the current log latest_index. Keeps
-an in-memory snapshot up-to-date by folding ONLY new entries since
-the last poll (O(new_entries), not O(log_size)). On any change that
-projects to a different daemon.toml content, regenerates daemon.toml
-and restarts bedrock-rust.
+Subscribes to /run/bedrock-rust.sock and folds each committed entry
+into an in-memory snapshot as it arrives. On any change that projects
+to a different daemon.toml content, regenerates daemon.toml and
+restarts bedrock-rust.
 
 This is the per-node side of "log-driven config propagation": the
 master appends a log entry; replication carries it to every peer;
-each peer's watcher detects the new index, folds the new entries,
-and reconfigures locally. No SSH between nodes.
+each peer's daemon notifies its local subscribers; the watcher folds
+the new entry and reconfigures locally. No SSH between nodes; no
+polling latency.
 
-Idempotent. Safe to start any time. Survives bedrock-rust restarts
-(reconnects on next poll).
+Subscribe-based: the daemon pushes commits, so config changes apply
+within milliseconds of replication. On daemon restart (IPC socket
+disappears, subscribe stream errors), the watcher reconnects, calls
+status(), reads the gap from `last_log_idx + 1..latest`, then
+re-subscribes — a self-healing loop.
+
+Idempotent. Safe to start any time.
 """
 from __future__ import annotations
 import hashlib
@@ -25,7 +30,8 @@ sys.path.insert(0, "/usr/local/lib/bedrock")
 
 from lib import view_builder, daemon_setup, state as state_mod, rust_ipc
 
-POLL_INTERVAL_S = 2.0
+# Time to wait between reconnect attempts when the daemon is unreachable.
+RECONNECT_BACKOFF_S = 2.0
 DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
 
 
@@ -35,62 +41,125 @@ def daemon_toml_hash() -> bytes:
     return hashlib.sha256(DAEMON_TOML.read_bytes()).digest()
 
 
+CLUSTER_JSON = view_builder.CLUSTER_JSON
+STATE_JSON = view_builder.STATE_JSON
+
+
+def write_projections(snapshot: dict, self_name: str) -> None:
+    """Persist the snapshot as cluster.json + state.json. Both are
+    deterministic projections of the same fold, so every node ends up
+    with byte-identical cluster.json after replication catches up.
+    The mgmt API on every node reads from these files — keeping them
+    fresh lets followers serve the same /api/cluster picture as the
+    master.
+    """
+    import json as _json
+    CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
+    CLUSTER_JSON.write_text(_json.dumps(view_builder._cluster_view(snapshot), indent=2))
+    if self_name and self_name in (snapshot.get("nodes") or {}):
+        existing = {}
+        if STATE_JSON.exists():
+            try:
+                existing = _json.loads(STATE_JSON.read_text())
+            except Exception:
+                existing = {}
+        existing.update(view_builder._state_view(snapshot, self_name))
+        STATE_JSON.write_text(_json.dumps(existing, indent=2))
+
+
+def apply_entry(snapshot: dict, entry: dict, self_name: str,
+                last_toml_hash: bytes) -> bytes:
+    """Fold one entry, project to cluster.json + state.json + daemon.toml.
+    Restart bedrock-rust if daemon.toml changed. Returns the (possibly
+    updated) last_toml_hash."""
+    view_builder.fold_into(snapshot, [entry])
+    try:
+        write_projections(snapshot, self_name)
+    except Exception as e:
+        print(f"watcher: write_projections failed at idx {entry['index']}: {e}",
+              flush=True)
+    try:
+        daemon_setup.render_from_snapshot(snapshot, self_name)
+    except Exception as e:
+        print(f"watcher: render_from_snapshot failed at idx {entry['index']}: {e}",
+              flush=True)
+        return last_toml_hash
+    new_hash = daemon_toml_hash()
+    if new_hash != last_toml_hash:
+        print(f"watcher: idx {entry['index']} changed daemon.toml; "
+              f"restarting bedrock-rust", flush=True)
+        try:
+            daemon_setup.restart()
+        except Exception as e:
+            print(f"watcher: restart failed: {e}", flush=True)
+            return last_toml_hash
+        return new_hash
+    return last_toml_hash
+
+
+def catch_up(d: rust_ipc.Daemon, snapshot: dict, last_log_idx: int,
+             self_name: str, last_toml_hash: bytes) -> tuple[int, bytes]:
+    """Read entries the watcher missed while disconnected from IPC."""
+    cur_idx = d.status()["latest_index"]
+    if cur_idx <= last_log_idx:
+        return last_log_idx, last_toml_hash
+    print(f"watcher: catching up: folding entries "
+          f"{last_log_idx + 1}..{cur_idx}", flush=True)
+    for e in d.read(from_index=last_log_idx + 1, to=cur_idx):
+        try:
+            last_toml_hash = apply_entry(snapshot, e, self_name, last_toml_hash)
+        except Exception as err:
+            print(f"watcher: STUCK at idx {e['index']}: {err!r}; "
+                  f"will retry on reconnect", flush=True)
+            return last_log_idx, last_toml_hash
+        last_log_idx = e["index"]
+    return last_log_idx, last_toml_hash
+
+
 def main() -> None:
     self_name = state_mod.load().get("node_name", "")
     snapshot = view_builder.empty_snapshot()      # in-memory; live
     last_log_idx = 0
     last_toml_hash = daemon_toml_hash()
-    print(f"bedrock-watcher: node={self_name!r}, polling /run/bedrock-rust.sock "
-          f"every {POLL_INTERVAL_S}s; daemon-toml at {DAEMON_TOML}",
+    print(f"bedrock-watcher: node={self_name!r}, subscribing to "
+          f"/run/bedrock-rust.sock; daemon-toml at {DAEMON_TOML}",
           flush=True)
 
     while True:
-        time.sleep(POLL_INTERVAL_S)
         try:
+            # Catch-up phase: read everything we missed (uses one
+            # connection); subscribe phase: open a fresh connection
+            # to receive pushed commits (the subscribe path holds the
+            # socket open, so we don't reuse the catch-up socket).
             with rust_ipc.Daemon() as d:
-                cur_idx = d.status()["latest_index"]
-                if cur_idx <= last_log_idx:
-                    continue   # log hasn't moved, nothing to fold
-                # Fetch ONLY the new entries.
-                new_entries = list(d.read(from_index=last_log_idx + 1, to=cur_idx))
+                last_log_idx, last_toml_hash = catch_up(
+                    d, snapshot, last_log_idx, self_name, last_toml_hash,
+                )
+            with rust_ipc.Daemon() as d:
+                for entry in d.subscribe():
+                    if entry["index"] <= last_log_idx:
+                        # Either a duplicate (we caught up past this),
+                        # or out-of-order push — skip.
+                        continue
+                    if entry["index"] != last_log_idx + 1:
+                        # Gap. Re-catch-up via Read to fill the hole,
+                        # then resume the stream from the next push.
+                        print(f"watcher: stream gap (have {last_log_idx}, "
+                              f"got {entry['index']}); re-syncing",
+                              flush=True)
+                        break
+                    try:
+                        last_toml_hash = apply_entry(
+                            snapshot, entry, self_name, last_toml_hash,
+                        )
+                    except Exception as err:
+                        print(f"watcher: STUCK at idx {entry['index']}: "
+                              f"{err!r}; will retry on reconnect", flush=True)
+                        break
+                    last_log_idx = entry["index"]
         except Exception as e:
-            # Daemon down or IPC down — wait for it. Don't reset the
-            # snapshot; it stays valid against the same log.
             print(f"watcher: ipc unreachable: {e}", flush=True)
-            continue
-
-        if not new_entries:
-            last_log_idx = cur_idx
-            continue
-
-        # Incremental fold onto the in-memory snapshot.
-        view_builder.fold_into(snapshot, new_entries)
-        last_log_idx = cur_idx
-
-        # Project the snapshot deterministically into daemon.toml.
-        # Re-render even when nothing daemon-relevant changed (cheap),
-        # then compare hashes — restart only if content actually
-        # differs.
-        try:
-            daemon_setup.render_from_snapshot(snapshot, self_name)
-        except Exception as e:
-            print(f"watcher: render_from_snapshot failed: {e}", flush=True)
-            continue
-        new_hash = daemon_toml_hash()
-        if new_hash != last_toml_hash:
-            print(f"watcher: log advanced through idx {cur_idx} "
-                  f"({len(new_entries)} new); daemon.toml changed; "
-                  f"restarting bedrock-rust", flush=True)
-            try:
-                daemon_setup.restart()
-            except Exception as e:
-                print(f"watcher: restart failed: {e}", flush=True)
-                continue
-            last_toml_hash = new_hash
-        else:
-            # The new entries (e.g. tier_state, vm_*) didn't affect
-            # daemon.toml's projection — no daemon restart needed.
-            pass
+        time.sleep(RECONNECT_BACKOFF_S)
 
 
 if __name__ == "__main__":

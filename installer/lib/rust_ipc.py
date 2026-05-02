@@ -95,16 +95,66 @@ class Daemon:
         r = self._call({"op": "verify"}, expect="verified")
         return r["entries_checked"]
 
+    def peer_status(self) -> list[dict]:
+        """Snapshot of every peer link the daemon knows about. Each
+        entry: {address, direction, identified_role, latest_index,
+        last_acked_index, last_frame_ms_ago}. Used by `_wait_replicated`
+        to confirm a freshly-appended entry has reached every peer."""
+        r = self._call({"op": "peer_status"}, expect="peer_status")
+        return list(r.get("links", []))
+
+    def subscribe(self) -> Iterable[dict]:
+        """Long-lived stream of committed entries.
+
+        Sends `Subscribe`, expects an Ok confirmation, then yields each
+        `Committed` entry as the daemon pushes it. Use a fresh `Daemon`
+        connection for each subscription — the connection stays open for
+        the lifetime of the iterator. Closes when the underlying socket
+        closes (daemon restart, IPC error, etc.).
+        """
+        body = msgpack.packb({"op": "subscribe"}, use_bin_type=True)
+        self._sock.sendall(struct.pack(">I", len(body)) + body)
+        # First frame: confirmation Ok or Error
+        first = self._read_response()
+        kind = first.get("kind")
+        if kind == "error":
+            raise IpcError(first.get("message", "<no message>"))
+        if kind != "ok":
+            raise IpcError(f"subscribe: expected ok, got {kind!r}: {first!r}")
+        while True:
+            resp = self._read_response()
+            kind = resp.get("kind")
+            if kind == "committed":
+                e = resp["entry"]
+                yield {
+                    "index": e["index"],
+                    "epoch": e["epoch"],
+                    "prev_hash": bytes(e["prev_hash"]),
+                    "kind": e["kind"],
+                    "payload": bytes(e["payload"]),
+                    "hash": bytes(e["hash"]),
+                }
+            elif kind == "subscribe_overrun":
+                # Caller's mailbox overflowed. Tell them so they can
+                # reconnect-and-catch-up via Read.
+                raise IpcError("subscribe: queue overrun; reconnect + catch up")
+            elif kind == "error":
+                raise IpcError(resp.get("message", "<no message>"))
+            else:
+                raise IpcError(f"subscribe: unexpected kind={kind!r}")
+
     # ── frame I/O ──
+
+    def _read_response(self) -> dict:
+        len_buf = self._recv_exact(4)
+        n = struct.unpack(">I", len_buf)[0]
+        body = self._recv_exact(n)
+        return msgpack.unpackb(body, raw=False)
 
     def _call(self, req: dict, expect: str) -> dict:
         body = msgpack.packb(req, use_bin_type=True)
         self._sock.sendall(struct.pack(">I", len(body)) + body)
-
-        len_buf = self._recv_exact(4)
-        n = struct.unpack(">I", len_buf)[0]
-        body = self._recv_exact(n)
-        resp = msgpack.unpackb(body, raw=False)
+        resp = self._read_response()
         kind = resp.get("kind")
         if kind == "error":
             raise IpcError(resp.get("message", "<no message>"))

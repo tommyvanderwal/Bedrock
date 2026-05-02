@@ -24,8 +24,25 @@ use crate::log_store::Log;
 use crate::payload::Kind;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+
+/// Set aggressive TCP keepalive on a peer-link socket so iptables-style
+/// silent partitions get torn down within ~15s instead of waiting for
+/// Linux's 2-hour default. The 3-probe / 5s interval pattern is what
+/// the design assumes — a real peer-down should be detected before
+/// the witness takeover threshold (2× ttl_ms = 10s by default).
+fn enable_keepalive(stream: &TcpStream) {
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(5))
+        .with_interval(Duration::from_secs(3))
+        .with_retries(3);
+    if let Err(e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
+        log::warn!("peer: failed to enable tcp keepalive: {}", e);
+    }
+    let _ = stream.set_nodelay(true);
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -39,6 +56,80 @@ pub type PeerLiveness = Arc<AtomicU64>;
 
 pub fn new_peer_liveness() -> PeerLiveness {
     Arc::new(AtomicU64::new(0))
+}
+
+/// Per-link state snapshotted for IPC PeerStatus replies and used by
+/// `_wait_replicated` (the Python verb that waits for a log entry to
+/// reach all peers before declaring the cluster operation done).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PeerLinkInfo {
+    pub address: String,
+    pub direction: String,           // "inbound" | "outbound"
+    pub identified_role: String,     // "leader" | "follower" | "standalone" | ""
+    pub latest_index: u64,           // most recent latest_index advertised by the peer
+    pub last_acked_index: u64,       // highest Ack we've received from this peer
+    pub last_frame_ms_ago: u64,      // ms since the last frame on this link
+}
+
+#[derive(Default)]
+struct PeerRegistryInner {
+    /// Keyed by stable id (address). Each link gets one entry.
+    links: std::collections::HashMap<String, PeerLinkInfo>,
+}
+
+#[derive(Clone)]
+pub struct PeerRegistry(Arc<Mutex<PeerRegistryInner>>);
+
+pub fn new_peer_registry() -> PeerRegistry {
+    PeerRegistry(Arc::new(Mutex::new(PeerRegistryInner::default())))
+}
+
+impl PeerRegistry {
+    pub fn snapshot(&self) -> Vec<PeerLinkInfo> {
+        let now = now_ms();
+        let inner = self.0.lock().unwrap();
+        inner
+            .links
+            .values()
+            .map(|l| {
+                let mut copy = l.clone();
+                // last_frame_ms_ago is computed on read.
+                copy.last_frame_ms_ago = now.saturating_sub(l.last_frame_ms_ago);
+                copy
+            })
+            .collect()
+    }
+
+    fn touch_frame(&self, key: &str, fill: impl FnOnce(&mut PeerLinkInfo)) {
+        let mut inner = self.0.lock().unwrap();
+        let entry = inner.links.entry(key.to_string()).or_default();
+        entry.last_frame_ms_ago = now_ms(); // store the timestamp; snapshot() converts to ago
+        fill(entry);
+    }
+
+    pub fn link_connected(&self, key: &str, address: String, direction: &str) {
+        self.touch_frame(key, |l| {
+            l.address = address;
+            l.direction = direction.to_string();
+        });
+    }
+
+    pub fn link_disconnected(&self, key: &str) {
+        let mut inner = self.0.lock().unwrap();
+        inner.links.remove(key);
+    }
+
+    pub fn observed_role(&self, key: &str, role: String) {
+        self.touch_frame(key, |l| l.identified_role = role);
+    }
+
+    pub fn observed_latest(&self, key: &str, idx: u64) {
+        self.touch_frame(key, |l| l.latest_index = l.latest_index.max(idx));
+    }
+
+    pub fn observed_ack(&self, key: &str, up_to_index: u64) {
+        self.touch_frame(key, |l| l.last_acked_index = l.last_acked_index.max(up_to_index));
+    }
 }
 
 fn now_ms() -> u64 {
@@ -65,6 +156,13 @@ pub struct Config {
     /// is alive without the witness. See design discussion §6:
     /// "If the nodes see each other they NEVER need a witness."
     pub liveness: PeerLiveness,
+    /// Per-link state surface for IPC PeerStatus + `_wait_replicated`.
+    pub registry: PeerRegistry,
+    /// Subscriber channel for committed entries — peer-replicated
+    /// appends notify the IPC subscribers via this hook so the
+    /// per-node watchers wake on the same commit event the local
+    /// IPC append path uses.
+    pub on_commit: crate::ipc::CommitNotifier,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +207,8 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
         let log_handle = Arc::clone(&cfg.log);
         let role = cfg.role;
         let liveness = Arc::clone(&cfg.liveness);
+        let registry = cfg.registry.clone();
+        let on_commit = cfg.on_commit.clone();
         let addr = addr.clone();
         handles.push(thread::spawn(move || {
             for stream in listener.incoming() {
@@ -116,6 +216,8 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
                     Ok(s) => {
                         let lg = Arc::clone(&log_handle);
                         let lv = Arc::clone(&liveness);
+                        let reg = registry.clone();
+                        let oc = on_commit.clone();
                         let listen_addr = addr.clone();
                         thread::spawn(move || {
                             let peer_addr = s
@@ -123,7 +225,11 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
                                 .map(|a| a.to_string())
                                 .unwrap_or_else(|_| "<unknown>".to_string());
                             log::info!("peer: link[{}] inbound from {}", listen_addr, peer_addr);
-                            if let Err(e) = handle_stream(s, lg, role, true, lv) {
+                            let key = format!("in:{}", peer_addr);
+                            reg.link_connected(&key, peer_addr.clone(), "inbound");
+                            let res = handle_stream(s, lg, role, true, lv, &reg, &key, &oc);
+                            reg.link_disconnected(&key);
+                            if let Err(e) = res {
                                 log::warn!("peer: link[{}] inbound from {}: {}", listen_addr, peer_addr, e);
                             }
                         });
@@ -138,12 +244,18 @@ pub fn start(cfg: Config) -> anyhow::Result<Vec<JoinHandle<()>>> {
         let log_handle = Arc::clone(&cfg.log);
         let role = cfg.role;
         let liveness = Arc::clone(&cfg.liveness);
+        let registry = cfg.registry.clone();
+        let on_commit = cfg.on_commit.clone();
         let target = target.clone();
         handles.push(thread::spawn(move || loop {
+            let key = format!("out:{}", target);
             match TcpStream::connect(&target) {
                 Ok(s) => {
                     log::info!("peer: link[{}] outbound connected", target);
-                    if let Err(e) = handle_stream(s, Arc::clone(&log_handle), role, false, Arc::clone(&liveness)) {
+                    registry.link_connected(&key, target.clone(), "outbound");
+                    let res = handle_stream(s, Arc::clone(&log_handle), role, false, Arc::clone(&liveness), &registry, &key, &on_commit);
+                    registry.link_disconnected(&key);
+                    if let Err(e) = res {
                         log::warn!("peer: link[{}] outbound: {}", target, e);
                     }
                 }
@@ -174,7 +286,11 @@ fn handle_stream(
     role: Role,
     inbound: bool,
     liveness: PeerLiveness,
+    registry: &PeerRegistry,
+    link_key: &str,
+    on_commit: &crate::ipc::CommitNotifier,
 ) -> anyhow::Result<()> {
+    enable_keepalive(&stream);
     stream.set_read_timeout(Some(Duration::from_millis(TICK_MS)))?;
     write_frame(
         &mut stream,
@@ -200,6 +316,7 @@ fn handle_stream(
                 match frame {
                 PeerFrame::Identify { node_role } => {
                     log::info!("peer: link identified peer as {}", node_role);
+                    registry.observed_role(link_key, node_role);
                 }
                 PeerFrame::ReplicateRequest { from_index } => {
                     if !matches!(role, Role::Leader) {
@@ -216,13 +333,15 @@ fn handle_stream(
                         log::warn!("peer: replicate entry to non-follower; ignoring");
                         continue;
                     }
-                    apply_replicated_entry(&log, &mut stream, entry)?;
+                    apply_replicated_entry(&log, &mut stream, entry, on_commit)?;
                 }
                 PeerFrame::Heartbeat { latest_index, .. } => {
                     log::debug!("peer: link heartbeat latest={}", latest_index);
+                    registry.observed_latest(link_key, latest_index);
                 }
                 PeerFrame::Ack { up_to_index } => {
                     log::debug!("peer: link ack up_to={}", up_to_index);
+                    registry.observed_ack(link_key, up_to_index);
                 }
             }},
             Err(e) if is_timeout(&e) => {
@@ -309,6 +428,7 @@ fn apply_replicated_entry(
     log: &Arc<Mutex<Log>>,
     stream: &mut TcpStream,
     entry: EntryWire,
+    on_commit: &crate::ipc::CommitNotifier,
 ) -> anyhow::Result<()> {
     let mut lg = log.lock().unwrap();
     let (latest_index, latest_hash) = lg.latest();
@@ -358,6 +478,18 @@ fn apply_replicated_entry(
         );
     }
     log::info!("peer: applied entry {} hash={}", appended.index, hex::encode(&appended.hash[..6]));
+    // Notify any local IPC subscribers that this entry was committed
+    // — same hook the IPC append path uses, so the per-node watcher
+    // wakes on replicated commits as well as locally-originated ones.
+    let wire = crate::ipc::EntryWire {
+        index: appended.index,
+        epoch: appended.epoch,
+        prev_hash: appended.prev_hash,
+        kind: appended.kind,
+        payload: appended.payload.clone(),
+        hash: appended.hash,
+    };
+    on_commit.notify(&wire);
     write_frame(
         stream,
         &PeerFrame::Ack {

@@ -199,14 +199,14 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "all_vms": all_vms, "running_vms": running_vms,
             "drbd_raw": "\n".join(sections.get("DRBD", [])),
             "thinpools": thinpools,
-            "cockpit_url": cfg["cockpit"],
+            "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
         }
     except Exception as e:
         return {
             "name": name, "host": host, "online": False, "error": str(e),
             "all_vms": [], "running_vms": [], "drbd_raw": "",
             "thinpools": [],
-            "cockpit_url": cfg["cockpit"],
+            "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
             "kernel": "", "uptime_since": "", "load": "0",
             "mem_total_mb": 0, "mem_used_mb": 0,
         }
@@ -514,7 +514,7 @@ async def startup():
                       "kernel": "", "uptime_since": "", "load": "",
                       "mem_total_mb": 0, "mem_used_mb": 0,
                       "all_vms": [], "running_vms": [], "drbd_raw": "",
-                      "cockpit_url": c.get("cockpit", "")}
+                      "cockpit_url": c.get("cockpit", f"https://{c.get('host', '')}:9090")}
                   for n, c in cfg.get("nodes", {}).items()},
         "vms": {},
         "witness": {"nodes": {}},
@@ -1421,6 +1421,9 @@ class VMCreateRequest(BaseModel):
     disk_gb: int = 20        # size of the primary (boot) disk
     priority: str = "normal"  # low | normal | high
     iso: Optional[str] = None  # filename in /opt/bedrock/iso, optional
+    # Workload type. Must satisfy workload.validate_type against current
+    # cluster size — pet needs ≥2 nodes, vipet needs ≥3.
+    vm_type: str = "cattle"  # cattle | pet | vipet
     # Additional data disks, in order — vdb, vdc, vdd … Each is another thin LV
     # attached to the VM via virtio. Empty list = single-disk VM (unchanged).
     extra_disks: list[VMDiskSpec] = []
@@ -1530,8 +1533,23 @@ async def api_vm_create(req: VMCreateRequest):
         iso_name = Path(req.iso).name
         if not (ISO_DIR / iso_name).exists():
             raise HTTPException(400, f"ISO not found: {iso_name}")
+
+    # Validate vm_type against current cluster size. Cattle = local LV
+    # (no DRBD, any cluster); pet = 2-way DRBD (≥2 nodes); vipet = 3-way
+    # DRBD (≥3 nodes). Reject early — never accept then quietly
+    # downgrade pet→cattle, which would silently turn a replicated
+    # workload into a single-host one.
+    import sys as _sys
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import workload as _workload
+    cluster_state_pre = build_cluster_state()
+    node_count = len(cluster_state_pre.get("nodes") or {})
+    ok, msg = _workload.validate_type(req.vm_type, node_count)
+    if not ok:
+        raise HTTPException(400, msg)
+
     # Existing VM?
-    if req.name in build_cluster_state()["vms"]:
+    if req.name in cluster_state_pre["vms"]:
         raise HTTPException(409, f"VM {req.name} already exists")
 
     disk_count = 1 + len(req.extra_disks or [])
@@ -1544,27 +1562,22 @@ async def api_vm_create(req: VMCreateRequest):
     # resume or roll back. Without this, a power loss between API
     # accept and the async creator's first write is invisible to
     # the cluster.
+    home = _mgmt_node_name()
     intent_idx = None
     intent_hash = None
     try:
         from pathlib import Path as _P
         if _P("/run/bedrock-rust.sock").exists():
-            import sys as _sys
-            _sys.path.insert(0, "/usr/local/lib/bedrock")
             from lib import rust_ipc as _ipc, log_entries as _le
             with _ipc.Daemon() as d:
-                home_node = (build_cluster_state().get("nodes") or {})
-                # Best-effort: pick this node's name as the home node.
-                # Real placement logic stays in _vm_create.
-                home = next(iter(home_node.keys()), "")
                 intent_idx, intent_hash = d.append(
                     _le.vm_create_intent(
                         name=req.name,
-                        vm_type="cattle",   # TODO: infer from priority/replicas
+                        vm_type=req.vm_type,
                         host=home,
                         ram_mb=int(req.ram_mb),
                         disk_gb=int(req.disk_gb),
-                        requested_by=os.environ.get("USER", "api"),
+                        requested_by=_os.environ.get("USER", "api"),
                     )
                 )
     except Exception as e:
@@ -1575,30 +1588,35 @@ async def api_vm_create(req: VMCreateRequest):
 
     task = task_registry().create(
         "vm.create",
-        f"Create VM {req.name} ({req.vcpus} vCPU, {req.ram_mb} MB, "
-        f"{disk_count} disk{'s' if disk_count != 1 else ''})",
+        f"Create {req.vm_type} VM {req.name} ({req.vcpus} vCPU, "
+        f"{req.ram_mb} MB, {disk_count} disk"
+        f"{'s' if disk_count != 1 else ''})",
         vm_name=req.name)
 
     async def _runner():
         loop = asyncio.get_event_loop()
         try:
-            task.step_start("provision + virt-install")
-            result = await loop.run_in_executor(None, _vm_create, req)
-            task.step_done("provision + virt-install")
+            task.step_start(f"provision {req.vm_type}")
+            if req.vm_type == "cattle":
+                result = await loop.run_in_executor(None, _vm_create, req)
+            else:
+                # pet/vipet: dispatch to the lib.vm path which manages
+                # DRBD allocation + multi-host VM definition. The mgmt
+                # API runs on the master, which has SSH to every peer
+                # — same auth context lib.vm.run_on relies on.
+                result = await loop.run_in_executor(
+                    None, _vm_create_replicated, req)
+            task.step_done(f"provision {req.vm_type}")
             task.log(f"created: {result}")
             task.succeed()
             # Settle the intent: append vm_created.
             try:
                 from pathlib import Path as _P
                 if _P("/run/bedrock-rust.sock").exists():
-                    import sys as _sys
-                    _sys.path.insert(0, "/usr/local/lib/bedrock")
                     from lib import rust_ipc as _ipc, log_entries as _le
                     with _ipc.Daemon() as d:
-                        home_node = (build_cluster_state().get("nodes") or {})
-                        home = next(iter(home_node.keys()), "")
                         d.append(_le.vm_created(
-                            name=req.name, vm_type="cattle", host=home,
+                            name=req.name, vm_type=req.vm_type, host=home,
                             ram_mb=int(req.ram_mb), disk_gb=int(req.disk_gb)))
             except Exception as e:
                 log.warning(f"vm_created log-append skipped: {e}")
@@ -1613,6 +1631,46 @@ async def api_vm_create(req: VMCreateRequest):
     return {"status": "accepted", "task_id": task.id, "name": req.name,
             "intent_log_index": intent_idx,
             "intent_log_hash": intent_hash.hex() if intent_hash else None}
+
+
+def _vm_create_replicated(req) -> dict:
+    """pet/vipet creation via DRBD. Dispatches to lib.vm helpers which
+    handle DRBD volume allocation, peer-side LV creation, and VM
+    definition on every replica. Runs on the mgmt master synchronously
+    (called via run_in_executor)."""
+    from lib import vm as _vm
+    from lib import state as _state
+    s = _state.load()
+    home_name = s.get("node_name", "")
+    cluster = _vm._cluster()
+    nodes = cluster.get("nodes", {})
+    home_host = nodes.get(home_name, {}).get("host")
+    if not home_host:
+        raise HTTPException(500, f"mgmt node {home_name} missing host")
+    _vm._ensure_thin_pool(home_host)
+    if req.vm_type == "pet":
+        peers = [n for n in nodes if n != home_name][:1]
+        if not peers:
+            raise HTTPException(400, "pet requires ≥1 peer")
+        _vm._create_pet(
+            home_host, nodes[peers[0]]["host"],
+            home_name, peers[0],
+            req.name, int(req.ram_mb), int(req.disk_gb),
+        )
+        return {"status": "created", "name": req.name,
+                "vm_type": "pet", "node": home_name,
+                "peers": [peers[0]]}
+    elif req.vm_type == "vipet":
+        peers = [n for n in nodes if n != home_name][:2]
+        if len(peers) < 2:
+            raise HTTPException(400, "vipet requires ≥2 peers")
+        _vm._create_vipet(nodes, home_name, peers,
+                          req.name, int(req.ram_mb), int(req.disk_gb))
+        return {"status": "created", "name": req.name,
+                "vm_type": "vipet", "node": home_name,
+                "peers": peers}
+    else:
+        raise HTTPException(400, f"unknown vm_type: {req.vm_type}")
 
 
 def _log_create_failed(vm_name: str, reason: str) -> None:
@@ -2557,6 +2615,31 @@ def _vm_create(req) -> dict:
             for prev in disks_plan[:d["index"]]:
                 ssh_cmd_rc(host, f"lvremove -f {prev['lv_path']} 2>&1", timeout=15)
             raise HTTPException(500, f"lvcreate {d['lv_name']} failed: {out}")
+
+    # 1b. If no ISO, populate disk0 with the cached Alpine cloud image so
+    # the VM has something to boot from. Without this, virt-install's
+    # `--import` attaches an empty raw block device and the guest BIOS
+    # halts with "no bootable device". Same Alpine image lib.vm._create_cattle
+    # uses; cached at /var/lib/bedrock/alpine.qcow2 on every node.
+    if not iso_path:
+        boot_lv = disks_plan[0]["lv_path"]
+        alpine_url = ("https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/"
+                      "cloud/nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2")
+        push_log(f"Create VM {req.name}: writing Alpine boot image to "
+                 f"{boot_lv}", node=home_name, app="bedrock-mgmt")
+        seed_cmd = (
+            "mkdir -p /var/lib/bedrock; "
+            "test -f /var/lib/bedrock/alpine.qcow2 || "
+            f"  curl -sfL -o /var/lib/bedrock/alpine.qcow2 '{alpine_url}'; "
+            f"qemu-img convert -f qcow2 -O raw "
+            f"  /var/lib/bedrock/alpine.qcow2 {boot_lv}"
+        )
+        out, rc = ssh_cmd_rc(host, seed_cmd, timeout=180)
+        if rc != 0:
+            for prev in disks_plan:
+                ssh_cmd_rc(host, f"lvremove -f {prev['lv_path']} 2>&1", timeout=15)
+            raise HTTPException(500,
+                f"seed boot disk failed: {out[-300:]}")
 
     # 2. virt-install — with or without CDROM. Always attach virtio-win.iso
     #    as a 2nd CDROM when any ISO is used: Windows Setup needs it for

@@ -14,9 +14,16 @@ pub struct DaemonConfig {
     pub ipc_sock: Option<PathBuf>,
     /// This node's sender_id (0..0xFE).
     pub sender_id: Option<u8>,
-    /// The peer's sender_id, if known. Required for witness-based
-    /// election; optional for standalone.
+    /// The peer's sender_id, if known. Legacy single-peer field. Use
+    /// `peer_sender_ids` for N-peer (≥3-node) clusters; this stays
+    /// for backward compat and is folded into `peer_sender_ids` on
+    /// load when only the single field is set.
     pub peer_sender_id: Option<u8>,
+    /// Sender_ids of every other node in the cluster. Length =
+    /// cluster_size - 1. Drives the weighted-vote election (see
+    /// witness::compute_election). Empty for standalone.
+    #[serde(default)]
+    pub peer_sender_ids: Vec<u8>,
     /// Listen addresses for inbound peer connections (multi-link
     /// supported per design §7).
     #[serde(default)]

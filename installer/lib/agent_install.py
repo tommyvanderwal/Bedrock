@@ -7,7 +7,7 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
-from . import state, exporters, tier_storage, daemon_setup
+from . import state, exporters, tier_storage, daemon_setup, dashboard_install
 
 
 def _register(mgmt_url: str, name: str, host: str, drbd_ip: str, pubkey: str):
@@ -168,8 +168,19 @@ def install(witness: str, cluster_info: dict, repo: str):
     except Exception as e:
         print(f"  WARN: bedrock-rust setup failed: {e}")
 
+    # Install + start the dashboard (FastAPI + Svelte UI). Reachable
+    # at http://<this-node>:8080. The follower's mgmt API serves the
+    # same cluster-wide picture from /etc/bedrock/cluster.json (kept
+    # in sync by the replicated log + view_builder); writes go through
+    # the same code paths and rely on cluster-wide SSH access.
+    print("  Installing dashboard application...")
+    try:
+        dashboard_install.install_dashboard(repo, with_metrics=False)
+    except Exception as e:
+        print(f"  WARN: dashboard install failed: {e}")
+
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")
-    print(f"  Dashboard: {s['mgmt_url']}")
+    print(f"  Dashboard: {s['mgmt_url']}  (also reachable at http://{mgmt_ip}:8080)")
     print(f"  Storage:   /bedrock/{{scratch,bulk,critical}} (local LVs)")
     print(f"  Promote to N>=2 from any node:  bedrock storage promote")
