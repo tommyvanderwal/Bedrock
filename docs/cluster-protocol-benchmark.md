@@ -64,10 +64,117 @@ copy gets destroyed when we eventually rejoin). But the transient-
 blip case is *much* more common in practice than node-actually-died,
 and we handle it without restarting the workload.
 
-Risk side: this only works because DRBD's protocol-C quorum prevents
-dual-primary. If we ever miscompute that, we'd be in worse shape
-than the cold-restart guys (whose cold restart is, by construction,
-incapable of split-brain because the source side was killed).
+### Real risks of pause-not-shutdown
+
+The cold-restart competitors have one thing going for them: by
+killing the source-side VM, they make split-brain *structurally
+impossible*. We give that property up to keep state, and we have
+to earn it back through other mechanisms. Specific failure modes
+to be honest about:
+
+**R1. Dual-primary at DRBD reconnect (the big one).**
+2-node case: A is DRBD primary on bulk/critical. A's cable cuts.
+A fences (NICs down) but does NOT demote — qemu's file descriptors
+are still open on /dev/drbd*, so `drbdadm secondary` would fail
+EBUSY anyway. Meanwhile B sees A's witness STATUS_LIST entry age
+out, gains quorum, mgmt promotes B to DRBD primary on those
+resources, B starts the failover copies. Cable comes back: both
+sides reconnect with both believing they're primary. Our DRBD
+config has `after-sb-2pri disconnect`, so DRBD detects this and
+halts replication — no data corruption, but **manual operator
+recovery is required**.
+
+Mitigation paths, all worth picking from:
+  a. `virsh save` instead of `virsh suspend` in the fence cleanup —
+     dumps RAM to disk, kills qemu, frees the DRBD device.
+     `drbdadm secondary all` then succeeds. On unfence, `virsh
+     restore` from the saved state. Cost: save file is ≈ guest RAM
+     size on local disk; save itself takes seconds-to-minutes.
+  b. Use DRBD's `--force` semantics or detach-while-paused flags to
+     demote even with open FDs. Less clean.
+  c. Accept it. Document that a fence-during-active-pet-VM may
+     require operator intervention on the formerly-fenced side
+     after reconnect. For cattle workloads (no DRBD), this risk
+     doesn't apply.
+
+  Today the code does (c) implicitly. **This is a real, named
+  hazard.** For v1.0 GA we should land (a) at least for pet VMs.
+
+**R2. Pause window has no upper bound.**
+A 30-second pause is invisible to a user. A 30-minute pause means
+guest TCP connections die, NTP drifts, retry storms hit on resume,
+healthchecks alarm. Resuming a 6-hour-old VM is operationally
+worse than restarting it cold.
+
+  Mitigation: cap unfence-wait. If `_wait_for_role` doesn't return
+  leader/follower within (say) 10 minutes, escalate to "treat as
+  real failover" — `virsh destroy` paused VMs locally, let the
+  cluster's takeover path do its job. **Not implemented.**
+
+**R3. Watchdog timer is inside the process being watchdogged.**
+The 270-second cleanup budget is `asyncio.wait_for` inside
+fence_responder. If mgmt itself crashes mid-cleanup, the timer
+dies with it. systemd will restart mgmt; on restart it sees the
+marker and runs cleanup again, but with the timer reset to 270 s.
+A pathological crash loop could keep the node dark indefinitely
+while never exceeding the timer.
+
+  Mitigation: make the watchdog a **separate** systemd timer/service
+  that checks the marker's age and `systemctl reboot`s if it
+  exceeds 5 min — independent of whether mgmt is alive.
+  **Not implemented.**
+
+**R4. Fence flap.**
+Flaky NIC, periodic. Each flap → fence → cleanup → unfence cycle.
+VMs get repeatedly paused and resumed. App-level havoc; transient
+TCP connections drop on every flap.
+
+  Mitigation: per-node "fence-flap" counter with backoff. After N
+  fences in M minutes, refuse to unfence; surface as a hard alert.
+  Operator decides recovery. **Not implemented.**
+
+**R5. NFS hangs on followers during a leader fence.**
+Followers mount /var/lib/bedrock/mounts/* from the leader's NFS
+export. When the leader fences, `exportfs -au` runs but the
+follower's NFS mount sees ECONNRESET / hangs depending on mount
+options. If a new leader takes over and re-exports, followers
+need to remount (the new leader has a different IP).
+
+  Mitigation: NFS mounts use `soft,intr,timeo=10,retrans=2` so
+  hangs surface fast; reactor handles `tier_state.master` change
+  by remounting against the new master's address. **Partially
+  there — soft-mount is set; remount-on-master-change isn't.**
+
+**R6. Witness STATUS_LIST staleness during the takeover window.**
+Between fence (T=0) and witness `last_seen_ms > 2× ttl` (T=10 s),
+the side that survives sees the fenced peer as "still recent" at
+the witness even though the fenced peer has stopped heartbeating.
+During this window the surviving side won't promote because
+`smaller_id_alive_anywhere` is still true. Promotion happens
+~10 s after fence, not ~1 s.
+
+  This is by design — premature promotion is worse than slow
+  promotion. But it's worth knowing the failover SLO is
+  ttl + 2× ttl + DRBD promote ≈ 20 s, not the ~5 s some
+  competitors claim. **Working as intended.**
+
+**R7. Race: fence simultaneous with operator action.**
+Operator runs `bedrock node leave sim-2`; while replication is
+in flight, sim-2 fences for an unrelated reason. Sim-2's fence
+cleanup runs against a snapshot that doesn't yet know it's been
+unregistered. Mostly harmless (we pause our own VMs, peer takes
+over per the unregister), but the post-unfence reconcile sees
+"I'm not in cluster.json" → role unknown → services held →
+eventually watchdog reboot. End result is correct (sim-2 leaves)
+but the path is messy.
+
+  Mitigation: `_cmd_node_leave` could SSH-stop bedrock-rust
+  *before* appending node_unregister, ensuring no fence races.
+  **Cosmetic; no data risk.**
+
+If we ship v1.0 with R1's mitigation (a) and R2/R3/R4 implemented,
+the pause-not-shutdown approach is genuinely safer than cold-restart
+across the scenario space, not just in the happy case.
 
 ---
 
@@ -91,29 +198,54 @@ ahead because we don't restart at all.
 
 This is the core safety property. Failures here = data loss.
 
+**A note on what the witness does and doesn't do.** In Bedrock, the
+witness is **arbitration-only** — it never sees a write, never
+acknowledges a commit, and isn't on the data path for anything. The
+log replicates between nodes over TCP; the witness is consulted
+purely to break ties when the nodes can't see each other. A node
+that can talk to its peers ignores the witness for liveness purposes
+(witness loss alone never fences a healthy cluster). This is by
+design: keep the witness's job tiny so the witness can be tiny.
+That's why an ESP32 is enough — and why the witness can sit on the
+public internet without being on the data hot-path.
+
+The 2-node case is the tightest constraint. We **recommend a direct
+cable** between the two nodes for orthogonality (no switch in the
+peer-link path), but **don't require it** — operators with no
+support for back-to-back cabling (rack hardware, multi-site setups,
+etc.) run the peer link over their existing switching gear and
+accept the wider blast radius. The witness still arbitrates the
+same way; partitioned both peer-link and witness-link only happens
+on a deeply-coordinated failure.
+
 | Product | Mechanism | Failure mode |
 |---|---|---|
-| VMware vSphere HA | Datastore heartbeats as a second channel beyond network. ESXi has APD (All Paths Down) and PDL (Permanent Device Loss) detection. | Pretty robust; vSAN cluster partition handling has had bugs over the years (CVE/KB list). |
-| Nutanix AHV | CVM Cassandra requires majority quorum for writes. Loss of CVM majority → cluster halts. | Robust by design; expensive (each host runs a CVM with 30+ GB RAM overhead). |
+| VMware vSphere HA | Network heartbeats AND datastore heartbeats — two independent channels. ESXi has APD (All Paths Down) and PDL (Permanent Device Loss) detection. | Robust in practice; vSAN cluster partition handling has had bugs over the years. |
+| Nutanix AHV | CVM Cassandra requires majority quorum for writes. Loss of CVM majority → cluster halts. **No external witness — the CVM majority *is* the arbitrator.** | Robust by design; expensive (each host runs a CVM with 30+ GB RAM overhead). |
 | Proxmox + Ceph | corosync quorum (Totem) + STONITH. Without STONITH → known split-brain risk; with STONITH → reboot enforces. Ceph monitors require quorum for writes. | STONITH via IPMI is standard but operators often skip it ("works fine for me until it doesn't"). 2-node cluster needs qdevice or stretches. |
 | Scale HC3 | Internal voting + fencing; appliance-level guarantees. | Closed; trust the vendor. |
-| **Bedrock** | Weighted-vote (10 per node + 1 per witness, strict majority). DRBD protocol-C quorum below us. Self-fence on lease loss. | Tested for 2/3/4-node, partition + witness scenarios. **Single witness is a single point of arbitration** — if witness lies (compromised, buggy), bad things happen. v1.0 mitigation: 3-of-5 multi-witness. |
+| **Bedrock** | Weighted-vote (10 per node + 1 per witness, strict majority). Witness consulted **only at election time**, never during commits. DRBD protocol-C quorum below us. Self-fence on lease loss. | Tested for 2/3/4-node, partition + witness scenarios. **Single witness is a single point of arbitration** — if witness lies, bad things happen. v1.0 mitigation: 3-of-5 multi-witness (the data model already supports it; quorum-of-witnesses logic is the missing piece). |
 
 **Where Bedrock is genuinely stronger:**
 - Hash-chained log = forensically clean. If divergence ever happens,
   the chain pinpoints the exact entry. No competitor exposes this.
-- Single-writer model — only the master can append. Every other
+- Single-writer log — only the master can append. Every other
   product has a distributed-write model and trusts internal
   consensus.
+- The arbitration channel and the data channel are different
+  protocols on different ports (UDP/12321 for witness vs TCP/8200
+  for peer log replication). A failure that only affects one
+  doesn't poison the other.
 
 **Where Bedrock is weaker:**
-- Single witness. VMware has 2 channels (network + datastore). Nutanix
-  doesn't need a separate witness because Cassandra-quorum *is* the
-  witness. Proxmox has corosync 3-node quorum or qdevice. We have
-  one Echo UDP service — if it lies, we have no second source.
-- DRBD protocol-C is robust but it's been around long enough to have
-  edge cases (especially around resync after multiple failures).
-  Ceph's CRUSH map + monitors is a more mature data layer.
+- Single witness today. VMware has 2 channels (network + datastore).
+  Nutanix's Cassandra-quorum doesn't *need* a separate witness.
+  Proxmox has corosync 3-node quorum or qdevice. We have one Echo
+  UDP service — if it lies, we have no second source until 3-of-5
+  ships.
+- DRBD protocol-C is mature but has edge cases (especially around
+  resync after multiple failures). Ceph's CRUSH map + monitors is
+  a more battle-tested data layer at scale.
 
 ---
 
@@ -293,19 +425,14 @@ and feel deceived. Saying them up front turns "missing feature" into
 
 ---
 
-## 10. Things to watch — known edge cases in our design
+## 10. Things to watch — additional known edge cases
 
-These are not hypothetical worries; they are places where the design
-*could* be doing something dumb that we should test for before v1.0:
+The pause-not-shutdown risks (R1-R7) are in §3. The items below are
+unrelated edge cases worth tracking before v1.0:
 
 | Risk | Why | Mitigation |
 |---|---|---|
-| Witness compromise (single witness) | One signal, one source of truth for arbitration | Ship 3-of-5 multi-witness with quorum-of-witnesses logic before v1.0 GA |
-| TCP keepalive too aggressive on slow links | 5/3/3 → ~14 s detection; on a flaky 100 Mbit link this could falsely trip | Operator-tunable in daemon.toml; document the trade-off |
-| DRBD protocol-C reconnect after both-dark | We rely on DRBD to figure out who's primary on reconnect | Scripted regression test against our specific reconnect scenarios |
-| Pause window too long | If we pause for 10+ minutes, guest TCP connections die anyway, OS clocks drift | Cap the unfence window; if cluster doesn't recover within N minutes, escalate to "treat as real failover" — kill paused VMs, peer takes over |
-| Witness lie about smaller_id_alive | A witness reporting an out-of-partition peer as recent could block promotion | Cross-check with our own peer.rs registry: if smaller_id_alive at witness but I haven't been able to reach them via TCP for 2× ttl, treat as gone |
-| Boot orchestrator races mgmt-restart | If mgmt restarts during DRBD startup, half-started services | Idempotent start_local_services + clear ordering |
-
-We should test 3 + 5 of these before committing to v1.0; the others
-go in the lessons-log as known limitations to revisit.
+| Witness compromise (single witness) | One signal, one source of truth for arbitration. A buggy or compromised witness can feed bad STATUS_LIST data. | Ship 3-of-5 multi-witness with quorum-of-witnesses logic before v1.0 GA. The data model already supports `Vec<WitnessSpec>`; only the cross-witness agreement logic is missing. |
+| TCP keepalive too aggressive on slow links | 5/3/3 → ~14 s detection; on a flaky 100 Mbit link or a long-RTT VPN this could trip on transient congestion. | Operator-tunable via daemon.toml; document the trade-off. |
+| Witness lies about smaller_id_alive | A witness reporting an out-of-partition peer as still-recent could block legitimate promotion (we'd see `smaller_id_alive_anywhere=true` and stay Follower). | Cross-check with peer.rs registry: if a peer is "alive at witness" but we haven't seen any TCP frame from them for 2× ttl on any link, treat as gone for the smaller-id-priority check. |
+| Boot orchestrator races mgmt-restart | If mgmt is restarted by systemd while `start_local_services` is mid-flight (e.g. drbd just started, libvirtd not yet), the next mgmt invocation must finish what was started. | `start_local_services` is already idempotent (systemctl start is no-op if running, drbdadm primary on already-primary is no-op, virsh start on running is no-op). Document this contract. |
