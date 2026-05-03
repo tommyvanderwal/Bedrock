@@ -90,6 +90,21 @@ systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
 systemctl disable drbd >/dev/null 2>&1 || true
 systemctl disable libvirtd >/dev/null 2>&1 || true
 
+# Independent fence watchdog: reboots the node if /tmp/bedrock-rust.fence
+# stays present for > 5 min, indicating mgmt's fence cleanup hung or
+# crashed. Runs as a systemd timer every 30s; survives mgmt crashes
+# because it doesn't depend on mgmt at all.
+log "Installing bedrock-fence-watchdog..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-fence-watchdog" \
+    -o /usr/local/bin/bedrock-fence-watchdog
+chmod +x /usr/local/bin/bedrock-fence-watchdog
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-fence-watchdog.service" \
+    -o /etc/systemd/system/bedrock-fence-watchdog.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-fence-watchdog.timer" \
+    -o /etc/systemd/system/bedrock-fence-watchdog.timer
+systemctl daemon-reload
+systemctl enable --now bedrock-fence-watchdog.timer >/dev/null 2>&1 || true
+
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(
     __init__.py

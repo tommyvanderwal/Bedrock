@@ -7,17 +7,31 @@ process per node, hosting:
   ① log_subscriber       fold log → cluster.json + state.json + daemon.toml
                           regen + restart bedrock-rust on toml change
   ② boot_orchestrator    on startup: wait for clear cluster role, then
-                          start drbd / libvirtd / VMs that belong here
-  ③ fence_responder      on fence marker: pause VMs + stop NFS exports;
-                          unfence (interfaces up, marker cleared);
-                          re-run boot orchestrator
-  ④ reactor              react to log entries that affect this node
-                          (vm_migrated, vm_destroyed, …) once services
-                          are up
+                          start DRBD / promote-or-secondary per cluster.json
+                          NFS export (master) or mount (follower)
+                          libvirtd + VMs that belong here
+  ③ fence_responder      on fence marker: pause running VMs + exportfs -au
+                          (cleanup is FAST — seconds, not minutes).
+                          Then unfence (interfaces up, marker cleared),
+                          wait for role to settle, reconcile paused VMs
+                          against the now-current log:
+                              moved/destroyed → virsh destroy + drbdadm
+                                                secondary on its resource
+                              still ours      → virsh resume
+                          re-run start_local_services for re-promotion.
+  ④ reactor              react to ongoing log entries — vm_migrated,
+                          vm_destroyed, tier_state.master change (NFS
+                          remount), once services are up.
 
 Single source of role truth: /run/bedrock-rust.role, written by the
 Rust daemon on every election change ("leader" / "follower" /
 "noquorum" / "fenced").
+
+The 5-min fence-to-reboot watchdog lives outside this process, in
+/usr/local/bin/bedrock-fence-watchdog (a systemd timer). Its job is
+to reboot the node if the marker stays around > 5 min, independent
+of whether mgmt is alive — covers the "mgmt itself crashed during
+cleanup" case.
 """
 from __future__ import annotations
 
@@ -43,10 +57,10 @@ DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
 FENCE_MARKER = Path("/tmp/bedrock-rust.fence")
 ROLE_FILE = Path("/run/bedrock-rust.role")
 
-# Watchdog: if mgmt's cleanup hasn't completed within this many seconds,
-# fall back to systemctl reboot — the universal cleanup. Should never
-# fire in a healthy cluster.
-FENCE_CLEANUP_TIMEOUT_S = 270.0
+# Cleanup itself is fast — virsh suspend + exportfs -au are seconds.
+# This is the cap on the cleanup procedure only; the broader 5-min
+# fence-to-reboot cap is the independent watchdog timer.
+FENCE_CLEANUP_TIMEOUT_S = 30.0
 
 # Live in-memory snapshot, updated by log_subscriber and read by other
 # tasks (and by the FastAPI handlers that want fresh state).
@@ -92,8 +106,8 @@ def _daemon_toml_hash() -> bytes:
 
 
 def _running_vm_names() -> list[str]:
-    """Names of VMs currently in `running` state. Empty list if libvirtd
-    is down — that's fine, nothing to pause anyway."""
+    """Names of VMs currently in `running` state. Empty if libvirtd is
+    down — that's fine, nothing to pause anyway."""
     r = subprocess.run(
         ["virsh", "list", "--state-running", "--name"],
         capture_output=True, text=True
@@ -109,12 +123,64 @@ def _paused_vm_names() -> list[str]:
     return [n.strip() for n in r.stdout.splitlines() if n.strip()]
 
 
+def _vm_drbd_resource(vm_name: str) -> str | None:
+    """Find the DRBD resource backing this VM's primary disk, by parsing
+    `virsh dumpxml` for `/dev/drbdN`. Returns None for cattle (local LV)."""
+    r = subprocess.run(
+        ["virsh", "dumpxml", vm_name],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return None
+    minor_match = re.search(r"<source dev='/dev/drbd(\d+)'", r.stdout)
+    if not minor_match:
+        return None
+    minor = minor_match.group(1)
+    for cfg in Path("/etc/drbd.d").glob("*.res"):
+        try:
+            text = cfg.read_text()
+        except Exception:
+            continue
+        # Match the minor to a resource name. We accept either an
+        # explicit `minor N;` line or the `/dev/drbdN` device path.
+        if re.search(rf"minor\s+{minor}\b", text) or f"/dev/drbd{minor}" in text:
+            res_match = re.search(r"resource\s+(\S+)\s*\{", text)
+            if res_match:
+                return res_match.group(1)
+    return None
+
+
+def _drbd_role(resource: str) -> str:
+    """Return one of: 'Primary', 'Secondary', 'Unknown'."""
+    r = subprocess.run(
+        ["drbdadm", "role", resource],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return "Unknown"
+    return (r.stdout or "").strip().split("/")[0] or "Unknown"
+
+
+def _find_drbd_nfs_master_drbd_ip(tiers: dict, nodes: dict) -> str | None:
+    """The drbd_ip of the current tier-master. All drbd-nfs tiers share
+    the same master in our model; we pick whichever is set."""
+    for tier in tiers.values():
+        if tier.get("mode") != "drbd-nfs":
+            continue
+        master_name = tier.get("master")
+        if master_name and master_name in nodes:
+            ip = nodes[master_name].get("drbd_ip")
+            if ip:
+                return ip
+    return None
+
+
 def get_snapshot() -> dict:
     """Read-only access to the live snapshot for FastAPI handlers."""
     return _SNAPSHOT
 
 
-# ── ① log_subscriber ──────────────────────────────────────────────────────
+# ── ① log_subscriber ─────────────────────────────────────────────────────
 
 async def log_subscriber():
     """Subscribe to bedrock-rust IPC; on each committed entry, fold into
@@ -137,7 +203,6 @@ def _subscriber_pass(self_name: str) -> None:
     global _LAST_LOG_IDX
     last_toml_hash = _daemon_toml_hash()
 
-    # Catch-up phase: fold any entries the subscriber missed.
     with rust_ipc.Daemon() as d:
         cur = d.status()["latest_index"]
         if cur > _LAST_LOG_IDX:
@@ -145,8 +210,6 @@ def _subscriber_pass(self_name: str) -> None:
             for entry in d.read(from_index=_LAST_LOG_IDX + 1, to=cur):
                 last_toml_hash = _apply_entry(entry, self_name, last_toml_hash)
 
-    # Subscribe phase: drain pushed entries until the connection ends
-    # or a gap is detected (which forces us back to catch-up).
     with rust_ipc.Daemon() as d:
         for entry in d.subscribe():
             if entry["index"] <= _LAST_LOG_IDX:
@@ -165,8 +228,6 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
     view_builder.fold_into(_SNAPSHOT, [entry])
     _LAST_LOG_IDX = entry["index"]
 
-    # Persist cluster.json + state.json — every node ends up with the
-    # same projection because fold_into is deterministic.
     try:
         CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
         CLUSTER_JSON.write_text(
@@ -185,9 +246,6 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
         log.warning("subscriber: projection write at idx %d: %s",
                     entry["index"], e)
 
-    # daemon.toml is a deterministic projection too; only restart
-    # bedrock-rust if its config actually changed (membership/witness/
-    # maintenance flag drove it).
     try:
         daemon_setup.render_from_snapshot(_SNAPSHOT, self_name)
     except Exception as e:
@@ -205,8 +263,6 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
             return last_toml_hash
         last_toml_hash = new_hash
 
-    # Schedule a reactor reaction. Fire-and-forget; reactor itself
-    # is a no-op if services aren't started yet.
     try:
         loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(
@@ -250,30 +306,70 @@ async def _wait_for_role(timeout_s: float) -> str:
 
 
 async def _start_local_services():
-    """Start DRBD (if needed), libvirtd, then VMs the log says belong
-    here. Idempotent — safe to call after a fence-recovery or repeated
-    starts."""
+    """Bring this node's local services up to the state cluster.json
+    says they should be in. Idempotent — safe at boot, after a fence
+    cycle, or when re-running because the log changed."""
     cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
     tiers = cluster.get("tiers", {}) or {}
-    needs_drbd = any(t.get("mode") == "drbd-nfs" for t in tiers.values())
+    nodes = cluster.get("nodes", {}) or {}
+    vms = cluster.get("vms", {}) or {}
+    self_name = _self_node_name()
+    drbd_tiers = {n: t for n, t in tiers.items() if t.get("mode") == "drbd-nfs"}
 
-    if needs_drbd:
+    if drbd_tiers:
+        # Make sure the drbd kernel module + resources are up. If
+        # already up, this is a no-op.
         log.info("services: starting drbd")
         subprocess.run(["systemctl", "start", "drbd"], check=False)
-        # Best-effort: wait briefly for resources to connect; not fatal
-        # if a peer isn't reachable yet.
-        for tier in ("bulk", "critical"):
+        for tier_name in drbd_tiers:
             subprocess.run(
-                ["drbdadm", "wait-connect-resource", f"tier-{tier}"],
+                ["drbdadm", "wait-connect-resource", f"tier-{tier_name}"],
                 timeout=20, check=False
             )
+
+        # Be the role cluster.json says we are. drbdadm is idempotent
+        # for already-correct state (primary→primary, secondary→secondary
+        # are no-ops). The dangerous case — secondary while we have an
+        # open qemu FD — is handled in _reconcile_paused_vms before we
+        # ever land here.
+        i_am_master_of_anything = False
+        for tier_name, tier in drbd_tiers.items():
+            res = f"tier-{tier_name}"
+            if tier.get("master") == self_name:
+                log.info("services: drbdadm primary %s", res)
+                subprocess.run(["drbdadm", "primary", res], check=False)
+                i_am_master_of_anything = True
+            else:
+                log.info("services: drbdadm secondary %s", res)
+                subprocess.run(["drbdadm", "secondary", res], check=False)
+
+        # NFS export side. The master serves /var/lib/bedrock/mounts/*
+        # to peers; followers mount whatever the current master serves.
+        if i_am_master_of_anything:
+            try:
+                from lib import tier_storage
+                tier_storage.nfs_export_drbd_tiers(
+                    ["192.168.2.0/24", "10.99.0.0/24"]
+                )
+                log.info("services: NFS exports applied")
+            except Exception as e:
+                log.warning("services: NFS export failed: %s", e)
+        else:
+            master_drbd_ip = _find_drbd_nfs_master_drbd_ip(drbd_tiers, nodes)
+            if master_drbd_ip:
+                try:
+                    from lib import tier_storage
+                    tier_storage.nfs_mount_drbd_tiers(master_drbd_ip)
+                    log.info("services: NFS mounts targeting master at %s",
+                             master_drbd_ip)
+                except Exception as e:
+                    log.warning("services: NFS mount failed: %s", e)
 
     log.info("services: starting libvirtd")
     subprocess.run(["systemctl", "start", "libvirtd"], check=False)
     await asyncio.sleep(2)
 
-    self_name = _self_node_name()
-    vms = cluster.get("vms", {}) or {}
+    # Start VMs the log says belong here.
     for vm_name, vm in vms.items():
         if vm.get("host") == self_name and vm.get("state") == "running":
             log.info("services: virsh start %s", vm_name)
@@ -283,10 +379,15 @@ async def _start_local_services():
 # ── ③ fence_responder ────────────────────────────────────────────────────
 
 async def fence_responder():
-    """Watch /tmp/bedrock-rust.fence. On appearance, run the cleanup
-    procedure (pause VMs, stop NFS exports) within FENCE_CLEANUP_TIMEOUT_S,
-    then bring interfaces back up + clear the marker. Reboot is the
-    safety net — only fires if the cleanup itself hangs or raises."""
+    """Watch /tmp/bedrock-rust.fence. On appearance, run cleanup
+    (pause VMs + drop NFS exports) within FENCE_CLEANUP_TIMEOUT_S,
+    bring interfaces back up + clear the marker, wait for cluster
+    membership to re-establish, reconcile paused VMs against the
+    now-current log, and (re-)start local services.
+
+    The independent bedrock-fence-watchdog timer reboots the node if
+    the marker stays around > 5 min — that covers the case where this
+    task itself crashes mid-cleanup."""
     global _SERVICES_STARTED
     while True:
         await asyncio.sleep(1)
@@ -300,17 +401,15 @@ async def fence_responder():
                 timeout=FENCE_CLEANUP_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            log.error("fence: cleanup did not complete in %ds — reboot fallback",
+            log.error("fence: cleanup did not complete in %ds — leaving "
+                      "marker for the watchdog to reboot us",
                       int(FENCE_CLEANUP_TIMEOUT_S))
-            subprocess.run(["systemctl", "reboot"])
             return
         except Exception as e:
-            log.error("fence: cleanup raised %r — reboot fallback", e)
-            subprocess.run(["systemctl", "reboot"])
+            log.error("fence: cleanup raised %r — leaving marker for "
+                      "the watchdog", e)
             return
 
-        # Cleanup succeeded → unfence: bring interfaces back up, then
-        # remove the marker so bedrock-rust resumes its normal loop.
         for iface in _fence_interfaces():
             log.info("fence: ip link set %s up (unfence)", iface)
             subprocess.run(["ip", "link", "set", iface, "up"], check=False)
@@ -320,9 +419,10 @@ async def fence_responder():
         except FileNotFoundError:
             pass
 
-        # We've been off the network — services and any paused VMs
-        # need re-evaluation against whatever the cluster decided
-        # while we were dark.
+        # Cluster contact re-evaluates. The log subscriber catches us
+        # up via Read+Subscribe; cluster.json reflects the cluster's
+        # truth about who's master, who runs which VM, etc. by the
+        # time _wait_for_role returns a settled role.
         _SERVICES_STARTED = False
         role = await _wait_for_role(timeout_s=120.0)
         if role in ("leader", "follower"):
@@ -330,17 +430,23 @@ async def fence_responder():
             await _start_local_services()
             _SERVICES_STARTED = True
         else:
-            log.warning("fence: post-unfence role=%r — services held until cluster recovers",
-                        role)
+            log.warning("fence: post-unfence role=%r — services held until "
+                        "cluster recovers (watchdog will reboot if this "
+                        "stays past 5 min total since fence)", role)
 
 
 async def _run_fence_cleanup():
-    """Minimum required to make this node not-dangerous to peers:
-       1. Pause every running VM (suspend; preserve state).
-       2. Stop NFS exports so peers stop hammering our dead server.
-    DRBD is left primary-but-quiet (paused VMs aren't writing); on
-    reconnect, DRBD's protocol-C quorum logic resolves who's primary.
-    libvirtd is left running (it doesn't endanger anyone)."""
+    """The minimum required to make this node not-dangerous to peers:
+       1. virsh suspend every running VM (preserve state).
+       2. exportfs -au (drop NFS so peers stop hammering our dead server).
+
+    We do NOT demote DRBD here — qemu's open file descriptors on the
+    DRBD device would EBUSY. The demote-when-needed happens in
+    _reconcile_paused_vms after we destroy stale paused copies, which
+    closes those FDs.
+
+    libvirtd is left running; the daemon itself isn't dangerous, the
+    writes were."""
     running = _running_vm_names()
     for vm in running:
         log.info("fence: virsh suspend %s", vm)
@@ -353,37 +459,58 @@ async def _run_fence_cleanup():
 
 
 async def _reconcile_paused_vms():
-    """After unfence: each paused VM's correct state is determined by
-    the (now-current) replicated log. If the log says we're the home
-    and it should be running → resume. If the log moved it elsewhere
-    while we were dark → destroy our stale paused copy."""
+    """After unfence + log catch-up, decide for each paused VM:
+
+      - log says VM moved (host != us) or destroyed → virsh destroy
+        the local stale copy (qemu releases the DRBD FD), then
+        drbdadm secondary that resource so DRBD's reconnect resyncs
+        from the peer's primary.
+
+      - log still has us as home + state == "running" → virsh resume.
+
+    This is the moment "did failover happen?" gets resolved against
+    the replicated log. The log is by construction up-to-date by the
+    time _wait_for_role returns a settled role (subscriber catches
+    us up over the just-restored network)."""
     self_name = _self_node_name()
     cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
     vms = cluster.get("vms", {}) or {}
 
     for vm_name in _paused_vm_names():
         vm = vms.get(vm_name)
+        res = _vm_drbd_resource(vm_name)
+
         if vm is None:
-            log.warning("fence: paused VM %s not in log — destroying stale copy",
+            log.warning("unfence: paused VM %s not in log — destroying stale copy",
                         vm_name)
             subprocess.run(["virsh", "destroy", vm_name], check=False)
+            if res:
+                log.info("unfence: drbdadm secondary %s "
+                         "(releasing for peer's primary)", res)
+                subprocess.run(["drbdadm", "secondary", res], check=False)
             continue
+
         if vm.get("host") != self_name:
-            log.info("fence: VM %s now hosted on %s — destroying our paused copy",
+            log.info("unfence: VM %s now hosted on %s — destroying our paused copy",
                      vm_name, vm.get("host"))
             subprocess.run(["virsh", "destroy", vm_name], check=False)
+            if res:
+                log.info("unfence: drbdadm secondary %s "
+                         "(releasing for peer's primary)", res)
+                subprocess.run(["drbdadm", "secondary", res], check=False)
             continue
+
         if vm.get("state") == "running":
-            log.info("fence: VM %s still ours per log — resuming", vm_name)
+            log.info("unfence: VM %s still ours per log — resuming", vm_name)
             subprocess.run(["virsh", "resume", vm_name], check=False)
 
 
 # ── ④ reactor ────────────────────────────────────────────────────────────
 
 async def _reactor(entry: dict, self_name: str):
-    """Per-entry reactions to log changes that affect this node's VMs.
-    Only active after boot_orchestrator has started services; otherwise
-    it's a no-op (the boot path will catch up on missed work)."""
+    """Per-entry reactions to log changes that affect this node's VMs
+    or storage. Only active after boot_orchestrator has started services;
+    otherwise it's a no-op (the boot path will catch up on missed work)."""
     if not _SERVICES_STARTED:
         return
 
@@ -408,6 +535,53 @@ async def _reactor(entry: dict, self_name: str):
         else:
             log.info("reactor: vm_migrated AWAY — destroying local %s", name)
             subprocess.run(["virsh", "destroy", name], check=False)
+    elif t == log_entries.TIER_STATE:
+        await _react_tier_state(payload, self_name)
+
+
+async def _react_tier_state(payload: dict, self_name: str):
+    """A tier_state entry can change who the master is — for the
+    drbd-nfs case that means everyone needs to re-evaluate where they
+    mount NFS from (and whether they should be promoting/demoting).
+
+    Idempotent: rendering for the role we already have is a no-op."""
+    if payload.get("mode") != "drbd-nfs":
+        return
+    new_master = payload.get("master")
+    tier_name = payload.get("tier", "")
+    res = f"tier-{tier_name}"
+
+    cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
+    nodes = cluster.get("nodes", {}) or {}
+
+    if new_master == self_name:
+        log.info("reactor: tier_state %s master=us; drbdadm primary + re-export",
+                 tier_name)
+        subprocess.run(["drbdadm", "primary", res], check=False)
+        try:
+            from lib import tier_storage
+            tier_storage.nfs_export_drbd_tiers(
+                ["192.168.2.0/24", "10.99.0.0/24"]
+            )
+        except Exception as e:
+            log.warning("reactor: NFS export failed: %s", e)
+    else:
+        master_node = nodes.get(new_master, {})
+        master_drbd_ip = master_node.get("drbd_ip")
+        if not master_drbd_ip:
+            return
+        log.info("reactor: tier_state %s master=%s; remount NFS from %s",
+                 tier_name, new_master, master_drbd_ip)
+        # Fast remount: lazy-unmount any existing mount that points at
+        # the wrong server, then re-mount via the canonical helper.
+        for t in ("bulk", "critical"):
+            mp = f"/var/lib/bedrock/mounts/{t}-drbd"
+            subprocess.run(["umount", "-l", mp], check=False)
+        try:
+            from lib import tier_storage
+            tier_storage.nfs_mount_drbd_tiers(master_drbd_ip)
+        except Exception as e:
+            log.warning("reactor: NFS remount failed: %s", e)
 
 
 # ── public registration ──────────────────────────────────────────────────
