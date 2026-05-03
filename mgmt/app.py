@@ -27,36 +27,22 @@ log = logging.getLogger("bedrock")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-# Fallback NODES for development (physical lab). On a real cluster, this is
-# overridden by /etc/bedrock/cluster.json — populated by bedrock init and
-# node register API calls from joining nodes.
-FALLBACK_NODES = {
-    "node1": {"host": "192.168.2.141", "tb_ip": "10.88.0.1", "eno_ip": "10.99.0.1",
-              "cockpit": "https://192.168.2.141:9090"},
-    "node2": {"host": "192.168.2.142", "tb_ip": "10.88.0.2", "eno_ip": "10.99.0.2",
-              "cockpit": "https://192.168.2.142:9090"},
-}
-
 CLUSTER_FILE = Path("/etc/bedrock/cluster.json")
 SSH_USER = "root"
-# Password fallback is only used when key auth fails. In a real cluster the
-# SSH mesh is key-based; this env var is for dev boxes that still rely on a
-# shared password. Leave unset and only key auth will be attempted.
 import os as _os
-SSH_PASS = _os.environ.get("BEDROCK_SSH_PASS", "")
-WITNESS_URL = _os.environ.get("BEDROCK_WITNESS_URL", "")
 
 
 def load_cluster():
-    """Load cluster config. Use /etc/bedrock/cluster.json if available, else fallback."""
+    """Load cluster config from /etc/bedrock/cluster.json. Returns
+    {nodes: {}, ...} on missing/bad file — the watcher writes the
+    canonical cluster.json from the replicated log; if it isn't there
+    yet, the right answer is "no nodes known", not stale dev data."""
     if CLUSTER_FILE.exists():
         try:
-            data = json.loads(CLUSTER_FILE.read_text())
-            if data.get("nodes"):
-                return data
+            return json.loads(CLUSTER_FILE.read_text())
         except Exception as e:
             log.warning("Failed to load %s: %s", CLUSTER_FILE, e)
-    return {"cluster_name": "bedrock-dev", "nodes": FALLBACK_NODES}
+    return {"cluster_name": "bedrock", "nodes": {}}
 
 
 def save_cluster(cluster: dict):
@@ -100,7 +86,7 @@ def write_scrape_config(cluster: dict):
 
 
 def get_nodes() -> dict:
-    return load_cluster().get("nodes", FALLBACK_NODES)
+    return load_cluster().get("nodes", {})
 
 
 # Per-VM config, now discovered dynamically from virsh/drbd state.
@@ -110,17 +96,12 @@ _VM_META_CACHE: dict = {}
 # ── SSH helpers ─────────────────────────────────────────────────────────────
 
 def _ssh_connect(host: str):
-    """Connect via SSH. Key auth first (production); password fallback only if
-    BEDROCK_SSH_PASS is set (dev/lab convenience)."""
+    """Connect via SSH using the root@host key mesh set up by
+    agent_install (every node has every other node's pubkey)."""
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        c.connect(host, username=SSH_USER, timeout=5, allow_agent=True,
-                  look_for_keys=True)
-    except paramiko.AuthenticationException:
-        if not SSH_PASS:
-            raise
-        c.connect(host, username=SSH_USER, password=SSH_PASS, timeout=5)
+    c.connect(host, username=SSH_USER, timeout=5, allow_agent=True,
+              look_for_keys=True)
     return c
 
 
@@ -244,11 +225,11 @@ def parse_drbd_status(raw: str) -> dict:
     return resources
 
 def get_witness_status() -> dict:
-    try:
-        resp = urllib.request.urlopen(WITNESS_URL + "/status", timeout=3)
-        return json.loads(resp.read())
-    except Exception:
-        return {"nodes": {}, "error": "unreachable"}
+    """Witness panel data for the dashboard. Pulls the configured
+    witnesses from the replicated log (cluster.json `witnesses` map);
+    live reachability is observed by bedrock-rust's lease loop and is
+    not currently surfaced through the mgmt API."""
+    return {"witnesses": load_cluster().get("witnesses", {})}
 
 def get_vm_drbd_resource(host: str, vm_name: str) -> str:
     """Parse virsh dumpxml to find the DRBD resource backing this VM's
@@ -522,6 +503,12 @@ async def startup():
     task_registry().wire(_main_loop, hub.broadcast)
     asyncio.create_task(state_push_loop())
     write_scrape_config(cfg)
+
+    # Boot the cluster-protocol orchestrator: log subscriber, boot
+    # service-starter, fence responder, reactor. Replaces the legacy
+    # standalone bedrock-watcher process.
+    import orchestrator
+    orchestrator.start_all()
 
 # ── REST API (same as before, for curl/scripting) ──────────────────────────
 

@@ -266,7 +266,7 @@ def _cmd_node_leave(target: str, reason: str):
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             f"root@{target_host}",
-            "systemctl stop bedrock-rust bedrock-watcher bedrock-mgmt 2>/dev/null; "
+            "systemctl stop bedrock-rust bedrock-mgmt 2>/dev/null; "
             "rm -f /tmp/bedrock-rust.fence; "
             "true",
         ]).returncode
@@ -293,7 +293,7 @@ def _cmd_node_maint(target: str, mode: str):
         idx, h = d.append(le.node_maintenance(node_name=target, on=on))
         print(f"  appended idx={idx} node_maintenance_set({target}, on={on})")
     print(f"  Log entry committed locally; replication propagates to peers.")
-    print(f"  Each node's bedrock-watcher regenerates daemon.toml on log change.")
+    print(f"  Each node's mgmt orchestrator regenerates daemon.toml on log change.")
     print(f"  When you take {target} offline now, surviving nodes won't fence.")
 
 
@@ -365,10 +365,6 @@ def cmd_witness(args):
         _propagate_daemon_config(args.id)
         return
 
-    if args.action == "_local-regen":
-        _local_regen()
-        return
-
 
 def _read_log():
     """Helper: yield every log entry via IPC."""
@@ -436,7 +432,7 @@ def _propagate_daemon_config(reason: str) -> None:
     eyeball the cluster as converged.
 
     No SSH between nodes. The log IS the propagation channel; each
-    peer's bedrock-watcher.service handles its side independently.
+    peer's mgmt orchestrator handles its side independently.
     """
     from lib import daemon_setup, view_builder, state as _state
     s = _state.load()
@@ -449,18 +445,6 @@ def _propagate_daemon_config(reason: str) -> None:
     # Brief pause for replication so a follow-up status command sees
     # the propagated state. Real per-peer ACK polling is queued.
     _wait_replicated(snapshot.get("log_index", 0))
-
-
-def _local_regen() -> None:
-    """Hidden subcommand: rebuild snapshot from local (replicated) log
-    and re-render daemon.toml. Called over SSH by the master after a
-    witness add/rm so every node's config follows the snapshot."""
-    from lib import view_builder, daemon_setup, state as _state
-    s = _state.load()
-    self_name = s.get("node_name", "")
-    snapshot = view_builder.rebuild(this_node=self_name)
-    daemon_setup.render_from_snapshot(snapshot, self_name)
-    daemon_setup.restart()
 
 
 def cmd_storage(args):
@@ -956,7 +940,6 @@ def main():
     p_w_add.add_argument("pubkey", help="X25519 pubkey hex (64 chars / 32 bytes)")
     p_w_rm = p_w_sub.add_parser("rm", help="Remove a witness (commit-then-restart)")
     p_w_rm.add_argument("id", help="witness id from `bedrock witness list`")
-    p_w_sub.add_parser("_local-regen", help=argparse.SUPPRESS)
     p_w.set_defaults(func=cmd_witness)
 
     p_st = sub.add_parser("storage", help="Storage tier operations")

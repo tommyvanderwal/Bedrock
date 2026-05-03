@@ -252,7 +252,11 @@ WantedBy=multi-user.target
         daemon_setup.init_log_if_needed(s["cluster_uuid"])
         daemon_setup.render_daemon_toml(
             sender_id=1,
-            peer_sender_id=None,    # filled in when first peer joins
+            # No peers yet — empty list. When a node joins, the master
+            # appends node_register; replication's no-op on the master
+            # but the watcher's fold + render_from_snapshot will fill
+            # peer_sender_ids and bounce the daemon.
+            peer_sender_ids=[],
             peer_listen=["0.0.0.0:8200"],
             peer=[],
             fence_interfaces=[],

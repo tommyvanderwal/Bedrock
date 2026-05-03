@@ -74,10 +74,6 @@ enum Cmd {
         /// This node's sender_id (0..0xFE).
         #[arg(long, default_value_t = 0)]
         sender_id: u8,
-        /// The peer's sender_id, used to drive witness-based leader
-        /// election (Phase 8). Omit for standalone / single-node.
-        #[arg(long)]
-        peer_sender_id: Option<u8>,
         /// Lease TTL in milliseconds; the leader is fenced if it can't
         /// renew within this window. Direct-cable default 5000ms.
         #[arg(long, default_value_t = 5_000)]
@@ -180,7 +176,6 @@ fn main() -> Result<()> {
             witness_pubkey,
             witness_pubkey_file,
             sender_id,
-            peer_sender_id,
             lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
@@ -198,7 +193,6 @@ fn main() -> Result<()> {
             witness_pubkey,
             witness_pubkey_file,
             sender_id,
-            peer_sender_id,
             lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,
@@ -325,7 +319,6 @@ fn run_daemon(
     cli_witness_pubkey: Option<String>,
     cli_witness_pubkey_file: Option<PathBuf>,
     cli_sender_id: u8,
-    cli_peer_sender_id: Option<u8>,
     cli_lease_ttl_ms: u64,
     cli_heartbeat_ms: u64,
     cli_fence_interfaces: String,
@@ -365,17 +358,10 @@ fn run_daemon(
         .and_then(|c| c.sender_id)
         .filter(|_| cli_sender_id == 0)
         .unwrap_or(cli_sender_id);
-    let peer_sender_id = cli_peer_sender_id.or_else(|| {
-        cfg_file.as_ref().and_then(|c| c.peer_sender_id)
-    });
-    // Build the peer_sender_ids list: prefer the new daemon.toml
-    // `peer_sender_ids` array; fall back to the legacy single
-    // `peer_sender_id` for compat with pre-quorum-vote configs.
     let peer_sender_ids: Vec<u8> = cfg_file
         .as_ref()
         .map(|c| c.peer_sender_ids.clone())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| peer_sender_id.into_iter().collect());
+        .unwrap_or_default();
     let lease_ttl_ms = cfg_file.as_ref()
         .and_then(|c| c.lease_ttl_ms)
         .filter(|_| cli_lease_ttl_ms == 5_000)
@@ -467,7 +453,7 @@ fn run_daemon(
         let cfg = witness::LeaseConfig {
             witnesses,
             sender_id,
-            peer_sender_ids: peer_sender_ids.clone(),
+            peer_sender_ids,
             ttl_ms: lease_ttl_ms,
             heartbeat_ms,
             fence_interfaces,

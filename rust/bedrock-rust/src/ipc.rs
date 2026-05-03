@@ -41,8 +41,6 @@ pub enum Request {
     Read { from: u64, to: Option<u64> },
     /// Latest (index, hash) for the local log.
     Status,
-    /// Compute the SHA-256 of the entry at `index` (sanity check).
-    Verify,
     /// Subscribe to commit events. The connection STAYS OPEN after
     /// this request; the daemon pushes a `Committed{entry}` response
     /// frame after every successful append (locally OR via peer
@@ -71,18 +69,11 @@ pub enum Response {
         #[serde(with = "serde_bytes_array")]
         latest_hash: [u8; 32],
     },
-    Verified {
-        entries_checked: u64,
-    },
     /// Server-pushed: a new entry was committed. Streamed continuously
     /// after a Subscribe request until the connection closes.
     Committed {
         entry: EntryWire,
     },
-    /// Server-pushed: subscriber's bounded queue overflowed; the
-    /// subscriber should disconnect, reconnect, fetch via Read to
-    /// catch up, then Subscribe again.
-    SubscribeOverrun,
     PeerStatus {
         links: Vec<crate::peer::PeerLinkInfo>,
     },
@@ -354,12 +345,6 @@ fn process(
                 latest_hash,
             }
         }
-        Request::Verify => match log.lock().unwrap().verify() {
-            Ok(n) => Response::Verified { entries_checked: n },
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
-        },
         Request::Subscribe => Response::Error {
             // Subscribe is handled in handle_client (it holds the connection
             // open and streams commits). If we ever land here it's a code bug.

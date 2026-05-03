@@ -91,10 +91,6 @@ class Daemon:
                 "hash": bytes(e["hash"]),
             }
 
-    def verify(self) -> int:
-        r = self._call({"op": "verify"}, expect="verified")
-        return r["entries_checked"]
-
     def peer_status(self) -> list[dict]:
         """Snapshot of every peer link the daemon knows about. Each
         entry: {address, direction, identified_role, latest_index,
@@ -134,10 +130,6 @@ class Daemon:
                     "payload": bytes(e["payload"]),
                     "hash": bytes(e["hash"]),
                 }
-            elif kind == "subscribe_overrun":
-                # Caller's mailbox overflowed. Tell them so they can
-                # reconnect-and-catch-up via Read.
-                raise IpcError("subscribe: queue overrun; reconnect + catch up")
             elif kind == "error":
                 raise IpcError(resp.get("message", "<no message>"))
             else:

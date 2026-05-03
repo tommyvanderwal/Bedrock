@@ -12,13 +12,10 @@ use std::path::{Path, PathBuf};
 pub struct DaemonConfig {
     pub log_dir: Option<PathBuf>,
     pub ipc_sock: Option<PathBuf>,
-    /// This node's sender_id (0..0xFE).
+    /// This node's sender_id (1..0xFE). 0xFF is reserved for the
+    /// witness; the master is conventionally sender_id 1 and additional
+    /// nodes get incrementing ids in cluster.json sorted order.
     pub sender_id: Option<u8>,
-    /// The peer's sender_id, if known. Legacy single-peer field. Use
-    /// `peer_sender_ids` for N-peer (≥3-node) clusters; this stays
-    /// for backward compat and is folded into `peer_sender_ids` on
-    /// load when only the single field is set.
-    pub peer_sender_id: Option<u8>,
     /// Sender_ids of every other node in the cluster. Length =
     /// cluster_size - 1. Drives the weighted-vote election (see
     /// witness::compute_election). Empty for standalone.

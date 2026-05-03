@@ -183,7 +183,7 @@ impl Log {
         }
         let next_index: u64 = self.latest.0 + 1;
         let prev_hash = self.latest.1;
-        let epoch: u64 = 1; // v0.1: always 1; epoch bumps on leader change (phase 4)
+        let epoch: u64 = 1; // single-writer log; epoch is reserved space, always 1.
 
         let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
         frame.extend_from_slice(&next_index.to_be_bytes());

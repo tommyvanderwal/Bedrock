@@ -82,13 +82,13 @@ systemctl daemon-reload
 # it without a config file would just fail-loop.
 systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
 
-log "Installing bedrock-watcher (per-node log → daemon.toml regen)..."
-curl -fsSL "${BEDROCK_REPO}/bedrock-watcher" -o "${INSTALL_DIR}/bedrock-watcher"
-chmod +x "${INSTALL_DIR}/bedrock-watcher"
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-watcher.service" \
-    -o /etc/systemd/system/bedrock-watcher.service
-systemctl daemon-reload
-systemctl enable bedrock-watcher.service >/dev/null 2>&1 || true
+# DRBD + libvirtd are NOT auto-started at boot. The mgmt service's
+# orchestrator decides when it's safe (cluster contact established,
+# role is leader/follower) and starts them imperatively. This is the
+# fence-aware boot model documented in cluster-protocol-overview.md
+# §"boot orchestration".
+systemctl disable drbd >/dev/null 2>&1 || true
+systemctl disable libvirtd >/dev/null 2>&1 || true
 
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(

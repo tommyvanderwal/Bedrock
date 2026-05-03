@@ -432,16 +432,29 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
     // *gaps* between successes, not the startup-to-first-success
     // gap.
     let mut had_success = false;
-    // Fence-marker auto-clear (L44). If the daemon comes up with the
-    // marker present, election forces Follower regardless of state —
-    // safe under the design. We track consecutive healthy ticks and
-    // clear the marker once the cluster has been stably-OK for a
-    // recovery window. Real faults keep the marker; transient blips
-    // that already healed don't lock the operator out forever.
-    const HEALTHY_TICKS_TO_CLEAR_MARKER: u32 = 30; // ~30s at 1Hz heartbeat
-    let mut healthy_ticks: u32 = 0;
 
     loop {
+        // Fence-aware idle: if the marker is present, we're in the
+        // "isolated, waiting for mgmt to clean up + unfence" state.
+        // Don't heartbeat (would lie about our liveness), don't run
+        // the election (could flap), don't try to self-fence again.
+        // bedrock-mgmt's fence_responder pauses VMs, stops NFS exports,
+        // brings the interfaces back up, and removes the marker — at
+        // which point this loop transparently resumes normal operation.
+        if fence_marker_present() {
+            if last_election != Election::Unknown {
+                log::warn!("lease: fence marker present — entering passive idle");
+                last_election = Election::Unknown;
+                write_role_file("fenced");
+            }
+            // Reset the TTL clock so when mgmt unfences we don't
+            // immediately self-fence on the still-stale `last_ok`.
+            last_ok = Instant::now();
+            had_success = false;
+            thread::sleep(Duration::from_millis(cfg.heartbeat_ms));
+            continue;
+        }
+
         let (latest_index, latest_hash) = {
             let lg = log.lock().unwrap();
             lg.latest()
@@ -449,9 +462,7 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
         let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
 
         // Always query STATUS_LIST: gives us per-tick visibility into
-        // every other peer's witness-recency in one round-trip. (For
-        // a 1-peer cluster the list has 1 entry — no extra cost vs
-        // the legacy STATUS_DETAIL targeted query.)
+        // every other peer's witness-recency in one round-trip.
         let target = QUERY_LIST_SENTINEL;
         let mut any_ok = false;
         // Map sender_id → seen_ms_ago, freshest reading from any
@@ -471,7 +482,6 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                 Ok(entries) => {
                     any_ok = true;
                     for (sid, ms) in entries {
-                        // Keep the freshest reading across witnesses.
                         let entry = witness_seen.entry(sid).or_insert(u32::MAX);
                         if ms < *entry {
                             *entry = ms;
@@ -488,27 +498,9 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
         if any_ok {
             had_success = true;
             last_ok = Instant::now();
-            // Track healthy-tick count for fence auto-clear (L44).
-            let peer_recent = peer_seen_ago_ms(&cfg.peer_liveness) < cfg.ttl_ms;
-            if peer_recent {
-                healthy_ticks = healthy_ticks.saturating_add(1);
-                if healthy_ticks >= HEALTHY_TICKS_TO_CLEAR_MARKER && fence_marker_present() {
-                    if let Err(e) = std::fs::remove_file(FENCE_MARKER_PATH) {
-                        log::warn!("lease: failed to auto-clear fence marker: {}", e);
-                    } else {
-                        log::warn!(
-                            "lease: cluster healthy for {} ticks (witness+peer both OK) — auto-cleared fence marker {}",
-                            healthy_ticks, FENCE_MARKER_PATH
-                        );
-                    }
-                }
-            } else {
-                healthy_ticks = 0;
-            }
-            // Weighted-vote election. Combine TCP-visible peer count
-            // (from peer.rs registry — peers in MY partition) with
-            // witness STATUS_LIST sender_ids (alive-anywhere) for the
-            // smaller_id-priority tiebreak.
+            // Weighted-vote election. TCP-visible peer count (peers in
+            // MY partition) drives quorum; witness STATUS_LIST sender_ids
+            // (alive-anywhere) drive the smaller_id-priority tiebreak.
             let takeover_threshold_ms = cfg.ttl_ms.saturating_mul(2) as u32;
             let n_visible_peers = count_distinct_peer_hosts(&cfg.peer_registry);
             let smaller_id_alive_anywhere = cfg
@@ -522,16 +514,16 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                             .map_or(false, |ms| ms <= takeover_threshold_ms)
                 });
             let outcome = compute_election(
-                fence_marker_present(),
+                /*fence_marker=*/ false,
                 n_visible_peers,
                 smaller_id_alive_anywhere,
                 cfg.peer_sender_ids.len(),
                 /*witness_reachable=*/ any_ok,
             );
-            let next = match outcome {
-                VoteOutcome::Leader => Election::Leader,
-                VoteOutcome::Follower => Election::Follower,
-                VoteOutcome::NoQuorum => Election::Follower,
+            let (next, role_str) = match outcome {
+                VoteOutcome::Leader   => (Election::Leader,   "leader"),
+                VoteOutcome::Follower => (Election::Follower, "follower"),
+                VoteOutcome::NoQuorum => (Election::Follower, "noquorum"),
             };
             if next != last_election {
                 log::info!(
@@ -540,18 +532,15 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                     n_visible_peers, witness_seen, smaller_id_alive_anywhere,
                 );
                 last_election = next;
+                write_role_file(role_str);
             }
-            // NoQuorum is a soft signal — the loop's existing TTL
-            // logic in the else-branch handles real fencing.
         } else {
             let elapsed = last_ok.elapsed();
             let peer_seen_ms_ago = peer_seen_ago_ms(&cfg.peer_liveness);
             let peer_fresh = peer_seen_ms_ago < cfg.ttl_ms;
-            // Quorum check: when there's no witness, peer-freshness alone
-            // is insufficient at N≥3. A 2-2 split with no witness has
-            // 20/41 votes — peers see each other but cluster has no
-            // authority. Only "I have quorum from TCP-visible peers
-            // alone" lets us keep running without a witness.
+            // Without a witness, peer-freshness alone isn't quorum at
+            // N≥3 (a 2-2 split sees 20/41 votes, no authority). Compute
+            // peer-only quorum as the only "keep running solo" path.
             let n_visible_peers = count_distinct_peer_hosts(&cfg.peer_registry);
             let total_votes =
                 (1 + cfg.peer_sender_ids.len() as u32) * VOTES_PER_NODE + VOTE_PER_WITNESS;
@@ -564,26 +553,17 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                 n_visible_peers, my_score_no_w, threshold, have_quorum_without_witness,
             );
             if cfg.peer_sender_ids.is_empty() {
-                // Standalone (1-node): no peers to wait for. The witness
-                // adds the +1 vote in normal operation; without it,
-                // 10/11 still meets threshold (single-node majority).
+                // Standalone (1-node): no peers to wait for. Witness loss
+                // alone shouldn't fence a single-node cluster.
                 last_ok = Instant::now();
-            } else if cfg.peer_in_maintenance && peer_fresh {
-                // Peer is intentionally offline; surviving partition
-                // keeps running. (This wins over the quorum check —
-                // a planned outage shouldn't fence the survivor even if
-                // the math says no quorum.)
+            } else if cfg.peer_in_maintenance {
                 if elapsed >= Duration::from_millis(cfg.ttl_ms) {
                     log::warn!(
                         "lease: witness TTL exhausted but peer in maintenance — keeping running solo"
                     );
                 }
                 last_ok = Instant::now();
-            } else if cfg.peer_in_maintenance {
-                last_ok = Instant::now();
             } else if have_quorum_without_witness {
-                // Cluster is healthy via peer cables; witness is just
-                // a tiebreaker we don't currently need.
                 last_ok = Instant::now();
             } else if !had_success {
                 // L49: daemon hasn't had a single successful heartbeat
@@ -595,7 +575,9 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
                     my_score_no_w, threshold,
                 );
                 self_fence(&cfg.fence_interfaces)?;
-                return Ok(());
+                // Fall through to next loop iteration; the
+                // fence_marker_present() check at the top will idle us
+                // until mgmt cleans up + unfences.
             }
         }
 
@@ -726,8 +708,6 @@ pub fn self_fence(interfaces: &[String]) -> Result<()> {
             Err(e) => log::warn!("self-fence: failed to spawn `ip link` for {}: {}", iface, e),
         }
     }
-    // Persist the fence marker so a post-reboot daemon refuses to
-    // claim leadership without operator inspection.
     let marker = PathBuf::from(FENCE_MARKER_PATH);
     if let Err(e) = std::fs::write(&marker, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
         log::warn!("self-fence: marker write failed at {}: {}",
@@ -735,18 +715,47 @@ pub fn self_fence(interfaces: &[String]) -> Result<()> {
     } else {
         log::error!("self-fence: marker written at {}", marker.display());
     }
-    log::error!("self-fence: dev mode — exiting the daemon process \
-                 (production: 300s python cleanup window then `systemctl reboot`)");
-    // In production we'd: signal Python via IPC, wait up to 300s for
-    // FenceComplete or timeout, `systemctl reboot`. v0.1 just exits.
-    std::process::exit(2);
+    write_role_file("fenced");
+    log::error!(
+        "self-fence: complete — daemon stays running but idle. \
+         bedrock-mgmt will pause VMs, stop NFS exports, then bring \
+         interfaces back up and clear the marker. If that doesn't \
+         happen within ~5 min, mgmt's watchdog `systemctl reboot`s."
+    );
+    Ok(())
 }
 
-/// Returns true if the fence marker is present from a prior fence event.
-/// Boot recovery uses this to refuse leader claims until the operator
-/// (or Python) clears the marker.
+/// Returns true if the fence marker is present.
+/// While present, the lease loop idles — no heartbeat, no election, no
+/// further fence. The marker is cleared by bedrock-mgmt's fence
+/// responder after the cleanup procedure (pause VMs, stop NFS exports)
+/// completes successfully and interfaces are brought back up.
 pub fn fence_marker_present() -> bool {
     std::path::Path::new(FENCE_MARKER_PATH).exists()
+}
+
+/// Path to the role file. bedrock-mgmt's boot orchestrator + fence
+/// responder poll this to decide what local services to (re-)start.
+pub const ROLE_FILE_PATH: &str = "/run/bedrock-rust.role";
+
+/// Persist the current election outcome so Python can read it without
+/// going through IPC. Single line; one of:
+///   "leader" / "follower" / "noquorum" / "fenced" / "unknown"
+///
+/// Atomic write via tempfile + rename so a concurrent reader never sees
+/// half-written content. Best-effort — failures are logged but don't
+/// affect cluster correctness.
+fn write_role_file(role: &str) {
+    let tmp = PathBuf::from(format!("{}.tmp", ROLE_FILE_PATH));
+    let final_path = PathBuf::from(ROLE_FILE_PATH);
+    if let Err(e) = std::fs::write(&tmp, format!("{}\n", role)) {
+        log::warn!("write_role_file: tmp write failed: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        log::warn!("write_role_file: rename to {} failed: {}",
+                   final_path.display(), e);
+    }
 }
 
 #[cfg(test)]

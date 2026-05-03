@@ -155,8 +155,13 @@ def install(witness: str, cluster_info: dict, repo: str):
         daemon_setup.init_log_if_needed(s["cluster_uuid"])
         master_drbd = result.get("master_drbd_ip", witness)
         daemon_setup.render_daemon_toml(
-            sender_id=int(s["node_id"]) + 1,  # 0 reserved for the original master
-            peer_sender_id=0,                 # the original master is sender_id 0
+            # Initial daemon.toml gets bedrock-rust talking to the master.
+            # The watcher overwrites this from the replicated snapshot
+            # within ~1s of the first node_register entry arriving, so
+            # don't sweat exact sender_id assignment here — sorted-name
+            # ordering happens in render_from_snapshot.
+            sender_id=int(s["node_id"]) + 1,
+            peer_sender_ids=[1],   # master is sender_id 1 by convention
             peer_listen=["0.0.0.0:8200"],
             peer=[f"{master_drbd}:8200"],
             fence_interfaces=[],
