@@ -372,96 +372,228 @@ the diff against it (`lvm thin` exposes block-allocation maps —
 `thin_dump`/`thin_delta` give the changed-block list, equivalent to
 VMware CBT or Ceph RBD diff). This is a v1.1 feature.
 
-### 6c-bis. Changed-block tracking — does PBS need to read the whole volume each time?
+### 6c-bis. Changed-block tracking — and choosing the right method per VM
 
-Short answer: **no it doesn't, but the cheapest way to avoid that
-*does* require keeping the previous snapshot around.** Three options,
-in increasing operational complexity:
+Short answer up front: **no, PBS doesn't need to re-read the whole
+volume every time, and there are three quite different mechanisms
+to avoid it. The right pick depends on the VM's write pattern, so
+mgmt picks per-VM and explains the choice.** What follows is what
+each mechanism actually does, why one beats the other in different
+conditions, and how mgmt decides.
 
-**Option 1 — read whole snapshot, rely on PBS chunk dedup. (v1.0)**
+#### What thin-pool CoW actually charges for
 
-This is the default. proxmox-backup-client reads the whole snapshot
-locally, chunks it (typically 4 MiB), hashes each chunk, and sends
-to PBS only the chunks PBS doesn't already have. The wire and the
-PBS storage are efficient — only changed chunks travel — but the
-**local read** is the full volume each backup.
+A common misread (mine, in the earlier draft): "if the volume gets
+fully written every 12 h, the snapshot eats the whole volume's
+worth of space." That's not how LVM thin works.
 
-For a 1 TB pet VM with 50 GB nightly change, that's 1 TB of disk
-read every night just to discover what changed. The thin pool helps
-slightly (only allocated blocks are read), but on a busy VM that's
-still hundreds of GB of IO.
+LVM thin CoW counts **first-write-since-snapshot per block**, not
+total writes:
 
-This is fine for small VMs and overnight backup windows. It's the
-right starting point.
+- A 4 KiB block written 10 times since the snapshot consumes
+  one block of divergence space, not ten.
+- A circular WAL / database redo log that rewrites the same 100 MB
+  region all night: divergence space ≈ 100 MB, not 100 MB × the
+  rewrite count.
+- A database that touches large parts of its working set with
+  *random* updates across many distinct blocks: divergence space
+  scales with unique-block count. **This** is the case that can
+  blow up the snapshot.
 
-**Option 2 — `thin_delta` between two LV snapshots. (v1.1)**
+So the user's "DB log file with lots of edits, same blocks" example
+is actually fine for thin-snapshot CBT — the divergence space stays
+small because the writes hit the same blocks. The problematic case
+is the working-set churn one.
 
-LVM thin's metadata knows exactly which blocks belong to which
-snapshot. `thin_dump` exports the metadata; `thin_delta` between
-two thin device IDs lists the blocks that changed.
+#### Three CBT mechanisms
+
+**Mechanism 1 — `thin_delta` between LV snapshots.**
+
+Cost: keep one reference snapshot alive between backups (sized by
+unique-block churn, not total writes).
+Failure mode: when the working set is large and randomly updated,
+the reference snapshot's divergence approaches the source LV size.
+At that point CBT loses its space advantage and we should fall back
+to a full read.
 
 ```
-  step 1 (last night): take snap-N, back up via PBS, KEEP snap-N
-                       around as the next reference
-  step 2 (tonight):    take snap-N+1
-                       thin_delta /dev/mapper/bedrock-thinpool snap-N snap-N+1
-                          → list of changed block ranges
-                       read only those ranges from snap-N+1
-                       send the changed chunks to PBS (PBS dedup
-                          still applies on top)
-                       lvremove snap-N
-                       keep snap-N+1 as the new reference
+  step 1 (last night): snap-N, full backup; keep snap-N as reference.
+  step 2 (tonight):    snap-N+1.
+                       thin_delta pool snap-N snap-N+1 → changed blocks.
+                       read only those; ship to PBS.
+                       lvremove snap-N; keep snap-N+1 as next reference.
 ```
 
-This **does require the previous reference snapshot to exist** —
-that's how thin_delta knows what "changed since last backup" means.
-The cost is the divergence space the reference snapshot accumulates
-over its lifetime: roughly one day's worth of writes for a daily
-backup.
+**Mechanism 2 — QEMU persistent dirty bitmap.**
 
-For a 1 TB VM with 50 GB nightly change:
-- Without CBT: 1 TB read/night, 50 GB on the wire (after dedup).
-- With CBT: 50 GB read/night, 50 GB on the wire. Identical wire
-  traffic; **20× less local IO**. Cost: 50 GB of extra thin-pool
-  space for the reference snapshot.
+QEMU has a built-in feature called a *block dirty bitmap*: a small
+in-memory map of which blocks of a virtual disk have been written
+since some reference moment. `qmp` (the QEMU monitor protocol)
+exposes `block-dirty-bitmap-add`, `-clear`, `-remove`, and a query
+that returns the dirty block list.
 
-That's a great trade for big-disk VMs. Implementation is small —
-thin_dump + thin_delta + a custom uploader to PBS that does the
-sparse read. PBS's dedup-by-content storage doesn't care that we
-sent partial data; it just ends up reusing the chunks that didn't
-change.
+On qcow2 disks the bitmap is *natively persistent* — it lives in the
+qcow2 metadata. On raw block devices (our LV-on-DRBD case) the
+bitmap is in-memory only by default; we have to handle persistence
+ourselves.
 
-**Option 3 — `dm-era` or QEMU persistent dirty bitmap. (later, if ever)**
+Backup loop:
+```
+  At VM start (idempotent):
+     qmp: block-dirty-bitmap-add name=bedrock-cbt size=64KiB granularity
+            (if not already present — load from sidecar file if so)
 
-If the "always have one extra snapshot taking space" cost ever
-becomes objectionable, two alternatives don't need it:
+  Backup time:
+     qmp: query for current dirty blocks
+     read only those offsets from the running disk image
+     ship to PBS
+     qmp: block-dirty-bitmap-clear   (mark all clean again)
 
-- **`dm-era`** is a device-mapper layer above the thin LV that
-  records a "dirty block era" continuously. You ask "what blocks
-  changed since era N?" without keeping a snapshot at era N.
-  Adds an extra dm layer; works for any block device.
-- **QEMU persistent dirty bitmap** (`qemu-img bitmap --add ... --persistent`)
-  records dirty blocks in qcow2 metadata or a sidecar file. After a
-  backup, clear the bitmap; QEMU starts tracking again from zero.
-  Backup-time, read only blocks the bitmap says are dirty. This is
-  what Proxmox VE itself uses for QEMU-managed VMs.
+  At VM stop:
+     qmp: dump bitmap state to /var/lib/bedrock/bitmaps/<vm>-disk0.bitmap
 
-Both need integration work that thin_delta doesn't. v1 picks
-thin_delta because it's the path of least resistance from where
-we already are (LVM thin is the storage primitive on every node;
-the kernel and userspace tooling are already installed).
+  On live migration:
+     QEMU 5.0+ migrates dirty bitmaps natively along with the VM
+     (the destination side ends up with the same bitmap state).
 
-**Storage-cost summary for daily backups:**
+  On cold migration / VM definition transfer:
+     copy the sidecar bitmap file along with the disk content.
+```
 
-| Option | Local IO/night | Wire/night | Extra disk used |
-|---|---|---|---|
-| Whole-volume + PBS dedup (v1.0) | full volume | changed bytes (≈daily delta) | none — snapshot lives only during backup |
-| `thin_delta` CBT (v1.1) | changed bytes | changed bytes | ~1 day's worth of writes (the reference snapshot) |
-| `dm-era` or QEMU bitmap | changed bytes | changed bytes | metadata only (~MB) |
+The bitmap itself is tiny: at 64 KiB granularity, a 1 TB disk =
+2 MB bitmap. Practically free.
 
-For most of our target market, option 1 is enough. Option 2 lands
-in v1.1 when bigger VMs become a concern. Option 3 stays in the
-"only if" pile.
+**Why this is interesting compared to thin_delta:**
+
+| | `thin_delta` | QEMU bitmap |
+|---|---|---|
+| Storage cost | 1 day's worth of writes (reference snapshot) | ~2 MB sidecar per disk; constant |
+| Reads back to | "any earlier snapshot" — operator can pick any reference | Always "since last clear" — flat history |
+| Works when VM is off | yes (you snapshot the LV regardless) | no — bitmap requires QEMU to be running and tracking |
+| Survives ungraceful crash | snapshot survives; whatever's after the snapshot is what changed | bitmap is in-memory; OS crash loses pending writes from the bitmap. **Requires fall-back to thin_delta or full on next backup after a crash.** |
+| Migration | snapshot is a local artifact — not portable across nodes by itself | QEMU 5.0+ migrates bitmaps natively |
+| Read cost while VM busy | reads from a frozen LV; no live-IO conflict | reads from the live disk while VM runs (potential IO contention) |
+
+The big win for QEMU bitmap: **no extra disk space.** The big
+catches: (a) it depends on QEMU running continuously between
+backups; a guest crash or host fence loses the bitmap state and
+forces a full re-read; (b) the read is from the *live* disk, so
+it competes with the running guest's IO unless we also take a
+quick LV snapshot to read from.
+
+The clean combination is bitmap-decides-what + snapshot-provides-
+read-source: take a fast LV snapshot at backup time, query QEMU's
+bitmap for the dirty list, read those offsets from the snapshot
+(no contention), ship to PBS, drop the snapshot, clear the bitmap.
+Best of both worlds; no persistent reference snapshot eating space.
+
+**Mechanism 3 — `dm-era`.**
+
+Continuous dirty-block tracking at the device-mapper layer. Adds
+an extra dm device above the thin LV; tracks "eras" of writes;
+ask "what changed since era N?" at any time. Works for any block
+device (no QEMU dependency). Bitmap size is metadata-only.
+
+Less battle-tested than thin_delta or QEMU bitmaps in production
+backup pipelines. Mostly interesting if a non-VM workload ever
+needs CBT. Skip for v1.
+
+#### Adaptive selection — which one does mgmt use?
+
+Per-VM, mgmt picks at backup time. Pseudo-logic:
+
+```
+  decide_cbt_method(vm):
+      if vm is offline:
+          # bitmap is gone (or stale across stop/start); fall back
+          return "thin_delta if reference exists else FULL"
+
+      if qemu_bitmap_supported(vm) and bitmap_is_clean(vm):
+          # QEMU has been tracking continuously since last clear
+          return "qemu_bitmap"
+
+      if reference_snapshot_exists(vm):
+          ref_div = lv_thin_used(reference_snapshot)
+          source_size = lv_size(vm.disk0)
+          if ref_div > 0.5 * source_size:
+              # snapshot has diverged so much that CBT savings
+              # are gone; do full + reset reference.
+              return "FULL_RESET"
+          return "thin_delta"
+
+      return "FULL"   # creates the next reference
+```
+
+The 50% threshold is the tunable switchover. Below it, CBT-by-
+snapshot saves IO; above it, we're paying snapshot storage for no
+read savings, and a full re-read is cheaper.
+
+#### How does PBS know which method we used?
+
+It doesn't, and it doesn't need to. **PBS receives data; we choose
+how to send it.** Specifically:
+
+- For full backup: stream the snapshot block device end-to-end.
+  PBS chunks at 4 MiB, hashes, dedups. Most chunks already exist
+  on PBS from the previous backup → only new chunks transfer.
+- For CBT (any flavor): we have a list of changed-block offsets.
+  We don't try to re-shape that into something PBS understands
+  natively. Instead:
+  - **Easiest path:** stream the *whole* snapshot to PBS as a
+    full backup. PBS's chunk-dedup already takes care of the
+    storage-and-wire side. CBT only saves us *local* read IO and
+    chunk-hashing CPU. So CBT becomes "tell proxmox-backup-client
+    to skip these byte ranges (read as zeros), don't bother PBS
+    about it" — except that breaks dedup because zeros at the
+    wrong offsets produce different chunk hashes than the real
+    content did.
+  - **Correct path:** maintain our own reference image (the result
+    of last backup) and patch it with changed blocks; PBS sees
+    a normal full image with mostly-unchanged chunks. The chunks
+    we didn't read are filled from the local previous reference
+    snapshot, which is the *same content* PBS already has.
+    Everything dedups.
+
+  Concretely, when CBT is on:
+  ```
+    ① take snap-N+1
+    ② thin_delta snap-N snap-N+1 → changed-block list
+    ③ for each chunk:
+          if chunk overlaps any changed block:
+              read from snap-N+1 (the new content)
+          else:
+              read from snap-N      (the unchanged content; what PBS
+                                      has already)
+       (or with QEMU bitmap, replace ② and the if-overlap test
+        with the bitmap query result)
+    ④ stream chunks to proxmox-backup-client as one image
+    ⑤ PBS chunk-hashes; the unchanged chunks are byte-identical
+       to last time → dedup hit; only the changed chunks transfer.
+    ⑥ rotate references: lvremove snap-N; snap-N+1 becomes next ref.
+  ```
+
+  PBS sees a full image arriving every backup; from PBS's perspective
+  there are no "incremental backups" — just full backups that happen
+  to dedup well. That's fine; it's exactly how PBS is designed to be
+  used. We get the local-IO savings; PBS handles the wire and the
+  storage.
+
+The tag we attach to each backup_completed log entry includes the
+method used (`full` / `thin_delta` / `qemu_bitmap`) so the operator
+can see what happened at any point in history.
+
+**Storage-cost summary for daily backups (1 TB VM, 50 GB daily change):**
+
+| Method | Local read/night | Wire/night | Extra disk used | Notes |
+|---|---|---|---|---|
+| FULL (v1.0 default) | 1 TB | ~50 GB | 0 | snapshot lives only during backup |
+| `thin_delta` (v1.1) | ~50 GB | ~50 GB | 50 GB (reference snap) | breaks down when working set is large + random |
+| QEMU bitmap (v1.2) | ~50 GB | ~50 GB | ~2 MB sidecar | needs continuous QEMU; falls back to FULL after a crash |
+
+For the user's "DB redo log getting hammered" example: thin_delta
+works great (writes hit the same blocks; divergence stays tiny).
+For "DB working set with random updates across many blocks":
+adaptive logic catches the case and falls back to FULL.
 
 ### 6d. Bedrock-native backup tier (v1.x)
 
@@ -603,20 +735,33 @@ them a clean read surface.
 **Lifecycle of one backup run, end-to-end:**
 
 ```
-  v1.0 (whole-volume + PBS dedup):
-     lvcreate --snapshot   → PBS reads     → lvremove
+  v1.0 (FULL): always works, no extra storage cost.
+     lvcreate --snapshot   → PBS reads → lvremove
      [snapshot exists for ~minutes]
 
-  v1.1 (thin_delta CBT):
+  v1.1 (thin_delta CBT): adaptive — falls back to FULL when the
+                         reference snapshot has diverged > ~50%.
      lvcreate --snapshot snap-N+1
-     thin_delta snap-N snap-N+1            → list of changed ranges
-     PBS reads only those ranges from snap-N+1
-     lvremove snap-N        (the previous reference; not snap-N+1)
-     [the JUST-USED snapshot becomes the next reference;
-      one snapshot is always alive between backups]
+     thin_delta snap-N snap-N+1                 → changed ranges
+     compose a chunk stream:
+       changed regions read from snap-N+1
+       unchanged regions read from snap-N        (= what PBS already has)
+     stream as a full image to proxmox-backup-client
+     PBS dedups the unchanged chunks; only changed chunks transfer.
+     lvremove snap-N; keep snap-N+1 as next reference.
+
+  v1.2 (QEMU bitmap): no extra storage; needs continuous QEMU.
+     lvcreate --snapshot snap-N+1                (frozen read source)
+     qmp query bitmap → changed offsets
+     compose chunk stream as above (using a small "previous content"
+       cache OR the prior backup's PBS-side image as the unchanged
+       source)
+     stream as full image; PBS dedups.
+     qmp clear bitmap; lvremove snap-N+1.
 ```
 
-The "make → read → discard" pattern is the cheap default. CBT
-keeps one snapshot alive between backups as the reference for
-"what changed since last time" — that's the price of the 20×
-local-IO reduction. Thin pool fill alarms keep that price visible.
+The right pattern depends on the VM's write profile, and **mgmt
+picks per-VM** with the adaptive logic in §6c-bis. PBS doesn't
+care — it always sees full images; the dedup engine takes care
+of the rest. Thin-pool fill alarms keep the storage cost of any
+kept reference snapshots visible.
