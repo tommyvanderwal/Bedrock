@@ -177,3 +177,12 @@ The copyright holder (Tommy van der Wal) reserves the right to relicense the ent
 By contributing code, documentation, or any other material to this repository, you explicitly agree that your contributions may be relicensed under GPLv2 in the future.
 
 You are free to use, modify, and distribute Bedrock under the current MIT terms until any such change occurs.
+
+## Contributing
+
+By submitting any contribution (code, documentation, pull requests, issues, etc.), you acknowledge and agree to the following:
+
+- Your contribution is licensed under the current MIT License.
+- The copyright holder (Tommy van der Wal) reserves the irrevocable right to relicense your contribution (and the entire project) under the **GNU General Public License version 2** (GPLv2) at any time in the future.
+
+No separate CLA document is required. Submitting a contribution constitutes your agreement to these terms.
