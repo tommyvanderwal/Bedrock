@@ -41,6 +41,7 @@ def empty_snapshot() -> dict:
         "params": {},
         "mgmt_master": None,
         "vms": {},
+        "backup_targets": {},
         "log_index": 0,
     }
 
@@ -214,6 +215,80 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
             if n is not None:
                 n["maintenance"] = bool(payload.get("on", False))
 
+        # ── backup ─────────────────────────────────────────────────
+        elif kind == le.BACKUP_TARGET_SET:
+            targets = out.setdefault("backup_targets", {})
+            tid = payload["target_id"]
+            existing = targets.get(tid, {})
+            existing.update({
+                "id":   tid,
+                "kind": payload.get("kind", "kopia-s3"),
+                "s3_endpoint":     payload.get("s3_endpoint", ""),
+                "s3_bucket":       payload.get("s3_bucket", ""),
+                "s3_region":       payload.get("s3_region", ""),
+                "s3_disable_tls":              bool(payload.get("s3_disable_tls", False)),
+                "s3_disable_tls_verification": bool(payload.get("s3_disable_tls_verification", False)),
+                "filesystem_path": payload.get("filesystem_path", ""),
+                "override_source_prefix": payload.get("override_source_prefix", ""),
+                "cache_directory": payload.get("cache_directory", ""),
+            })
+            targets[tid] = existing
+
+        elif kind == le.BACKUP_TARGET_REMOVED:
+            (out.get("backup_targets") or {}).pop(payload["target_id"], None)
+
+        elif kind == le.BACKUP_DONE:
+            vm = out["vms"].setdefault(payload["vm"], {})
+            backups = vm.setdefault("backups", [])
+            backups.append({
+                "kopia_snapshot_id": payload["kopia_snapshot_id"],
+                "target_id":   payload["target_id"],
+                "source_node": payload.get("source_node", ""),
+                "bytes_added": payload.get("bytes_added", 0),
+                "duration_s":  payload.get("duration_s", 0.0),
+                "label":       payload.get("label", ""),
+                "ts_index":    entry["index"],   # log index serves as timestamp
+            })
+            # Keep newest first; cap to a reasonable length so cluster.json
+            # doesn't bloat unboundedly. Older entries still in the log
+            # if anyone wants to replay.
+            backups.sort(key=lambda b: b["ts_index"], reverse=True)
+            del backups[200:]
+
+        elif kind == le.BACKUP_FAILED:
+            vm = out["vms"].setdefault(payload["vm"], {})
+            vm["last_backup_error"] = {
+                "ts_index": entry["index"],
+                "target_id": payload.get("target_id", ""),
+                "reason": payload.get("reason", ""),
+            }
+
+        elif kind == le.BACKUP_DELETED:
+            vm = out["vms"].get(payload["vm"])
+            if vm is not None:
+                vm["backups"] = [
+                    b for b in (vm.get("backups") or [])
+                    if b.get("kopia_snapshot_id") != payload["kopia_snapshot_id"]
+                ]
+
+        elif kind == le.RESTORE_DONE:
+            vm = out["vms"].setdefault(payload["vm"], {})
+            vm["last_restore"] = {
+                "ts_index":          entry["index"],
+                "kopia_snapshot_id": payload["kopia_snapshot_id"],
+                "target_id":         payload.get("target_id", ""),
+                "dest_node":         payload.get("dest_node", ""),
+            }
+
+        elif kind == le.RESTORE_FAILED:
+            vm = out["vms"].setdefault(payload["vm"], {})
+            vm["last_restore_error"] = {
+                "ts_index":          entry["index"],
+                "kopia_snapshot_id": payload.get("kopia_snapshot_id", ""),
+                "target_id":         payload.get("target_id", ""),
+                "reason":            payload.get("reason", ""),
+            }
+
         # Bootstrap entry, free-form payloads, and unknown kinds are
         # ignored — they just record history without affecting the
         # materialised view.
@@ -255,13 +330,15 @@ def rebuild(sock_path: str = rust_ipc.DEFAULT_SOCK,
 def _cluster_view(v: dict) -> dict:
     """The cluster.json shape — cluster-wide canonical view."""
     return {
-        "cluster_name": v["cluster_name"],
-        "cluster_uuid": v["cluster_uuid"],
-        "nodes": v["nodes"],
-        "tiers": v["tiers"],
-        "witnesses": v["witnesses"],
-        "params": v["params"],
-        "log_index": v["log_index"],
+        "cluster_name":   v["cluster_name"],
+        "cluster_uuid":   v["cluster_uuid"],
+        "nodes":          v["nodes"],
+        "tiers":          v["tiers"],
+        "witnesses":      v["witnesses"],
+        "params":         v["params"],
+        "vms":            v.get("vms", {}),
+        "backup_targets": v.get("backup_targets", {}),
+        "log_index":      v["log_index"],
     }
 
 

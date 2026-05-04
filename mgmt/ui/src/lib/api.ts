@@ -200,3 +200,105 @@ export async function uploadIso(file: File, onProgress?: (pct: number) => void) 
 		xhr.send(fd);
 	});
 }
+
+// ── Backup ────────────────────────────────────────────────────────────────
+
+export interface BackupTarget {
+	id: string;
+	kind: 'kopia-s3' | 'kopia-fs';
+	s3_endpoint?: string;
+	s3_bucket?: string;
+	s3_region?: string;
+	filesystem_path?: string;
+	override_source_prefix?: string;
+	cache_directory?: string;
+}
+
+export interface VmBackup {
+	kopia_snapshot_id: string;
+	target_id: string;
+	source_node: string;
+	bytes_added: number;
+	duration_s: number;
+	label: string;
+	ts_index: number;
+}
+
+export interface BackupTargetSetRequest {
+	target_id?: string;
+	kind: 'kopia-s3' | 'kopia-fs';
+	s3_endpoint?: string;
+	s3_bucket?: string;
+	s3_region?: string;
+	filesystem_path?: string;
+	override_source_prefix?: string;
+	cache_directory?: string;
+	reason?: string;
+	// Inline credentials — sent only when the operator types them in;
+	// server fans out via SSH to every node, then runs kopia connect.
+	s3_access_key?: string;
+	s3_secret_key?: string;
+	encryption_password?: string;
+	force_password_overwrite?: boolean;
+}
+
+export interface BackupCredsStatus {
+	nodes: Record<string, {
+		has_password: boolean;
+		creds: Record<string, boolean>;
+		error?: string;
+	}>;
+}
+
+export async function listBackupTargets(): Promise<{ targets: Record<string, BackupTarget> }> {
+	return apiGet('/api/backup/targets');
+}
+
+export async function getBackupCredsStatus(): Promise<BackupCredsStatus> {
+	return apiGet('/api/backup/credentials/status');
+}
+
+export async function setBackupTarget(req: BackupTargetSetRequest) {
+	return apiPost('/api/backup/targets', req);
+}
+
+export async function removeBackupTarget(target_id: string, reason: string = '') {
+	const q = reason ? `?reason=${encodeURIComponent(reason)}` : '';
+	const r = await fetch(`/api/backup/targets/${encodeURIComponent(target_id)}${q}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
+export async function vmBackup(name: string, target_id: string = 'main', label: string = '') {
+	return apiPost(`/api/vms/${encodeURIComponent(name)}/backup`, { target_id, label });
+}
+
+export async function vmBackupsList(name: string): Promise<{
+	vm: string;
+	backups: VmBackup[];
+	last_backup_error?: { ts_index: number; target_id: string; reason: string };
+	last_restore?: { ts_index: number; kopia_snapshot_id: string; target_id: string; dest_node: string };
+	last_restore_error?: { ts_index: number; kopia_snapshot_id: string; target_id: string; reason: string };
+}> {
+	return apiGet(`/api/vms/${encodeURIComponent(name)}/backups`);
+}
+
+export async function vmRestore(name: string, body: {
+	target_id?: string;
+	kopia_snapshot_id: string;
+	dest_node?: string;
+	target_lv_path?: string;
+}) {
+	return apiPost(`/api/vms/${encodeURIComponent(name)}/restore`, body);
+}
+
+export async function vmBackupDelete(name: string, kopia_snapshot_id: string,
+	body: { target_id?: string; reason?: string } = {}) {
+	const r = await fetch(`/api/vms/${encodeURIComponent(name)}/backups/${encodeURIComponent(kopia_snapshot_id)}`, {
+		method: 'DELETE',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}

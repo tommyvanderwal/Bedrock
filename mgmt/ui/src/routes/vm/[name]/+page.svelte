@@ -2,7 +2,9 @@
 	import { page } from '$app/stores';
 	import { vms, nodes, events } from '$lib/stores';
 	import { goto } from '$app/navigation';
-	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmDelete } from '$lib/api';
+	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmDelete,
+		vmBackup, vmBackupsList, vmBackupDelete, listBackupTargets,
+		type VmBackup } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
 
@@ -20,6 +22,13 @@
 
 	let replicaCount = $derived(vm?.defined_on?.length ?? 1);
 	let isPet = $derived(replicaCount >= 2);  // drives Migrate button enabled/disabled
+
+	// Backup state — populated on mount + after each backup completes.
+	let backups = $state<VmBackup[]>([]);
+	let lastBackupError = $state<{ts_index: number; target_id: string; reason: string} | null>(null);
+	let backupTargetId = $state('main');
+	let hasBackupTarget = $state(false);
+	let backingUp = $state(false);
 
 	// Delete confirmation — Proxmox-style modal. Click Delete → modal shows
 	// the VM name; operator types "delete" (literal word) to enable the
@@ -84,6 +93,66 @@
 		} catch (e) { /* keep whatever we have */ }
 	}
 
+	async function fetchBackups(name: string) {
+		try {
+			const r = await vmBackupsList(name);
+			backups = r.backups || [];
+			lastBackupError = r.last_backup_error || null;
+		} catch (e) { /* not ready */ }
+	}
+
+	async function fetchBackupTargets() {
+		try {
+			const r = await listBackupTargets();
+			const ids = Object.keys(r.targets || {});
+			hasBackupTarget = ids.length > 0;
+			if (ids.length > 0 && !ids.includes(backupTargetId)) {
+				backupTargetId = ids[0];
+			}
+		} catch (e) {
+			hasBackupTarget = false;
+		}
+	}
+
+	async function startBackup() {
+		if (backingUp || !hasBackupTarget) return;
+		backingUp = true;
+		actionStatus = 'Backup queued — running on home node...';
+		try {
+			await vmBackup(vmName, backupTargetId);
+			// Backup is fire-and-forget; live updates land via the WS task
+			// channel. We just refresh the history shortly to catch the
+			// fast cases (small VM / warm cache).
+			setTimeout(() => fetchBackups(vmName), 5000);
+			actionStatus = 'Backup started — see Tasks tab for progress';
+			setTimeout(() => actionStatus = '', 6000);
+		} catch (e: any) {
+			actionStatus = `Backup failed to start: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+		} finally {
+			backingUp = false;
+		}
+	}
+
+	async function deleteBackup(snapshotId: string) {
+		if (!confirm(`Delete kopia snapshot ${snapshotId}? This cannot be undone.`)) return;
+		try {
+			await vmBackupDelete(vmName, snapshotId, { target_id: backupTargetId });
+			await fetchBackups(vmName);
+		} catch (e: any) {
+			actionStatus = `Delete backup failed: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+		}
+	}
+
+	function fmtBytes(n: number): string {
+		if (!n) return '-';
+		if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+		if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
+		if (n >= 1024) return `${(n / 1024).toFixed(0)} KiB`;
+		return `${n} B`;
+	}
+
 	// Rebinds on route param change — previous setInterval + store subscription
 	// are cleaned up so a navigation /vm/A → /vm/B doesn't leave stale filters.
 	$effect(() => {
@@ -91,13 +160,20 @@
 		metrics = {};
 		seededLogs = [];
 		liveLogs = [];
+		backups = [];
+		lastBackupError = null;
 		fetchMetrics(name);
 		fetchSeededLogs(name);
+		fetchBackups(name);
+		fetchBackupTargets();
 		const iv = setInterval(() => fetchMetrics(name), 15000);
+		// Cheap poll for backup history — covers task-completion races
+		// without subscribing to the task WS channel here.
+		const ivb = setInterval(() => fetchBackups(name), 20000);
 		const unsub = events.subscribe(all => {
 			liveLogs = all.filter((e: any) => (e._msg || '').includes(name));
 		});
-		return () => { clearInterval(iv); unsub(); };
+		return () => { clearInterval(iv); clearInterval(ivb); unsub(); };
 	});
 </script>
 
@@ -187,12 +263,71 @@
 			{#if vm.state === 'running' && vm.vnc_ws_url}
 				<a href="/console/{vmName}" class="btn console">Open Console</a>
 			{/if}
+			<button class="btn backup" disabled={backingUp || !hasBackupTarget}
+				title={hasBackupTarget
+					? 'Take an LV snapshot and push it to the kopia repository'
+					: 'No backup target configured — set one with `bedrock backup target set`'}
+				onclick={startBackup}>{backingUp ? 'Backup...' : 'Backup'}</button>
 			<a href="/vm/{vmName}/settings" class="btn settings">Settings</a>
 			<button class="btn delete" disabled={converting}
 				title="Stop, tear down DRBD, remove LVs, drop from inventory"
 				onclick={openDeleteModal}>Delete VM</button>
 		</div>
 	</div>
+</div>
+
+<h2>Backups</h2>
+<div class="info-card backups-card">
+	{#if !hasBackupTarget}
+		<p class="muted">
+			No backup target configured. On the mgmt master, drop
+			<code>/etc/bedrock/backup.key</code> (32+ random bytes, mode 0600)
+			and <code>/etc/bedrock/backup-credentials/&lt;target&gt;.env</code>,
+			then call <code>POST /api/backup/targets</code>.
+		</p>
+	{:else}
+		<div class="backups-head">
+			<span class="muted">Target:</span> <code>{backupTargetId}</code>
+			<span class="muted" style="margin-left: 16px;">{backups.length} snapshot{backups.length === 1 ? '' : 's'}</span>
+		</div>
+		{#if lastBackupError}
+			<div class="backup-error">
+				Last backup error: <code>{lastBackupError.target_id}</code> — {lastBackupError.reason}
+			</div>
+		{/if}
+		{#if backups.length > 0}
+			<table class="disks-table">
+				<thead>
+					<tr>
+						<th>Snapshot</th>
+						<th>Target</th>
+						<th>Size added</th>
+						<th>Duration</th>
+						<th>Source node</th>
+						<th>Label</th>
+						<th></th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each backups as b}
+						<tr>
+							<td><code title={b.kopia_snapshot_id}>{b.kopia_snapshot_id.slice(0, 12)}…</code></td>
+							<td>{b.target_id}</td>
+							<td>{fmtBytes(b.bytes_added)}</td>
+							<td>{b.duration_s ? `${b.duration_s.toFixed(1)}s` : '-'}</td>
+							<td>{b.source_node || '-'}</td>
+							<td>{#if b.label}{b.label}{:else}<span class="muted">—</span>{/if}</td>
+							<td>
+								<button class="btn-small" onclick={() => deleteBackup(b.kopia_snapshot_id)}>Delete</button>
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		{:else}
+			<p class="muted">No backups yet. Click <strong>Backup</strong> above to take one.</p>
+		{/if}
+	{/if}
 </div>
 
 {#if Object.values(metrics.cpu || {}).length > 0}
@@ -271,6 +406,20 @@
 	.btn.settings:hover { background: #30363d; text-decoration: none; }
 	.btn.delete { border-color: #f85149; color: #f85149; }
 	.btn.delete:hover:not(:disabled) { background: #f8514922; }
+	.btn.backup { border-color: #d29922; color: #f0c674; }
+	.btn.backup:hover:not(:disabled) { background: #d2992222; }
+
+	.backups-card { padding: 12px 16px; }
+	.backups-head { font-size: 12px; margin-bottom: 8px; }
+	.backup-error {
+		font-size: 12px; color: #f85149; background: #f8514911;
+		border-left: 3px solid #f85149; padding: 6px 10px; margin: 6px 0 10px;
+	}
+	.btn-small {
+		padding: 2px 8px; border: 1px solid #30363d; border-radius: 4px;
+		background: #21262d; color: #8b949e; font-size: 11px; cursor: pointer;
+	}
+	.btn-small:hover { background: #30363d; color: #f85149; border-color: #f85149; }
 
 	.ha-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; cursor: pointer; }
 	.ha-check.nested { margin-left: 20px; }

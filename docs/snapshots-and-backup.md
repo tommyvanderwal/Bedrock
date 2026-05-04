@@ -1354,6 +1354,94 @@ right tool — no need to spin up a whole VM. mgmt exposes a
 
 ---
 
+## 9c-bis. v1 architecture — locked in
+
+After working through the trade-offs above, the v1 backup architecture
+is:
+
+- **Backend tool: Kopia** (single binary on every node, no daemon, no
+  long-running VM, ~50 MB binary + ~5 GB tunable cache). Reasons:
+  light footprint, native S3 + Object Lock, store-driven recovery,
+  Velero's enterprise validation. Restic and PBS stay possible as
+  alternative target types in v1.x; not in v1.0 to keep scope small.
+- **One Kopia repository per cluster.** Operator picks the location:
+  S3 / S3-compatible (Wasabi, B2, R2, MinIO, QNAP-S3, ...) or NFS /
+  filesystem path. Every Bedrock node connects to the same repo as
+  a different client.
+- **Each node has its own local cache** at `/root/.cache/kopia/`.
+  Caches don't share state and don't need to. Chunks are content-
+  addressed and immutable so cached data never goes stale; a
+  per-invocation index refresh from the repo handles the only
+  "what's in the repo right now?" need.
+- **Stable VM identity via `--override-source`.** Snapshots for VM
+  X always land under `<cluster-uuid>:vms:<vm-name>` regardless of
+  which Bedrock node ran the backup. Live migration doesn't fork
+  the snapshot history.
+- **Maintenance owner = mgmt master.** mgmt schedules
+  `kopia maintenance run` weekly only on the master. If the master
+  changes, the new master claims ownership via
+  `kopia maintenance set --owner=...`.
+- **Local fast cache for fast restore is per-node.** Each node
+  warms its cache as it does work. No shared cache needed.
+- **Encryption key is the one out-of-band secret** the operator
+  carries across clusters. Lives at `/etc/bedrock/backup.key`,
+  mode 0600, never in the cluster log.
+- **Content-hash floor: ≥256 bits, no exceptions.** Kopia's dedup is
+  content-addressed — a chunk is identified by its hash and a
+  collision means a wrong-blob restore. Bedrock creates new repos
+  with `--block-hash=BLAKE2B-256` and refuses (at connect time) any
+  repo whose block hash isn't in the ≥256-bit allow-list
+  `{HMAC-SHA256, HMAC-SHA3-256, BLAKE2B-256, BLAKE2S-256, BLAKE3-256}`.
+  Truncated 128-bit variants (`HMAC-SHA256-128`, `BLAKE3-256-128`,
+  `BLAKE2S-128`, ...) save microseconds per chunk and we don't take
+  that trade. If kopia adds a new ≥256-bit hash, extend the allow-list
+  in `mgmt/backup.py:ALLOWED_BLOCK_HASHES`. There is no override;
+  fail-loud is the right default for content addressing.
+
+### Live-migration cold-cache: what actually happens
+
+The user's concern: a VM migrates from node A to node B. B has no
+cache for that VM's chunks. Does the next backup re-upload everything?
+
+**No.** Kopia's dedup is repo-level, not cache-level. The cache is
+only an optimization to avoid asking the repo "do you already have
+this chunk?". With a cold cache, that question gets asked over the
+network instead of from local disk. Each chunk costs one HEAD/GET
+request to S3.
+
+Concretely, for a 100 GB VM at 4 MB chunk size:
+- ~25,000 chunk-existence checks against S3
+- Each ~10 ms latency = ~4 minutes of metadata wall-clock
+- Trivial monetary cost (Wasabi: free; AWS: ~$0.01)
+- Only the truly-new chunks transfer; identical content doesn't
+  re-upload
+
+**This is not the maintenance job's responsibility.** Maintenance
+does GC + index compaction on its own schedule. The "warm-up"
+cost of a cold cache after migration is paid by the first backup
+on the new home node. After that, the cache knows; subsequent
+backups are fast.
+
+If we ever want to make this faster, mgmt can run a one-shot
+"warm cache" step on the new home node after migration:
+`kopia content list` (or similar) pre-fetches the index. Optional
+v1.x optimization; not load-bearing.
+
+### Two-repo / hot-and-cold tier — explicitly v1.x, not v1.0
+
+The "local NAS + remote S3" pattern uses Kopia's
+`kopia repository sync-to`. Two repos, same encryption key, second
+repo gets the new blobs from the first periodically. Identical
+chunks dedup naturally because both repos are content-addressed
+on the same hashes.
+
+For v1.0 we ship single-repo. The operator can pick a single
+target (S3 directly, or local NAS-backed S3, or NFS path); the
+sync-to topology is a v1.x extension that doesn't change Bedrock's
+internal API.
+
+---
+
 ## 10. The honest summary
 
 LVM thin under both cattle and pet is the lucky accident that makes

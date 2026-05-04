@@ -62,6 +62,19 @@ VM_DESTROYED          = "vm_destroyed"
 VM_MIGRATED           = "vm_migrated"
 VM_STATE_CHANGE       = "vm_state_change"
 
+# Backup target + per-VM backup history. Backup data lives in the
+# Kopia repository (S3 / FS / etc.); the log records intent + outcome
+# + which kopia snapshot id corresponds to which Bedrock backup, so
+# the dashboard can show backup history per VM and the operator can
+# initiate restores.
+BACKUP_TARGET_SET     = "backup_target_set"      # idempotent: latest wins
+BACKUP_TARGET_REMOVED = "backup_target_removed"
+BACKUP_DONE           = "backup_done"
+BACKUP_FAILED         = "backup_failed"
+BACKUP_DELETED        = "backup_deleted"
+RESTORE_DONE          = "restore_done"
+RESTORE_FAILED        = "restore_failed"
+
 
 def encode(t: str, **fields) -> bytes:
     """Encode a typed entry payload."""
@@ -189,3 +202,97 @@ def vm_state_change(name: str, host: str, state: str) -> bytes:
 
 def node_maintenance(node_name: str, on: bool) -> bytes:
     return encode(NODE_MAINTENANCE, node_name=node_name, on=bool(on))
+
+
+# ── backup ─────────────────────────────────────────────────────────────
+
+def backup_target_set(target_id: str, kind: str, *,
+                      s3_endpoint: str = "",
+                      s3_bucket: str = "",
+                      s3_region: str = "",
+                      s3_disable_tls: bool = False,
+                      s3_disable_tls_verification: bool = False,
+                      filesystem_path: str = "",
+                      override_source_prefix: str = "",
+                      cache_directory: str = "",
+                      reason: str = "") -> bytes:
+    """Operator-set backup target. `target_id` is operator-chosen
+    (e.g. "main"). `kind` is "kopia-s3" or "kopia-fs" for v1.
+
+    Credentials (S3 access/secret keys, encryption password) live in
+    /etc/bedrock/backup-credentials/<target_id>.env on each node, NOT
+    in the log. The log records connection metadata only — endpoint,
+    bucket, region, paths, prefix — enough for the dashboard to
+    show the target and for any node to know where to point kopia
+    after the credentials file is in place.
+
+    `s3_disable_tls` swaps to plain HTTP (insecure). `s3_disable_tls_
+    verification` keeps HTTPS but skips cert validation — typically
+    needed for self-hosted S3 (QNAP, MinIO with self-signed certs)
+    on a private LAN. Both default to False; turning them on is an
+    explicit choice the operator makes per target."""
+    return encode(
+        BACKUP_TARGET_SET,
+        target_id=target_id, kind=kind,
+        s3_endpoint=s3_endpoint, s3_bucket=s3_bucket, s3_region=s3_region,
+        s3_disable_tls=bool(s3_disable_tls),
+        s3_disable_tls_verification=bool(s3_disable_tls_verification),
+        filesystem_path=filesystem_path,
+        override_source_prefix=override_source_prefix,
+        cache_directory=cache_directory,
+        reason=reason,
+    )
+
+
+def backup_target_removed(target_id: str, reason: str = "") -> bytes:
+    return encode(BACKUP_TARGET_REMOVED, target_id=target_id, reason=reason)
+
+
+def backup_done(vm: str, target_id: str, kopia_snapshot_id: str, *,
+                source_node: str = "", bytes_added: int = 0,
+                duration_s: float = 0.0, label: str = "") -> bytes:
+    """A backup completed successfully. `kopia_snapshot_id` is what
+    kopia returned (e.g. "k1234abcd"); the operator uses this to
+    invoke a restore."""
+    return encode(
+        BACKUP_DONE, vm=vm, target_id=target_id,
+        kopia_snapshot_id=kopia_snapshot_id,
+        source_node=source_node,
+        bytes_added=int(bytes_added),
+        duration_s=float(duration_s),
+        label=label,
+    )
+
+
+def backup_failed(vm: str, target_id: str, reason: str, *,
+                  source_node: str = "", label: str = "") -> bytes:
+    return encode(
+        BACKUP_FAILED, vm=vm, target_id=target_id, reason=reason,
+        source_node=source_node, label=label,
+    )
+
+
+def backup_deleted(vm: str, target_id: str, kopia_snapshot_id: str,
+                   reason: str = "") -> bytes:
+    return encode(
+        BACKUP_DELETED, vm=vm, target_id=target_id,
+        kopia_snapshot_id=kopia_snapshot_id, reason=reason,
+    )
+
+
+def restore_done(vm: str, target_id: str, kopia_snapshot_id: str, *,
+                 dest_node: str = "", duration_s: float = 0.0) -> bytes:
+    return encode(
+        RESTORE_DONE, vm=vm, target_id=target_id,
+        kopia_snapshot_id=kopia_snapshot_id,
+        dest_node=dest_node, duration_s=float(duration_s),
+    )
+
+
+def restore_failed(vm: str, target_id: str, kopia_snapshot_id: str,
+                   reason: str, *, dest_node: str = "") -> bytes:
+    return encode(
+        RESTORE_FAILED, vm=vm, target_id=target_id,
+        kopia_snapshot_id=kopia_snapshot_id,
+        reason=reason, dest_node=dest_node,
+    )

@@ -1814,6 +1814,458 @@ def api_vm_attach_disk(vm_name: str, req: AttachDiskRequest):
 def api_vm_migrate(vm_name: str, req: MigrateRequest = MigrateRequest()):
     return _vm_migrate(vm_name, req.target_node)
 
+
+# ── Backup endpoints ────────────────────────────────────────────────────────
+# Kopia orchestration. The mgmt master appends BACKUP_TARGET_SET to the
+# replicated log; every node's reactor reacts by running
+# `kopia repository connect` locally so any node can do backups/restores
+# of its locally-resident VMs. See snapshots-and-backup.md §9c-bis.
+
+class BackupTargetSetRequest(BaseModel):
+    target_id: str = "main"
+    kind: str = "kopia-s3"           # "kopia-s3" | "kopia-fs"
+    s3_endpoint: str = ""
+    s3_bucket: str = ""
+    s3_region: str = ""
+    # Self-hosted S3 (QNAP, MinIO with self-signed certs) often needs
+    # one of these. Default off — operator opts in per target.
+    s3_disable_tls: bool = False              # plain HTTP
+    s3_disable_tls_verification: bool = False  # HTTPS, skip cert check
+    filesystem_path: str = ""
+    override_source_prefix: str = ""  # default: "<cluster_uuid>:vms"
+    cache_directory: str = ""         # default: /var/cache/bedrock-kopia
+    reason: str = ""
+    # ── Credentials (NEVER logged) ─────────────────────────────────
+    # Optional inline secrets. When present, mgmt writes the
+    # corresponding files on every cluster node before appending
+    # BACKUP_TARGET_SET to the log. When absent, the operator is
+    # expected to have dropped the files manually.
+    s3_access_key: Optional[str] = None    # → KOPIA_S3_ACCESS_KEY in env file
+    s3_secret_key: Optional[str] = None    # → KOPIA_S3_SECRET_KEY in env file
+    encryption_password: Optional[str] = None  # → /etc/bedrock/backup.key
+    # If True, overwrite /etc/bedrock/backup.key even if it already
+    # exists. Defaults to False — changing the password makes existing
+    # backups unreadable, so this is a deliberate destructive action.
+    force_password_overwrite: bool = False
+
+
+class BackupRunRequest(BaseModel):
+    target_id: str = "main"
+    label: str = ""                   # operator-visible tag
+
+
+class RestoreRequest(BaseModel):
+    target_id: str = "main"
+    kopia_snapshot_id: str
+    dest_node: Optional[str] = None
+    target_lv_path: Optional[str] = None
+
+
+class BackupDeleteRequest(BaseModel):
+    target_id: str = "main"
+    reason: str = ""
+
+
+def _import_backup_module():
+    """Lazy-import mgmt/backup.py — keeps app.py importable when the
+    module is missing (e.g. during partial install) and matches the
+    lazy-import pattern used elsewhere for lib modules."""
+    import backup as _b
+    return _b
+
+
+# ── Backup secret propagation ──────────────────────────────────────────────
+#
+# Two secrets need to live on every node, mode 0600, never in the log:
+#   - /etc/bedrock/backup.key                    (kopia repo password)
+#   - /etc/bedrock/backup-credentials/<id>.env   (S3 access/secret keys)
+#
+# The dashboard collects them once on the master, then mgmt fans them
+# out via the existing root@host SSH mesh that agent_install set up.
+# Failure to propagate to one node is logged (push_log) but doesn't
+# abort the target-set; the affected node will fail loudly the first
+# time its reactor tries to `kopia repository connect`. The operator
+# can re-trigger propagation by submitting the same form again.
+
+BACKUP_KEY_FILE = "/etc/bedrock/backup.key"
+BACKUP_CRED_DIR = "/etc/bedrock/backup-credentials"
+
+
+def _write_local_secret(path: str, content: str, mode: int = 0o600):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.parent.chmod(0o700)
+    p.write_text(content)
+    p.chmod(mode)
+
+
+def _write_remote_secret(host: str, path: str, content: str,
+                         mode: int = 0o600, timeout: int = 15):
+    """Push a secret file via paramiko SFTP. Atomic-replace via tmp +
+    POSIX rename. Caller passes already-rendered content (env file or
+    raw key).
+
+    Why posix_rename: plain `sftp.rename()` maps to SSH_FXP_RENAME
+    which (per the SFTP spec) refuses to overwrite an existing target.
+    `posix_rename` maps to OpenSSH's `posix-rename@openssh.com`
+    extension and behaves like POSIX `rename(2)` — atomic replace.
+    Without this, every secret update past the first one fails with a
+    nondescript "Failure" from the server."""
+    c = _ssh_connect(host)
+    try:
+        parent = str(Path(path).parent)
+        # exec_command is async-fire-and-forget; wait for the channel
+        # to close so the directory definitely exists before SFTP open.
+        _, so, _ = c.exec_command(f"mkdir -p -m 700 {parent}", timeout=timeout)
+        so.channel.recv_exit_status()
+
+        sftp = c.open_sftp()
+        tmp = f"{path}.tmp.bedrock"
+        with sftp.open(tmp, "wb") as f:
+            f.write(content.encode())
+        sftp.chmod(tmp, mode)
+        sftp.posix_rename(tmp, path)
+        sftp.close()
+    finally:
+        c.close()
+
+
+def _propagate_secret(rel_path: str, content: str, mode: int = 0o600):
+    """Write a secret to `rel_path` on every node (including this one).
+    Returns (ok_nodes, failed_nodes) so the caller can surface partial
+    failure to the UI."""
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []  # (node_name, reason)
+    self_host = _self_host()
+    for name, node in get_nodes().items():
+        host = node.get("host")
+        if not host:
+            continue
+        try:
+            if host == self_host:
+                _write_local_secret(rel_path, content, mode)
+            else:
+                _write_remote_secret(host, rel_path, content, mode)
+            ok.append(name)
+        except Exception as e:
+            failed.append((name, str(e)))
+            push_log(f"backup: propagate {rel_path} → {name} ({host}) "
+                     f"failed: {e}",
+                     node="mgmt", app="bedrock-mgmt", level="warn")
+    return ok, failed
+
+
+def _self_host() -> str:
+    """Best-effort detection of this node's IP/hostname so we don't
+    SSH-loop to ourselves (some sshd configs reject that)."""
+    try:
+        from lib import state as _state
+        s = _state.load() if hasattr(_state, "load") else {}
+        nodes = get_nodes()
+        n = nodes.get(s.get("node_name", ""))
+        if n and n.get("host"):
+            return n["host"]
+    except Exception:
+        pass
+    return ""
+
+
+def _render_s3_creds_env(access_key: str, secret_key: str) -> str:
+    """Bash-sourceable env file. Variable names match what kopia's S3
+    backend reads from the environment (KOPIA_S3_ACCESS_KEY, etc.)."""
+    import shlex as _sh
+    return (
+        "# bedrock-managed; do not edit by hand. mode 0600.\n"
+        f"export KOPIA_S3_ACCESS_KEY={_sh.quote(access_key)}\n"
+        f"export KOPIA_S3_SECRET_KEY={_sh.quote(secret_key)}\n"
+        # AWS_* mirrors so other tools that read the file work too
+        f"export AWS_ACCESS_KEY_ID={_sh.quote(access_key)}\n"
+        f"export AWS_SECRET_ACCESS_KEY={_sh.quote(secret_key)}\n"
+    )
+
+
+@app.get("/api/backup/credentials/status")
+def api_backup_credentials_status():
+    """What secrets exist on each node? UI uses this to decide whether
+    to show empty fields (operator must enter creds) vs. "already
+    configured" placeholders.
+
+    Returns per-node booleans:
+      - has_password: /etc/bedrock/backup.key exists, mode 0600
+      - has_creds.<target_id>: corresponding env file exists
+    """
+    out: dict = {"nodes": {}}
+    for name, node in get_nodes().items():
+        host = node.get("host", "")
+        if not host:
+            continue
+        info: dict = {"has_password": False, "creds": {}}
+        try:
+            r = ssh_cmd(host, f"[ -f {BACKUP_KEY_FILE} ] && echo yes || echo no")
+            info["has_password"] = (r.strip() == "yes")
+            r2 = ssh_cmd(host, f"ls {BACKUP_CRED_DIR}/*.env 2>/dev/null | xargs -n1 basename 2>/dev/null")
+            for ln in (r2 or "").splitlines():
+                ln = ln.strip()
+                if ln.endswith(".env"):
+                    info["creds"][ln[:-4]] = True
+        except Exception as e:
+            info["error"] = str(e)
+        out["nodes"][name] = info
+    return out
+
+
+@app.post("/api/backup/targets")
+def api_backup_target_set(req: BackupTargetSetRequest):
+    """Configure (or update) the cluster's backup target. Idempotent —
+    emitting the same target twice produces a single fold result.
+
+    Action sequence:
+      1. (Optional) Propagate inline credentials to every node:
+           - encryption_password → /etc/bedrock/backup.key
+           - s3_access_key/secret → /etc/bedrock/backup-credentials/<id>.env
+         Files are written mode 0600. Failure on individual nodes is
+         logged but doesn't abort — the affected node will fail loudly
+         on its reactor's `kopia repository connect`.
+      2. Run `kopia repository connect` (or create) locally on master.
+         Verifies the repo's block hash is ≥256 bits.
+      3. Append BACKUP_TARGET_SET to the cluster log. Every node's
+         reactor reacts by running `kopia repository connect` against
+         the new target.
+      4. Return the log index so callers know the change is committed.
+
+    Credentials are NEVER in the log — only file paths and metadata
+    (endpoint, bucket, region) make it into BACKUP_TARGET_SET."""
+    import sys as _sys
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import rust_ipc as _ipc, log_entries as _le
+
+    backup = _import_backup_module()
+
+    propagation_warnings: list[str] = []
+
+    # ── (1a) Encryption password ──────────────────────────────────
+    if req.encryption_password is not None:
+        already_have_local_key = Path(BACKUP_KEY_FILE).exists()
+        if already_have_local_key and not req.force_password_overwrite:
+            raise HTTPException(
+                400,
+                "encryption_password supplied but /etc/bedrock/backup.key "
+                "already exists. Changing the password makes existing "
+                "backups unreadable. Pass force_password_overwrite=true "
+                "to confirm — or omit encryption_password to keep the "
+                "current key."
+            )
+        ok, failed = _propagate_secret(
+            BACKUP_KEY_FILE, req.encryption_password, mode=0o600
+        )
+        if failed:
+            propagation_warnings.append(
+                f"backup.key not deployed to: "
+                + ", ".join(f"{n}({e})" for n, e in failed)
+            )
+
+    # ── (1b) S3 credentials ────────────────────────────────────────
+    if req.kind == "kopia-s3" and (req.s3_access_key or req.s3_secret_key):
+        if not (req.s3_access_key and req.s3_secret_key):
+            raise HTTPException(
+                400, "s3_access_key and s3_secret_key must be supplied together"
+            )
+        env_path = f"{BACKUP_CRED_DIR}/{req.target_id}.env"
+        ok, failed = _propagate_secret(
+            env_path,
+            _render_s3_creds_env(req.s3_access_key, req.s3_secret_key),
+            mode=0o600,
+        )
+        if failed:
+            propagation_warnings.append(
+                f"S3 credentials not deployed to: "
+                + ", ".join(f"{n}({e})" for n, e in failed)
+            )
+
+    # ── (2) Connect this node + verify hash floor ──────────────────
+    try:
+        backup.configure_target_locally(
+            target_id=req.target_id, kind=req.kind,
+            s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
+            s3_region=req.s3_region,
+            s3_disable_tls=req.s3_disable_tls,
+            s3_disable_tls_verification=req.s3_disable_tls_verification,
+            filesystem_path=req.filesystem_path,
+            override_source_prefix=req.override_source_prefix,
+            cache_directory=req.cache_directory,
+        )
+    except Exception as e:
+        raise HTTPException(400, f"backup target setup failed locally: {e}")
+
+    # ── (3) Append to log so peers get it via their reactors ──────
+    try:
+        with _ipc.Daemon() as d:
+            idx, _ = d.append(_le.backup_target_set(
+                target_id=req.target_id, kind=req.kind,
+                s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
+                s3_region=req.s3_region,
+                s3_disable_tls=req.s3_disable_tls,
+                s3_disable_tls_verification=req.s3_disable_tls_verification,
+                filesystem_path=req.filesystem_path,
+                override_source_prefix=req.override_source_prefix,
+                cache_directory=req.cache_directory,
+                reason=req.reason,
+            ))
+    except Exception as e:
+        raise HTTPException(500, f"log append failed: {e}")
+
+    push_log(f"backup target {req.target_id!r} set ({req.kind})",
+             app="bedrock-mgmt", level="info")
+    return {
+        "status": "ok",
+        "log_index": idx,
+        "target_id": req.target_id,
+        "warnings": propagation_warnings,
+    }
+
+
+@app.get("/api/backup/targets")
+def api_backup_targets_list():
+    """List configured backup targets, drawn from cluster.json (i.e. the
+    folded log). Always returns immediately — no kopia roundtrip."""
+    cluster = load_cluster()
+    return {"targets": cluster.get("backup_targets", {})}
+
+
+@app.delete("/api/backup/targets/{target_id}")
+def api_backup_target_remove(target_id: str, reason: str = ""):
+    import sys as _sys
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import rust_ipc as _ipc, log_entries as _le
+    try:
+        with _ipc.Daemon() as d:
+            idx, _ = d.append(_le.backup_target_removed(
+                target_id=target_id, reason=reason or "operator-remove",
+            ))
+    except Exception as e:
+        raise HTTPException(500, f"log append failed: {e}")
+    return {"status": "ok", "log_index": idx, "target_id": target_id}
+
+
+@app.post("/api/vms/{vm_name}/backup")
+async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()):
+    """Take a backup of `vm_name` to `target_id`. Returns 202 + task_id;
+    the UI watches /api/tasks (or the WS task channel) for completion.
+
+    The backup runs on the VM's home node: take an LV snapshot, kopia
+    snapshot create, drop the LV snapshot. Idempotent only at the
+    log-entry level; multiple in-flight backups of the same VM are not
+    serialised here — the operator is expected not to double-click."""
+    cluster = load_cluster()
+    vm = (cluster.get("vms") or {}).get(vm_name)
+    if vm is None:
+        raise HTTPException(404, f"VM {vm_name!r} not found")
+    target = (cluster.get("backup_targets") or {}).get(req.target_id)
+    if target is None:
+        raise HTTPException(400, f"backup target {req.target_id!r} not configured")
+
+    backup = _import_backup_module()
+    task = task_registry().create(
+        "vm.backup",
+        f"Backup VM {vm_name} → {req.target_id}",
+        vm_name=vm_name,
+    )
+
+    async def _run():
+        try:
+            task.step_start("snapshot+kopia")
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: backup.run_backup(req.target_id, vm_name, label=req.label),
+            )
+            task.step_done("snapshot+kopia")
+            task.log(f"kopia snapshot id: {result['kopia_snapshot_id']}")
+            task.log(f"bytes added: {result['bytes_added']}")
+            task.log(f"duration: {result['duration_s']:.1f}s")
+            task.succeed()
+        except Exception as e:
+            task.step_fail("snapshot+kopia", str(e))
+            task.fail(str(e))
+
+    asyncio.create_task(_run())
+    return {"status": "accepted", "task_id": task.id}
+
+
+@app.get("/api/vms/{vm_name}/backups")
+def api_vm_backups_list(vm_name: str):
+    """Backup history for a VM, drawn from cluster.json. Newest first."""
+    cluster = load_cluster()
+    vm = (cluster.get("vms") or {}).get(vm_name)
+    if vm is None:
+        raise HTTPException(404, f"VM {vm_name!r} not found")
+    return {
+        "vm": vm_name,
+        "backups": vm.get("backups") or [],
+        "last_backup_error": vm.get("last_backup_error"),
+        "last_restore": vm.get("last_restore"),
+        "last_restore_error": vm.get("last_restore_error"),
+    }
+
+
+@app.post("/api/vms/{vm_name}/restore")
+async def api_vm_restore(vm_name: str, req: RestoreRequest):
+    """Restore a backup into a fresh LV. Mints a task; result lands in
+    the log via RESTORE_DONE / RESTORE_FAILED."""
+    cluster = load_cluster()
+    if (cluster.get("backup_targets") or {}).get(req.target_id) is None:
+        raise HTTPException(400, f"backup target {req.target_id!r} not configured")
+
+    backup = _import_backup_module()
+    task = task_registry().create(
+        "vm.restore",
+        f"Restore VM {vm_name} from {req.kopia_snapshot_id}",
+        vm_name=vm_name,
+    )
+
+    async def _run():
+        try:
+            task.step_start("kopia snapshot restore")
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: backup.run_restore(
+                    req.target_id, req.kopia_snapshot_id, vm_name,
+                    target_lv_path=req.target_lv_path,
+                    dest_node_name=req.dest_node,
+                ),
+            )
+            task.step_done("kopia snapshot restore")
+            task.log(f"restored to: {result['target_lv_path']}")
+            task.log(f"on node: {result['dest_node']}")
+            task.log(f"duration: {result['duration_s']:.1f}s")
+            task.succeed()
+        except Exception as e:
+            task.step_fail("kopia snapshot restore", str(e))
+            task.fail(str(e))
+
+    asyncio.create_task(_run())
+    return {"status": "accepted", "task_id": task.id}
+
+
+@app.delete("/api/vms/{vm_name}/backups/{kopia_snapshot_id}")
+def api_vm_backup_delete(vm_name: str, kopia_snapshot_id: str,
+                         req: BackupDeleteRequest = BackupDeleteRequest()):
+    """Delete one snapshot from the kopia repo. Returns synchronously —
+    delete is fast (just drops a manifest). GC of the underlying chunks
+    happens during the next `kopia maintenance run` on the master."""
+    cluster = load_cluster()
+    if (cluster.get("backup_targets") or {}).get(req.target_id) is None:
+        raise HTTPException(400, f"backup target {req.target_id!r} not configured")
+    backup = _import_backup_module()
+    try:
+        backup.delete_backup(req.target_id, kopia_snapshot_id, vm_name,
+                             reason=req.reason or "operator-delete")
+    except Exception as e:
+        raise HTTPException(500, f"delete failed: {e}")
+    return {"status": "ok", "kopia_snapshot_id": kopia_snapshot_id}
+
+
 # ── VM action implementations ──────────────────────────────────────────────
 
 def _vm_start(vm_name: str) -> dict:

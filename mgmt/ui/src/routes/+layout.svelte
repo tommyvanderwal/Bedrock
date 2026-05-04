@@ -104,6 +104,9 @@
 			<a class="tree-top" class:active={isActive('/imports')} href="/imports">
 				<span class="tree-icon">↥</span> Imports
 			</a>
+			<a class="tree-top" class:active={isActive('/backups')} href="/backups">
+				<span class="tree-icon">⎘</span> Backups
+			</a>
 
 			<div class="tree-group">
 				<div class="tree-header" class:active={isActive('/hosts')}>

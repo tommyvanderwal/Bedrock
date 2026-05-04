@@ -375,6 +375,35 @@ async def _start_local_services():
             log.info("services: virsh start %s", vm_name)
             subprocess.run(["virsh", "start", vm_name], check=False)
 
+    # Reconcile backup targets. Reactor only runs on NEW log entries
+    # while the node is up; entries seen during catch-up don't trigger
+    # `_react_backup_target_set` because _SERVICES_STARTED is still
+    # False then. So at boot we walk the materialised view and connect
+    # each target idempotently. `kopia repository connect` is a no-op
+    # if we're already connected.
+    for target_id, t in (cluster.get("backup_targets") or {}).items():
+        log.info("services: reconciling backup target %s", target_id)
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            import backup as bedrock_backup  # type: ignore
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda tid=target_id, t=t: bedrock_backup.configure_target_locally(
+                    target_id=tid, kind=t.get("kind", "kopia-s3"),
+                    s3_endpoint=t.get("s3_endpoint", ""),
+                    s3_bucket=t.get("s3_bucket", ""),
+                    s3_region=t.get("s3_region", ""),
+                    s3_disable_tls=bool(t.get("s3_disable_tls", False)),
+                    s3_disable_tls_verification=bool(t.get("s3_disable_tls_verification", False)),
+                    filesystem_path=t.get("filesystem_path", ""),
+                    override_source_prefix=t.get("override_source_prefix", ""),
+                    cache_directory=t.get("cache_directory", ""),
+                ),
+            )
+        except Exception as e:
+            log.warning("services: backup target %s reconcile failed: %s",
+                        target_id, e)
+
 
 # ── ③ fence_responder ────────────────────────────────────────────────────
 
@@ -537,6 +566,8 @@ async def _reactor(entry: dict, self_name: str):
             subprocess.run(["virsh", "destroy", name], check=False)
     elif t == log_entries.TIER_STATE:
         await _react_tier_state(payload, self_name)
+    elif t == log_entries.BACKUP_TARGET_SET:
+        await _react_backup_target_set(payload)
 
 
 async def _react_tier_state(payload: dict, self_name: str):
@@ -582,6 +613,51 @@ async def _react_tier_state(payload: dict, self_name: str):
             tier_storage.nfs_mount_drbd_tiers(master_drbd_ip)
         except Exception as e:
             log.warning("reactor: NFS remount failed: %s", e)
+
+
+async def _react_backup_target_set(payload: dict):
+    """A backup target was configured cluster-wide. Run `kopia repository
+    connect` on this node so subsequent backup/restore invocations work.
+
+    No-op on credentials/key file missing — the operator is expected to
+    drop /etc/bedrock/backup.key and
+    /etc/bedrock/backup-credentials/<target_id>.env onto every node
+    before issuing the target-set. If they're missing, this connect
+    fails and we log a warning; nothing else breaks. Re-running the
+    target-set after the files arrive will retry."""
+    target_id = payload.get("target_id")
+    kind = payload.get("kind", "kopia-s3")
+    if not target_id:
+        return
+    try:
+        sys.path.insert(0, "/usr/local/lib/bedrock")
+        # mgmt/backup.py is alongside us under mgmt/.
+        sys.path.insert(0, str(Path(__file__).parent))
+        import backup as bedrock_backup  # type: ignore
+    except Exception as e:
+        log.warning("reactor: cannot import mgmt/backup.py: %s", e)
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: bedrock_backup.configure_target_locally(
+                target_id=target_id, kind=kind,
+                s3_endpoint=payload.get("s3_endpoint", ""),
+                s3_bucket=payload.get("s3_bucket", ""),
+                s3_region=payload.get("s3_region", ""),
+                s3_disable_tls=bool(payload.get("s3_disable_tls", False)),
+                s3_disable_tls_verification=bool(payload.get("s3_disable_tls_verification", False)),
+                filesystem_path=payload.get("filesystem_path", ""),
+                override_source_prefix=payload.get("override_source_prefix", ""),
+                cache_directory=payload.get("cache_directory", ""),
+            ),
+        )
+        log.info("reactor: kopia repository connected (target=%s, kind=%s)",
+                 target_id, kind)
+    except Exception as e:
+        log.warning("reactor: kopia connect for target=%s failed: %s",
+                    target_id, e)
 
 
 # ── public registration ──────────────────────────────────────────────────
