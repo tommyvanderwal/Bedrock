@@ -33,6 +33,61 @@ The lock bug is a cancellation-safety leak in RustFS fast lock state handling:
 
 In short: stale waiter metadata blocks readers even when no writer is actually holding the lock.
 
+## GitHub issue draft (compact; copy/paste)
+
+Use this as the top section in `rustfs/rustfs` bug report:
+
+### Summary
+
+`FastObjectLockManager` appears vulnerable to a cancellation-safety leak in exclusive slow-path waiter accounting: stale `WRITERS_WAITING` can remain set after peer/task teardown, causing subsequent shared-lock acquisitions on contended keys to time out even when no active writer holds the lock.
+
+### RustFS version / build
+
+- `docker.io/rustfs/rustfs:1.0.0-beta.1` (also previously observed on `1.0.0-alpha.99`)
+
+### Environment
+
+- 4-node RustFS lab (`192.168.2.189-192`)
+- Storage class: `REDUCED_REDUNDANCY` (`EC:1`)
+- Reproducer: `installer/lib/rustfs-patches/reproduce-leak.sh`
+
+### Steps to reproduce
+
+1. Run high-contention same-key profile:
+   - `HOT_KEYS=16`
+   - `WRITERS_PER_KEY=36`
+   - `PAYLOAD_BYTES=16MiB`
+   - `KILL_DELAY=0.6`
+   - `READ_ROUNDS=2`
+   - `STORAGE_CLASS=REDUCED_REDUNDANCY`
+2. Start concurrent overwrites via one victim endpoint.
+3. Kill victim RustFS during burst.
+4. Read hot keys from survivors and compare with cold control keys.
+
+### Expected behavior
+
+- Shared-lock reads should recover once no writer is actively holding lock.
+- Hot-key reads should not systematically time out while cold controls remain healthy.
+
+### Actual behavior
+
+- Hot contended keys fail reads (timeouts / lock acquire failures), while cold control keys stay healthy.
+- Signature is contention-key specific, not whole-cluster outage.
+
+### Repro frequency (current)
+
+- Beta.1 c02-style 20-run check (single-initial-reset hardened runner): `14/20 strict`, `bad=1`  
+  (`hot_fail>0 && cold_fail==0` strict criterion)
+- Monte Carlo 200-run on beta.1: `44/200 strict`, `bad=0`
+- Highest observed hotspot band remains around `(hot=16, writers=36, payload=16MiB)`.
+
+### Additional notes
+
+- This report includes stock-vs-patched historical evidence and large sweep artifacts.
+- A local patch that ignores stale `WRITERS_WAITING` for shared fast-path removes this failure mode in lab testing (see patch link in references).
+
+---
+
 ## Why this is likely the real bug (not just environment noise)
 
 The signal signature is consistent across controlled sweeps:
@@ -202,6 +257,12 @@ All key artifacts are in this repository and should be linked directly in the up
 - patched focused confirmation:
   - `installer/lib/rustfs-patches/sweep-results/sweep-4node-confirm-20260430T143527Z.csv`
   - `installer/lib/rustfs-patches/sweep-results/sweep-4node-confirm-20260430T143527Z.log`
+- beta.1 c02 20-run check (latest):
+  - `installer/lib/rustfs-patches/sweep-results/run-c02-20x-20260503T213554Z.log`
+  - `installer/lib/rustfs-patches/sweep-results/sweep-4node-c02-beta1-20x-20260503T213554Z.csv`
+- beta.1 Monte Carlo 200-run (latest):
+  - `installer/lib/rustfs-patches/sweep-results/sweep-4node-monte200-20260504-011229.log`
+  - `installer/lib/rustfs-patches/sweep-results/sweep-4node-monte200-20260504-011229.csv`
 - patch under test (RustFS fork):
   - `installer/lib/rustfs-patches/0002-shared-lock-bypass-stale-writers-waiting.patch`
   - branch: `https://github.com/tommyvanderwal/rustfs/tree/fix/shared-lock-stale-writers-waiting`
@@ -218,6 +279,12 @@ Concrete examples:
   - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/sweep-4node-confirm-20260430T083055Z.csv`
 - patched 80-run:
   - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/sweep-4node-confirm-20260430T143527Z.csv`
+- beta.1 c02 20-run:
+  - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/run-c02-20x-20260503T213554Z.log`
+  - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/sweep-4node-c02-beta1-20x-20260503T213554Z.csv`
+- beta.1 Monte Carlo 200-run:
+  - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/sweep-4node-monte200-20260504-011229.log`
+  - `https://github.com/tommyvanderwal/Bedrock/blob/master/installer/lib/rustfs-patches/sweep-results/sweep-4node-monte200-20260504-011229.csv`
 
 ## Upstream recommendation
 
@@ -225,5 +292,6 @@ Recommended upstream issue framing:
 
 1. This is a cancellation-safety leak in fast lock waiter accounting, causing stale `WRITERS_WAITING` to block shared-lock fast path.
 2. Reproduction is deterministic in this lab with profile `c02` on stock (`20/20`).
-3. Patch eliminates the failure mode under the same profile set (`0/80` across four top profiles).
-4. Lock correctness is preserved around active writer exclusion; only stale waiter handling changes on shared fast path.
+3. On current beta.1, the failure still reproduces under both focused and Monte Carlo sweeps (`14/20` focused; `44/200` Monte Carlo, `bad=0`).
+4. Historical patched-fork validation eliminated this mode in prior stock-vs-patched comparisons (`0/80` across four top profiles).
+5. Lock correctness is preserved around active writer exclusion; only stale waiter handling changes on shared fast path.
