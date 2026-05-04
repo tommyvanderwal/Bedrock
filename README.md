@@ -170,7 +170,10 @@ with a private DRBD ring on `10.99.0.x`.
 
 ## License
 
-Proprietary; copyright Tommy van der Wal / IT-Launch B.V. The RustFS patches
-under `installer/lib/rustfs-patches/` are derivatives of the upstream
-project and are intended for upstream review (see issue 2795); they are
-licensed under the same terms as RustFS upstream (Apache-2.0).
+Bedrock is currently licensed under the **MIT License**.
+
+**Future relicensing:**  
+The copyright holder (Tommy Vanderwal) reserves the right to relicense the entire project (including all contributions) to the GNU General Public License version 2 (GPLv2) at any time.  
+By contributing code, documentation, or any other material to this repository, you explicitly agree that your contributions may be relicensed under GPLv2 in the future.
+
+You are free to use, modify, and distribute Bedrock under the current MIT terms until any such change occurs.
