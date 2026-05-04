@@ -724,24 +724,38 @@ def save_inventory(inv: dict):
 
 @app.get("/api/isos")
 def api_list_isos():
-    """Return the list of .iso files in /opt/bedrock/iso with sizes."""
+    """Return every file in /opt/bedrock/iso whose extension is `.iso`
+    case-insensitive. Microsoft's official Windows Server downloads
+    arrive with `.ISO` (uppercase) and we want them visible without
+    making the operator rename them by hand."""
     if not ISO_DIR.exists(): return []
     out = []
-    for p in sorted(ISO_DIR.glob("*.iso")):
-        try:
-            out.append({"name": p.name, "size_bytes": p.stat().st_size})
-        except Exception: continue
+    for p in sorted(ISO_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() == ".iso":
+            try:
+                out.append({"name": p.name, "size_bytes": p.stat().st_size})
+            except Exception:
+                continue
     return out
 
 
 @app.post("/api/isos/upload")
 async def api_upload_iso(file: UploadFile = File(...)):
     """Stream-upload an ISO to /opt/bedrock/iso. Chunked to stay memory-safe
-    for multi-GB Windows ISOs."""
+    for multi-GB Windows ISOs.
+
+    The on-disk filename gets its extension normalised to lowercase
+    `.iso` regardless of how the source named it (`.ISO`, `.iso`,
+    `.Iso`). That makes downstream tooling — including manual `ls`
+    and any path-equality check — consistent. The basename is
+    preserved verbatim so the operator still recognises their file."""
     if not file.filename.lower().endswith(".iso"):
         raise HTTPException(400, "filename must end in .iso")
     ISO_DIR.mkdir(parents=True, exist_ok=True)
-    dst = ISO_DIR / Path(file.filename).name  # strip any directory
+    src_name = Path(file.filename).name  # strip any directory
+    # Normalise extension to lowercase .iso
+    base = src_name[:-4] if len(src_name) > 4 else src_name
+    dst = ISO_DIR / f"{base}.iso"
     total = 0
     with dst.open("wb") as fh:
         while True:
@@ -985,7 +999,11 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
             rc = await loop.run_in_executor(None, _run_cmd, log,
                 ["tar", "-xf", str(src), "-C", str(extract)])
             if rc == 0:
-                ovf_files = list(extract.glob("*.ovf"))
+                # Globs here are case-insensitive on purpose: VMware exports
+                # often use .OVF/.VMDK uppercase while Linux tools default to
+                # lowercase. Same hygiene as the ISO listing.
+                ovf_files = [p for p in extract.iterdir()
+                             if p.is_file() and p.suffix.lower() == ".ovf"]
                 disk_refs: list[Path] = []
                 if ovf_files:
                     # Parse OVF: <References><File ovf:id=... ovf:href=...>,
@@ -1020,10 +1038,15 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                         push_log(f"OVF parse failed, falling back to glob: {e}",
                                  node="mgmt", app="bedrock-mgmt", level="warn")
                 if not disk_refs:
-                    # Fallback: glob-find disks in whatever order the tar gives
-                    disk_refs = (sorted(extract.glob("*.vmdk"))
-                                 + sorted(extract.glob("*.img"))
-                                 + sorted(extract.glob("*.raw")))
+                    # Fallback: case-insensitive disk discovery, in the
+                    # priority order vmdk → img → raw.
+                    by_ext: dict[str, list[Path]] = {".vmdk": [], ".img": [], ".raw": []}
+                    for p in extract.iterdir():
+                        if p.is_file() and p.suffix.lower() in by_ext:
+                            by_ext[p.suffix.lower()].append(p)
+                    disk_refs = (sorted(by_ext[".vmdk"])
+                                 + sorted(by_ext[".img"])
+                                 + sorted(by_ext[".raw"]))
                 if not disk_refs:
                     meta["error"] = "OVA contained no recognisable disks"
                     rc = 1
@@ -1438,12 +1461,18 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm: raise HTTPException(404, f"VM {vm_name} not found")
-    if vm["state"] != "running":
-        raise HTTPException(400, "VM must be running to hot-convert")
     if req.target_type not in ("cattle", "pet", "vipet"):
         raise HTTPException(400, f"Invalid target_type: {req.target_type}")
     nodes_cfg = get_nodes()
-    src_name = vm["running_on"]
+    # `running_on` is empty for shut-off VMs — fall back to the first
+    # `defined_on` node (where virsh dumpxml resolved) so offline
+    # convert works too. Online convert keeps using the live host.
+    src_name = (vm.get("running_on")
+                or (vm.get("defined_on") or [None])[0])
+    if not src_name:
+        raise HTTPException(400,
+            f"Cannot resolve home node for {vm_name} — VM not defined "
+            f"on any cluster node")
     current_type = (
         "vipet" if vm.get("drbd_resource")
             and _count_drbd_peers(nodes_cfg[src_name]["host"], vm["drbd_resource"]) >= 3
@@ -2612,11 +2641,15 @@ def _vm_convert(vm_name: str, target_type: str, peer_nodes=None,
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm: raise HTTPException(404, f"VM {vm_name} not found")
-    if vm["state"] != "running":
-        raise HTTPException(400, "VM must be running to hot-convert")
 
     nodes_cfg = get_nodes()
-    src_name = vm["running_on"]
+    # Running → use running_on; offline → first defined_on node.
+    src_name = (vm.get("running_on")
+                or (vm.get("defined_on") or [None])[0])
+    if not src_name:
+        raise HTTPException(400,
+            f"Cannot resolve home node for {vm_name}")
+    is_running = (vm.get("state") == "running")
     src = nodes_cfg[src_name]
     current_type = "vipet" if vm.get("drbd_resource") and _count_drbd_peers(src["host"], vm["drbd_resource"]) >= 3 \
                    else ("pet" if vm.get("drbd_resource") else "cattle")
@@ -2626,9 +2659,11 @@ def _vm_convert(vm_name: str, target_type: str, peer_nodes=None,
 
     rank = {"cattle": 0, "pet": 1, "vipet": 2}
     if rank[target_type] > rank[current_type]:
-        return _vm_convert_upgrade(vm_name, current_type, target_type, src_name, peer_nodes, task)
+        return _vm_convert_upgrade(vm_name, current_type, target_type, src_name,
+                                   peer_nodes, task, is_running=is_running)
     else:
-        return _vm_convert_downgrade(vm_name, current_type, target_type, src_name, peer_nodes, task)
+        return _vm_convert_downgrade(vm_name, current_type, target_type, src_name,
+                                     peer_nodes, task)
 
 
 def _count_drbd_peers(host: str, resource: str) -> int:
@@ -2643,12 +2678,29 @@ def _count_drbd_peers(host: str, resource: str) -> int:
 
 
 def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
-                         peer_nodes, task: Optional[Task] = None) -> dict:
+                         peer_nodes, task: Optional[Task] = None,
+                         is_running: bool = True) -> dict:
     """Cattle → pet / cattle → ViPet / pet → ViPet.
 
     Iterates over every disk the VM has, so multi-disk guests become
     pet/ViPet across ALL their disks. Atomic: if any disk fails mid-way,
-    rollback unwinds the changes already made to earlier disks."""
+    rollback unwinds the changes already made to earlier disks.
+
+    Two execution paths:
+
+      - **online** (`is_running=True`): use `virsh blockcopy ...
+        --pivot` to swap qemu's disk reference from the local LV to
+        /dev/drbdN with no guest pause. Required for "convert this
+        VM to HA without downtime" — the operator never reboots.
+
+      - **offline** (`is_running=False`): the VM is shut off, so no
+        qemu is holding the LV. Skip blockcopy; directly rewrite the
+        persistent libvirt XML to point at /dev/drbdN, redefine on
+        all peers. DRBD does its own initial sync from primary
+        (this side, marked `--force`) to the peer's empty LV in the
+        background. Faster, no live-migration risk, and matches the
+        operator expectation that "convert" should also work for VMs
+        that haven't been booted yet."""
     nodes_cfg = get_nodes()
     src = nodes_cfg[src_name]
 
@@ -2808,26 +2860,58 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                 if task: task.step_done(
                     f"{step_prefix}: assert /dev/drbd{minor} == backing LV")
 
-                if task: task.step_start(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
-                # Belt-and-braces: clear any stale libvirt blockjob state on
-                # this disk before we start. No-op if nothing is pending.
-                ssh_cmd_rc(src["host"],
-                    f"virsh blockjob {vm_name} {target_dev} --abort 2>&1 || true",
-                    timeout=10)
-                copy_started.append(target_dev)
-                out, rc = ssh_cmd_rc(src["host"],
-                    f"virsh blockcopy {vm_name} {target_dev} /dev/drbd{minor} "
-                    f"--reuse-external --wait --pivot --verbose "
-                    f"--transient-job --blockdev --format raw", timeout=1800)
-                if rc != 0:
-                    if task: task.step_fail(f"{step_prefix}: blockcopy → /dev/drbd{minor}",
-                                            f"rc={rc}: {out[-400:]}")
-                    raise HTTPException(500, f"blockcopy failed on disk{i}: {out}")
-                # Blockcopy succeeded + pivoted → target_dev is no longer in
-                # the `needs-abort` set (pivot drops the mirror).
-                if target_dev in copy_started:
-                    copy_started.remove(target_dev)
-                if task: task.step_done(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                if is_running:
+                    if task: task.step_start(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                    # Belt-and-braces: clear any stale libvirt blockjob state on
+                    # this disk before we start. No-op if nothing is pending.
+                    ssh_cmd_rc(src["host"],
+                        f"virsh blockjob {vm_name} {target_dev} --abort 2>&1 || true",
+                        timeout=10)
+                    copy_started.append(target_dev)
+                    out, rc = ssh_cmd_rc(src["host"],
+                        f"virsh blockcopy {vm_name} {target_dev} /dev/drbd{minor} "
+                        f"--reuse-external --wait --pivot --verbose "
+                        f"--transient-job --blockdev --format raw", timeout=1800)
+                    if rc != 0:
+                        if task: task.step_fail(f"{step_prefix}: blockcopy → /dev/drbd{minor}",
+                                                f"rc={rc}: {out[-400:]}")
+                        raise HTTPException(500, f"blockcopy failed on disk{i}: {out}")
+                    # Blockcopy succeeded + pivoted → target_dev is no longer in
+                    # the `needs-abort` set (pivot drops the mirror).
+                    if target_dev in copy_started:
+                        copy_started.remove(target_dev)
+                    if task: task.step_done(f"{step_prefix}: blockcopy → /dev/drbd{minor}")
+                else:
+                    # Offline path: rewrite this disk's <source dev='…'> in
+                    # the persistent XML on the source. DRBD's local side is
+                    # already primary --force on the live data LV, so no
+                    # data copy is needed locally — DRBD's initial-sync from
+                    # primary streams to peers in the background. The VM,
+                    # when restarted, opens /dev/drbdN and reads the same
+                    # bytes through the replication layer.
+                    if task: task.step_start(f"{step_prefix}: rewrite XML offline")
+                    xml_text = ssh_cmd(src["host"],
+                        f"virsh dumpxml --inactive {vm_name}", timeout=15)
+                    needle = f"source dev='{src_lv}'"
+                    if needle not in xml_text:
+                        # Try double-quoted variant (libvirt may emit either)
+                        needle_dq = f'source dev="{src_lv}"'
+                        if needle_dq not in xml_text:
+                            raise HTTPException(500,
+                                f"could not find {src_lv!r} in {vm_name}'s "
+                                f"persistent XML — XML schema unexpected")
+                        new_xml = xml_text.replace(
+                            needle_dq, f'source dev="/dev/drbd{minor}"')
+                    else:
+                        new_xml = xml_text.replace(
+                            needle, f"source dev='/dev/drbd{minor}'")
+                    import base64 as _b64
+                    xml_b64 = _b64.b64encode(new_xml.encode()).decode()
+                    ssh_cmd(src["host"],
+                        f"echo {xml_b64} | base64 -d > /tmp/{vm_name}.xml && "
+                        f"virsh define /tmp/{vm_name}.xml >/dev/null", timeout=15)
+                    if task: task.step_done(f"{step_prefix}: rewrite XML offline")
+
                 converted_disks.append({"index": i, "target": target_dev,
                                         "resource": resource, "minor": minor})
                 # DRBD device is now live cluster-wide; future ssh-ls checks
