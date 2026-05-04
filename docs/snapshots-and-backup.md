@@ -698,6 +698,125 @@ Phase C (v1.2 or later):
 
 ---
 
+## 9b. Deploying PBS — licensing and where it lives
+
+Proxmox Backup Server is **AGPLv3** (server, client, web UI). No
+commercial restrictions on use; the optional enterprise subscription
+buys access to the stable repo and support, nothing else gates use.
+You can run PBS anywhere, including as a VM on the very Bedrock
+cluster it's backing up.
+
+Three deployment shapes, in increasing safety:
+
+**Shape A — PBS off-cluster (recommended for prod).**
+A small dedicated host: a NUC, a Raspberry Pi 4 with a USB SSD,
+or a 1U appliance. PBS is light: ~1 GB RAM idle, single-digit CPU
+%, storage = however much backup history you keep. The backup
+data sits *outside* Bedrock, so a Bedrock-cluster disaster doesn't
+also destroy the backups. This is what you want.
+
+**Shape B — PBS as a pet VM on Bedrock with datastore on external
+storage.**
+The PBS VM itself runs on Bedrock (HA via DRBD); but its datastore
+disk is mounted from a separate NAS / S3 / NFS share / external
+disk. VM gets HA; backups stay independent of Bedrock storage.
+Acceptable production pattern when "deploy a separate host" isn't
+practical.
+
+**Shape C — PBS as a pet VM with datastore on Bedrock.**
+Everything lives on Bedrock. Cheap and easy; backups recover from
+*guest-level* mistakes (someone deleted the wrong file, malware,
+config rollback) but not from *cluster-level* failure (storage
+corruption, node loss before backup ships elsewhere). OK for
+dev/test/lab; **not** OK as your only backup story for production.
+
+Mixed-mode is fine: shape B locally for fast restores + shape A
+offsite for DR. PBS supports `proxmox-backup-client sync` between
+two PBS instances, so two-tier topologies are first-class.
+
+In all three cases the install on a Bedrock node is just:
+
+```
+  apt install proxmox-backup-client
+```
+
+(or grab the static binary from PBS's repo if not on Debian-derived).
+
+---
+
+## 9c. Recovery flow
+
+The reverse of backup. PBS streams chunks; we provide an LV-thin
+target; bytes land on the LV. Then we define the libvirt VM and
+log it.
+
+**Cattle (single LV, single node):**
+
+```
+  bedrock vm restore my-cattle --from pbs://backup.example/store-1/<backup-id>
+        │
+        ▼
+   ① mgmt fetches backup metadata (disk count, sizes, original config).
+   ② lvcreate -V <size>G --thin -n vm-my-cattle-disk0 almalinux/thinpool
+   ③ proxmox-backup-client restore <backup-id> my-cattle-disk0.img \
+        --target /dev/almalinux/vm-my-cattle-disk0
+        (PBS streams chunks; client writes them to the block device)
+   ④ define libvirt VM XML — disk path = /dev/almalinux/vm-my-cattle-disk0
+   ⑤ append vm_create_intent + vm_created log entries
+   ⑥ (optional) virsh start
+```
+
+**Pet / vipet (DRBD-replicated):**
+
+```
+   ① mgmt fetches backup metadata.
+   ② on the chosen home node (typically the master):
+        lvcreate -V <size>G --thin -n vm-my-pet-disk0 bedrock/thinpool
+        proxmox-backup-client restore <id> my-pet-disk0.img \
+          --target /dev/bedrock/vm-my-pet-disk0
+   ③ append a tier-side log entry assigning a fresh DRBD minor + node-ids.
+   ④ on peer(s): lvcreate the matching empty LV (same size, --thin).
+   ⑤ on home: drbdadm create-md tier-vm-my-pet (using the new resource def);
+              drbdadm up; drbdadm primary --force.
+              DRBD's initial sync starts, copying our restored content
+              to the peer's empty LV.
+   ⑥ define libvirt VM XML — disk path = /dev/drbdN.
+   ⑦ append vm_create_intent + vm_created.
+   ⑧ (optional) virsh start.
+```
+
+Initial sync is data-rate × disk size; over a 10 GbE direct cable
+~= disk size in seconds-to-minutes for SSDs, longer for spinning
+rust. The VM can start as soon as the home side is primary; the
+sync continues in the background and DRBD serves reads/writes from
+local + degraded-peer the whole time.
+
+**Cross-cluster restore (DR):**
+
+Identical flow on a fresh cluster. The new cluster has its own
+LV pool, its own DRBD config, its own log. PBS doesn't care which
+cluster it's serving — backups are data-only, no cluster identity
+embedded. As long as the new cluster has network reach + credentials
+to PBS, `bedrock vm restore` works. This is also how you'd lift-and-
+shift a workload from one Bedrock site to another.
+
+**File-level restore** (when backup was file-level rather than
+block-level):
+
+`proxmox-backup-client` supports `mount`, `ls`, and partial-tree
+restore. For "I deleted one config file" scenarios this is the
+right tool — no need to spin up a whole VM. mgmt exposes a
+`bedrock vm restore-files` verb for this.
+
+**Restore time vs read-cost:**
+- Restore is always a full read on PBS's side (it has to send all
+  the chunks). The dedup that made backup fast doesn't apply to
+  restore — you still need every chunk to materialise the disk.
+- Local network is the bottleneck; gigabit ≈ 100 MB/s wire ≈ 360
+  GB/h. Plan capacity accordingly.
+
+---
+
 ## 10. The honest summary
 
 LVM thin under both cattle and pet is the lucky accident that makes
