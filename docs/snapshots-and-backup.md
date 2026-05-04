@@ -312,7 +312,9 @@ RBD snap diff). Bedrock's design intentionally aligns.
 
 ### 6a. Proxmox Backup Server (PBS)
 
-PBS reads backup data via `proxmox-backup-client`. Bedrock's hook:
+PBS reads backup data via `proxmox-backup-client`. The snapshot
+exists only for the duration of the backup run — make it, read it,
+delete it:
 
 ```
   bedrock vm backup my-pet --target pbs://backup.example/datastore-1
@@ -320,14 +322,26 @@ PBS reads backup data via `proxmox-backup-client`. Bedrock's hook:
         ▼
    ① snapshot create (--quiesce) → snapshot_created log entry
    ② mount snapshot LV read-only at /var/lib/bedrock/backup-staging/<vm>
-   ③ proxmox-backup-client backup vm-my-pet.img:/var/lib/bedrock/backup-staging/<vm> \
-       --repository pbs://...
-   ④ unmount + lvremove the snapshot
+        OR: pass /dev/bedrock/vm-my-pet-disk0-bk-<ts> as a block device
+   ③ proxmox-backup-client backup \
+        my-pet-disk0.img:/dev/bedrock/vm-my-pet-disk0-bk-<ts> \
+        --repository pbs://...
+   ④ lvremove the snapshot                              (← "discard")
    ⑤ append backup_completed log entry { target, size, ts, vm }
 ```
 
-PBS handles its own retention and deduplication. We just provide a
-read-mounted snapshot for the duration of a backup run.
+That's the basic loop the user asked about: **make → PBS reads →
+discard**. The snapshot only consumes thin-pool space while it
+exists. For an unattended nightly run it's typically a few minutes.
+
+**Safeguards in mgmt:**
+- Snapshot has a max lifetime (default 6 h). A periodic task in mgmt
+  scans for snapshots older than max-age + not in an active backup
+  job and force-removes them.
+- Each backup task has a timeout. If `proxmox-backup-client` doesn't
+  finish in N hours, the task aborts and the snapshot is removed.
+- backup-failed and backup-aborted are log entries too — an
+  abandoned snapshot is observable, not silent.
 
 ### 6b. Borg / Restic
 
@@ -357,6 +371,97 @@ Differential backup: maintain a "last full" snapshot and compute
 the diff against it (`lvm thin` exposes block-allocation maps —
 `thin_dump`/`thin_delta` give the changed-block list, equivalent to
 VMware CBT or Ceph RBD diff). This is a v1.1 feature.
+
+### 6c-bis. Changed-block tracking — does PBS need to read the whole volume each time?
+
+Short answer: **no it doesn't, but the cheapest way to avoid that
+*does* require keeping the previous snapshot around.** Three options,
+in increasing operational complexity:
+
+**Option 1 — read whole snapshot, rely on PBS chunk dedup. (v1.0)**
+
+This is the default. proxmox-backup-client reads the whole snapshot
+locally, chunks it (typically 4 MiB), hashes each chunk, and sends
+to PBS only the chunks PBS doesn't already have. The wire and the
+PBS storage are efficient — only changed chunks travel — but the
+**local read** is the full volume each backup.
+
+For a 1 TB pet VM with 50 GB nightly change, that's 1 TB of disk
+read every night just to discover what changed. The thin pool helps
+slightly (only allocated blocks are read), but on a busy VM that's
+still hundreds of GB of IO.
+
+This is fine for small VMs and overnight backup windows. It's the
+right starting point.
+
+**Option 2 — `thin_delta` between two LV snapshots. (v1.1)**
+
+LVM thin's metadata knows exactly which blocks belong to which
+snapshot. `thin_dump` exports the metadata; `thin_delta` between
+two thin device IDs lists the blocks that changed.
+
+```
+  step 1 (last night): take snap-N, back up via PBS, KEEP snap-N
+                       around as the next reference
+  step 2 (tonight):    take snap-N+1
+                       thin_delta /dev/mapper/bedrock-thinpool snap-N snap-N+1
+                          → list of changed block ranges
+                       read only those ranges from snap-N+1
+                       send the changed chunks to PBS (PBS dedup
+                          still applies on top)
+                       lvremove snap-N
+                       keep snap-N+1 as the new reference
+```
+
+This **does require the previous reference snapshot to exist** —
+that's how thin_delta knows what "changed since last backup" means.
+The cost is the divergence space the reference snapshot accumulates
+over its lifetime: roughly one day's worth of writes for a daily
+backup.
+
+For a 1 TB VM with 50 GB nightly change:
+- Without CBT: 1 TB read/night, 50 GB on the wire (after dedup).
+- With CBT: 50 GB read/night, 50 GB on the wire. Identical wire
+  traffic; **20× less local IO**. Cost: 50 GB of extra thin-pool
+  space for the reference snapshot.
+
+That's a great trade for big-disk VMs. Implementation is small —
+thin_dump + thin_delta + a custom uploader to PBS that does the
+sparse read. PBS's dedup-by-content storage doesn't care that we
+sent partial data; it just ends up reusing the chunks that didn't
+change.
+
+**Option 3 — `dm-era` or QEMU persistent dirty bitmap. (later, if ever)**
+
+If the "always have one extra snapshot taking space" cost ever
+becomes objectionable, two alternatives don't need it:
+
+- **`dm-era`** is a device-mapper layer above the thin LV that
+  records a "dirty block era" continuously. You ask "what blocks
+  changed since era N?" without keeping a snapshot at era N.
+  Adds an extra dm layer; works for any block device.
+- **QEMU persistent dirty bitmap** (`qemu-img bitmap --add ... --persistent`)
+  records dirty blocks in qcow2 metadata or a sidecar file. After a
+  backup, clear the bitmap; QEMU starts tracking again from zero.
+  Backup-time, read only blocks the bitmap says are dirty. This is
+  what Proxmox VE itself uses for QEMU-managed VMs.
+
+Both need integration work that thin_delta doesn't. v1 picks
+thin_delta because it's the path of least resistance from where
+we already are (LVM thin is the storage primitive on every node;
+the kernel and userspace tooling are already installed).
+
+**Storage-cost summary for daily backups:**
+
+| Option | Local IO/night | Wire/night | Extra disk used |
+|---|---|---|---|
+| Whole-volume + PBS dedup (v1.0) | full volume | changed bytes (≈daily delta) | none — snapshot lives only during backup |
+| `thin_delta` CBT (v1.1) | changed bytes | changed bytes | ~1 day's worth of writes (the reference snapshot) |
+| `dm-era` or QEMU bitmap | changed bytes | changed bytes | metadata only (~MB) |
+
+For most of our target market, option 1 is enough. Option 2 lands
+in v1.1 when bigger VMs become a concern. Option 3 stays in the
+"only if" pile.
 
 ### 6d. Bedrock-native backup tier (v1.x)
 
@@ -494,3 +599,24 @@ failure modes for a rarely-exercised feature.
 What's NOT in the design: a clever native backup engine. We don't
 need one. PBS and Borg and rsync-to-S3 already work; we just give
 them a clean read surface.
+
+**Lifecycle of one backup run, end-to-end:**
+
+```
+  v1.0 (whole-volume + PBS dedup):
+     lvcreate --snapshot   → PBS reads     → lvremove
+     [snapshot exists for ~minutes]
+
+  v1.1 (thin_delta CBT):
+     lvcreate --snapshot snap-N+1
+     thin_delta snap-N snap-N+1            → list of changed ranges
+     PBS reads only those ranges from snap-N+1
+     lvremove snap-N        (the previous reference; not snap-N+1)
+     [the JUST-USED snapshot becomes the next reference;
+      one snapshot is always alive between backups]
+```
+
+The "make → read → discard" pattern is the cheap default. CBT
+keeps one snapshot alive between backups as the reference for
+"what changed since last time" — that's the price of the 20×
+local-IO reduction. Thin pool fill alarms keep that price visible.
