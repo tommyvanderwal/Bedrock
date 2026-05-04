@@ -982,6 +982,138 @@ delete its archives.
 
 ---
 
+## 9b-quat. Other backup tools worth considering
+
+The user's contract for the backup story:
+
+> Operator picks a file/object store + an encryption key. Tells
+> Bedrock to put backups there. Later — on this cluster, on a new
+> cluster, on a recovery cluster after a fire — they install
+> Bedrock, point at the same store with the same key, and can
+> restore anything that was put there.
+
+This is the **store-driven model**. The store is the durable
+artefact; the backup *tool* is interchangeable software you can
+run anywhere. PBS fits this with the caveat that the tool is a
+running service — you bring up a PBS VM on the new cluster,
+point it at the existing bucket with `reuse-datastore`, and
+operate. Other tools fit the same contract more directly because
+they're library-style: install a binary, set two environment
+variables, run.
+
+The genuinely-relevant comparators in 2026 (free / open-source,
+S3 + filesystem, encrypted, dedup):
+
+| Tool | License | S3 native | Filesystem | Encryption | Dedup style | Server / serverless | VM-block backup |
+|---|---|---|---|---|---|---|---|
+| **PBS** (Proxmox Backup Server) | AGPLv3 | ✓ (4.2+) + cache | ✓ POSIX, NFS, CIFS | per-datastore key, AES | content-defined chunks; per-chunk dedup | server-style (a PBS daemon) | first-class — purpose-built for it |
+| **Restic** | BSD-2 | ✓ native AWS S3 / B2 / Wasabi / R2 / Azure Blob / GCS / SFTP / local; the most provider-agnostic | ✓ direct | per-repo password, AES-256-CTR + Poly1305, all metadata encrypted | content-defined chunks; per-chunk dedup | serverless — `restic backup` and `restic restore` are CLI calls; the repo IS the source of truth | block device via `--read-special`; full disk backup works but isn't VM-aware |
+| **Kopia** | Apache-2.0 | ✓ native; deepest S3 feature support (parallel uploads, storage classes, lifecycle awareness) | ✓ direct | per-repo password, AES-256, all metadata encrypted | content-defined chunks; per-chunk dedup; zstd compression | serverless **OR** with a built-in web UI server if you want | block device via raw read; not VM-aware |
+| **BorgBackup** | BSD-3 | ✗ native (needs rclone wrapper for S3) | ✓ local + SSH | per-repo passphrase, AES-256-HMAC-SHA256 | content-defined chunks; **best per-chunk compression** of the three | serverless; SSH-centric | block device read works; same VM-not-aware caveat |
+| **Duplicati** | LGPL | ✓ many backends | ✓ many | per-job passphrase, AES-256 | block-level dedup; less aggressive than the others | mostly serverless with optional GUI | not great for block devices; file-oriented |
+| **Duplicacy** | partial-FOSS (CLI free for personal; paid for commercial) | ✓ | ✓ | per-repo password | content-defined; lock-free | serverless | works |
+| **rclone** + crypt | MIT | ✓ — every cloud under the sun | ✓ | optional crypt remote | none — pure sync | serverless tool; not a backup tool, a cloud-sync tool | not really |
+
+Reading off the table:
+
+- **PBS**'s differentiator is **VM-aware UX**: web UI to browse
+  backups by VM, retention policies that understand "keep 7
+  daily / 4 weekly / 12 monthly per VM," verify-jobs that
+  catch bitrot in the datastore, qemu-guest-agent integration
+  for application-consistent backups. None of the other tools
+  have any of that out of the box — you'd build it yourself
+  on top.
+
+- **Restic** is the workhorse for the **store-driven contract
+  the user described**. Single binary, set `RESTIC_REPOSITORY`
+  and `RESTIC_PASSWORD`, you can `restic snapshots` and
+  `restic restore` from anywhere with network reach. No service,
+  no daemon, no concept of "instances". The widest provider
+  list. The "pick this if you can pick only one" choice in
+  most homelab/SMB surveys.
+
+- **Kopia** is younger but feature-rich: best raw S3 performance
+  via parallel uploads, optional integrated web UI, zstd-by-
+  default compression, retention policies built in. Where
+  Restic feels Unix-like, Kopia feels application-like.
+
+- **Borg** is the speed/compression king on local-or-SSH
+  targets. For a "small site, NAS over SSH" deployment Borg is
+  excellent. Adding S3 means rclone-wrapping it, which dilutes
+  the cleanness.
+
+- **Duplicati** is GUI-first; nice for desktop/SMB scenarios but
+  weaker for our block-device, scripted-orchestration use case.
+
+- **Duplicacy** has a partial-FOSS / partial-paid licensing
+  model — fine for personal use, awkward to bake into an
+  open-source project's defaults.
+
+- **rclone+crypt** is a tool, not a backup system. You'd reach
+  for it if you wanted "sync this directory to S3 with
+  encryption" without any of the dedup/snapshot/retention
+  layer. Not the right level for Bedrock's needs.
+
+### What this means for Bedrock's defaults
+
+The honest read: the user's **store-driven contract** is more
+naturally served by Restic/Kopia than by PBS. The user goes:
+
+> install Bedrock on a new box → set backup target = `s3://...`
+> + key → run restore.
+
+With PBS that becomes:
+
+> install Bedrock on a new box → spin up the PBS cattle VM →
+> configure PBS to point at `s3://...` with `reuse-datastore` →
+> set encryption key → run restore via PBS API.
+
+The PBS VM is "internal infrastructure" the operator doesn't
+have to think about much, but it's an extra moving part vs the
+Restic flow.
+
+**The reasonable v1 architecture: support both, pick one as
+default.**
+
+- **Default backend = PBS.** It's the right answer for VM-
+  centric workloads — the operator UX is genuinely better, and
+  the dual-datastore (hot NVMe + cold S3) pattern of §9b-bis
+  gives a great out-of-the-box story. The "spin up PBS on a
+  new cluster to read backups" step is a one-shot per cluster.
+
+- **Alternative backend = Restic.** For users who want the truly
+  store-driven, serverless model, mgmt offers a Restic target
+  type. The contract from Bedrock's side is identical — point
+  at a target, set a key — but the on-the-wire backup format is
+  Restic's. Less polished than the PBS path; simpler to operate
+  on a fresh DR site.
+
+The two options are not equivalent — backups taken to a PBS
+target can only be read by PBS; backups to a Restic repo can
+only be read by Restic. But the operator's contract with
+Bedrock looks the same: target URL + encryption key + retention
+policy. Operators pick once; backups go to that target type
+forever; restores use the same target type.
+
+Implementation-wise, mgmt's `bedrock vm backup` orchestration
+abstracts the backend:
+
+```
+  bedrock backup target add prod-pbs --type pbs --url ... --token ... --key /etc/...
+  bedrock backup target add cold-s3  --type restic --repo s3://... --password-file ...
+
+  bedrock vm backup my-pet --target prod-pbs
+  bedrock vm restore my-pet --from prod-pbs --snapshot 2026-05-04T02:00
+  bedrock vm restore my-pet --from cold-s3  --snapshot 2026-05-04T02:00
+```
+
+Two backend implementations, same orchestrator surface. **Phase
+A ships PBS first (it's the better VM UX) and Restic second
+(it's the cleaner DR contract).** Either suffices on its own
+for an operator who wants to pick one.
+
+---
+
 ## 9c. Recovery flow
 
 The reverse of backup. PBS streams chunks; we provide an LV-thin
