@@ -260,12 +260,18 @@ def configure_target_locally(target_id: str, kind: str,
             f"missing {ENCRYPTION_KEY_FILE}; "
             f"create it (32+ random bytes, mode 0600) before configuring a target"
         )
+    # Per-target credentials file is required for S3 (KOPIA_S3_*) but
+    # optional for kopia-fs targets — those just need a writable
+    # directory + the encryption password. Avoiding the requirement for
+    # FS targets removes a useless tripwire while keeping S3 targets
+    # safe (kopia would otherwise prompt interactively for keys, which
+    # never works under a systemd service).
     cred_file = CREDENTIALS_DIR / f"{target_id}.env"
-    if not cred_file.exists():
+    if kind == "kopia-s3" and not cred_file.exists():
         raise RuntimeError(
             f"missing {cred_file}; "
-            f"populate it with the target's S3 keys (KOPIA_S3_ACCESS_KEY etc.) "
-            f"or filesystem mount info, mode 0600"
+            f"populate it with the target's S3 keys (KOPIA_S3_ACCESS_KEY, "
+            f"KOPIA_S3_SECRET_KEY), mode 0600, before configuring an S3 target"
         )
 
     # Resolve the cache dir once and pass it through. _kopia_cache_dir
@@ -285,8 +291,20 @@ def configure_target_locally(target_id: str, kind: str,
     )
     log.info("backup: kopia repository connect (target=%s, kind=%s)",
              target_id, kind)
-    r = subprocess.run(["bash", "-lc", connect_cmd],
-                       capture_output=True, text=True, timeout=120)
+    # 30 s is plenty for a reachable S3 endpoint (kopia connect does
+    # a list-blobs round-trip + format-block read; both ~1 s under
+    # normal latency). Bumping above this just means a UI wait when
+    # the operator typed a bad endpoint — fail fast.
+    try:
+        r = subprocess.run(["bash", "-lc", connect_cmd],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"kopia repository connect timed out after 30s — "
+            f"endpoint {s3_endpoint or filesystem_path!r} is unreachable "
+            f"or refusing connections. Check the endpoint URL, network "
+            f"reachability, and (for S3) the access key permissions."
+        )
 
     if r.returncode != 0 and "already connected" not in (r.stderr or "").lower():
         # Distinguish "repo not initialized" from real errors. Kopia
@@ -305,14 +323,14 @@ def configure_target_locally(target_id: str, kind: str,
                 filesystem_path=filesystem_path,
             )
             cr = subprocess.run(["bash", "-lc", create_cmd],
-                                capture_output=True, text=True, timeout=180)
+                                capture_output=True, text=True, timeout=45)
             if cr.returncode != 0:
                 # Race: another node created it between our connect and
                 # our create. Try the connect once more.
                 if _looks_like_already_initialized(cr.stderr or cr.stdout or ""):
                     log.info("backup: repo created concurrently — re-connecting")
                     r2 = subprocess.run(["bash", "-lc", connect_cmd],
-                                        capture_output=True, text=True, timeout=120)
+                                        capture_output=True, text=True, timeout=30)
                     if r2.returncode != 0 and "already connected" not in (r2.stderr or "").lower():
                         raise RuntimeError(
                             f"kopia connect (post-race) failed: "
@@ -677,6 +695,26 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
     if not node:
         raise RuntimeError(f"destination node {dest_node_name!r} not in cluster")
     ssh_host = node["host"]
+
+    # ── Safety: refuse restore on a running VM ──────────────────
+    # qemu holds /dev/<lv> with O_RDWR while the VM is running; the
+    # dd write would race with qemu's writes and corrupt both the
+    # in-flight VM state and the restore. The dashboard already
+    # disables the per-row button when state==running, but the API
+    # is the security boundary — also enforce here.
+    try:
+        state = _ssh(ssh_host,
+                     f"virsh domstate {shlex.quote(vm_name)} 2>/dev/null || true",
+                     check=False).strip().lower()
+    except Exception:
+        state = ""
+    if state == "running":
+        raise RuntimeError(
+            f"refusing to restore VM {vm_name!r}: it is currently running on "
+            f"{dest_node_name}. Shut it down first (POST /api/vms/{vm_name}/poweroff "
+            f"or /shutdown) — restoring while qemu holds the disk would race "
+            f"with the in-flight VM state and corrupt both."
+        )
 
     # If the caller didn't specify, restore back onto the VM's primary
     # disk LV — the most common case for "undo my last change to this VM".

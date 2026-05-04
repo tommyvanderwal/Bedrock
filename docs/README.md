@@ -37,6 +37,10 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | Export a VM to qcow2/vmdk/vhdx/raw | Export card on Settings | [`actions/vm-import-export.md`](actions/vm-import-export.md) |
 | Live-migrate a VM | `Live Migrate` button | [`actions/vm-migrate.md`](actions/vm-migrate.md) |
 | Start / stop / delete a VM | dashboard buttons | [`actions/vm-lifecycle.md`](actions/vm-lifecycle.md) |
+| Configure a backup target | dashboard `/backups` | [`actions/backup-target-set.md`](actions/backup-target-set.md) |
+| Back up a VM | dashboard `Backup` button on VM | [`actions/vm-backup.md`](actions/vm-backup.md) |
+| Restore a VM from a backup | dashboard `Restore` button on snapshot | [`actions/vm-restore.md`](actions/vm-restore.md) |
+| List & delete backups | dashboard `/backups` (cluster-wide) or VM card | [`actions/backup-list-delete.md`](actions/backup-list-delete.md) |
 
 ## Failure scenarios (what happens when things break)
 

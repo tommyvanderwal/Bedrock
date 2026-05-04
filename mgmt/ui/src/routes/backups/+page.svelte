@@ -29,7 +29,11 @@
 	let s3_access_key = $state('');
 	let s3_secret_key = $state('');
 	let encryption_password = $state('');
-	let force_password_overwrite = $state(false);
+	// force_password_overwrite is a CLI-only emergency flag; not exposed
+	// in the UI on purpose. Rotating the kopia password destroys access
+	// to every existing snapshot — too dangerous to surface as a
+	// dashboard checkbox. The /backups page disables the password
+	// field entirely once any node has the key installed.
 
 	let submitting = $state(false);
 	let banner = $state<{ kind: 'ok' | 'err' | 'warn'; text: string } | null>(null);
@@ -159,7 +163,8 @@
 				s3_access_key: s3_access_key || undefined,
 				s3_secret_key: s3_secret_key || undefined,
 				encryption_password: encryption_password || undefined,
-				force_password_overwrite,
+				// force_password_overwrite intentionally omitted — UI
+				// never rotates passwords; CLI-only emergency path.
 				reason: 'set via dashboard',
 			});
 			const warns = (r as any)?.warnings as string[] | undefined;
@@ -174,7 +179,6 @@
 			s3_access_key = '';
 			s3_secret_key = '';
 			encryption_password = '';
-			force_password_overwrite = false;
 			await refresh();
 		} catch (e: any) {
 			banner = { kind: 'err', text: e.message };
@@ -204,6 +208,18 @@
 	Bedrock enforces a <strong>≥256-bit content-hash floor</strong> at
 	repo creation; weaker repos are refused.
 </p>
+
+<div class="key-banner">
+	<strong>Operator responsibility:</strong> the encryption password is set
+	<strong>once</strong> when you first configure a target. It is the only
+	secret that decrypts your backups. Bedrock writes it to
+	<code>/etc/bedrock/backup.key</code> on every node, but a full cluster
+	wipe destroys all copies. Store the password — together with the S3
+	access key / secret key / bucket name / endpoint — in a password
+	manager or printed sheet outside this cluster. Lose any of those and
+	your backups become permanently unreadable; there is no recovery
+	channel.
+</div>
 
 {#if banner}
 	<div class="banner banner-{banner.kind}">{banner.text}</div>
@@ -373,25 +389,50 @@
 
 	<div class="row">
 		<label class="grow">Encryption password
-			{#if allNodesHavePassword && !force_password_overwrite}
-				<input type="password" autocomplete="off" disabled placeholder="(installed on every node — leave blank)" />
+			{#if allNodesHavePassword}
+				<input type="password" autocomplete="off" disabled
+					placeholder="(installed on every node — set once, never rotate from here)" />
 				<span class="hint">
-					<label class="inline">
-						<input type="checkbox" bind:checked={force_password_overwrite} />
-						Rotate password (destroys access to existing backups — irreversible)
-					</label>
+					Already configured. Bedrock deliberately does NOT expose
+					password rotation in the UI — rotating destroys access to
+					every existing backup. If you ever truly need to start
+					over with a fresh key, do it via the CLI on the master
+					(<code>bedrock backup target set …</code> with
+					<code>--force-password-overwrite</code>) <em>after</em>
+					you've confirmed every backup tied to the old key is
+					expendable.
 				</span>
 			{:else}
 				<input type="password" autocomplete="off" bind:value={encryption_password}
-					placeholder="32+ chars; cannot be recovered if lost" />
+					placeholder="32+ chars; you set this ONCE" />
 				<span class="hint warn">
-					This is the single secret that protects every backup.
-					<strong>Write it down somewhere outside the cluster</strong> —
-					if every node and your records lose it, restores are impossible.
+					This is set <strong>once</strong> and never rotated. It is the
+					single secret that decrypts every backup. Bedrock does not
+					store it anywhere recoverable — losing it means losing every
+					backup ever taken against this repo.
 				</span>
 			{/if}
 		</label>
 	</div>
+
+	{#if !allNodesHavePassword}
+		<div class="critical-notice">
+			<h4>⚠ Operator responsibility — write these down NOW, outside this cluster:</h4>
+			<ol>
+				<li>The <strong>encryption password</strong> you typed above (it gets written to <code>/etc/bedrock/backup.key</code> on every node, but a full cluster wipe destroys all copies).</li>
+				<li>The <strong>S3 access key</strong> and <strong>secret key</strong> for this bucket.</li>
+				<li>The <strong>bucket name</strong> and <strong>endpoint URL</strong>.</li>
+			</ol>
+			<p>
+				Store them in a password manager / safe / printed sheet —
+				somewhere that survives a total cluster failure. Without all
+				three pieces, restoring backups onto a new cluster is
+				<strong>physically impossible</strong>: the bytes on S3 are
+				AES-256-GCM-encrypted with a key derived from the password,
+				and bedrock has no recovery channel.
+			</p>
+		</div>
+	{/if}
 
 	<div class="row">
 		<label class="grow">Override-source prefix <span class="muted">(optional)</span>
@@ -567,4 +608,31 @@
 	.banner-ok { background: #1a7f3722; border-left: 3px solid #3fb950; color: #3fb950; }
 	.banner-err { background: #f8514922; border-left: 3px solid #f85149; color: #f85149; }
 	.banner-warn { background: #d2992222; border-left: 3px solid #d29922; color: #d29922; }
+
+	.key-banner {
+		background: #d2992211; border: 1px solid #d29922; border-radius: 6px;
+		padding: 12px 16px; margin: 0 0 18px; font-size: 13px; color: #d8b362;
+		max-width: 920px; line-height: 1.5;
+	}
+	.key-banner strong { color: #f0c674; }
+	.key-banner code {
+		background: #21262d; padding: 1px 6px; border-radius: 3px; color: #c9d1d9;
+	}
+
+	.critical-notice {
+		background: #f8514916; border-left: 4px solid #f85149; border-radius: 4px;
+		padding: 12px 16px; margin: 4px 0 16px; color: #ec8c84;
+		font-size: 13px; line-height: 1.5;
+	}
+	.critical-notice h4 {
+		margin: 0 0 8px; color: #f85149; font-size: 13px; text-transform: none;
+		letter-spacing: 0; font-weight: 600;
+	}
+	.critical-notice ol { margin: 4px 0 8px; padding-left: 22px; }
+	.critical-notice li { margin: 3px 0; }
+	.critical-notice strong { color: #ffae9e; }
+	.critical-notice code {
+		background: #21262d; padding: 1px 6px; border-radius: 3px; color: #c9d1d9;
+	}
+	.critical-notice p { margin: 8px 0 0; }
 </style>
