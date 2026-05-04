@@ -706,33 +706,39 @@ buys access to the stable repo and support, nothing else gates use.
 You can run PBS anywhere, including as a VM on the very Bedrock
 cluster it's backing up.
 
-Three deployment shapes, in increasing safety:
+Four deployment shapes — pick by environment:
 
-**Shape A — PBS off-cluster (recommended for prod).**
-A small dedicated host: a NUC, a Raspberry Pi 4 with a USB SSD,
-or a 1U appliance. PBS is light: ~1 GB RAM idle, single-digit CPU
-%, storage = however much backup history you keep. The backup
-data sits *outside* Bedrock, so a Bedrock-cluster disaster doesn't
-also destroy the backups. This is what you want.
+**Shape A — PBS cattle VM on Bedrock with hot+cold datastores. (v1
+default.)**
+ONE PBS instance on a Bedrock node. Hot datastore on local NVMe
+LV-thin (fast backup, fast restore for recent stuff). Cold datastore
+on S3 (Wasabi / Backblaze B2 / AWS / R2 / self-hosted MinIO) —
+**this is the offsite tier, durably outside Bedrock by virtue of
+living at the S3 provider.** Internal PBS sync-job copies hot →
+cold periodically. Single VM, single PBS, two datastores; backups
+durable as soon as the sync runs.
 
-**Shape B — PBS as a pet VM on Bedrock with datastore on external
-storage.**
-The PBS VM itself runs on Bedrock (HA via DRBD); but its datastore
-disk is mounted from a separate NAS / S3 / NFS share / external
-disk. VM gets HA; backups stay independent of Bedrock storage.
-Acceptable production pattern when "deploy a separate host" isn't
-practical.
+**Shape B — PBS cattle VM on Bedrock + offsite PBS instance.**
+Same hot datastore on Bedrock. Sync-job → a remote PBS box
+(VPS, NUC, friend's homelab). Choose this when you want a real
+second physical site rather than relying on an S3 provider, or
+when you want to avoid recurring S3 bills for a homelab-scale setup.
 
-**Shape C — PBS as a pet VM with datastore on Bedrock.**
-Everything lives on Bedrock. Cheap and easy; backups recover from
-*guest-level* mistakes (someone deleted the wrong file, malware,
-config rollback) but not from *cluster-level* failure (storage
-corruption, node loss before backup ships elsewhere). OK for
-dev/test/lab; **not** OK as your only backup story for production.
+**Shape C — PBS off-cluster, single tier.**
+Small dedicated host (NUC, Pi 4 + SSD, 1U appliance). Bedrock
+nodes back up directly to it over LAN. Cleanest separation between
+workload and backup; downside is no local hot tier, so restores
+go over the LAN to the PBS host.
 
-Mixed-mode is fine: shape B locally for fast restores + shape A
-offsite for DR. PBS supports `proxmox-backup-client sync` between
-two PBS instances, so two-tier topologies are first-class.
+**Shape D — PBS cattle VM with datastore on Bedrock storage only.**
+No offsite tier. Backups recover from *guest-level* mistakes
+(deleted file, malware, config rollback) but not from *cluster-
+level* loss. **Dev/test/lab only — not a production backup story.**
+
+For most production sites, **Shape A** is the v1 default. Shape B
+applies when S3 isn't acceptable (regulated industries, air-gapped
+environments). Shape C is the conservative classic. Shape D is the
+"backup is set up but don't lean on it" lab pattern.
 
 In all three cases the install on a Bedrock node is just:
 
@@ -802,20 +808,29 @@ disaster recovery. Worth spelling out:
 1. **PBS is Debian-only.** PBS-as-cattle-VM with a Debian guest is
    the supported deployment shape on a Bedrock node. Bare-metal PBS
    on AlmaLinux means compiling from source — not viable.
-2. **PBS has no native S3 datastore.** "Offsite to S3" means one
-   of: (a) the offsite PBS instance has its datastore on real
-   filesystem and you sync there with `proxmox-backup-manager
-   sync-job`; (b) `rclone sync` the offsite PBS's datastore
-   directory to S3 as a periodic job; (c) S3-fuse mount as
-   datastore — works but slow + risky, avoid.
-3. **S3 Glacier specifically** has retrieval delays incompatible
-   with backup-tool expectations. Glacier is fine as the *third-tier
-   cold archive* (S3 lifecycle rules push old objects there); not
-   as the primary offsite destination.
-4. **Single-host local PBS = single point of failure for backups
-   taken since last offsite sync.** If the PBS host dies, the
-   backups since last sync are gone. Mitigation: sync hourly so
-   the loss window is small.
+2. **S3 datastore needs PBS 4.2+** (April 2026, GA after a
+   ~9-month tech-preview window in 4.0/4.1). Pin the cattle VM
+   to 4.2 or newer. See §9b-ter for what works and what doesn't.
+3. **S3 backend requires the PBS host to be online** for backups
+   to succeed — there's no "queue locally, flush later" mode.
+   This is fine in practice (the PBS VM is local on Bedrock; S3
+   is the offsite tier reached through normal internet) but worth
+   knowing.
+4. **PBS S3 backend doesn't support Object Lock yet.** For
+   ransomware-immutability, configure Object Lock at the bucket
+   level outside PBS, or use a separately-credentialed account
+   for the cold tier. Planned PBS feature; not there in 4.2.
+5. **S3 Glacier specifically** has retrieval delays incompatible
+   with backup-tool expectations. Glacier is fine as the *third-
+   tier cold archive* via S3 lifecycle rules (PBS sees Standard;
+   the bucket ages old objects to Glacier on its own); not as the
+   primary offsite destination.
+6. **Single-host local PBS = single point of failure for backups
+   in flight to S3.** If the PBS host dies mid-upload of a backup
+   not yet flushed to S3, that one backup is incomplete. The
+   already-uploaded ones are safe in S3. Mitigation: prefer the
+   dual-datastore pattern (hot + cold) so finished backups have
+   already been synced offsite.
 
 **What PBS gives us out of the box:**
 
@@ -857,86 +872,113 @@ That's the right contract.
 
 ---
 
-## 9b-ter. Why PBS doesn't have native S3 (and what everyone else does)
+## 9b-ter. PBS 4.2 has S3 — what changed and what it means here
 
-The "no S3 backend" gap is real and worth being candid about, since
-it affects how the offsite tier is shaped.
+**Update — May 2026.** Earlier drafts of this doc said "PBS has no
+native S3 backend." That was true for PBS 3.x. **It is not true for
+PBS 4.x.** Recapping what actually shipped:
 
-**The industry baseline:** Veeam, Commvault, Rubrik, Cohesity, and
-the open-source field (Restic, Duplicati, Kopia, Borg+rclone, Bareos,
-Bacula) all have first-class S3 support — usually with S3 Object
-Lock immutability, lifecycle to Glacier, and the ability to use S3
-as either primary backup target or capacity tier. **PBS is the
-outlier.**
+- **PBS 4.0 (2025):** S3-compatible object stores added as a
+  *technology preview* backend. Proxmox-blessed but flagged
+  experimental.
+- **PBS 4.1:** preview continued; performance + retry improvements.
+- **PBS 4.2 (April 2026):** S3 backend **graduated from tech preview
+  to officially supported.** Plus: HTTPS-only with cert-fingerprint
+  pinning, request/traffic stats with notification thresholds, HTTP
+  proxy support, bandwidth rate limits per direction, retry logic
+  for 500/503/504, and provider-quirks support (e.g. fallback for
+  S3 backends that don't implement DeleteObjects).
 
-**Why PBS doesn't have it (yet):**
+This is now ~9 months of tech-preview maturation followed by an
+official-support stamp. For a v1 Bedrock release shipping later
+this year, riding PBS 4.2's S3 backend is reasonable — both projects
+are young; the S3 feature has been used in real deployments
+throughout the preview window.
 
-PBS is built around a content-addressable store on POSIX with
-specific assumptions about latency and consistency. S3's per-call
-latency (tens of ms minimum) and eventual-consistency edge-cases
-make a robust S3 backend non-trivial to bolt on without hurting
-dedup-write and verify-read performance. Proxmox have prioritised
-tape support, removable-datastore support, ZFS integration, and
-web UI polish over an S3 backend. It's on the roadmap with no
-firm date.
+**How the S3 backend actually works:**
 
-So this is a known omission, not a design wall.
+S3 is the durable store; PBS keeps a **local persistent cache**
+(64–128 GiB recommended) that holds metadata and recently-used
+chunks. Writes go to cache + uploaded to S3 immediately. Reads come
+from cache when available; otherwise pulled from S3.
 
-**How PBS users actually take backups offsite today:**
+| Aspect | What you get |
+|---|---|
+| Tested providers | AWS S3, Cloudflare R2, Wasabi, Backblaze B2, MinIO (self-host), Ceph RADOS Gateway (self-host), RustFS |
+| Transport | HTTPS only; self-signed cert OK with fingerprint pin |
+| Dedup | Same as POSIX datastore — content-addressed; the cache tracks "already-seen chunks" so we don't re-upload duplicates |
+| Client-side encryption | Same as POSIX datastore — per-datastore key, chunks encrypted before they hit the cache or S3 |
+| Server-side encryption for push-sync | New in 4.2 — encrypt snapshots on-the-fly when copying to a remote |
+| Object Lock / immutability | **Not yet supported** by the PBS S3 implementation — this is the one real gap vs Veeam-class products. Ransomware-immutability needs a workaround for now (bucket policies, separate accounts) |
+| Bandwidth controls | Per-direction rate limit on S3 traffic (added 4.2) |
+| Restore latency | Cold restore reads chunks from S3 (network-bound); hot restore can hit cache. Plan accordingly. |
+| Offline behaviour | If S3 is unreachable, **new backups fail.** No queue-and-flush-later. Backup paths require S3 connectivity. |
+| Datastore sharing | A datastore can't be shared across PBS instances; one writer at a time |
 
-| Pattern | Officially blessed? | Notes |
-|---|---|---|
-| PBS sync-job → remote PBS instance | **Yes** — Proxmox-documented | The standard recommendation. Schedulable, throttleable, resumable, encrypted in flight. |
-| PBS tape (LTO) | Yes (PBS 2.0+) | Built-in. Cheap/TB but slow restore. Compliance-friendly. |
-| Removable USB datastores | Yes (PBS 3.0+) | Rotate drives in/out; carry offsite. Small-shop pattern. |
-| `rclone sync` the datastore directory to S3 | Community workaround, not official | PBS's `.chunks/` are write-once-immutable. rclone in correct order (chunks before indexes) works. Restore pulls chunks back from S3 before reading. |
-| `rsync` over SSH to a remote host | Community | Same idea, FS instead of S3. |
+**The architectural simplification this enables for Bedrock:**
 
-**What this means for Bedrock — the four real options:**
+Earlier we recommended a "two PBS instances, one local + one
+offsite" pattern because there was no other way to put data on S3.
+With PBS 4.2 we can do it cleaner with **one PBS instance, two
+datastores, sync between them**:
 
-**(a) PBS + remote PBS, no S3.**
-Local PBS = fast hot backup + restore. Offsite = a second PBS
-instance on cheap hardware (small VPS, colo Pi, friend's homelab).
-PBS sync-job ships dedup'd encrypted chunks. **This is the v1
-recommendation** because the docs match the pattern; everything is
-supported; no clever workarounds.
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │                       Bedrock cluster                       │
+   │                                                             │
+   │  Bedrock nodes ──────────► proxmox-backup-client backup     │
+   │                                       │                     │
+   │                                       ▼                     │
+   │                          ┌────────────────────────┐         │
+   │                          │  PBS cattle VM         │         │
+   │                          │  (Debian 13 guest)     │         │
+   │                          │                        │         │
+   │                          │  ┌──────────────────┐  │         │
+   │                          │  │ "hot" datastore  │  │         │
+   │                          │  │ on local NVMe    │  │         │
+   │                          │  │ LV-thin (fast)   │  │         │
+   │                          │  └────────┬─────────┘  │         │
+   │                          │           │ sync-job   │         │
+   │                          │           │ hourly     │         │
+   │                          │           ▼            │         │
+   │                          │  ┌──────────────────┐  │         │
+   │                          │  │ "cold" datastore │  │         │
+   │                          │  │ on S3 backend    │  │         │
+   │                          │  │ + 64 GiB local   │  │         │
+   │                          │  │   cache LV       │  │         │
+   │                          │  └────────┬─────────┘  │         │
+   │                          └───────────┼────────────┘         │
+   └──────────────────────────────────────┼─────────────────────-┘
+                                          │ HTTPS to bucket
+                                          ▼
+                              ┌──────────────────────────┐
+                              │ Wasabi / Backblaze B2 /  │
+                              │ AWS / Cloudflare R2 /    │
+                              │ self-hosted MinIO        │
+                              └──────────────────────────┘
+```
 
-**(b) PBS + remote PBS + rclone-to-S3 for cold archive.**
-Same as (a), plus the offsite PBS host runs a periodic `rclone sync`
-of its `.chunks/` + index dirs to S3 (Standard or IA). S3 lifecycle
-rules age objects into Glacier / Deep Archive after N days. Three
-tiers: hot local, online offsite, cold S3.
+**One PBS VM. Two datastores. S3 is the offsite.** Bandwidth limits,
+retries, encryption, and dedup all handled by PBS. The "second host
+running PBS offsite" becomes optional — the S3 provider IS the
+offsite, with whatever durability/availability guarantees they
+publish (Wasabi 11×9s, Backblaze 11×9s, etc.).
 
-Why this works: PBS chunks are write-once-immutable, so rclone's
-sync model (and Glacier's "you can't update objects" model) play
-well together. Cost: one cron job + rclone config. Restoring from
-the S3 tier means rclone-pulling chunks back to the offsite PBS
-host before they're readable. That's fine for "the building burned
-down"; not fine for "I deleted a file at lunch."
+For ransomware-immutability (PBS's one S3 gap): use bucket-level
+S3 Object Lock or versioning configured *outside* PBS, plus a
+restricted IAM key for the bucket. Or run the offsite tier in a
+separately-credentialed account so a compromised primary can't
+delete its archives.
 
-**(c) PBS for hot + Restic for S3-native offsite — don't.**
-Two backup systems = two retention models, two encryption-key
-schemes, two CLIs to learn, twice the operator surface area. Sounds
-clever; bites later.
+**Updated v1 recommendation:**
 
-**(d) Skip PBS, use Restic everywhere.**
-Restic has native S3, native dedup, native encryption. But no
-VM-aware UX, no built-in retention CLI (you script it), no web UI,
-no verify-jobs as a first-class concept, no tape, no Proxmox-
-ecosystem fit. Trade a lot of polish for the S3-native property.
-Right answer if S3 truly is non-negotiable; otherwise (a)/(b) are
-better.
-
-**Recommendation:** v1 ships option (a). It's the "PBS works the
-way the docs say it does" story. Operators who specifically want
-S3-tier archival add (b) by enabling rclone on the offsite PBS
-host — that's a one-host config change, not a Bedrock config change.
-
-If/when PBS gains a native S3 backend, the architecture doesn't
-change — you'd just point the offsite PBS's datastore at S3
-directly and remove the rclone step. Bedrock's API surface to PBS
-(`proxmox-backup-client backup` / `restore`) is identical regardless
-of where PBS's datastore lives.
+| Need | Pattern |
+|---|---|
+| "Backups land somewhere fast and durable" | PBS cattle VM, hot datastore on local NVMe, cold datastore on S3, internal sync-job hot→cold hourly. |
+| "I have an existing PBS box" | Configure that box as the cold-tier remote; sync-job from the local PBS to the remote PBS. Same shape, different topology. |
+| "I want immutability against ransomware" | S3 Object Lock at bucket level (outside PBS for now); plan to revisit when PBS adds Object Lock natively. |
+| "I want zero local storage cost" | Single PBS VM with only the S3 datastore (64 GiB cache LV). Trade restore speed for storage cost. Works; not as fast as the dual-datastore pattern. |
+| "I want belt-and-braces" | Dual-datastore PBS + a *third* tier: lifecycle rule on the S3 bucket aging old objects into Glacier / Deep Archive. PBS doesn't see the lifecycle; the bucket handles it. |
 
 ---
 
