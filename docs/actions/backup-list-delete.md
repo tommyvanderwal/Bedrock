@@ -1,4 +1,4 @@
-# List & delete backups
+# List & delete backups (per-VM and cluster-wide)
 
 Read-only history per VM is folded into `cluster.json` on every
 `BACKUP_DONE` log entry; deletion drops a kopia snapshot manifest
@@ -8,14 +8,17 @@ scheduled `kopia maintenance run`.
 
 **Triggered by:**
 
-- Dashboard: VM detail page → Backups card → row table (list);
-  per-row `Delete` button (delete)
+- Dashboard: VM detail page → Backups card → row table (per-VM list)
+- Dashboard: `/backups` page → "Snapshots — cluster-wide" card
+  (every VM's backups, sorted newest-first by log index)
 - HTTP:
-  - `GET /api/vms/{name}/backups`
+  - `GET /api/vms/{name}/backups`         (per-VM)
+  - `GET /api/backups`                     (cluster-wide)
   - `DELETE /api/vms/{name}/backups/{kopia_snapshot_id}`
     body `{"target_id":"main", "reason":"<freeform>"}`
 
 **Source:** `mgmt/app.py:api_vm_backups_list`,
+`mgmt/app.py:api_backups_list_all`,
 `mgmt/app.py:api_vm_backup_delete`,
 `mgmt/backup.py:list_backups_for_vm`,
 `mgmt/backup.py:delete_backup`,
@@ -48,7 +51,7 @@ The list is **kept in cluster.json**, capped at the most recent 200
 entries per VM. Older entries are still in the kopia repo and the
 cluster log; the cap exists to keep cluster.json size bounded.
 
-## Sequence — list
+## Sequence — per-VM list
 
 ```
   GET /api/vms/NAME/backups
@@ -69,6 +72,29 @@ Pure projection read. No SSH, no kopia call, no log append. Sub-
 millisecond response time. The dashboard refreshes this on a 20 s
 interval as part of the VM detail page; live updates flow through
 the `task` WS channel during in-flight backups.
+
+## Sequence — cluster-wide list
+
+```
+  GET /api/backups
+       │
+       │ load_cluster()
+       │ for vm_name, vm in c["vms"]:
+       │   for b in vm.get("backups", []):
+       │     row = {**b, "vm": vm_name, "vm_present": True}
+       │     out.append(row)
+       │
+       │ out.sort(key=ts_index, reverse=True)
+       │
+       │ Return 200 { "backups": [...] }
+```
+
+Same projection-read characteristics — flattens every VM's history
+into one timeline. The `/backups` page in the dashboard polls this
+every 15 s and renders the table with per-row `Restore` and
+`Delete` buttons. `vm_present=False` is reserved for v1.x when we
+surface "orphan" snapshots from `kopia snapshot list` whose source
+VM has been deleted from the cluster log.
 
 ## Sequence — delete
 

@@ -1,12 +1,21 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { listBackupTargets, getBackupCredsStatus, setBackupTarget,
-		removeBackupTarget,
-		type BackupTarget, type BackupCredsStatus } from '$lib/api';
+		removeBackupTarget, listAllBackups, vmRestore, vmBackupDelete,
+		type BackupTarget, type BackupCredsStatus,
+		type ClusterBackupRow } from '$lib/api';
 
 	let targets = $state<Record<string, BackupTarget>>({});
 	let credsStatus = $state<BackupCredsStatus | null>(null);
 	let loading = $state(true);
+
+	// Cluster-wide backup history.
+	let clusterBackups = $state<ClusterBackupRow[]>([]);
+	let restoring = $state<string | null>(null);  // kopia_snapshot_id in progress
+
+	// Restore-confirm modal — destructive write to /dev/<lv>, type vm name.
+	let restoreModal = $state<ClusterBackupRow | null>(null);
+	let restoreTyped = $state('');
 
 	// Form state — defaults sized for the QNAP-S3 testbed case.
 	let target_id = $state('main');
@@ -41,9 +50,12 @@
 	async function refresh() {
 		loading = true;
 		try {
-			const [t, c] = await Promise.all([listBackupTargets(), getBackupCredsStatus()]);
+			const [t, c, b] = await Promise.all([
+				listBackupTargets(), getBackupCredsStatus(), listAllBackups(),
+			]);
 			targets = t.targets || {};
 			credsStatus = c;
+			clusterBackups = b.backups || [];
 			// If a target with this id already exists, prefill the form
 			// with its non-secret fields. Lets the operator edit endpoint
 			// or rotate keys without re-typing everything.
@@ -63,7 +75,64 @@
 		}
 	}
 
-	onMount(refresh);
+	onMount(() => {
+		refresh();
+		// Light polling — backup history grows, in-flight backups land
+		// in cluster.json after the BACKUP_DONE log fold (~1s after the
+		// task completes). 15s is fine; live updates flow via the
+		// 'task' WS channel for in-flight progress.
+		const iv = setInterval(refresh, 15000);
+		return () => clearInterval(iv);
+	});
+
+	function openRestoreModal(b: ClusterBackupRow) {
+		restoreModal = b;
+		restoreTyped = '';
+	}
+	function closeRestoreModal() {
+		restoreModal = null;
+		restoreTyped = '';
+	}
+
+	async function confirmRestore() {
+		if (!restoreModal) return;
+		if (restoreTyped !== restoreModal.vm) return;
+		const b = restoreModal;
+		restoreModal = null;
+		restoring = b.kopia_snapshot_id;
+		banner = { kind: 'warn', text: `Restore queued for ${b.vm} → snapshot ${b.kopia_snapshot_id.slice(0,12)}…` };
+		try {
+			await vmRestore(b.vm, {
+				target_id: b.target_id,
+				kopia_snapshot_id: b.kopia_snapshot_id,
+			});
+			banner = { kind: 'ok',
+				text: `Restore started for ${b.vm}. Track progress in the Tasks drawer.` };
+		} catch (e: any) {
+			banner = { kind: 'err', text: `Restore failed to start: ${e.message}` };
+		} finally {
+			restoring = null;
+			setTimeout(() => banner?.kind === 'ok' && (banner = null), 8000);
+		}
+	}
+
+	async function deleteSnapshot(b: ClusterBackupRow) {
+		if (!confirm(`Delete kopia snapshot ${b.kopia_snapshot_id.slice(0,12)}… for ${b.vm}? Repo chunks are GC'd at the next maintenance run.`)) return;
+		try {
+			await vmBackupDelete(b.vm, b.kopia_snapshot_id, { target_id: b.target_id });
+			await refresh();
+		} catch (e: any) {
+			banner = { kind: 'err', text: `Delete failed: ${e.message}` };
+		}
+	}
+
+	function fmtBytes(n: number): string {
+		if (!n) return '0 B';
+		if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+		if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
+		if (n >= 1024) return `${(n / 1024).toFixed(0)} KiB`;
+		return `${n} B`;
+	}
 
 	async function submit() {
 		banner = null;
@@ -165,6 +234,50 @@
 						</td>
 						<td>{t.s3_region || '—'}</td>
 						<td><button class="btn-small danger" onclick={() => remove(id)}>Remove</button></td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+</div>
+
+<h2>Snapshots — cluster-wide</h2>
+<div class="card">
+	{#if clusterBackups.length === 0}
+		<p class="muted">No backups yet. Backups appear here automatically when a VM has been backed up via the dashboard, CLI, or API.</p>
+	{:else}
+		<table class="snapshots-table">
+			<thead>
+				<tr>
+					<th>VM</th>
+					<th>Snapshot</th>
+					<th>Target</th>
+					<th>Size added</th>
+					<th>Duration</th>
+					<th>Source node</th>
+					<th>Label</th>
+					<th>Log idx</th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each clusterBackups as b}
+					<tr class:in-progress={restoring === b.kopia_snapshot_id}>
+						<td><a href="/vm/{b.vm}">{b.vm}</a></td>
+						<td><code title={b.kopia_snapshot_id}>{b.kopia_snapshot_id.slice(0, 12)}…</code></td>
+						<td>{b.target_id}</td>
+						<td>{fmtBytes(b.bytes_added)}</td>
+						<td>{b.duration_s ? `${b.duration_s.toFixed(1)}s` : '-'}</td>
+						<td>{b.source_node || '-'}</td>
+						<td>{#if b.label}{b.label}{:else}<span class="muted">—</span>{/if}</td>
+						<td class="muted">{b.ts_index}</td>
+						<td>
+							<button class="btn-small primary" disabled={restoring !== null}
+								title="Stream this snapshot back onto the VM's primary disk LV. The VM must be shut down."
+								onclick={() => openRestoreModal(b)}>Restore</button>
+							<button class="btn-small danger" disabled={restoring !== null}
+								onclick={() => deleteSnapshot(b)}>Delete</button>
+						</td>
 					</tr>
 				{/each}
 			</tbody>
@@ -296,6 +409,40 @@
 	</div>
 </div>
 
+{#if restoreModal}
+	<div class="modal-bg" role="presentation" onclick={closeRestoreModal}>
+		<div class="modal" role="dialog" aria-modal="true"
+			onclick={(e) => e.stopPropagation()}
+			onkeydown={(e) => { if (e.key === 'Escape') closeRestoreModal(); }}>
+			<h3>Restore VM from snapshot</h3>
+			<dl class="restore-meta">
+				<dt>VM</dt><dd><code>{restoreModal.vm}</code></dd>
+				<dt>Snapshot</dt><dd><code>{restoreModal.kopia_snapshot_id}</code></dd>
+				<dt>Target</dt><dd><code>{restoreModal.target_id}</code></dd>
+				<dt>Label</dt><dd>{restoreModal.label || '—'}</dd>
+				<dt>Source node</dt><dd>{restoreModal.source_node || '—'}</dd>
+			</dl>
+			<p class="restore-warn">
+				This streams the snapshot's bytes back onto the VM's primary disk LV.
+				Anything written to the disk since this backup will be lost.
+				<strong>The VM must be shut down before restoring.</strong>
+			</p>
+			<label class="restore-typecheck">
+				Type the VM name <code>{restoreModal.vm}</code> to confirm:
+				<input type="text" bind:value={restoreTyped} autocomplete="off"
+					autofocus
+					onkeydown={(e) => { if (e.key === 'Enter' && restoreModal && restoreTyped === restoreModal.vm) confirmRestore(); }} />
+			</label>
+			<div class="restore-actions">
+				<button class="btn" onclick={closeRestoreModal}>Cancel</button>
+				<button class="btn btn-danger"
+					disabled={!restoreModal || restoreTyped !== restoreModal.vm}
+					onclick={confirmRestore}>Restore</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 <style>
 	h1 { font-size: 24px; margin: 0 0 6px; }
 	h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin: 24px 0 8px; }
@@ -356,8 +503,56 @@
 	.btn-small {
 		padding: 2px 8px; border: 1px solid #30363d; border-radius: 4px;
 		background: #21262d; color: #8b949e; font-size: 11px; cursor: pointer;
+		margin-right: 4px;
 	}
-	.btn-small.danger:hover { color: #f85149; border-color: #f85149; }
+	.btn-small:hover:not(:disabled) { background: #30363d; }
+	.btn-small:disabled { opacity: 0.4; cursor: not-allowed; }
+	.btn-small.danger:hover:not(:disabled) { color: #f85149; border-color: #f85149; }
+	.btn-small.primary { border-color: #1f6feb; color: #58a6ff; }
+	.btn-small.primary:hover:not(:disabled) { background: #1f6feb22; color: #fff; }
+
+	.snapshots-table { font-variant-numeric: tabular-nums; }
+	.snapshots-table tbody tr.in-progress { opacity: 0.5; }
+
+	/* Restore confirm modal — same look-and-feel as VM delete modal */
+	.modal-bg {
+		position: fixed; inset: 0; background: #0008; backdrop-filter: blur(2px);
+		display: flex; align-items: center; justify-content: center; z-index: 1000;
+	}
+	.modal {
+		background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+		padding: 24px; min-width: 460px; max-width: 600px;
+	}
+	.modal h3 {
+		font-size: 16px; color: #e6edf3; text-transform: none; letter-spacing: 0;
+		margin: 0 0 12px;
+	}
+	.restore-meta {
+		display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px;
+		font-size: 12px; margin: 0 0 12px;
+	}
+	.restore-meta dt { color: #8b949e; }
+	.restore-meta dd { margin: 0; color: #c9d1d9; }
+	.restore-meta code {
+		background: #0d1117; padding: 1px 6px; border-radius: 3px; font-size: 11px;
+	}
+	.restore-warn {
+		font-size: 12px; color: #d29922; background: #d2992211;
+		border-left: 3px solid #d29922; padding: 8px 12px; margin: 0 0 14px;
+	}
+	.restore-typecheck { display: block; font-size: 12px; color: #c9d1d9; margin-bottom: 14px; }
+	.restore-typecheck code { background: #21262d; padding: 1px 6px; border-radius: 3px; color: #f0c674; }
+	.restore-typecheck input {
+		display: block; width: 100%; margin-top: 6px;
+		background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+		padding: 8px 12px; color: #e6edf3; font-size: 14px;
+		font-family: ui-monospace, SFMono-Regular, monospace;
+	}
+	.restore-typecheck input:focus { outline: none; border-color: #58a6ff; }
+	.restore-actions { display: flex; justify-content: flex-end; gap: 8px; }
+	.btn-danger { border-color: #f85149; color: #fff; background: #da3633; }
+	.btn-danger:hover:not(:disabled) { background: #f85149; }
+	.btn-danger:disabled { background: #30363d; color: #6e7681; border-color: #30363d; }
 
 	.pill {
 		display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;

@@ -3,7 +3,8 @@
 	import { vms, nodes, events } from '$lib/stores';
 	import { goto } from '$app/navigation';
 	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmDelete,
-		vmBackup, vmBackupsList, vmBackupDelete, listBackupTargets,
+		vmBackup, vmBackupsList, vmBackupDelete, vmRestore,
+		listBackupTargets,
 		type VmBackup } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
@@ -141,6 +142,41 @@
 			await fetchBackups(vmName);
 		} catch (e: any) {
 			actionStatus = `Delete backup failed: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+		}
+	}
+
+	// Restore-confirm modal — destructive write to the LV; require typing
+	// the VM name. Same pattern as the Delete VM modal so the operator's
+	// muscle memory is consistent.
+	let restoreModal = $state<VmBackup | null>(null);
+	let restoreTyped = $state('');
+
+	function openRestoreModal(b: VmBackup) {
+		restoreModal = b;
+		restoreTyped = '';
+	}
+	function closeRestoreModal() {
+		restoreModal = null;
+		restoreTyped = '';
+	}
+
+	async function confirmRestore() {
+		if (!restoreModal) return;
+		if (restoreTyped !== vmName) return;
+		const b = restoreModal;
+		restoreModal = null;
+		actionStatus = `Restore queued for snapshot ${b.kopia_snapshot_id.slice(0,12)}…`;
+		try {
+			await vmRestore(vmName, {
+				target_id: b.target_id,
+				kopia_snapshot_id: b.kopia_snapshot_id,
+			});
+			actionStatus = 'Restore started — see Tasks tab for progress';
+			setTimeout(() => fetchBackups(vmName), 5000);
+			setTimeout(() => actionStatus = '', 8000);
+		} catch (e: any) {
+			actionStatus = `Restore failed to start: ${e.message}`;
 			setTimeout(() => actionStatus = '', 8000);
 		}
 	}
@@ -317,8 +353,13 @@
 							<td>{b.duration_s ? `${b.duration_s.toFixed(1)}s` : '-'}</td>
 							<td>{b.source_node || '-'}</td>
 							<td>{#if b.label}{b.label}{:else}<span class="muted">—</span>{/if}</td>
-							<td>
-								<button class="btn-small" onclick={() => deleteBackup(b.kopia_snapshot_id)}>Delete</button>
+							<td class="row-actions">
+								<button class="btn-small primary" disabled={vm.state === 'running'}
+									title={vm.state === 'running'
+										? 'Shut the VM down before restoring (qemu would race the disk write)'
+										: 'Stream this snapshot back onto the VM disk'}
+									onclick={() => openRestoreModal(b)}>Restore</button>
+								<button class="btn-small danger" onclick={() => deleteBackup(b.kopia_snapshot_id)}>Delete</button>
 							</td>
 						</tr>
 					{/each}
@@ -373,6 +414,41 @@
 	</div>
 {/if}
 
+{#if restoreModal}
+	<div class="modal-bg" role="presentation" onclick={closeRestoreModal}>
+		<div class="modal" role="dialog" aria-modal="true"
+			onclick={(e) => e.stopPropagation()}
+			onkeydown={(e) => { if (e.key === 'Escape') closeRestoreModal(); }}>
+			<h3>Restore VM from snapshot</h3>
+			<p class="del-vm-name">{vmName}</p>
+			<dl class="restore-meta">
+				<dt>Snapshot</dt><dd><code title={restoreModal.kopia_snapshot_id}>{restoreModal.kopia_snapshot_id}</code></dd>
+				<dt>Target</dt><dd><code>{restoreModal.target_id}</code></dd>
+				<dt>Label</dt><dd>{restoreModal.label || '—'}</dd>
+				<dt>Source node</dt><dd>{restoreModal.source_node || '—'}</dd>
+				<dt>Size added</dt><dd>{fmtBytes(restoreModal.bytes_added)}</dd>
+			</dl>
+			<p class="del-warn">
+				This streams the snapshot's bytes back onto <code>{vmName}</code>'s primary disk LV.
+				<strong>Anything written since this backup will be lost.</strong>
+				The VM must be shut down first — qemu holding the disk would race
+				with the restore writes.
+			</p>
+			<label class="del-label">
+				Type the VM name <code>{vmName}</code> to confirm:
+				<input type="text" bind:value={restoreTyped} autocomplete="off"
+					autofocus
+					onkeydown={(e) => { if (e.key === 'Enter' && restoreTyped === vmName) confirmRestore(); }} />
+			</label>
+			<div class="del-actions">
+				<button class="btn" onclick={closeRestoreModal}>Cancel</button>
+				<button class="btn btn-danger" disabled={restoreTyped !== vmName}
+					onclick={confirmRestore}>Restore</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 <style>
 	.breadcrumb { font-size: 13px; color: #8b949e; margin-bottom: 12px; }
 	.header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
@@ -418,8 +494,24 @@
 	.btn-small {
 		padding: 2px 8px; border: 1px solid #30363d; border-radius: 4px;
 		background: #21262d; color: #8b949e; font-size: 11px; cursor: pointer;
+		margin-right: 4px;
 	}
-	.btn-small:hover { background: #30363d; color: #f85149; border-color: #f85149; }
+	.btn-small:hover:not(:disabled) { background: #30363d; }
+	.btn-small:disabled { opacity: 0.4; cursor: not-allowed; }
+	.btn-small.danger:hover:not(:disabled) { color: #f85149; border-color: #f85149; }
+	.btn-small.primary { border-color: #1f6feb; color: #58a6ff; }
+	.btn-small.primary:hover:not(:disabled) { background: #1f6feb22; color: #fff; }
+	.row-actions { white-space: nowrap; }
+
+	.restore-meta {
+		display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px;
+		font-size: 12px; margin: 0 0 12px;
+	}
+	.restore-meta dt { color: #8b949e; }
+	.restore-meta dd { margin: 0; color: #c9d1d9; }
+	.restore-meta code {
+		background: #0d1117; padding: 1px 6px; border-radius: 3px; font-size: 11px;
+	}
 
 	.ha-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; cursor: pointer; }
 	.ha-check.nested { margin-left: 20px; }

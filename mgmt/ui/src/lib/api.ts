@@ -283,6 +283,15 @@ export async function vmBackupsList(name: string): Promise<{
 	return apiGet(`/api/vms/${encodeURIComponent(name)}/backups`);
 }
 
+export interface ClusterBackupRow extends VmBackup {
+	vm: string;
+	vm_present: boolean;
+}
+
+export async function listAllBackups(): Promise<{ backups: ClusterBackupRow[] }> {
+	return apiGet('/api/backups');
+}
+
 export async function vmRestore(name: string, body: {
 	target_id?: string;
 	kopia_snapshot_id: string;

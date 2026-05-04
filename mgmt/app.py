@@ -2132,6 +2132,36 @@ def api_backup_targets_list():
     return {"targets": cluster.get("backup_targets", {})}
 
 
+@app.get("/api/backups")
+def api_backups_list_all():
+    """Cluster-wide backup history. Walks every VM in cluster.json
+    and flattens its `backups` list, decorating each row with the
+    owning vm name + whether the source VM still exists. Used by
+    the dashboard's Backups page to render a single restore-able
+    list across the whole cluster.
+
+    Sorted newest-first by ts_index (cluster log index = monotonic
+    timestamp). vm_present=False rows are kept so operators can
+    still restore a deleted VM's snapshots into a fresh LV."""
+    cluster = load_cluster()
+    vms = cluster.get("vms", {}) or {}
+    out = []
+    for vm_name, vm in vms.items():
+        for b in (vm.get("backups") or []):
+            row = dict(b)
+            row["vm"] = vm_name
+            row["vm_present"] = True
+            out.append(row)
+    # Snapshots whose source VM was deleted: walk backup history that
+    # might be referenced by RESTORE_DONE / etc. but not the live vm
+    # record. v1 simplification: cluster.json only retains entries on
+    # live VM records, so this branch is empty for now. Hook left
+    # in place for v1.x when we surface "orphan" snapshots from the
+    # repo via `kopia snapshot list`.
+    out.sort(key=lambda r: r.get("ts_index", 0), reverse=True)
+    return {"backups": out}
+
+
 @app.delete("/api/backup/targets/{target_id}")
 def api_backup_target_remove(target_id: str, reason: str = ""):
     import sys as _sys
