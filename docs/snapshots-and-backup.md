@@ -744,6 +744,119 @@ In all three cases the install on a Bedrock node is just:
 
 ---
 
+## 9b-bis. The recommended v1 deployment: local PBS + offsite sync
+
+In practice we expect almost every Bedrock site to land on the
+same shape — local PBS for fast backup + restore, offsite copy for
+disaster recovery. Worth spelling out:
+
+```
+   ┌───────────────────────────────────────────────────────────────┐
+   │                      Bedrock cluster                          │
+   │                                                               │
+   │   Node A (master)       Node B               Node C           │
+   │   ┌───────────────┐     ┌──────────┐         ┌──────────┐     │
+   │   │ pet-vm-1, ... │     │  pbs-vm  │         │ cattle-N │     │
+   │   │ cattle-X, ... │     │ (cattle, │         │ ...      │     │
+   │   │               │     │ Debian)  │         │          │     │
+   │   └──────┬────────┘     └─────┬────┘         └─────┬────┘     │
+   │          │ snapshot + push    │                    │          │
+   │          ├───────────────────►│◄───────────────────┤          │
+   │          │  proxmox-backup-   │                    │          │
+   │          │  client over LAN   │                    │          │
+   │          │                    │                    │          │
+   │   cluster.json carries:                                       │
+   │     backup.local_pbs = { url, datastore, api-token, fp }      │
+   │     backup.offsite   = { url, datastore, api-token, fp }      │
+   │     backup.encryption_key_path = /etc/bedrock/backup.key      │
+   │     backup.default_schedule    = "0 2 * * *"                  │
+   │     backup.default_retention   = "keep-last=7,..."            │
+   │                                                               │
+   └───────────────────────────────┼───────────────────────────────┘
+                                   │ PBS sync-job, hourly
+                                   │ (encrypted dedup'd chunks)
+                                   ▼
+                        ┌────────────────────────┐
+                        │ off-site PBS instance  │
+                        │ (cheap host / NAS)     │
+                        │ long retention,        │
+                        │ verify weekly,         │
+                        │ Glacier-tier monthly   │
+                        └────────────────────────┘
+```
+
+**Why this shape:**
+
+- Local PBS does the expensive work — chunking, dedup, compression,
+  encryption — once, locally, fast. Bedrock nodes write encrypted
+  dedup'd chunks over LAN; no expensive crypto on the workload nodes.
+- Offsite gets only the dedup'd, compressed, encrypted result. Wire
+  cost is approximately the change-rate, not the workload size.
+- Cattle PBS VM means: if its host node dies, no DRBD primary to
+  fail over; we just spin up a fresh PBS VM elsewhere and re-attach
+  it to the synced offsite copy. The local datastore is replaceable
+  because the data is also offsite.
+
+**Hard roadblocks worth knowing:**
+
+1. **PBS is Debian-only.** PBS-as-cattle-VM with a Debian guest is
+   the supported deployment shape on a Bedrock node. Bare-metal PBS
+   on AlmaLinux means compiling from source — not viable.
+2. **PBS has no native S3 datastore.** "Offsite to S3" means one
+   of: (a) the offsite PBS instance has its datastore on real
+   filesystem and you sync there with `proxmox-backup-manager
+   sync-job`; (b) `rclone sync` the offsite PBS's datastore
+   directory to S3 as a periodic job; (c) S3-fuse mount as
+   datastore — works but slow + risky, avoid.
+3. **S3 Glacier specifically** has retrieval delays incompatible
+   with backup-tool expectations. Glacier is fine as the *third-tier
+   cold archive* (S3 lifecycle rules push old objects there); not
+   as the primary offsite destination.
+4. **Single-host local PBS = single point of failure for backups
+   taken since last offsite sync.** If the PBS host dies, the
+   backups since last sync are gone. Mitigation: sync hourly so
+   the loss window is small.
+
+**What PBS gives us out of the box:**
+
+| Need | PBS support |
+|---|---|
+| Local dedup + zstd compression | ✓ content-defined chunking; content-addressed store |
+| Client-side encryption | ✓ per-datastore key; chunks encrypted before upload; dedup still works because same plaintext+key produces same ciphertext |
+| Sync to offsite PBS | ✓ `proxmox-backup-manager sync-job`, schedulable, bandwidth-throttled, resumable |
+| Sync to S3 directly | ✗ — need rclone or remote-PBS-with-S3-fuse |
+| API tokens for non-interactive auth | ✓ per-token permissions; one per Bedrock cluster |
+| Cross-cluster restore | ✓ — backups are cluster-identity-free; any client with URL + token + key reads them |
+| Per-VM retention | ✓ `prune` configurable per group |
+| Web UI | ✓ HTTPS dashboard |
+| Backup verification (catches bitrot) | ✓ `verify-job` reads + checksums periodically |
+
+**Encryption key handling:**
+
+The per-datastore encryption key is the **single thing the operator
+must keep out-of-band**. It is **not** stored in the cluster log
+(which is otherwise the source of truth). Mechanics:
+
+- Master generates the key on first PBS setup (`proxmox-backup-client
+  key create`); operator copies the file to a secure store (1Password,
+  KeePass, hardware token).
+- The key file ships to every Bedrock node that needs to backup or
+  restore (`/etc/bedrock/backup.key`, mode 0600). Put it there during
+  install, or push via `bedrock` CLI verb.
+- Same file needed on any *other* Bedrock cluster that wants to read
+  these backups (DR site, lift-and-shift, recovery-to-different-
+  hardware). The operator carries it across.
+- Rotation: PBS supports rotating to a new key for new backups while
+  keeping old backups readable with the old key. Standard operational
+  practice.
+
+**Endgame:** any Bedrock cluster + the offsite PBS endpoint URL +
+the API token + the encryption key file = full recovery access to
+every backup ever taken. Three things, one of them out-of-band.
+That's the right contract.
+
+---
+
 ## 9c. Recovery flow
 
 The reverse of backup. PBS streams chunks; we provide an LV-thin
