@@ -1215,27 +1215,48 @@ Three honest takeaways:
    Lock support in compliance mode. Restic relies on the storage
    layer entirely; PBS likewise (the feature is on PBS's roadmap).
 
-**Revised v1 architecture: support multiple backends, pick one
-default. Kopia is now the leading candidate for default.**
+**Revised v1 architecture: support multiple backends; pick a
+default that errs on the conservative side; let users opt up.**
 
-| Backend | Footprint | Store-driven | Object Lock | UX | Complexity |
+| Backend | Footprint | Store-driven | Object Lock | UX | Track record |
 |---|---|---|---|---|---|
-| **Kopia** | tiny | yes — `kopia repository connect` from anywhere | native | optional web UI | low |
-| **Restic** | tiny | yes — env vars + binary | storage-layer only | CLI only | low |
-| **PBS** | heavy (~1 GB RAM + 64 GiB cache LV) | needs a PBS VM running on the new cluster | storage-layer only (planned) | best VM UX | a whole VM |
-| **Borg** | smallest | yes — but SSH-only without rclone | append-only mode | CLI only | medium (rclone for S3) |
+| **Restic** | tiny | yes — env vars + binary | storage-layer only | CLI | ~9 years prod-ready, ~30k★ |
+| **Kopia** | tiny | yes — `kopia repository connect` | native | optional web UI | ~4 years prod-ready, ~13k★, **Velero v1.10+ default** |
+| **PBS** | heavy (~1 GB RAM + 64 GiB cache LV) | needs a PBS VM on the new cluster | storage-layer only (planned) | best VM UX | very mature, Proxmox-backed |
+| **Borg** | smallest | yes — SSH-centric | append-only | CLI | very mature |
 
-**My (revised) recommendation:** Phase A ships **Kopia as the
-default**, with **Restic and PBS as alternative target types**.
-Justification:
-- Kopia hits the "light" bar Bedrock cares about.
-- Native S3 Object Lock means we can ship ransomware-immutability
-  out of the box.
-- The store-driven contract maps directly: `target URL + key =
-  recovery on any cluster`.
-- PBS stays available for users who want the rich VM dashboard;
-  Restic stays for users who want the most provider-agnostic
-  serverless flow.
+**Maturity check on Kopia specifically:** production-ready since
+~2022; latest v0.22.3 (Dec 2025); 13.1k★ on GitHub; **Velero (the
+de-facto Kubernetes backup tool) chose Kopia as its default over
+Restic in v1.10+**, citing 4× S3 throughput thanks to parallel
+uploads. That's a serious enterprise-workload trust signal.
+
+Real reported Kopia issues to know about:
+- Clock skew can trigger inappropriate GC (mitigated by NTP).
+- "Server mode" is insecure by design — but our pattern uses
+  `kopia repository connect`, not server mode.
+- Default config fails the entire backup on a single-file read
+  error (configurable; surprising default).
+- Compliance-mode S3 Object Lock has metadata-overwrite caveats.
+
+Restic has fewer reported issues, mostly because it's older +
+simpler. Both are real production options.
+
+**Recommendation:** Phase A ships **Restic as the conservative
+default** (longest track record, largest community, "boring is
+good") with **Kopia as the upgrade target type** for users who
+want native S3 Object Lock or the cloud-throughput advantage,
+and **PBS as the third target type** for users who want the
+rich VM-aware dashboard.
+
+| If priority is... | Pick |
+|---|---|
+| Longest track record, "boring is good" | Restic (default) |
+| Built-in S3 Object Lock for ransomware-immutability | Kopia |
+| Best raw cloud throughput | Kopia |
+| Velero / Kubernetes-ecosystem alignment | Kopia |
+| Rich VM-aware dashboard | PBS |
+| Local + SSH only, smallest footprint | Borg |
 
 mgmt's CLI surface stays backend-agnostic:
 
