@@ -857,6 +857,89 @@ That's the right contract.
 
 ---
 
+## 9b-ter. Why PBS doesn't have native S3 (and what everyone else does)
+
+The "no S3 backend" gap is real and worth being candid about, since
+it affects how the offsite tier is shaped.
+
+**The industry baseline:** Veeam, Commvault, Rubrik, Cohesity, and
+the open-source field (Restic, Duplicati, Kopia, Borg+rclone, Bareos,
+Bacula) all have first-class S3 support — usually with S3 Object
+Lock immutability, lifecycle to Glacier, and the ability to use S3
+as either primary backup target or capacity tier. **PBS is the
+outlier.**
+
+**Why PBS doesn't have it (yet):**
+
+PBS is built around a content-addressable store on POSIX with
+specific assumptions about latency and consistency. S3's per-call
+latency (tens of ms minimum) and eventual-consistency edge-cases
+make a robust S3 backend non-trivial to bolt on without hurting
+dedup-write and verify-read performance. Proxmox have prioritised
+tape support, removable-datastore support, ZFS integration, and
+web UI polish over an S3 backend. It's on the roadmap with no
+firm date.
+
+So this is a known omission, not a design wall.
+
+**How PBS users actually take backups offsite today:**
+
+| Pattern | Officially blessed? | Notes |
+|---|---|---|
+| PBS sync-job → remote PBS instance | **Yes** — Proxmox-documented | The standard recommendation. Schedulable, throttleable, resumable, encrypted in flight. |
+| PBS tape (LTO) | Yes (PBS 2.0+) | Built-in. Cheap/TB but slow restore. Compliance-friendly. |
+| Removable USB datastores | Yes (PBS 3.0+) | Rotate drives in/out; carry offsite. Small-shop pattern. |
+| `rclone sync` the datastore directory to S3 | Community workaround, not official | PBS's `.chunks/` are write-once-immutable. rclone in correct order (chunks before indexes) works. Restore pulls chunks back from S3 before reading. |
+| `rsync` over SSH to a remote host | Community | Same idea, FS instead of S3. |
+
+**What this means for Bedrock — the four real options:**
+
+**(a) PBS + remote PBS, no S3.**
+Local PBS = fast hot backup + restore. Offsite = a second PBS
+instance on cheap hardware (small VPS, colo Pi, friend's homelab).
+PBS sync-job ships dedup'd encrypted chunks. **This is the v1
+recommendation** because the docs match the pattern; everything is
+supported; no clever workarounds.
+
+**(b) PBS + remote PBS + rclone-to-S3 for cold archive.**
+Same as (a), plus the offsite PBS host runs a periodic `rclone sync`
+of its `.chunks/` + index dirs to S3 (Standard or IA). S3 lifecycle
+rules age objects into Glacier / Deep Archive after N days. Three
+tiers: hot local, online offsite, cold S3.
+
+Why this works: PBS chunks are write-once-immutable, so rclone's
+sync model (and Glacier's "you can't update objects" model) play
+well together. Cost: one cron job + rclone config. Restoring from
+the S3 tier means rclone-pulling chunks back to the offsite PBS
+host before they're readable. That's fine for "the building burned
+down"; not fine for "I deleted a file at lunch."
+
+**(c) PBS for hot + Restic for S3-native offsite — don't.**
+Two backup systems = two retention models, two encryption-key
+schemes, two CLIs to learn, twice the operator surface area. Sounds
+clever; bites later.
+
+**(d) Skip PBS, use Restic everywhere.**
+Restic has native S3, native dedup, native encryption. But no
+VM-aware UX, no built-in retention CLI (you script it), no web UI,
+no verify-jobs as a first-class concept, no tape, no Proxmox-
+ecosystem fit. Trade a lot of polish for the S3-native property.
+Right answer if S3 truly is non-negotiable; otherwise (a)/(b) are
+better.
+
+**Recommendation:** v1 ships option (a). It's the "PBS works the
+way the docs say it does" story. Operators who specifically want
+S3-tier archival add (b) by enabling rclone on the offsite PBS
+host — that's a one-host config change, not a Bedrock config change.
+
+If/when PBS gains a native S3 backend, the architecture doesn't
+change — you'd just point the offsite PBS's datastore at S3
+directly and remove the rclone step. Bedrock's API surface to PBS
+(`proxmox-backup-client backup` / `restore`) is identical regardless
+of where PBS's datastore lives.
+
+---
+
 ## 9c. Recovery flow
 
 The reverse of backup. PBS streams chunks; we provide an LV-thin
