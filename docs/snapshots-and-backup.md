@@ -71,14 +71,51 @@ Bedrock's answer to each, sketched first, then deeply:
 | | How |
 |---|---|
 | 1. Quiescence | `virsh domfsfreeze` via qemu-guest-agent for app-consistent; otherwise crash-consistent (still useful — ext4/xfs always recover from crash-consistent state). |
-| 2. Atomicity | Wrap the per-disk `lvcreate --snapshot` calls inside a single fsfreeze window. All disks at the same instant. |
-| 3. Multi-replica | The master appends `snapshot_create_intent` to the log. Both DRBD peers' reactors run `lvcreate --snapshot` locally on the underlying LV. Both ends up with a local snapshot of the same content. |
+| 2. Atomicity | Wrap the per-disk `lvcreate --snapshot` calls inside a single fsfreeze window. All disks of the VM at the same logical instant. |
+| 3. Multi-replica | **Snapshot on the DRBD primary side only.** This is the part where I had a fragile design earlier; see §3 below for why "both sides at the same time" doesn't hold up and why one-side-only is the right answer. |
 | 4. Storage cost | Snapshots are log-tracked. mgmt enforces a per-VM retention policy (keep last N, delete older than M days). Thin-pool fill alarms. |
-| 5. Restore | Stop VM → `lvconvert --merge` → start VM. For pet, the master coordinates the merge on both peers via `snapshot_restore_intent`. Read-only inspection: mount the snapshot directly (bypassing DRBD entirely). |
+| 5. Restore | Stop VM → `lvconvert --merge` → restart VM (cattle: trivial; pet: triggers a DRBD resync to the peer, which is fine — it's the price of one-side-only snapshots). Read-only inspection: mount the snapshot directly. |
 
 ---
 
-## 3. The core flow — taking one snapshot
+## 3. Why "both sides at the same time" is the wrong primitive
+
+The earlier draft of this doc said: master appends an intent, both
+DRBD peers run `lvcreate --snapshot` locally, both end up with a
+snapshot of the same content. That's wrong, or at least fragile.
+Spelling out why before I fix it:
+
+- **fsfreeze pauses guest-issued writes**, but only the writes from
+  inside the guest. DRBD has its own pipeline between the device the
+  guest sees and the underlying LV. Writes that the guest issued
+  before fsfreeze returned may still be in flight on either node
+  when we run `lvcreate`. fsfreeze guarantees the guest **filesystem**
+  is consistent; it does not guarantee both **LVs** are byte-identical
+  at the lvcreate moment.
+- **DRBD Protocol C guarantees an *acked* write hit both LVs**, but
+  it doesn't give you a "freeze the LVs at this exact byte" primitive.
+  If a write is in flight at lvcreate time, one side may have
+  written it and the other hasn't yet.
+- **Wall-clock skew between the two `lvcreate` calls** is real. Even
+  with NTP, processes on two nodes scheduling at the "same time" can
+  differ by tens of ms. A busy guest writes a lot of bytes in tens
+  of ms.
+- **Conclusion:** there is no off-the-shelf primitive in the
+  DRBD/LVM stack that guarantees byte-identical snapshots on both
+  peers without explicit IO-suspension coordination. Pretending
+  otherwise gives you a sync that *seems* to work in low-load
+  testing and breaks under production load. Exactly the user's
+  intuition.
+
+What you'd need to make it actually-byte-identical: `drbdsetup
+suspend-io` on both peers (DRBD blocks new writes and drains in-
+flight ones), waited for both peers to confirm "drained", then
+`lvcreate` on both, then `drbdsetup resume-io`. Doable, but it's
+a coordination protocol with timeouts, peer-failure handling, etc.
+Lots of moving parts, lots of failure modes that mostly hurt the
+operator who just wanted a backup.
+
+**The right answer for v1: snapshot on the DRBD primary side only.**
 
 ```
    operator: bedrock vm snapshot create my-pet --label nightly --quiesce
@@ -90,57 +127,68 @@ Bedrock's answer to each, sketched first, then deeply:
            { vm: my-pet, label: nightly,
              ts: 2026-05-04T10:00:00Z,
              quiesce: true,
-             requested_by: <user> }
+             requested_by: <user>,
+             primary_node: <where DRBD primary lives> }
         ③ return 202 + intent_log_index to caller
         │
         ▼ replication
         │
-   ┌────┴────────────────────────────────────────────┐
-   │                                                 │
-   ▼ on every node where this VM has a disk:         ▼
-   reactor on master                            reactor on peer
-   sees snapshot_create_intent                  sees snapshot_create_intent
-        │                                                 │
-        │  (master also drives the quiesce)               │
-        ▼                                                 │
-   if quiesce: virsh domfsfreeze my-pet                   │
-        │  (qemu-ga → fsfreeze syscall in guest)          │
-        │  → guest FS quiesces; in-flight IO drains       │
-        ▼                                                 ▼
-   for each disk LV of my-pet:           for each disk LV of my-pet:
-     lvcreate --snapshot --name             lvcreate --snapshot --name
-       vm-my-pet-disk0-nightly-<ts>           vm-my-pet-disk0-nightly-<ts>
-       bedrock/vm-my-pet-disk0                bedrock/vm-my-pet-disk0
-        │                                                 │
-        ▼                                                 ▼
-   if quiesce: virsh domfsthaw my-pet     (peer is done; appends ack
-                                            via mgmt API on master)
-        │                                                 │
-        ▼                                                 │
-   master collects acks; once all nodes acked:           │
-        ④ append snapshot_created log entry:              │
-           { vm: my-pet, label: nightly, ts: ...,         │
-             nodes: [node1, node2],                       │
-             disks: [{lv: vm-my-pet-disk0,                │
-                      snap: vm-my-pet-disk0-nightly-<ts>,
-                      bytes: <thin pool delta>}] }
+   ▼ ONLY on the DRBD-primary node (master in single-master setups):
+   reactor sees snapshot_create_intent + primary_node == self
+        │
+        ▼
+   if quiesce: virsh domfsfreeze my-pet
+        │  (qemu-ga → fsfreeze syscall in guest)
+        │  → guest FS quiesces; in-flight IO drains
+        ▼
+   for each disk LV of my-pet:
+     lvcreate --snapshot --name vm-my-pet-disk0-nightly-<ts>
+       bedrock/vm-my-pet-disk0
+        │
+        ▼
+   if quiesce: virsh domfsthaw my-pet
+        │
+        ▼
+   append snapshot_created log entry:
+     { vm: my-pet, label: nightly, ts: ...,
+       primary_node: <self>,
+       disks: [{lv: vm-my-pet-disk0,
+                snap: vm-my-pet-disk0-nightly-<ts>,
+                bytes: <thin pool delta>}] }
+
+   ── On the DRBD secondary node:
+   reactor sees snapshot_create_intent → primary_node != self → NO-OP
+   The peer's underlying LV is byte-identical to the primary's
+   (Protocol C, modulo acked writes), but we DON'T take a local
+   snapshot there. The snapshot is one LV on one node.
 ```
 
-A few subtleties:
+Why this is fine:
+- **Backup**: PBS / Borg / S3 reads the one snapshot from the
+  primary; ships data offsite. We don't need redundant local
+  snapshots — the offsite copy is the redundancy.
+- **Audit / inspection**: `mount -o ro /dev/.../snap-...` on the
+  primary, look around. Read-only, no DRBD interaction.
+- **Disaster**: if the primary node dies before backup ships, the
+  snapshot is gone — but that's exactly when you wanted a snapshot
+  anyway. Take the next one on the new primary; ship it offsite
+  promptly.
 
-- **fsfreeze runs only on one side** — the master / DRBD primary —
-  because that's where qemu is running. The peer just snapshots its
-  underlying LV; the *content* is the same because DRBD already
-  synchronously wrote it to both LVs before fsfreeze let the next
-  guest IO proceed.
-- **fsfreeze window is microseconds-to-tens-of-milliseconds.** No
-  observable hang in the guest, no TCP timeouts upstream.
-- **`cache=none`** in the VM's libvirt XML is required (we set it
-  already) — without it, qemu has its own writeback cache that could
-  contain dirty data not yet on the DRBD device when fsfreeze returns.
-- **Cattle is the same flow with one peer** — snapshot lives only on
-  the home node. The reactor is a no-op on other nodes for cattle
-  intents because the disk LV doesn't exist there.
+The trade-off is **revert speed** for pet/vipet (see §4b below):
+since only one side has the snapshot, reverting forces a DRBD
+resync to the peer afterwards. That's the right trade — reverts
+are rare and admin-driven; backup operations are frequent and
+unattended. We optimise for the common case.
+
+Cattle is even simpler: only one node has the disk LV at all, so
+"primary side only" and "the home node" are the same place.
+
+**`cache=none`** in the VM's libvirt XML stays required — without
+it, qemu has its own writeback cache that holds dirty pages
+fsfreeze can't see. We already set it.
+
+**fsfreeze window** is microseconds to tens of milliseconds. No
+observable hang in the guest.
 
 ---
 
@@ -163,27 +211,56 @@ snapshot was taken. This is the pattern backup tools will use.
 
 ### 4b. Revert (roll back the VM to the snapshot)
 
-Destructive; loses all writes since the snapshot:
+Destructive; loses all writes since the snapshot. Cattle case is
+trivial; pet case involves a DRBD resync (the cost of one-side-only
+snapshots).
 
+**Cattle:**
 ```
-  ① bedrock vm shutdown my-pet           (or virsh destroy if forced)
+  ① bedrock vm shutdown my-cattle
+  ② bedrock vm snapshot restore my-cattle --label nightly
+  ③ master appends snapshot_restore_intent
+  ④ home node's reactor:
+       lvconvert --merge almalinux/vm-my-cattle-disk0-nightly-<ts>
+       (origin LV ends up at the snapshot's content; snap consumed)
+  ⑤ append snapshot_restored
+  ⑥ bedrock vm start my-cattle
+```
+
+**Pet/vipet:**
+```
+  ① bedrock vm shutdown my-pet              (no IO on the resource)
   ② bedrock vm snapshot restore my-pet --label nightly
   ③ master appends snapshot_restore_intent
-  ④ on every node with the disk:
-       reactor: drbdadm down tier-pet-disk    (if DRBD)
-                lvconvert --merge bedrock/vm-my-pet-disk0-nightly-<ts>
-                       (this merges snapshot back into origin;
-                        snapshot LV is consumed)
-                drbdadm up tier-pet-disk      (DRBD re-syncs;
-                                               on both sides
-                                               at once → instant)
-  ⑤ master appends snapshot_restored
-  ⑥ bedrock vm start my-pet
+  ④ DRBD-primary node's reactor:
+       drbdadm secondary tier-pet-disk      (no FDs left after step 1)
+       drbdadm down tier-pet-disk           (release the LV)
+       lvconvert --merge bedrock/vm-my-pet-disk0-nightly-<ts>
+       drbdadm up tier-pet-disk             (DRBD reads the LV again)
+       drbdadm primary --force tier-pet-disk
+       drbdadm new-current-uuid --clear-bitmap tier-pet-disk
+              (mark our content authoritative; peer becomes "outdated"
+               and DRBD will resync to it)
+       drbdadm primary tier-pet-disk
+  ⑤ DRBD-secondary node:
+       (no log-driven action needed — DRBD's resync brings its LV
+        in line with our merged content automatically)
+  ⑥ append snapshot_restored
+  ⑦ bedrock vm start my-pet                 (resync continues in
+                                              background; no impact
+                                              on the primary's IO)
 ```
 
-For pet/vipet, the merge happens on both peers simultaneously (via
-log replication); both end up with identical content; DRBD doesn't
-need to resync anything because the content is already identical.
+The `drbdadm new-current-uuid --clear-bitmap` is the key incantation
+that tells DRBD "my data is authoritative; treat the peer as
+outdated". After that, the resync pushes the new content to the
+peer in the background. Resync time = data divergence × bandwidth;
+for a pet VM with a few hundred GB of disk this is minutes-to-an-
+hour over a fast cable. Acceptable for a rare, admin-initiated
+operation.
+
+A faster revert is possible if both sides had a synchronized
+snapshot — that's the §3 trade-off we deliberately didn't take.
 
 ### 4c. Clone (create a new VM from a snapshot)
 
@@ -303,7 +380,7 @@ diverges:
 | Snapshot primitive | VMFS redo logs (chained delta files) | Cassandra-tracked CoW at storage layer | Ceph RBD snap (CoW) | SCRIBE block-level CoW | **LVM thin snap** |
 | Multi-disk atomicity | "Create snapshot of all disks" inside VM scope | Same | Same | Same | One fsfreeze window wraps all `lvcreate` calls |
 | Quiescence | VSS / VMware Tools | NGT (Nutanix Guest Tools) | qemu-guest-agent | Vendor agent | **qemu-guest-agent** (the same tool everyone else uses) |
-| Multi-replica | vSAN replicates blocks + snap blocks | Cassandra distributes snap metadata + blocks | Ceph RBD replication carries snaps | SCRIBE handles it | Reactor takes the snapshot independently on each DRBD peer; **no extra replication needed** because DRBD already mirrored the data |
+| Multi-replica | vSAN replicates blocks + snap blocks | Cassandra distributes snap metadata + blocks | Ceph RBD replication carries snaps | SCRIBE handles it | **One snapshot on the DRBD-primary side** — no fragile two-peer coordination. Backup tools ship offsite for redundancy; revert pays a DRBD resync. See §3. |
 | Storage cost | Operator monitors datastore | Cluster automatically rebalances | Ceph balanced; pool quotas | Vendor manages | Per-VM retention in cluster.json + thin-pool fill alarm |
 | CBT / changed-block | CBT (proprietary, internal) | Internal track-changed-extents | Ceph RBD `--diff` between snaps | Internal | **`thin_dump` / `thin_delta`** — Linux's own CBT-equivalent on thin pools |
 | Backup integration | Veeam/Commvault hook into CBT | Native + 3rd-party | Native PBS | Vendor backup | Snapshot is the read surface; any tool that can read a block device or a mounted FS works |
@@ -389,17 +466,31 @@ Phase C (v1.2 or later):
 LVM thin under both cattle and pet is the lucky accident that makes
 the snapshot story tidy. Same primitive, same code path, same
 operator mental model. DRBD doesn't fight us because it's a thin
-layer over the LV — snapshot the LV, get the same bytes the DRBD
-device serves. Both peers snapshot in parallel because the log
-replicates the intent.
+layer over the LV — snapshot the LV (on the primary side), get the
+same bytes the DRBD device serves.
 
-The interesting new design call is the **fsfreeze + per-node lvcreate
-+ log-coordinated** triple: it gives application consistency,
-multi-replica coordination, and audit-clean intent tracking in one
-move. That's better than VMware's redo-log chains (which fragment
-storage and slow VMs over time) and as good as Nutanix's snap-at-
-storage-layer (which requires their whole storage stack).
+The design call I had to walk back: **don't try to snapshot both
+DRBD peers simultaneously without explicit IO coordination.** It
+*looks* simple ("the LVs are byte-identical, just lvcreate on both")
+but in production it's not — fsfreeze handles guest-level writes,
+not in-flight DRBD pipeline writes; wall-clock skew is real; the
+DRBD/LVM stack has no off-the-shelf "freeze both LVs at the same
+logical byte" primitive. Pretending otherwise gives a sync that
+works under low load and breaks when machines are busy.
 
-The piece that's NOT in the design: a clever native backup engine.
-We don't need one. PBS and Borg and rsync-to-S3 already work; we
-just give them a clean read surface.
+The chosen primitive is single-side snapshotting (always on the
+DRBD primary), with `drbdadm new-current-uuid --clear-bitmap`
++ resync as the price of revert. Backup operations are unaffected
+by this choice; they just read the one snapshot and ship it
+offsite. PBS / Borg / S3 are the v1 backup story; the snapshot is
+the API surface.
+
+A coordinated two-peer snapshot is doable later if fast revert
+becomes a real customer ask — `drbdsetup suspend-io` on both,
+`lvcreate` on both, `drbdsetup resume-io`. But it's deliberately
+out of v1 because it adds a coordination protocol with timeout/
+failure modes for a rarely-exercised feature.
+
+What's NOT in the design: a clever native backup engine. We don't
+need one. PBS and Borg and rsync-to-S3 already work; we just give
+them a clean read surface.
