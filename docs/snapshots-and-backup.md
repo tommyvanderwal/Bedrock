@@ -1054,63 +1054,209 @@ Reading off the table:
   encryption" without any of the dedup/snapshot/retention
   layer. Not the right level for Bedrock's needs.
 
+### Footprint, performance, and the engineering details
+
+Walking through each of the practical questions for Restic / Kopia
+vs PBS:
+
+#### Footprint
+
+Public benchmarks on a 4 GB-RAM 30 GB-SSD VM:
+
+| Tool | Binary size | Idle RAM | Active backup RAM | Notes |
+|---|---|---|---|---|
+| **Borg** | ~10 MB Python+C | <50 MB | 50–150 MB | most memory-efficient of the three; clear winner for ≤2 GB RAM hosts |
+| **Restic** | ~25 MB Go | ~30 MB | 100–200 MB | RAM scales with chunk metadata loaded; large repos (TB+) can push higher |
+| **Kopia** | ~50 MB Go | ~50 MB | 80–180 MB | configurable; aggressive caching can spike RAM and IO |
+| **PBS** | ~150 MB Debian package set + a daemon | ~700 MB–1 GB minimum (it's a full server with web UI, REST API, multiple worker processes) | 1–2 GB during heavy backup/verify | + 64–128 GiB local cache LV when using S3 backend |
+
+For a "Bedrock should be light" target, the order is:
+
+  Borg ≪ Restic ≈ Kopia ≪ PBS
+
+PBS is genuinely heavy because it's a full server (dashboard, REST
+API, sync engine, verify engine, prune engine). Restic/Kopia are
+single binaries that exit when done.
+
+#### Performance
+
+| Tool | Local backup throughput | Local restore throughput | Cloud upload | Notes |
+|---|---|---|---|---|
+| Borg | **180–220 MB/s** | best of the three | n/a (rclone wrapped) | top dog for SSH/local backends |
+| Restic | 120–160 MB/s | competitive | good native S3 | most balanced; widest backend support |
+| Kopia | varies (chunks tunable) | competitive | **best cloud throughput** via parallel uploads | best when cloud is the target |
+| PBS | similar to Restic for the actual dedup work; the daemon adds some per-call overhead |
+
+For backups that go local-NVMe-first (our v1 hot tier), Borg/Restic
+wins on raw throughput. For backups that go S3-first, Kopia or PBS
+4.2 wins on parallelism.
+
+#### Can they use LVM thin's `thin_delta` for changed-block-only reads?
+
+**Short answer: none of them natively integrate, but it doesn't matter
+for any of them — the orchestrator handles it.**
+
+Each tool does its own dedup at its own granularity (content-defined
+chunks, ~4 MiB typical). They expect to read a full image and dedup
+on the way through. None of them reads `thin_dump` metadata or
+otherwise looks at LVM internals.
+
+The §6c-bis trick — read changed regions from the new snapshot and
+unchanged regions from the previous reference snapshot, compose
+into a "full image" stream, hand to the backup tool — works
+identically with PBS, Restic, or Kopia. The tool sees a full image;
+it dedups; the unchanged regions hash to the same chunks the repo
+already has and dedup-skip; only the changed bytes count toward
+local read or wire transfer.
+
+This means the choice of tool doesn't constrain our CBT story.
+
+#### Ransomware protection — tool layer + storage layer
+
+**Tool-level** (the backup tool itself refuses destructive operations):
+
+| Tool | Append-only / immutability mode |
+|---|---|
+| Borg | **native append-only mode** (`--append-only`) — well-tested, established |
+| Restic | append-only via REST/SFTP backend with restricted permissions; **no native S3 Object Lock support** as of mid-2026 (open feature request); workaround = S3 bucket policy + restricted IAM key |
+| Kopia | **native S3 Object Lock support** with compliance-mode option; recommended for true ransomware-proof backups; some metadata-overwrite caveat in strict compliance mode (open issue) |
+| PBS | no native Object Lock yet (planned); restricted-credential pattern at S3 layer is the workaround |
+
+**Storage-level** (the bucket / FS makes data un-deletable):
+
+- **S3 Object Lock (Compliance mode)** is the strongest: even the
+  storage admin can't delete locked objects before retention
+  expires. Available on AWS, MinIO, Wasabi, Backblaze B2, R2.
+- **S3 versioning** is weaker but useful: deleted objects are
+  recoverable for a window.
+- **NFS/local snapshots** (ZFS, btrfs): the FS layer protects
+  even if the backup tool is compromised.
+
+**Best practice across all of them**: use both layers. Tool's
+append-only/immutable mode + S3 Object Lock. **Kopia's the
+strongest of the three for end-to-end immutability today**;
+Restic and PBS rely more on the storage layer.
+
+Concretely: if ransomware is a concern, lean toward Kopia (with
+MinIO/Wasabi/etc. + Object Lock compliance mode) over Restic or
+PBS today. Bedrock orchestration doesn't know or care which one
+the user picked.
+
+#### Local fast cache for fast restore
+
+| Tool | Local cache | Size | What it caches |
+|---|---|---|---|
+| PBS (S3 backend) | **mandatory** persistent cache | 64–128 GiB | metadata + recently-used chunks |
+| Kopia | configurable LRU cache | typically 5–10% of repo size; tunable | metadata + LRU chunks |
+| Restic | metadata-only cache | typically <1 GiB | snapshot list + index, NOT bulk chunks |
+| Borg | minimal | tiny | mostly chunk index |
+
+**For "fast restore from backup" to feel instant, the chunk data
+needs to be cached locally.** PBS is built around this assumption
+(64 GiB is the floor). Kopia opts in. Restic doesn't really; cold
+restores hit S3 directly.
+
+#### "Snapshot never lives long, always backup-then-restore"
+
+This is the right philosophy and **what v1 already aims for**.
+
+The cleanest mental model: snapshots are an internal mechanism
+for *taking a consistent backup*; they never persist beyond the
+backup run. The backup repo is the source of truth for "yesterday's
+state."
+
+To make that feel snappy:
+- Hot tier on local NVMe (whatever the tool: PBS dual-datastore,
+  Kopia local repo + cloud sync, Restic local repo + offsite
+  copy).
+- Cache (where the tool supports it) sized for the recent-restore
+  window — last 7 days of changes, say.
+- Restore from local hot tier reads from NVMe (≈GB/s); restore
+  from cold S3 reads at network speed.
+
+For our orchestrator, this means:
+
+```
+  bedrock vm restore my-vm --snapshot 2026-05-04T02:00 --target prod-pbs
+
+  ① mgmt: find target's recent snapshot of my-vm at the requested ts.
+  ② lvcreate the target LV.
+  ③ tool restores chunks → LV. Hot-tier fast; cold-tier slower.
+  ④ define libvirt VM; log; (optional) start.
+```
+
+Same flow regardless of which tool is the backend. The local fast
+cache is the tool's responsibility to manage; Bedrock just trusts
+it.
+
 ### What this means for Bedrock's defaults
 
-The honest read: the user's **store-driven contract** is more
-naturally served by Restic/Kopia than by PBS. The user goes:
+The footprint and store-driven angles change the math. PBS gives
+the best VM-aware UX **but** weighs ~1 GB RAM as a running daemon
+plus a 64 GiB cache LV when using S3. Restic and Kopia are
+disposable single binaries that exit when done; their "contract"
+is just `binary + repo URL + key`.
 
-> install Bedrock on a new box → set backup target = `s3://...`
-> + key → run restore.
+Three honest takeaways:
 
-With PBS that becomes:
+1. **For "Bedrock should be light":** Kopia or Restic are
+   ~10× lighter than a PBS cattle VM. Kopia in particular —
+   single binary, optional web UI when you want one (the daemon
+   is opt-in), aggressive local caching, native S3 with
+   parallel uploads, native S3 Object Lock for ransomware
+   immutability. Strong v1 candidate.
 
-> install Bedrock on a new box → spin up the PBS cattle VM →
-> configure PBS to point at `s3://...` with `reuse-datastore` →
-> set encryption key → run restore via PBS API.
+2. **For "the operator wants a dashboard with backup history per
+   VM":** PBS still wins — Restic/Kopia don't have anything as
+   polished out of the box.
 
-The PBS VM is "internal infrastructure" the operator doesn't
-have to think about much, but it's an extra moving part vs the
-Restic flow.
+3. **For "ransomware protection matters":** Kopia is currently
+   the strongest because it's the only one with native S3 Object
+   Lock support in compliance mode. Restic relies on the storage
+   layer entirely; PBS likewise (the feature is on PBS's roadmap).
 
-**The reasonable v1 architecture: support both, pick one as
-default.**
+**Revised v1 architecture: support multiple backends, pick one
+default. Kopia is now the leading candidate for default.**
 
-- **Default backend = PBS.** It's the right answer for VM-
-  centric workloads — the operator UX is genuinely better, and
-  the dual-datastore (hot NVMe + cold S3) pattern of §9b-bis
-  gives a great out-of-the-box story. The "spin up PBS on a
-  new cluster to read backups" step is a one-shot per cluster.
+| Backend | Footprint | Store-driven | Object Lock | UX | Complexity |
+|---|---|---|---|---|---|
+| **Kopia** | tiny | yes — `kopia repository connect` from anywhere | native | optional web UI | low |
+| **Restic** | tiny | yes — env vars + binary | storage-layer only | CLI only | low |
+| **PBS** | heavy (~1 GB RAM + 64 GiB cache LV) | needs a PBS VM running on the new cluster | storage-layer only (planned) | best VM UX | a whole VM |
+| **Borg** | smallest | yes — but SSH-only without rclone | append-only mode | CLI only | medium (rclone for S3) |
 
-- **Alternative backend = Restic.** For users who want the truly
-  store-driven, serverless model, mgmt offers a Restic target
-  type. The contract from Bedrock's side is identical — point
-  at a target, set a key — but the on-the-wire backup format is
-  Restic's. Less polished than the PBS path; simpler to operate
-  on a fresh DR site.
+**My (revised) recommendation:** Phase A ships **Kopia as the
+default**, with **Restic and PBS as alternative target types**.
+Justification:
+- Kopia hits the "light" bar Bedrock cares about.
+- Native S3 Object Lock means we can ship ransomware-immutability
+  out of the box.
+- The store-driven contract maps directly: `target URL + key =
+  recovery on any cluster`.
+- PBS stays available for users who want the rich VM dashboard;
+  Restic stays for users who want the most provider-agnostic
+  serverless flow.
 
-The two options are not equivalent — backups taken to a PBS
-target can only be read by PBS; backups to a Restic repo can
-only be read by Restic. But the operator's contract with
-Bedrock looks the same: target URL + encryption key + retention
-policy. Operators pick once; backups go to that target type
-forever; restores use the same target type.
-
-Implementation-wise, mgmt's `bedrock vm backup` orchestration
-abstracts the backend:
+mgmt's CLI surface stays backend-agnostic:
 
 ```
-  bedrock backup target add prod-pbs --type pbs --url ... --token ... --key /etc/...
-  bedrock backup target add cold-s3  --type restic --repo s3://... --password-file ...
+  bedrock backup target add cold-s3 --type kopia --repo s3://... --password-file /etc/...
+  bedrock backup target add prod-pbs --type pbs   --url ... --token ... --key /etc/...
+  bedrock backup target add archive  --type restic --repo s3://... --password-file ...
 
-  bedrock vm backup my-pet --target prod-pbs
-  bedrock vm restore my-pet --from prod-pbs --snapshot 2026-05-04T02:00
-  bedrock vm restore my-pet --from cold-s3  --snapshot 2026-05-04T02:00
+  bedrock vm backup my-pet --target cold-s3
+  bedrock vm restore my-pet --from cold-s3 --snapshot 2026-05-04T02:00
 ```
 
-Two backend implementations, same orchestrator surface. **Phase
-A ships PBS first (it's the better VM UX) and Restic second
-(it's the cleaner DR contract).** Either suffices on its own
-for an operator who wants to pick one.
+Same operator contract regardless of which backend the data
+landed in.
+
+**The "full backup + dedup" philosophy still wins** independent of
+the tool. Snapshot lives only for the duration of the backup; the
+backup repo is the durable artefact; restore = stream from repo
+to a fresh LV. Local hot tier (Kopia local cache, PBS hot
+datastore, Restic local cache) keeps recent restores fast; the
+remote tier provides DR.
 
 ---
 
