@@ -74,6 +74,8 @@ BACKUP_FAILED         = "backup_failed"
 BACKUP_DELETED        = "backup_deleted"
 RESTORE_DONE          = "restore_done"
 RESTORE_FAILED        = "restore_failed"
+BACKUP_SCHEDULE_SET     = "backup_schedule_set"      # cron string per VM
+BACKUP_SCHEDULE_REMOVED = "backup_schedule_removed"
 
 
 def encode(t: str, **fields) -> bytes:
@@ -248,19 +250,57 @@ def backup_target_removed(target_id: str, reason: str = "") -> bytes:
     return encode(BACKUP_TARGET_REMOVED, target_id=target_id, reason=reason)
 
 
-def backup_done(vm: str, target_id: str, kopia_snapshot_id: str, *,
-                source_node: str = "", bytes_added: int = 0,
-                duration_s: float = 0.0, label: str = "") -> bytes:
-    """A backup completed successfully. `kopia_snapshot_id` is what
-    kopia returned (e.g. "k1234abcd"); the operator uses this to
-    invoke a restore."""
+def backup_done(vm: str, target_id: str, *,
+                disks: list | None = None,
+                source_node: str = "",
+                duration_s: float = 0.0,
+                label: str = "",
+                fs_freeze_used: bool = False,
+                # Legacy single-disk fields — kept so older callers /
+                # mid-rolling-update peers still produce well-formed log
+                # entries that fold deterministically. New code MUST pass
+                # `disks=[…]`; the legacy kwargs build a 1-disk list.
+                kopia_snapshot_id: str | None = None,
+                bytes_added: int = 0) -> bytes:
+    """A backup completed successfully.
+
+    `disks` is the canonical multi-disk list:
+        [{"target_dev": "vda", "lv_path": "/dev/vg/lv",
+          "kopia_snapshot_id": "abc…", "bytes_added": 12345}, …]
+
+    All disks of one bedrock-backup are captured at the same LV-snapshot
+    instant (with `virsh domfsfreeze` around them when qemu-guest-agent
+    is reachable), so a multi-disk VM restore is consistent across
+    disks. `fs_freeze_used` records whether the OS-level quiesce
+    actually happened — False means the snapshot is crash-consistent
+    only (still safe for ext4/xfs journal-replay; not safe for an
+    RDBMS not using its own crash recovery)."""
+    if disks is None:
+        if kopia_snapshot_id is None:
+            raise ValueError("backup_done: pass `disks=[…]` (or legacy "
+                             "kopia_snapshot_id=… for single-disk)")
+        disks = [{
+            "target_dev": "disk0",
+            "lv_path": "",
+            "kopia_snapshot_id": kopia_snapshot_id,
+            "bytes_added": int(bytes_added),
+        }]
+    # Normalise types so msgpack output is stable
+    norm_disks = []
+    for d in disks:
+        norm_disks.append({
+            "target_dev": str(d.get("target_dev", "")),
+            "lv_path":    str(d.get("lv_path", "")),
+            "kopia_snapshot_id": str(d.get("kopia_snapshot_id", "")),
+            "bytes_added": int(d.get("bytes_added", 0)),
+        })
     return encode(
         BACKUP_DONE, vm=vm, target_id=target_id,
-        kopia_snapshot_id=kopia_snapshot_id,
+        disks=norm_disks,
         source_node=source_node,
-        bytes_added=int(bytes_added),
         duration_s=float(duration_s),
         label=label,
+        fs_freeze_used=bool(fs_freeze_used),
     )
 
 
@@ -295,4 +335,37 @@ def restore_failed(vm: str, target_id: str, kopia_snapshot_id: str,
         RESTORE_FAILED, vm=vm, target_id=target_id,
         kopia_snapshot_id=kopia_snapshot_id,
         reason=reason, dest_node=dest_node,
+    )
+
+
+def backup_schedule_set(vm: str, target_id: str, cron_expr: str, *,
+                        label_prefix: str = "auto",
+                        retention_count: int = 0,
+                        reason: str = "") -> bytes:
+    """Schedule a periodic backup of `vm` to `target_id` using the
+    given 5-field cron expression. All times are UTC.
+
+    `label_prefix` is prepended to the auto-generated label so the
+    operator can distinguish manual from scheduled backups in the
+    history list (default "auto" → labels look like "auto-20260504T020000").
+
+    `retention_count` (0 = keep all) is the v1.x rolling-retention
+    knob. When >0, after each successful scheduled backup the master
+    deletes the oldest backups beyond this count for the same VM +
+    target_id. v1.0 ships with retention_count = 0 (no automatic
+    pruning) — operator deletes manually."""
+    return encode(
+        BACKUP_SCHEDULE_SET,
+        vm=vm, target_id=target_id, cron_expr=cron_expr,
+        label_prefix=label_prefix,
+        retention_count=int(retention_count),
+        reason=reason,
+    )
+
+
+def backup_schedule_removed(vm: str, *, reason: str = "") -> bytes:
+    """Remove the scheduled backup for `vm`. Existing snapshots stay
+    in the kopia repo; only future fires are cancelled."""
+    return encode(
+        BACKUP_SCHEDULE_REMOVED, vm=vm, reason=reason,
     )

@@ -5,6 +5,7 @@
 	import { apiGet, vmStart, vmShutdown, vmPoweroff, vmMigrate, vmDelete,
 		vmBackup, vmBackupsList, vmBackupDelete, vmRestore,
 		listBackupTargets,
+		setBackupSchedule, removeBackupSchedule, cronPreview,
 		type VmBackup } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
@@ -101,6 +102,85 @@
 			lastBackupError = r.last_backup_error || null;
 		} catch (e) { /* not ready */ }
 	}
+
+	// ── Schedule state ──
+	// `vm.backup_schedule` is folded into cluster.json; we read it
+	// straight from the live `vm` object.
+	let scheduleInput = $state('');
+	let schedulePreview = $state<string[]>([]);
+	let schedulePreviewError = $state<string | null>(null);
+	let scheduleSaving = $state(false);
+
+	let activeSchedule = $derived(vm?.backup_schedule);
+
+	// Debounced cron-preview lookup as the operator types.
+	let previewTimer: any = null;
+	function onScheduleInput() {
+		schedulePreviewError = null;
+		if (previewTimer) clearTimeout(previewTimer);
+		const expr = scheduleInput.trim();
+		if (!expr) { schedulePreview = []; return; }
+		previewTimer = setTimeout(async () => {
+			try {
+				const r = await cronPreview(expr, 5);
+				schedulePreview = r.next_fires_utc;
+				schedulePreviewError = null;
+			} catch (e: any) {
+				schedulePreview = [];
+				schedulePreviewError = e.message.replace(/^\d+: /, '');
+			}
+		}, 300);
+	}
+
+	async function saveSchedule() {
+		if (!scheduleInput.trim()) {
+			actionStatus = 'Cron expression is empty.';
+			setTimeout(() => actionStatus = '', 4000);
+			return;
+		}
+		scheduleSaving = true;
+		try {
+			await setBackupSchedule(vmName, {
+				target_id: backupTargetId,
+				cron_expr: scheduleInput.trim(),
+			});
+			actionStatus = 'Schedule saved.';
+			scheduleInput = '';
+			schedulePreview = [];
+			setTimeout(() => actionStatus = '', 4000);
+		} catch (e: any) {
+			actionStatus = `Schedule save failed: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+		} finally {
+			scheduleSaving = false;
+		}
+	}
+
+	async function clearSchedule() {
+		if (!confirm(`Remove the backup schedule for ${vmName}?`)) return;
+		try {
+			await removeBackupSchedule(vmName, 'cleared via dashboard');
+			actionStatus = 'Schedule cleared.';
+			setTimeout(() => actionStatus = '', 4000);
+		} catch (e: any) {
+			actionStatus = `Schedule remove failed: ${e.message}`;
+			setTimeout(() => actionStatus = '', 8000);
+		}
+	}
+
+	// Re-preview the EXISTING schedule's next runs (read-only display).
+	let activeNextRuns = $state<string[]>([]);
+	let lastPreviewedExpr = '';
+	$effect(() => {
+		const cur = activeSchedule?.cron_expr || '';
+		if (cur && cur !== lastPreviewedExpr) {
+			lastPreviewedExpr = cur;
+			cronPreview(cur, 5).then(r => activeNextRuns = r.next_fires_utc).catch(() => activeNextRuns = []);
+		} else if (!cur) {
+			activeNextRuns = [];
+			lastPreviewedExpr = '';
+		}
+	});
 
 	async function fetchBackupTargets() {
 		try {
@@ -326,6 +406,50 @@
 			<span class="muted">Target:</span> <code>{backupTargetId}</code>
 			<span class="muted" style="margin-left: 16px;">{backups.length} snapshot{backups.length === 1 ? '' : 's'}</span>
 		</div>
+
+		<!-- Schedule subsection -->
+		<div class="schedule-block">
+			<h4>Schedule</h4>
+			{#if activeSchedule}
+				<div class="schedule-active">
+					<span class="muted">Cron (UTC):</span>
+					<code>{activeSchedule.cron_expr}</code>
+					<span class="muted">→ target</span>
+					<code>{activeSchedule.target_id}</code>
+					<button class="btn-small danger" onclick={clearSchedule}>Remove schedule</button>
+				</div>
+				{#if activeNextRuns.length > 0}
+					<div class="schedule-preview">
+						<span class="muted">Next 5 runs (UTC):</span>
+						<ul>
+							{#each activeNextRuns as t}<li><code>{t}</code></li>{/each}
+						</ul>
+					</div>
+				{/if}
+			{:else}
+				<div class="schedule-form">
+					<input type="text" bind:value={scheduleInput} oninput={onScheduleInput}
+						placeholder="0 2 * * *  (daily 02:00 UTC)  •  @daily  •  */15 * * * *" />
+					<button class="btn-small primary" disabled={scheduleSaving || !scheduleInput.trim() || !!schedulePreviewError}
+						onclick={saveSchedule}>{scheduleSaving ? 'Saving…' : 'Save schedule'}</button>
+				</div>
+				{#if schedulePreviewError}
+					<div class="schedule-err">⚠ {schedulePreviewError}</div>
+				{:else if schedulePreview.length > 0}
+					<div class="schedule-preview">
+						<span class="muted">Next 5 runs (UTC):</span>
+						<ul>
+							{#each schedulePreview as t}<li><code>{t}</code></li>{/each}
+						</ul>
+					</div>
+				{/if}
+				<p class="schedule-note muted">
+					All times are UTC. Cron syntax: <code>m h dom mon dow</code> or one of
+					<code>@hourly</code> / <code>@daily</code> / <code>@weekly</code> / <code>@monthly</code>.
+					The mgmt master fires the backup; on master change the schedule keeps running.
+				</p>
+			{/if}
+		</div>
 		{#if lastBackupError}
 			<div class="backup-error">
 				Last backup error: <code>{lastBackupError.target_id}</code> — {lastBackupError.reason}
@@ -336,6 +460,8 @@
 				<thead>
 					<tr>
 						<th>Snapshot</th>
+						<th>Disks</th>
+						<th>Quiesce</th>
 						<th>Target</th>
 						<th>Size added</th>
 						<th>Duration</th>
@@ -348,6 +474,20 @@
 					{#each backups as b}
 						<tr>
 							<td><code title={b.kopia_snapshot_id}>{b.kopia_snapshot_id.slice(0, 12)}…</code></td>
+							<td>
+								{#if b.disks && b.disks.length > 1}
+									<span class="pill multi" title={b.disks.map(d => `${d.target_dev}=${d.kopia_snapshot_id.slice(0,8)}…`).join('\n')}>{b.disks.length} disks</span>
+								{:else}
+									<span class="muted">{b.disks?.[0]?.target_dev || 'disk0'}</span>
+								{/if}
+							</td>
+							<td>
+								{#if b.fs_freeze_used}
+									<span class="pill ok" title="virsh domfsfreeze succeeded — guest filesystems were quiesced before snapshot">fs-freeze</span>
+								{:else}
+									<span class="pill warn" title="VM was off, or no qemu-guest-agent — snapshot is crash-consistent only">crash-consistent</span>
+								{/if}
+							</td>
 							<td>{b.target_id}</td>
 							<td>{fmtBytes(b.bytes_added)}</td>
 							<td>{b.duration_s ? `${b.duration_s.toFixed(1)}s` : '-'}</td>
@@ -357,7 +497,7 @@
 								<button class="btn-small primary" disabled={vm.state === 'running'}
 									title={vm.state === 'running'
 										? 'Shut the VM down before restoring (qemu would race the disk write)'
-										: 'Stream this snapshot back onto the VM disk'}
+										: 'Stream this snapshot back onto the VM disk(s)'}
 									onclick={() => openRestoreModal(b)}>Restore</button>
 								<button class="btn-small danger" onclick={() => deleteBackup(b.kopia_snapshot_id)}>Delete</button>
 							</td>
@@ -422,17 +562,35 @@
 			<h3>Restore VM from snapshot</h3>
 			<p class="del-vm-name">{vmName}</p>
 			<dl class="restore-meta">
-				<dt>Snapshot</dt><dd><code title={restoreModal.kopia_snapshot_id}>{restoreModal.kopia_snapshot_id}</code></dd>
+				<dt>Backup ID</dt><dd><code title={restoreModal.kopia_snapshot_id}>{restoreModal.kopia_snapshot_id}</code></dd>
 				<dt>Target</dt><dd><code>{restoreModal.target_id}</code></dd>
 				<dt>Label</dt><dd>{restoreModal.label || '—'}</dd>
 				<dt>Source node</dt><dd>{restoreModal.source_node || '—'}</dd>
 				<dt>Size added</dt><dd>{fmtBytes(restoreModal.bytes_added)}</dd>
+				<dt>Quiesce</dt><dd>{restoreModal.fs_freeze_used ? 'fs-freeze (consistent)' : 'crash-consistent'}</dd>
+				<dt>Disks ({restoreModal.disks?.length ?? 1})</dt>
+				<dd>
+					{#if restoreModal.disks && restoreModal.disks.length > 0}
+						<ul class="restore-disks">
+							{#each restoreModal.disks as d}
+								<li>
+									<code>{d.target_dev}</code> →
+									<code title={d.kopia_snapshot_id}>{d.kopia_snapshot_id.slice(0,12)}…</code>
+									<span class="muted">({fmtBytes(d.bytes_added)})</span>
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<span class="muted">single disk (legacy backup record)</span>
+					{/if}
+				</dd>
 			</dl>
 			<p class="del-warn">
-				This streams the snapshot's bytes back onto <code>{vmName}</code>'s primary disk LV.
-				<strong>Anything written since this backup will be lost.</strong>
-				The VM must be shut down first — qemu holding the disk would race
-				with the restore writes.
+				All <strong>{restoreModal.disks?.length ?? 1}</strong> disk(s) will be
+				streamed back onto <code>{vmName}</code>'s LVs in one operation.
+				<strong>Anything written to any of these disks since this backup
+				will be lost.</strong> The VM must be shut down first — qemu holding
+				a disk would race with the restore writes.
 			</p>
 			<label class="del-label">
 				Type the VM name <code>{vmName}</code> to confirm:
@@ -486,6 +644,46 @@
 	.btn.backup:hover:not(:disabled) { background: #d2992222; }
 
 	.backups-card { padding: 12px 16px; }
+
+	.schedule-block {
+		margin: 12px 0; padding: 10px 12px;
+		background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+	}
+	.schedule-block h4 {
+		margin: 0 0 8px; font-size: 11px; color: #8b949e;
+		text-transform: uppercase; letter-spacing: 1px; font-weight: 500;
+	}
+	.schedule-active {
+		display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+		font-size: 12px;
+	}
+	.schedule-active code {
+		background: #21262d; padding: 1px 6px; border-radius: 3px; font-size: 11px;
+	}
+	.schedule-form {
+		display: flex; gap: 8px; align-items: center;
+	}
+	.schedule-form input {
+		flex: 1; background: #161b22; border: 1px solid #30363d;
+		border-radius: 6px; padding: 6px 10px; color: #e6edf3; font-size: 13px;
+		font-family: ui-monospace, SFMono-Regular, monospace;
+	}
+	.schedule-form input:focus { outline: none; border-color: #58a6ff; }
+	.schedule-preview { margin-top: 8px; font-size: 11px; }
+	.schedule-preview ul { list-style: none; margin: 4px 0 0; padding: 0; }
+	.schedule-preview li { padding: 1px 0; }
+	.schedule-preview code {
+		background: #21262d; padding: 1px 5px; border-radius: 3px;
+		font-size: 11px; color: #c9d1d9;
+	}
+	.schedule-err {
+		margin-top: 6px; font-size: 12px; color: #f85149;
+	}
+	.schedule-note { margin: 8px 0 0; font-size: 11px; }
+	.schedule-note code {
+		background: #21262d; padding: 1px 5px; border-radius: 3px;
+		font-size: 10px;
+	}
 	.backups-head { font-size: 12px; margin-bottom: 8px; }
 	.backup-error {
 		font-size: 12px; color: #f85149; background: #f8514911;
@@ -512,6 +710,15 @@
 	.restore-meta code {
 		background: #0d1117; padding: 1px 6px; border-radius: 3px; font-size: 11px;
 	}
+	.restore-disks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+	.restore-disks li { padding: 2px 0; }
+
+	.pill {
+		display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+	}
+	.pill.ok { background: #1a7f3733; color: #3fb950; }
+	.pill.warn { background: #d2992233; color: #d29922; }
+	.pill.multi { background: #1f6feb33; color: #58a6ff; cursor: help; }
 
 	.ha-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; cursor: pointer; }
 	.ha-check.nested { margin-left: 20px; }

@@ -2210,8 +2210,12 @@ async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()
                 lambda: backup.run_backup(req.target_id, vm_name, label=req.label),
             )
             task.step_done("snapshot+kopia")
-            task.log(f"kopia snapshot id: {result['kopia_snapshot_id']}")
-            task.log(f"bytes added: {result['bytes_added']}")
+            disks = result.get("disks") or []
+            task.log(f"{len(disks)} disk(s) backed up "
+                     f"(fs_freeze_used={result.get('fs_freeze_used', False)})")
+            for d in disks:
+                task.log(f"  {d['target_dev']}: kopia={d['kopia_snapshot_id']} "
+                         f"({d['bytes_added']} bytes added)")
             task.log(f"duration: {result['duration_s']:.1f}s")
             task.succeed()
         except Exception as e:
@@ -2266,7 +2270,9 @@ async def api_vm_restore(vm_name: str, req: RestoreRequest):
                 ),
             )
             task.step_done("kopia snapshot restore")
-            task.log(f"restored to: {result['target_lv_path']}")
+            for d in (result.get("disks") or []):
+                task.log(f"  {d['target_dev']} ← kopia={d['kopia_snapshot_id']} "
+                         f"→ {d['target_lv_path']}")
             task.log(f"on node: {result['dest_node']}")
             task.log(f"duration: {result['duration_s']:.1f}s")
             task.succeed()
@@ -2276,6 +2282,94 @@ async def api_vm_restore(vm_name: str, req: RestoreRequest):
 
     asyncio.create_task(_run())
     return {"status": "accepted", "task_id": task.id}
+
+
+class BackupScheduleSetRequest(BaseModel):
+    target_id: str = "main"
+    cron_expr: str               # 5-field UTC cron, e.g. "0 2 * * *" or "@daily"
+    label_prefix: str = "auto"   # auto-generated labels start with "<prefix>-"
+    retention_count: int = 0     # 0 = keep all (v1.0 default)
+    reason: str = ""
+
+
+@app.post("/api/vms/{vm_name}/backup-schedule")
+def api_vm_backup_schedule_set(vm_name: str, req: BackupScheduleSetRequest):
+    """Set or replace the periodic-backup schedule for a VM. The
+    schedule is stored in the cluster log so it survives master
+    failover; the master's `backup_scheduler` loop is the only firer.
+
+    Returns the next 5 fire times (UTC) so the caller can sanity-check
+    their cron expression before relying on it."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import cron as _cron
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import rust_ipc as _ipc, log_entries as _le
+
+    cluster = load_cluster()
+    if (cluster.get("vms") or {}).get(vm_name) is None:
+        raise HTTPException(404, f"VM {vm_name!r} not found")
+    if (cluster.get("backup_targets") or {}).get(req.target_id) is None:
+        raise HTTPException(400, f"backup target {req.target_id!r} not configured")
+
+    # Validate the cron expression server-side. Better to fail at submit
+    # time than have the scheduler silently skip the VM forever.
+    try:
+        next_fires = _cron.next_n(req.cron_expr, n=5)
+    except _cron.CronError as e:
+        raise HTTPException(400, f"invalid cron expression: {e}")
+
+    try:
+        with _ipc.Daemon() as d:
+            idx, _ = d.append(_le.backup_schedule_set(
+                vm=vm_name, target_id=req.target_id,
+                cron_expr=req.cron_expr,
+                label_prefix=req.label_prefix,
+                retention_count=req.retention_count,
+                reason=req.reason or "set via dashboard",
+            ))
+    except Exception as e:
+        raise HTTPException(500, f"log append failed: {e}")
+
+    push_log(f"backup schedule set for VM {vm_name}: cron={req.cron_expr!r} "
+             f"target={req.target_id}",
+             app="bedrock-mgmt", level="info")
+    return {
+        "status": "ok",
+        "log_index": idx,
+        "vm": vm_name,
+        "cron_expr": req.cron_expr,
+        "next_fires_utc": next_fires,
+    }
+
+
+@app.delete("/api/vms/{vm_name}/backup-schedule")
+def api_vm_backup_schedule_remove(vm_name: str, reason: str = ""):
+    import sys as _sys
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import rust_ipc as _ipc, log_entries as _le
+    try:
+        with _ipc.Daemon() as d:
+            idx, _ = d.append(_le.backup_schedule_removed(
+                vm=vm_name, reason=reason or "removed via dashboard",
+            ))
+    except Exception as e:
+        raise HTTPException(500, f"log append failed: {e}")
+    return {"status": "ok", "log_index": idx, "vm": vm_name}
+
+
+@app.get("/api/cron/preview")
+def api_cron_preview(expr: str, n: int = 5):
+    """Return the next N fire times for a cron expression (UTC ISO).
+    Used by the dashboard's schedule-input field for live preview as
+    the operator types. Pure parser — no I/O."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import cron as _cron
+    try:
+        return {"cron_expr": expr, "next_fires_utc": _cron.next_n(expr, n=max(1, min(n, 20)))}
+    except _cron.CronError as e:
+        raise HTTPException(400, f"invalid cron expression: {e}")
 
 
 @app.delete("/api/vms/{vm_name}/backups/{kopia_snapshot_id}")

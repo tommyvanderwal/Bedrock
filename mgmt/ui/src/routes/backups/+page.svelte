@@ -267,6 +267,8 @@
 				<tr>
 					<th>VM</th>
 					<th>Snapshot</th>
+					<th>Disks</th>
+					<th>Quiesce</th>
 					<th>Target</th>
 					<th>Size added</th>
 					<th>Duration</th>
@@ -281,6 +283,20 @@
 					<tr class:in-progress={restoring === b.kopia_snapshot_id}>
 						<td><a href="/vm/{b.vm}">{b.vm}</a></td>
 						<td><code title={b.kopia_snapshot_id}>{b.kopia_snapshot_id.slice(0, 12)}…</code></td>
+						<td>
+							{#if b.disks && b.disks.length > 1}
+								<span class="pill multi" title={b.disks.map(d => `${d.target_dev}=${d.kopia_snapshot_id.slice(0,8)}…`).join('\n')}>{b.disks.length} disks</span>
+							{:else}
+								<span class="muted">{b.disks?.[0]?.target_dev || 'disk0'}</span>
+							{/if}
+						</td>
+						<td>
+							{#if b.fs_freeze_used}
+								<span class="pill ok" title="virsh domfsfreeze succeeded — guest filesystems were quiesced before snapshot">fs-freeze</span>
+							{:else}
+								<span class="pill warn" title="VM was off, or no qemu-guest-agent — snapshot is crash-consistent only">crash</span>
+							{/if}
+						</td>
 						<td>{b.target_id}</td>
 						<td>{fmtBytes(b.bytes_added)}</td>
 						<td>{b.duration_s ? `${b.duration_s.toFixed(1)}s` : '-'}</td>
@@ -289,7 +305,7 @@
 						<td class="muted">{b.ts_index}</td>
 						<td>
 							<button class="btn-small primary" disabled={restoring !== null}
-								title="Stream this snapshot back onto the VM's primary disk LV. The VM must be shut down."
+								title="Restore ALL disks of this snapshot back onto the VM. The VM must be shut down."
 								onclick={() => openRestoreModal(b)}>Restore</button>
 							<button class="btn-small danger" disabled={restoring !== null}
 								onclick={() => deleteSnapshot(b)}>Delete</button>
@@ -458,15 +474,33 @@
 			<h3>Restore VM from snapshot</h3>
 			<dl class="restore-meta">
 				<dt>VM</dt><dd><code>{restoreModal.vm}</code></dd>
-				<dt>Snapshot</dt><dd><code>{restoreModal.kopia_snapshot_id}</code></dd>
+				<dt>Backup ID</dt><dd><code>{restoreModal.kopia_snapshot_id}</code></dd>
 				<dt>Target</dt><dd><code>{restoreModal.target_id}</code></dd>
 				<dt>Label</dt><dd>{restoreModal.label || '—'}</dd>
 				<dt>Source node</dt><dd>{restoreModal.source_node || '—'}</dd>
+				<dt>Quiesce</dt><dd>{restoreModal.fs_freeze_used ? 'fs-freeze (consistent)' : 'crash-consistent'}</dd>
+				<dt>Disks ({restoreModal.disks?.length ?? 1})</dt>
+				<dd>
+					{#if restoreModal.disks && restoreModal.disks.length > 0}
+						<ul class="restore-disks">
+							{#each restoreModal.disks as d}
+								<li>
+									<code>{d.target_dev}</code> →
+									<code title={d.kopia_snapshot_id}>{d.kopia_snapshot_id.slice(0,12)}…</code>
+									<span class="muted">({fmtBytes(d.bytes_added)})</span>
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<span class="muted">single disk (legacy backup record)</span>
+					{/if}
+				</dd>
 			</dl>
 			<p class="restore-warn">
-				This streams the snapshot's bytes back onto the VM's primary disk LV.
-				Anything written to the disk since this backup will be lost.
-				<strong>The VM must be shut down before restoring.</strong>
+				All <strong>{restoreModal.disks?.length ?? 1}</strong> disk(s) of
+				<code>{restoreModal.vm}</code> will be streamed back onto their LVs in
+				one operation. <strong>Anything written since this backup will be lost.</strong>
+				The VM must be shut down before restoring.
 			</p>
 			<label class="restore-typecheck">
 				Type the VM name <code>{restoreModal.vm}</code> to confirm:
@@ -577,6 +611,8 @@
 	.restore-meta code {
 		background: #0d1117; padding: 1px 6px; border-radius: 3px; font-size: 11px;
 	}
+	.restore-disks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+	.restore-disks li { padding: 2px 0; }
 	.restore-warn {
 		font-size: 12px; color: #d29922; background: #d2992211;
 		border-left: 3px solid #d29922; padding: 8px 12px; margin: 0 0 14px;
@@ -600,6 +636,7 @@
 	}
 	.pill.ok { background: #1a7f3733; color: #3fb950; }
 	.pill.warn { background: #d2992233; color: #d29922; }
+	.pill.multi { background: #1f6feb33; color: #58a6ff; cursor: help; }
 	.cred-pill { font-size: 11px; margin-right: 4px; }
 
 	.banner {

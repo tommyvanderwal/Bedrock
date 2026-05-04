@@ -22,14 +22,31 @@ sectors never re-upload.
 - The kopia repo is connected on the VM's home node (mgmt master's
   reactor or boot-reconcile runs `kopia repository connect` on every
   node when a target_set entry lands).
-- The VM is **shut down** (any state ≠ running). Live backup of a
-  running VM works in principle (LV thin snapshot is a point-in-time
-  COW), but the inner filesystem may be in a crash-inconsistent
-  state — the operator is responsible for quiescing first if they
-  care about FS consistency. Cattle VMs without a guest agent should
-  be stopped before backup.
+- VM may be running OR shut down. When running with `qemu-guest-agent`
+  reachable, bedrock calls `virsh domfsfreeze` around the LV-snapshot
+  step so the resulting backup is **filesystem-consistent** (DBs flush,
+  journals settle). When the agent is absent, bedrock falls through to
+  a crash-consistent snapshot — safe for ext4/xfs which replay their
+  own journals on first boot. The `fs_freeze_used` field on the backup
+  row records which path actually ran.
 - The VM's home node has free space in the LV thin pool for the COW
   of the snapshot; only changed sectors take space until lvremove.
+
+## Multi-disk VMs
+
+VMs with multiple disks are backed up as **one consistent point-in-
+time**: bedrock takes ALL disk LV snapshots inside one bash invocation
+on the home node, with `virsh domfsfreeze` before the first lvcreate
+and `virsh domfsthaw` immediately after the last. The fs-freeze
+window is bounded by `lvcreate × N` (typically tens of milliseconds
+per disk) so the guest's IO pause is sub-second even on 4-disk VMs.
+
+Each disk lands in the kopia repo as its own snapshot under a
+per-disk source line (`<prefix>:<vm>:<target_dev>`, e.g.
+`<uuid>:vms:web1:vda`, `<uuid>:vms:web1:vdb`). Dedup still works
+per-disk because chunks are content-addressed independently. The
+cluster log's `BACKUP_DONE` entry carries the `disks[]` list so
+restore puts every disk back at the same LV path it came from.
 
 ## Sequence
 

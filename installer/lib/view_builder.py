@@ -240,13 +240,32 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
         elif kind == le.BACKUP_DONE:
             vm = out["vms"].setdefault(payload["vm"], {})
             backups = vm.setdefault("backups", [])
+            # Multi-disk schema: `disks` is the canonical list. Legacy
+            # entries (singular `kopia_snapshot_id` at the top) get
+            # normalised into a 1-element list so the UI/restore path
+            # has one shape to deal with.
+            disks = payload.get("disks")
+            if not disks:
+                disks = [{
+                    "target_dev":  "disk0",
+                    "lv_path":     "",
+                    "kopia_snapshot_id": payload.get("kopia_snapshot_id", ""),
+                    "bytes_added": payload.get("bytes_added", 0),
+                }]
+            total_bytes = sum(int(d.get("bytes_added", 0) or 0) for d in disks)
+            primary_kid = (disks[0].get("kopia_snapshot_id") or "") if disks else ""
             backups.append({
-                "kopia_snapshot_id": payload["kopia_snapshot_id"],
+                # `kopia_snapshot_id` stays at the top as the row's
+                # primary identifier (= disk0's kopia id); the UI uses it
+                # for delete/restore lookup. `disks[]` is authoritative.
+                "kopia_snapshot_id": primary_kid,
+                "disks":             disks,
                 "target_id":   payload["target_id"],
                 "source_node": payload.get("source_node", ""),
-                "bytes_added": payload.get("bytes_added", 0),
+                "bytes_added": total_bytes,    # rolled-up across disks
                 "duration_s":  payload.get("duration_s", 0.0),
                 "label":       payload.get("label", ""),
+                "fs_freeze_used": bool(payload.get("fs_freeze_used", False)),
                 "ts_index":    entry["index"],   # log index serves as timestamp
             })
             # Keep newest first; cap to a reasonable length so cluster.json
@@ -288,6 +307,21 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
                 "target_id":         payload.get("target_id", ""),
                 "reason":            payload.get("reason", ""),
             }
+
+        elif kind == le.BACKUP_SCHEDULE_SET:
+            vm = out["vms"].setdefault(payload["vm"], {})
+            vm["backup_schedule"] = {
+                "target_id":       payload.get("target_id", ""),
+                "cron_expr":       payload.get("cron_expr", ""),
+                "label_prefix":    payload.get("label_prefix", "auto"),
+                "retention_count": int(payload.get("retention_count", 0)),
+                "set_at_index":    entry["index"],
+            }
+
+        elif kind == le.BACKUP_SCHEDULE_REMOVED:
+            vm = out["vms"].get(payload["vm"])
+            if vm is not None:
+                vm.pop("backup_schedule", None)
 
         # Bootstrap entry, free-form payloads, and unknown kinds are
         # ignored — they just record history without affecting the

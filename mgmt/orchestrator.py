@@ -660,6 +660,163 @@ async def _react_backup_target_set(payload: dict):
                     target_id, e)
 
 
+# ── ⑤ backup_scheduler ───────────────────────────────────────────────────
+
+# In-memory ledger of in-flight scheduled backups so a slow `run_backup`
+# doesn't get re-queued every minute by the next tick. Cleared when the
+# task finishes (success or failure). Only meaningful on the leader.
+_SCHEDULED_INFLIGHT: set[str] = set()
+
+
+async def backup_scheduler():
+    """Master-only loop. Every 60 s, walks every VM's `backup_schedule`
+    in cluster.json and decides whether to fire a backup. Decision
+    uses bedrock-managed mtime — `cron.should_fire_now` compares the
+    cron expression against last-fired (most recent BACKUP_DONE for
+    the same VM + target_id) and a 60-min grace window for first-
+    time fires.
+
+    Why master-only: appending log entries (and, more importantly,
+    actually orchestrating the LV snapshot + dd | kopia stream) must
+    not double-fire. The leader is the single writer of the cluster
+    log, so scheduling against the leader's view is naturally
+    serialised.
+
+    A follower running this loop would either (a) duplicate the work
+    or (b) discover its IPC append fails (only the leader can append).
+    Cleaner to short-circuit on role.
+    """
+    sys.path.insert(0, str(Path(__file__).parent))
+    log.info("scheduler: starting (master-only loop)")
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not _is_leader():
+                continue
+            await _scheduler_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("scheduler: tick failed: %s", e)
+
+
+def _is_leader() -> bool:
+    return _current_role() == "leader"
+
+
+async def _scheduler_tick():
+    """Single pass: load cluster.json, evaluate every VM's schedule,
+    queue run_backup for the ones that are due."""
+    if not CLUSTER_JSON.exists():
+        return
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except Exception as e:
+        log.warning("scheduler: cluster.json read failed: %s", e)
+        return
+
+    import datetime as dt
+    import cron as bedrock_cron  # type: ignore
+    now = dt.datetime.utcnow()
+
+    vms = cluster.get("vms") or {}
+    targets = cluster.get("backup_targets") or {}
+
+    for vm_name, vm in vms.items():
+        sched = vm.get("backup_schedule")
+        if not sched:
+            continue
+        target_id = sched.get("target_id") or ""
+        cron_expr = sched.get("cron_expr") or ""
+        if not target_id or not cron_expr:
+            continue
+        if target_id not in targets:
+            log.warning("scheduler: VM %s scheduled to non-existent target %r",
+                        vm_name, target_id)
+            continue
+        if vm_name in _SCHEDULED_INFLIGHT:
+            continue  # previous run hasn't finished — skip this tick
+
+        # last_fired_at: most recent BACKUP_DONE for this VM + target.
+        # The cluster log doesn't carry wall-clock — only ts_index.
+        # Approximate "last fired wall-clock" by mapping ts_index → minutes
+        # ago: each new entry roughly corresponds to one operator action,
+        # which doesn't give us minutes. Better: store the wall-clock the
+        # scheduler fired AT in cluster-log via a SCHEDULE_FIRED entry,
+        # OR rely on the fact that we only need MONOTONIC ordering
+        # ("did we fire AFTER this cron tick?"), not absolute wall-clock.
+        #
+        # Pragmatic v1: don't try to fire missed catch-up windows from
+        # before mgmt-startup. Use the master's process-start time as a
+        # floor on "last_fired_at" if no BACKUP_DONE has happened yet
+        # since startup. This avoids firing every scheduled VM on master
+        # restart (which would happen if we passed last_fired_at=None to
+        # should_fire_now and the cron has fired in the last hour).
+        last_fired_at = _last_scheduled_fire_time(vm, sched, now)
+
+        try:
+            should_fire = bedrock_cron.should_fire_now(
+                cron_expr, now=now, last_fired_at=last_fired_at,
+                grace_minutes=60,
+            )
+        except bedrock_cron.CronError as e:
+            log.warning("scheduler: invalid cron %r for %s: %s",
+                        cron_expr, vm_name, e)
+            continue
+
+        if not should_fire:
+            continue
+
+        log.info("scheduler: firing scheduled backup for %s (target=%s, cron=%r, "
+                 "last_fired=%s)",
+                 vm_name, target_id, cron_expr, last_fired_at)
+        _SCHEDULED_INFLIGHT.add(vm_name)
+        asyncio.create_task(_run_scheduled_backup(vm_name, target_id, sched))
+
+
+def _last_scheduled_fire_time(vm: dict, sched: dict,
+                              now) -> "dt.datetime | None":
+    """Best-effort wall-clock of the most recent scheduled fire. We
+    reconstruct it from BACKUP_DONE entries that carry the schedule's
+    label_prefix — those are the auto-generated labels of the form
+    "<prefix>-YYYYMMDDTHHMMSS" written by run_backup when invoked from
+    the scheduler. Returns None if we've never fired one."""
+    import datetime as dt
+    prefix = sched.get("label_prefix") or "auto"
+    target_id = sched.get("target_id") or ""
+    backups = vm.get("backups") or []
+    for b in backups:  # newest-first
+        if b.get("target_id") != target_id:
+            continue
+        lbl = b.get("label") or ""
+        if not lbl.startswith(prefix + "-"):
+            continue
+        ts_part = lbl[len(prefix) + 1:]
+        try:
+            return dt.datetime.strptime(ts_part, "%Y%m%dT%H%M%S")
+        except ValueError:
+            continue
+    return None
+
+
+async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
+    import datetime as dt
+    label = f"{sched.get('label_prefix') or 'auto'}-{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import backup as bedrock_backup  # type: ignore
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: bedrock_backup.run_backup(target_id, vm_name, label=label),
+        )
+        log.info("scheduler: backup of %s done (label=%s)", vm_name, label)
+    except Exception as e:
+        log.warning("scheduler: backup of %s failed: %s", vm_name, e)
+    finally:
+        _SCHEDULED_INFLIGHT.discard(vm_name)
+
+
 # ── public registration ──────────────────────────────────────────────────
 
 def start_all():
@@ -668,4 +825,6 @@ def start_all():
     asyncio.create_task(log_subscriber())
     asyncio.create_task(fence_responder())
     asyncio.create_task(boot_orchestrator())
-    log.info("orchestrator: tasks started (subscriber, fence_responder, boot)")
+    asyncio.create_task(backup_scheduler())
+    log.info("orchestrator: tasks started (subscriber, fence_responder, "
+             "boot, backup_scheduler)")

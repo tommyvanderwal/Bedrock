@@ -106,10 +106,46 @@ def _override_source_for_vm(vm_name: str) -> str:
 
 def _vm_disk_lvs(vm_name: str, ssh_host: str) -> list[str]:
     """List the LV paths backing a VM by parsing virsh dumpxml on the
-    home node. Returns a list like ['/dev/bedrock/vm-X-disk0', ...]."""
+    home node. Returns a list like ['/dev/bedrock/vm-X-disk0', ...].
+    Order matches `_vm_disk_target_devs(...)` element-by-element."""
     out = _ssh(ssh_host, f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
+    return _parse_disks_from_xml(out)[0]
+
+
+def _vm_disk_target_devs(vm_name: str, ssh_host: str) -> list[str]:
+    """Guest-visible target dev names ('vda', 'vdb', …) for the VM's
+    disks, in the same order as `_vm_disk_lvs`. Used as the kopia
+    per-disk source-line suffix."""
+    out = _ssh(ssh_host, f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
+    return _parse_disks_from_xml(out)[1]
+
+
+def _parse_disks_from_xml(xml: str) -> tuple[list[str], list[str]]:
+    """Parse virsh dumpxml output, returning ([source LV paths],
+    [target devs]) in the order the disks appear. Each <disk> block
+    has a `<source dev='/dev/.../lv'/>` and a `<target dev='vda'/>`;
+    we pair them positionally so element i of one list corresponds to
+    element i of the other."""
     import re
-    return re.findall(r"<source dev='([^']+)'", out)
+    # Split on <disk … to get one chunk per disk; first chunk is XML
+    # before the first <disk>, drop it.
+    blocks = re.split(r"<disk\b", xml)[1:]
+    lvs: list[str] = []
+    devs: list[str] = []
+    for blk in blocks:
+        # Only consider block-device disks (LVs). Cdroms / passthrough
+        # files aren't backup-eligible the same way.
+        if "device='disk'" not in blk and 'device="disk"' not in blk:
+            continue
+        m_src = re.search(r"<source dev='([^']+)'", blk) or \
+                re.search(r'<source dev="([^"]+)"', blk)
+        m_dev = re.search(r"<target dev='([^']+)'", blk) or \
+                re.search(r'<target dev="([^"]+)"', blk)
+        if not m_src:
+            continue
+        lvs.append(m_src.group(1))
+        devs.append(m_dev.group(1) if m_dev else "")
+    return lvs, devs
 
 
 def _ssh(host: str, cmd: str, check: bool = True, timeout: int = 600) -> str:
@@ -504,11 +540,37 @@ def _verify_repo_block_hash(target_id: str) -> None:
 # ── public: run a backup ─────────────────────────────────────────────────
 
 def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
-    """Take an LV snapshot of the VM's disk(s), run kopia snapshot
-    create against it, then drop the snapshot. Append BACKUP_DONE on
-    success or BACKUP_FAILED on failure.
+    """Back up every disk of `vm_name` to `target_id` as one
+    consistent point-in-time. Returns:
 
-    Returns: {kopia_snapshot_id, bytes_added, duration_s, label}.
+      {disks: [{target_dev, lv_path, kopia_snapshot_id, bytes_added}, …],
+       duration_s, label, fs_freeze_used}
+
+    Sequence:
+      1. Resolve the VM's home node + every disk's LV path.
+      2. If the VM is running and qemu-guest-agent responds, call
+         `virsh domfsfreeze` so the guest kernel quiesces every
+         filesystem before we snapshot. This is what makes the
+         resulting snapshot OS-level consistent (DBs flush, journals
+         settle). If GA isn't there, we proceed with a crash-
+         consistent snapshot — safe for ext4/xfs which replay their
+         own journals on next mount, less safe for unconfigured DBs.
+      3. lvcreate every disk's snapshot, in one bash invocation. The
+         time the FS is frozen is bounded by lvcreate × N (a few
+         tens of milliseconds per disk).
+      4. virsh domfsthaw immediately after the last lvcreate. The
+         guest unfreezes; user-visible IO pause is sub-second.
+      5. lvchange -ay -K every snapshot LV (thin snapshots are skip-
+         activation by default).
+      6. For each disk, dd the LV snapshot into a kopia stdin-file
+         snapshot with a per-disk --override-source so each disk is
+         a separate kopia source-line:
+            <prefix>:<vm>:<target_dev>     e.g. <uuid>:vms:web1:vda
+         Kopia content-defined chunks at ~4 MiB; identical sectors
+         across snapshots don't re-upload, so dedup still works for
+         each disk independently.
+      7. Drop every LV snapshot. ALWAYS — even on kopia failure.
+      8. Append BACKUP_DONE with the multi-disk record.
     """
     cluster = _read_cluster()
     vm = (cluster.get("vms") or {}).get(vm_name)
@@ -517,10 +579,7 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
     target = (cluster.get("backup_targets") or {}).get(target_id)
     if target is None:
         raise RuntimeError(f"backup target {target_id!r} not configured")
-    # vm["host"] is the node-NAME (e.g. "bedrock-sim-1.bedrock.local"),
-    # NOT an IP. The IP lives in nodes[<node-name>]["host"]. Resolve in
-    # that order; fall back to a host-equality scan only if the name
-    # lookup fails (older cluster.json layouts).
+
     nodes = cluster.get("nodes") or {}
     home_node_name = vm.get("host") or ""
     node = nodes.get(home_node_name)
@@ -538,81 +597,154 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
         )
     ssh_host = node["host"]
 
-    disks = _vm_disk_lvs(vm_name, ssh_host)
-    if not disks:
+    disk_lvs = _vm_disk_lvs(vm_name, ssh_host)
+    if not disk_lvs:
         raise RuntimeError(f"no disks discovered for VM {vm_name}")
+    target_devs = _vm_disk_target_devs(vm_name, ssh_host)
+    # _vm_disk_target_devs returns same length list as disk_lvs in same order.
 
     started = time.monotonic()
     snap_label = label or time.strftime("%Y%m%dT%H%M%S")
+    cluster_uuid = cluster.get("cluster_uuid", "unknown-cluster")
+    prefix_override = (target.get("override_source_prefix") or "").strip()
+    src_prefix = prefix_override or f"{cluster_uuid}:vms"
 
-    # For v1 we back up only the first disk. Multi-disk handling lands
-    # in v1.x with a per-disk override-source. The first disk is the
-    # boot/primary; that's what 99% of backup scenarios want first.
-    primary = disks[0]
-    snap_lv_name = f"{Path(primary).name}-bk-{snap_label}"
-    vg = primary.split("/")[2] if primary.startswith("/dev/") else "bedrock"
-    src_lv_name = Path(primary).name
+    # Build the per-disk plan — paths, snapshot names, kopia source line.
+    plans = []
+    for i, lv in enumerate(disk_lvs):
+        vg = lv.split("/")[2] if lv.startswith("/dev/") else "bedrock"
+        lv_name = Path(lv).name
+        snap_lv = f"{lv_name}-bk-{snap_label}"
+        target_dev = (target_devs[i] if i < len(target_devs) else "") or f"disk{i}"
+        plans.append({
+            "target_dev":     target_dev,
+            "lv_path":        lv,
+            "vg":             vg,
+            "src_lv_name":    lv_name,
+            "snap_lv":        snap_lv,
+            "snap_path":      f"/dev/{vg}/{snap_lv}",
+            "override_source": f"{src_prefix}:{vm_name}:{target_dev}",
+        })
+    log.info("backup[%s]: %d disk(s) to back up: %s",
+             vm_name, len(plans), ", ".join(p["target_dev"] for p in plans))
 
-    override_source = _override_source_for_vm(vm_name)
     g = _kopia_global_flags(target_id)
     cred_env = _credentials_env(target_id)
-    # NB: --cache-directory is only valid on `repository connect/create`
-    # in kopia 0.21. snapshot create/restore/delete pick up the cache
-    # location from the persisted repo config (via --config-file).
 
-    # Thin snapshots default to "activation skip" — the LV exists but
-    # /dev/<vg>/<lv> isn't a usable block device until lvchange -ay -K
-    # activates it. Without -K (the override flag), `lvchange -ay` is a
-    # no-op for skip-activation snapshots. So: create + activate.
-    snap_path = f"/dev/{vg}/{snap_lv_name}"
-    create_snap = (
-        f"lvcreate --snapshot "
-        f"  --name {shlex.quote(snap_lv_name)} "
-        f"  {shlex.quote(f'/dev/{vg}/{src_lv_name}')} && "
-        f"lvchange -ay -K {shlex.quote(snap_path)}"
+    # ── Step 1+2+3+4: fs-freeze, lvcreate every disk, fs-thaw ──────
+    # All in one bash script so the freeze window is bounded by the
+    # round-trip from mgmt to home node, not the SSH latency × N.
+    # Critical: thaw is in a `trap` so we always unfreeze even on
+    # lvcreate failure mid-loop.
+    lvcreate_lines = " && ".join(
+        f"lvcreate --snapshot --name {shlex.quote(p['snap_lv'])} "
+        f"{shlex.quote(p['lv_path'])}"
+        for p in plans
+    )
+    activate_lines = " && ".join(
+        f"lvchange -ay -K {shlex.quote(p['snap_path'])}"
+        for p in plans
+    )
+    snapshot_script = (
+        f"set -e; "
+        f"FROZEN=0; "
+        # Only attempt freeze if VM is running AND domain has a guest agent.
+        # virsh domfsfreeze fails fast (~50ms) if no GA — silently fall
+        # through to crash-consistent.
+        f"if virsh domstate {shlex.quote(vm_name)} 2>/dev/null | grep -q running; then "
+        f"  if virsh domfsfreeze {shlex.quote(vm_name)} >/dev/null 2>&1; then "
+        f"    FROZEN=1; "
+        f"  fi; "
+        f"fi; "
+        # Even if lvcreate dies mid-loop, run thaw before exiting so we
+        # don't leave the guest hanging.
+        f"trap 'if [ $FROZEN -eq 1 ]; then "
+        f"  virsh domfsthaw {shlex.quote(vm_name)} >/dev/null 2>&1 || true; "
+        f"fi' EXIT; "
+        f"{lvcreate_lines}; "
+        # Thaw ASAP — minimise quiesce time. The trap also runs at end
+        # but explicit thaw here means thaw happens BEFORE activate,
+        # which is the slower step.
+        f"if [ $FROZEN -eq 1 ]; then "
+        f"  virsh domfsthaw {shlex.quote(vm_name)} >/dev/null 2>&1 || true; "
+        f"  FROZEN=0; "
+        f"fi; "
+        f"{activate_lines}; "
+        f"echo \"FS_FREEZE_USED=$FROZEN_INITIAL\""
+    ).replace("$FROZEN_INITIAL",
+              # Capture original value for reporting, since we set FROZEN=0
+              # after thaw. Append to script:
+              "$(if [ $FROZEN -eq 0 ] && [ -n \"$FROZEN_WAS\" ]; then "
+              "echo $FROZEN_WAS; else echo $FROZEN; fi)")
+    # Simpler: just report whether we got to the freeze branch initially.
+    # Rewrite cleaner:
+    snapshot_script = (
+        f"set -e; "
+        f"FROZEN_USED=0; "
+        f"if virsh domstate {shlex.quote(vm_name)} 2>/dev/null | grep -q running; then "
+        f"  if virsh domfsfreeze {shlex.quote(vm_name)} >/dev/null 2>&1; then "
+        f"    FROZEN_USED=1; "
+        f"    trap 'virsh domfsthaw {shlex.quote(vm_name)} >/dev/null 2>&1 || true' EXIT; "
+        f"  fi; "
+        f"fi; "
+        f"{lvcreate_lines}; "
+        # Thaw NOW (before activate, kopia, etc.); the trap stays as a
+        # safety net but normally fires on a no-op since fs is already
+        # thawed.
+        f"if [ $FROZEN_USED -eq 1 ]; then "
+        f"  virsh domfsthaw {shlex.quote(vm_name)} >/dev/null 2>&1 || true; "
+        f"fi; "
+        f"{activate_lines}; "
+        f"echo \"FS_FREEZE_USED=$FROZEN_USED\""
     )
 
-    # Stream the LV snapshot directly into kopia via stdin. Kopia stores
-    # it as a single file (--stdin-file=disk0.img) under a virtual
-    # snapshot path that we override to the cluster's stable VM identity.
-    # Block-fidelity backup with no intermediate file: kopia's content-
-    # defined chunking dedups identical 4 MiB blocks across snapshots,
-    # so unchanged sectors don't re-upload.
-    #
-    # The path argument to `snapshot create` is purely a label for the
-    # virtual-source identity; --override-source replaces it on the
-    # server side. We pick a stable bedrock-flavoured pseudo-path so
-    # `kopia snapshot list` is human-readable on the operator side too.
-    pseudo_path = f"/bedrock/vms/{vm_name}"
-    kopia_create = (
-        f"set -o pipefail; "
-        f"{cred_env} && "
-        f"dd if={shlex.quote(snap_path)} bs=4M status=none | "
-        f"kopia {g} snapshot create "
-        f"  {shlex.quote(pseudo_path)} "
-        f"  --stdin-file=disk0.img "
-        f"  --override-source={shlex.quote(override_source)} "
-        f"  --description={shlex.quote(snap_label)} "
-        f"  --json"
+    cleanup_script = "; ".join(
+        f"lvremove -f {shlex.quote(p['snap_path'])} 2>&1"
+        for p in plans
     )
-    cleanup_snap = f"lvremove -f {shlex.quote(snap_path)} 2>&1"
+
+    fs_freeze_used = False
+    disk_results: list[dict] = []
 
     try:
-        # 1. Take the LV snapshot on the home node.
-        log.info("backup[%s]: lvcreate snapshot %s", vm_name, snap_path)
-        _ssh(ssh_host, create_snap)
+        log.info("backup[%s]: snapshot phase (freeze + lvcreate × %d)",
+                 vm_name, len(plans))
+        out = _ssh(ssh_host, snapshot_script, timeout=120)
+        for line in out.splitlines():
+            if line.startswith("FS_FREEZE_USED="):
+                fs_freeze_used = (line.split("=", 1)[1].strip() == "1")
+        log.info("backup[%s]: snapshots taken (fs_freeze_used=%s)",
+                 vm_name, fs_freeze_used)
 
         try:
-            # 2. Stream it through kopia.
-            log.info("backup[%s]: dd | kopia snapshot create (stdin-file)", vm_name)
-            out = _ssh(ssh_host, kopia_create, timeout=14400)
-            kopia_snap_id, bytes_added = _parse_kopia_create(out)
+            for p in plans:
+                pseudo_path = f"/bedrock/vms/{vm_name}/{p['target_dev']}"
+                kopia_create = (
+                    f"set -o pipefail; "
+                    f"{cred_env} && "
+                    f"dd if={shlex.quote(p['snap_path'])} bs=4M status=none | "
+                    f"kopia {g} snapshot create "
+                    f"  {shlex.quote(pseudo_path)} "
+                    f"  --stdin-file=disk0.img "
+                    f"  --override-source={shlex.quote(p['override_source'])} "
+                    f"  --description={shlex.quote(snap_label)} "
+                    f"  --json"
+                )
+                log.info("backup[%s]: kopia stream disk %s ← %s",
+                         vm_name, p["target_dev"], p["snap_path"])
+                disk_out = _ssh(ssh_host, kopia_create, timeout=14400)
+                kid, bytes_added = _parse_kopia_create(disk_out)
+                disk_results.append({
+                    "target_dev": p["target_dev"],
+                    "lv_path": p["lv_path"],
+                    "kopia_snapshot_id": kid,
+                    "bytes_added": bytes_added,
+                })
         finally:
-            # 3. Always drop the LV snapshot — short-lived COW only.
             try:
-                _ssh(ssh_host, cleanup_snap, check=False)
+                _ssh(ssh_host, cleanup_script, check=False, timeout=120)
             except Exception as e:
-                log.warning("backup[%s]: lvremove cleanup: %s", vm_name, e)
+                log.warning("backup[%s]: cleanup: %s", vm_name, e)
     except Exception as e:
         duration = time.monotonic() - started
         reason = f"{type(e).__name__}: {e}"
@@ -627,21 +759,27 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
         raise
 
     duration = time.monotonic() - started
-    log.info("backup[%s] done: kopia=%s, %d bytes added, %.1fs",
-             vm_name, kopia_snap_id, bytes_added, duration)
+    total_bytes = sum(d["bytes_added"] for d in disk_results)
+    log.info("backup[%s] done: %d disk(s), %d bytes added total, %.1fs, "
+             "fs_freeze_used=%s",
+             vm_name, len(disk_results), total_bytes, duration, fs_freeze_used)
     _log_append(le.backup_done(
         vm=vm_name, target_id=target_id,
-        kopia_snapshot_id=kopia_snap_id,
+        disks=disk_results,
         source_node=home_node_name,
-        bytes_added=bytes_added,
         duration_s=duration,
         label=snap_label,
+        fs_freeze_used=fs_freeze_used,
     ))
     return {
-        "kopia_snapshot_id": kopia_snap_id,
-        "bytes_added": bytes_added,
+        "disks": disk_results,
         "duration_s": duration,
         "label": snap_label,
+        "fs_freeze_used": fs_freeze_used,
+        # Legacy fields — keep until callers migrate. Primary disk = first.
+        "kopia_snapshot_id": disk_results[0]["kopia_snapshot_id"]
+                              if disk_results else "",
+        "bytes_added": total_bytes,
     }
 
 
@@ -716,66 +854,111 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
             f"with the in-flight VM state and corrupt both."
         )
 
-    # If the caller didn't specify, restore back onto the VM's primary
-    # disk LV — the most common case for "undo my last change to this VM".
-    if target_lv_path is None:
-        disks = _vm_disk_lvs(vm_name, ssh_host)
-        if not disks:
-            raise RuntimeError(
-                f"can't auto-resolve target LV for VM {vm_name} "
-                f"(no disks discovered via virsh dumpxml)"
-            )
-        target_lv_path = disks[0]
+    # Look up the backup row matching the kopia_snapshot_id. The
+    # caller passes any disk's kopia id (typically the row's primary,
+    # which is disk0); we walk every disk in every backup row to find
+    # it, then restore EVERY disk in that row. That's how a VM with
+    # multiple disks is restored as one consistent unit — operator
+    # picks one snapshot, gets the whole VM rolled back.
+    vm_rec = (cluster.get("vms") or {}).get(vm_name) or {}
+    matched_row: dict | None = None
+    for b in (vm_rec.get("backups") or []):
+        for d in (b.get("disks") or []):
+            if d.get("kopia_snapshot_id") == kopia_snapshot_id:
+                matched_row = b
+                break
+        if matched_row:
+            break
+    # Single-LV operator override path: caller passed an explicit
+    # target_lv_path. Used by v1.x flows like restore-to-fresh-LV.
+    # In that case we don't need a matched row — we just restore the
+    # one snapshot the caller named, to the LV the caller chose.
+    if target_lv_path is not None:
+        plan = [{
+            "target_dev": "custom",
+            "kopia_snapshot_id": kopia_snapshot_id,
+            "target_lv_path": target_lv_path,
+        }]
+    elif matched_row is None:
+        raise RuntimeError(
+            f"snapshot {kopia_snapshot_id!r} not found in backup history "
+            f"of {vm_name}. Pass `target_lv_path` to restore an arbitrary "
+            f"snapshot to a specific LV."
+        )
+    else:
+        # Build per-disk plan: kopia_snapshot_id from the row, LV path
+        # from either (a) the disk record's lv_path (frozen at backup
+        # time, may be obsolete if VM was rebuilt) or (b) the current
+        # VM's matching target_dev. Prefer (b) since it survives
+        # rename/recreate, fall back to (a).
+        cur_lvs = _vm_disk_lvs(vm_name, ssh_host)
+        cur_devs = _vm_disk_target_devs(vm_name, ssh_host)
+        cur_by_dev = dict(zip(cur_devs, cur_lvs))
+        plan = []
+        for d in matched_row.get("disks") or []:
+            tgt_dev = d.get("target_dev") or ""
+            tgt_lv = cur_by_dev.get(tgt_dev) or d.get("lv_path") or ""
+            if not tgt_lv:
+                raise RuntimeError(
+                    f"can't resolve target LV for disk {tgt_dev!r} of {vm_name} "
+                    f"(VM no longer has this disk and the backup record "
+                    f"didn't capture an lv_path)"
+                )
+            plan.append({
+                "target_dev":        tgt_dev,
+                "kopia_snapshot_id": d.get("kopia_snapshot_id") or "",
+                "target_lv_path":    tgt_lv,
+            })
+    log.info("restore[%s]: %d disk(s) to restore: %s",
+             vm_name, len(plan),
+             ", ".join(f"{p['target_dev']}→{p['target_lv_path']}" for p in plan))
 
     g = _kopia_global_flags(target_id)
     cred_env = _credentials_env(target_id)
-    # Streaming restore via kopia's FUSE mount: kopia exposes the
-    # snapshot read-only at a mountpoint, dd reads disk0.img directly
-    # to the target LV. No intermediate temp file. Block-fidelity
-    # restore — every byte written back exactly as captured at backup
-    # time.
-    #
-    # Why FUSE: kopia 0.21's `snapshot restore` doesn't support stdout
-    # output, and writing to a block device target hits a truncate(2)
-    # call that EINVALs on /dev/* paths. FUSE is the supported escape:
-    # mount → read-via-vfs → unmount. fusermount is in /usr/bin on
-    # AlmaLinux 9 stock, no extra packages needed.
-    mnt = f"/run/bedrock-restore-{vm_name}-{int(time.monotonic()*1000)}"
-    cmd = (
-        f"set -o pipefail; "
-        f"{cred_env} && "
-        f"mkdir -p {shlex.quote(mnt)} && "
-        f"kopia {g} mount {shlex.quote(kopia_snapshot_id)} "
-        f"  {shlex.quote(mnt)} >/tmp/kopia-restore.log 2>&1 & "
-        f"MOUNT_PID=$!; "
-        # Wait up to 20s for FUSE mount to populate disk0.img
-        f"for i in $(seq 1 20); do "
-        f"  [ -f {shlex.quote(mnt + '/disk0.img')} ] && break; "
-        f"  sleep 1; "
-        f"done; "
-        f"if [ ! -f {shlex.quote(mnt + '/disk0.img')} ]; then "
-        f"  echo 'kopia mount did not surface disk0.img within 20s'; "
-        f"  cat /tmp/kopia-restore.log; "
-        f"  fusermount -u {shlex.quote(mnt)} 2>/dev/null; "
-        f"  rmdir {shlex.quote(mnt)} 2>/dev/null; "
-        f"  exit 1; "
-        f"fi; "
-        f"dd if={shlex.quote(mnt + '/disk0.img')} "
-        f"   of={shlex.quote(target_lv_path)} "
-        f"   bs=4M conv=sparse status=none; "
-        f"DDRC=$?; "
-        f"fusermount -u {shlex.quote(mnt)} 2>/dev/null || "
-        f"  kopia {g} mount unmount {shlex.quote(mnt)} 2>/dev/null; "
-        f"wait $MOUNT_PID 2>/dev/null; "
-        f"rmdir {shlex.quote(mnt)} 2>/dev/null; "
-        f"exit $DDRC"
-    )
 
     started = time.monotonic()
+    restored: list[dict] = []
     try:
-        out = _ssh(ssh_host, cmd, timeout=14400)
-        log.info("restore[%s] from kopia=%s done: %s",
-                 vm_name, kopia_snapshot_id, out[-200:].strip())
+        for p in plan:
+            # Streaming restore via kopia's FUSE mount: kopia exposes
+            # the snapshot read-only at a mountpoint, dd reads
+            # disk0.img directly to the target LV. No intermediate
+            # temp file. Block-fidelity restore — every byte written
+            # back exactly as captured at backup time.
+            mnt = (f"/run/bedrock-restore-{vm_name}-{p['target_dev']}-"
+                   f"{int(time.monotonic()*1000)}")
+            cmd = (
+                f"set -o pipefail; "
+                f"{cred_env} && "
+                f"mkdir -p {shlex.quote(mnt)} && "
+                f"kopia {g} mount {shlex.quote(p['kopia_snapshot_id'])} "
+                f"  {shlex.quote(mnt)} >/tmp/kopia-restore.log 2>&1 & "
+                f"MOUNT_PID=$!; "
+                f"for i in $(seq 1 20); do "
+                f"  [ -f {shlex.quote(mnt + '/disk0.img')} ] && break; "
+                f"  sleep 1; "
+                f"done; "
+                f"if [ ! -f {shlex.quote(mnt + '/disk0.img')} ]; then "
+                f"  echo 'kopia mount did not surface disk0.img within 20s'; "
+                f"  cat /tmp/kopia-restore.log; "
+                f"  fusermount -u {shlex.quote(mnt)} 2>/dev/null; "
+                f"  rmdir {shlex.quote(mnt)} 2>/dev/null; "
+                f"  exit 1; "
+                f"fi; "
+                f"dd if={shlex.quote(mnt + '/disk0.img')} "
+                f"   of={shlex.quote(p['target_lv_path'])} "
+                f"   bs=4M conv=sparse status=none; "
+                f"DDRC=$?; "
+                f"fusermount -u {shlex.quote(mnt)} 2>/dev/null || "
+                f"  kopia {g} mount unmount {shlex.quote(mnt)} 2>/dev/null; "
+                f"wait $MOUNT_PID 2>/dev/null; "
+                f"rmdir {shlex.quote(mnt)} 2>/dev/null; "
+                f"exit $DDRC"
+            )
+            log.info("restore[%s]: kopia mount %s → dd %s",
+                     vm_name, p["kopia_snapshot_id"], p["target_lv_path"])
+            _ssh(ssh_host, cmd, timeout=14400)
+            restored.append(dict(p))
     except Exception as e:
         duration = time.monotonic() - started
         reason = f"{type(e).__name__}: {e}"
@@ -789,7 +972,10 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
         except Exception:
             pass
         raise
+
     duration = time.monotonic() - started
+    log.info("restore[%s] done: %d disk(s) in %.1fs",
+             vm_name, len(restored), duration)
     _log_append(le.restore_done(
         vm=vm_name, target_id=target_id,
         kopia_snapshot_id=kopia_snapshot_id,
@@ -797,9 +983,11 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
     ))
     return {
         "kopia_snapshot_id": kopia_snapshot_id,
-        "target_lv_path": target_lv_path,
+        "disks": restored,
         "dest_node": dest_node_name,
         "duration_s": duration,
+        # Legacy single-disk field — primary disk's target.
+        "target_lv_path": restored[0]["target_lv_path"] if restored else "",
     }
 
 

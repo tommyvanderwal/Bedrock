@@ -214,13 +214,25 @@ export interface BackupTarget {
 	cache_directory?: string;
 }
 
-export interface VmBackup {
+export interface VmBackupDisk {
+	target_dev: string;     // 'vda', 'vdb', …
+	lv_path: string;
 	kopia_snapshot_id: string;
+	bytes_added: number;
+}
+
+export interface VmBackup {
+	// `kopia_snapshot_id` at the top is the row's primary identifier
+	// (= disks[0].kopia_snapshot_id). Keep using it for restore/delete
+	// API calls; the server resolves the full row from it.
+	kopia_snapshot_id: string;
+	disks?: VmBackupDisk[];     // multi-disk authoritative list
 	target_id: string;
 	source_node: string;
-	bytes_added: number;
+	bytes_added: number;        // rolled-up across disks
 	duration_s: number;
 	label: string;
+	fs_freeze_used?: boolean;
 	ts_index: number;
 }
 
@@ -308,6 +320,41 @@ export async function vmBackupDelete(name: string, kopia_snapshot_id: string,
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(body),
 	});
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
+// ── Backup scheduling ────────────────────────────────────────────────────
+
+export interface BackupSchedule {
+	target_id: string;
+	cron_expr: string;
+	label_prefix: string;
+	retention_count: number;
+	set_at_index: number;
+}
+
+export async function setBackupSchedule(name: string, body: {
+	target_id: string;
+	cron_expr: string;
+	label_prefix?: string;
+	retention_count?: number;
+}): Promise<{ status: string; log_index: number; vm: string; cron_expr: string; next_fires_utc: string[] }> {
+	return apiPost(`/api/vms/${encodeURIComponent(name)}/backup-schedule`, body);
+}
+
+export async function removeBackupSchedule(name: string, reason: string = '') {
+	const q = reason ? `?reason=${encodeURIComponent(reason)}` : '';
+	const r = await fetch(`/api/vms/${encodeURIComponent(name)}/backup-schedule${q}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
+export async function cronPreview(expr: string, n: number = 5): Promise<{
+	cron_expr: string; next_fires_utc: string[]
+}> {
+	const q = `?expr=${encodeURIComponent(expr)}&n=${n}`;
+	const r = await fetch(`/api/cron/preview${q}`);
 	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
 	return r.json();
 }
