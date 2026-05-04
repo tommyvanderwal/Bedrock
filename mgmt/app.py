@@ -1802,13 +1802,15 @@ def api_vm_attach_disk(vm_name: str, req: AttachDiskRequest):
         raise HTTPException(400, "No free virtio target (vda..vdp in use)")
     idx = len(vm.get("disks", []))
     lv_name = f"vm-{vm_name}-disk{idx}"
-    lv_path = f"/dev/almalinux/{lv_name}"
+    vg = _vm_disk_vg(host)
+    lv_path = f"/dev/{vg}/{lv_name}"
 
-    _ensure_thinpool(host)
-    push_log(f"Attach disk to {vm_name}: lvcreate {req.size_gb}G ({lv_name})",
+    _ensure_thinpool(host, vg_name=vg)
+    push_log(f"Attach disk to {vm_name}: lvcreate {req.size_gb}G ({lv_name}) "
+             f"in VG {vg}",
              node=host_name, app="bedrock-mgmt")
     out, rc = ssh_cmd_rc(host,
-        f"lvcreate -y -V {req.size_gb}G --thin -n {lv_name} almalinux/thinpool "
+        f"lvcreate -y -V {req.size_gb}G --thin -n {lv_name} {vg}/thinpool "
         f"2>&1", timeout=60)
     if rc != 0 and "already exists" not in out:
         raise HTTPException(500, f"lvcreate failed: {out}")
@@ -2524,9 +2526,47 @@ def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
 
 # ── Workload conversion (cattle ↔ pet ↔ vipet) ──────────────────────────────
 
-def _ensure_thinpool(host: str, vg_name: str = "almalinux", pool: str = "thinpool"):
-    """Make sure {vg_name}/{pool} exists on host. Creates a loop-backed VG if needed
-    (matches the testbed/bedrock-vm-create pattern so peers are ready on first use)."""
+def _vm_disk_vg(host: str) -> str:
+    """Choose the LVM VG to put new VM disks in. Prefers the `bedrock`
+    VG (the one bedrock-init creates on the dedicated data PV during
+    `bedrock storage init`) — that lives on a real block device with
+    plenty of room. Only falls back to `almalinux` when `bedrock`
+    isn't there yet (very early bootstrap before storage init has run).
+
+    Why this matters: on the testbed, the AlmaLinux 9 host's root VG is
+    always called `almalinux`. Without this helper, every VM disk
+    landed in the root VG, which on the testbed sims is loop-backed
+    onto a sparse file on `/` — Windows installs filled `/` and the
+    installer rolled back. Bedrock VG sits on /dev/vdb (real disk,
+    ~100 GB free) and never has this problem."""
+    try:
+        out = ssh_cmd(host,
+            "vgs --noheadings -o vg_name 2>/dev/null || true",
+            timeout=10)
+        vgs = set(out.split())
+        if "bedrock" in vgs:
+            pool = ssh_cmd(host,
+                "lvs --noheadings -o lv_name bedrock 2>/dev/null || true",
+                timeout=10)
+            if "thinpool" in pool.split():
+                return "bedrock"
+    except Exception:
+        pass
+    return "almalinux"
+
+
+def _ensure_thinpool(host: str, vg_name: Optional[str] = None, pool: str = "thinpool"):
+    """Make sure {vg_name}/{pool} exists on host. When `vg_name` is None
+    we resolve the operator's preferred VG via `_vm_disk_vg` (prefers
+    the dedicated `bedrock` VG over the host's `almalinux` root VG).
+
+    Creates a loop-backed VG only as a last resort, when no real VG
+    exists yet — the loop-file path is for greenfield bootstrap before
+    `bedrock storage init` has been run. Never use the loop fallback
+    for VM disks in steady state; it puts disk write traffic on `/`
+    and fills the root filesystem during multi-GB installs."""
+    if vg_name is None:
+        vg_name = _vm_disk_vg(host)
     out = ssh_cmd(host, f"lvs --noheadings -o lv_name {vg_name} 2>/dev/null || true")
     if pool in out.split():
         return
@@ -2717,6 +2757,44 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
         chosen = (peer_nodes or available)[:need_peers]
         if len(chosen) < need_peers:
             raise HTTPException(400, f"{tgt} needs {need_peers} peers, have {len(chosen)}")
+
+        # ── Pre-flight: every peer's thin pool must have headroom for
+        # the SUM of all disk virtual sizes + 5 GB slack for meta LVs +
+        # blockcopy's COW. Without this guard, an online convert started
+        # while a heavy guest workload (Windows install, DB seed) is
+        # writing to the source can fill the destination thin pool
+        # mid-blockcopy and trip the LV silent-truncation guard, OR
+        # — worse — fill the host's `/` if the thin pool is loop-
+        # backed onto a sparse file there. We've seen the latter on
+        # the testbed during a Windows-install-while-converting.
+        try:
+            total_disk_b = sum(int(d.get("size_bytes") or 0) for d in disks)
+        except Exception:
+            total_disk_b = 0
+        if total_disk_b > 0:
+            slack_b = (5 << 30)  # 5 GB
+            for pname in [src_name] + chosen:
+                p_host = nodes_cfg[pname]["host"]
+                p_vg = _vm_disk_vg(p_host)
+                pool_info, _rc = ssh_cmd_rc(p_host,
+                    f"lvs --noheadings --units b --nosuffix --separator '|' "
+                    f"-o lv_size,data_percent {p_vg}/thinpool 2>/dev/null | head -1",
+                    timeout=10)
+                try:
+                    parts = [s.strip() for s in pool_info.split("|") if s.strip()]
+                    pool_size_b = int(parts[0])
+                    pool_used_pct = float(parts[1] or "0")
+                    pool_free_b = int(pool_size_b * (100.0 - pool_used_pct) / 100.0)
+                except Exception:
+                    pool_free_b = 0
+                need = total_disk_b + slack_b
+                if pool_free_b < need:
+                    raise HTTPException(507,
+                        f"Convert refused: {p_vg}/thinpool on {pname} has "
+                        f"{pool_free_b // (1<<30)} GB free; this convert "
+                        f"needs {need // (1<<30)} GB ({total_disk_b // (1<<30)} GB "
+                        f"of disks + 5 GB slack). Free space first or "
+                        f"shrink the VM disks.")
 
         # Track what we created so we can unwind on failure
         created: list[dict] = []  # [{resource, hosts: [host, lv, meta], target_dev}]
@@ -3236,6 +3314,10 @@ def _vm_create(req) -> dict:
 
     # All disks: disk0 is the primary/boot disk (req.disk_gb), any additional
     # entries from req.extra_disks become vdb, vdc, ... at their given sizes.
+    # Resolved VG: prefer `bedrock` (dedicated PV, lots of room), fall
+    # back to `almalinux` only when bedrock-storage hasn't been
+    # initialised yet.
+    vg = _vm_disk_vg(host)
     extra = req.extra_disks or []
     disks_plan: list[dict] = []
     for i, spec in enumerate([VMDiskSpec(size_gb=req.disk_gb)] + extra):
@@ -3244,19 +3326,19 @@ def _vm_create(req) -> dict:
         lv_name = f"vm-{req.name}-disk{i}"
         disks_plan.append({
             "index": i, "lv_name": lv_name,
-            "lv_path": f"/dev/almalinux/{lv_name}",
+            "lv_path": f"/dev/{vg}/{lv_name}",
             "size_gb": spec.size_gb,
         })
 
     # 1. Ensure thin pool, create every thin LV
-    _ensure_thinpool(host)
+    _ensure_thinpool(host, vg_name=vg)
     for d in disks_plan:
         push_log(f"Create VM {req.name}: lvcreate {d['size_gb']}G thin "
-                 f"({d['lv_name']}) on {home_name}",
+                 f"({d['lv_name']}) in VG {vg} on {home_name}",
                  node=home_name, app="bedrock-mgmt")
         out, rc = ssh_cmd_rc(host,
             f"lvcreate -y -V {d['size_gb']}G --thin -n {d['lv_name']} "
-            f"almalinux/thinpool", timeout=30)
+            f"{vg}/thinpool", timeout=30)
         if rc != 0 and "already exists" not in out:
             # Unwind any LVs we already made
             for prev in disks_plan[:d["index"]]:
@@ -3413,7 +3495,8 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
                 firmware = "uefi"
         except Exception: pass
 
-    _ensure_thinpool(host)
+    vg = _vm_disk_vg(host)
+    _ensure_thinpool(host, vg_name=vg)
 
     # Pre-flight: thin-pool must fit the SUM of actual sizes of all disks.
     total_actual_b = sum(int(d.get("actual_size_bytes") or 0) for d in src_disks)
@@ -3428,8 +3511,8 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
             except Exception: pass
         total_actual_b = sum(int(d.get("actual_size_bytes") or 0) for d in src_disks)
     pool_info, _ = ssh_cmd_rc(host,
-        "lvs --noheadings --units b --nosuffix --separator '|' "
-        "-o lv_size,data_percent almalinux/thinpool 2>/dev/null | head -1",
+        f"lvs --noheadings --units b --nosuffix --separator '|' "
+        f"-o lv_size,data_percent {vg}/thinpool 2>/dev/null | head -1",
         timeout=10)
     try:
         parts = [p.strip() for p in pool_info.split("|") if p.strip()]
