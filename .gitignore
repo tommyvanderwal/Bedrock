@@ -3,3 +3,8 @@ rust/target
 **/__pycache__/
 testbed/images/
 testbed/state/
+
+# bedrock-install ISO build artifacts (large + reproducible from build-iso.sh)
+installer/iso-build/build/
+installer/iso-build/output/
+installer/iso-build/payload/
