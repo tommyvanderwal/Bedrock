@@ -71,10 +71,76 @@ from pathlib import Path
 
 # ── Layout constants ───────────────────────────────────────────────────────
 
-VG = "bedrock"
+# Bedrock's storage model is "one disk per node, one VG, one thin pool".
+# The VG already exists on the system after AlmaLinux install (default
+# name `almalinux`); bedrock-bootstrap adopts it rather than creating a
+# new one. Whatever VG name the OS installer happened to use is written
+# to /etc/bedrock/storage.json at bootstrap time so every subsequent
+# bedrock command + the mgmt service all agree on it.
+#
+# A `bedrock` VG name is preferred when no VG exists yet (greenfield
+# install), and ensure_vg() will create that name only as a last
+# resort. We don't auto-rename existing VGs — that requires grub +
+# initramfs regeneration and a reboot.
 THINPOOL = "thinpool"
-# Candidate raw disks for the bedrock VG, in order. First unused disk wins.
+STORAGE_JSON = Path("/etc/bedrock/storage.json")
+DEFAULT_VG = "bedrock"
+
+# Candidate raw disks for the bedrock VG when greenfield-creating one
+# (no usable VG present). On real-lab nodes the OS install already
+# made an `almalinux` VG on /dev/nvme0n1p3 — that's the path we adopt
+# in `detect_vg()` below, so this list is only relevant for second-
+# disk legacy testbed setups.
 DATA_DISK_CANDIDATES = ("/dev/vdb", "/dev/sdb", "/dev/nvme1n1")
+
+
+def _read_storage_json() -> dict:
+    """Persisted storage layout decisions. Written at bootstrap time."""
+    if not STORAGE_JSON.exists():
+        return {}
+    try:
+        return json.loads(STORAGE_JSON.read_text())
+    except Exception:
+        return {}
+
+
+def _write_storage_json(d: dict) -> None:
+    STORAGE_JSON.parent.mkdir(parents=True, exist_ok=True)
+    STORAGE_JSON.write_text(json.dumps(d, indent=2) + "\n")
+    STORAGE_JSON.chmod(0o644)
+
+
+def detect_vg() -> str:
+    """Resolve the VG bedrock uses on this node. Priority:
+
+      1. /etc/bedrock/storage.json {"vg": "..."} — written at bootstrap.
+      2. A single VG already present (typical post-AlmaLinux install).
+      3. The literal name `bedrock` if multiple VGs exist (operator
+         must have made a choice; we won't second-guess them).
+      4. Fallback: `bedrock` for first-ever bootstrap.
+    """
+    cfg = _read_storage_json()
+    if cfg.get("vg"):
+        return cfg["vg"]
+    try:
+        out = subprocess.run(
+            ["vgs", "--noheadings", "-o", "vg_name"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        vgs = [v.strip() for v in out.split() if v.strip()]
+    except Exception:
+        vgs = []
+    if len(vgs) == 1:
+        return vgs[0]
+    if DEFAULT_VG in vgs:
+        return DEFAULT_VG
+    return DEFAULT_VG
+
+
+# Module-level VG name. Stable for the lifetime of the running process;
+# write to storage.json before re-importing if the layout was just
+# rebuilt mid-bootstrap.
+VG = detect_vg()
 
 # Tier sizes (testbed defaults — operator can override per-node by setting
 # /etc/bedrock/tier-sizes.json before init/join).
@@ -290,8 +356,9 @@ def vg_exists() -> bool:
 
 
 def find_data_disk() -> str:
-    """Find an unused candidate disk for the bedrock VG. Picks the first
-    disk that exists, has no partition table, and isn't mounted.
+    """Find an unused separate data disk for the bedrock VG. Used only
+    in legacy second-disk testbed setups. New v1.0 installs adopt the
+    boot disk's existing VG via `ensure_vg()` and never call this.
     """
     for dev in DATA_DISK_CANDIDATES:
         if not Path(dev).exists():
@@ -313,38 +380,114 @@ def find_data_disk() -> str:
 
 
 def ensure_vg() -> None:
-    """Create the bedrock VG on a dedicated data disk if it doesn't exist."""
+    """Adopt or create the VG bedrock uses for the thin pool + tier LVs +
+    VM disks. Single-disk model: AlmaLinux's installer already created
+    a VG (typically `almalinux`) on the boot disk's LVM partition.
+    Bedrock writes that name to /etc/bedrock/storage.json and uses it
+    going forward — we don't rename, since vgrename would force a
+    grub + initramfs + reboot dance that's not worth the cosmetic gain.
+
+    Greenfield branch: if NO VG exists on the system at all (operator
+    booted a fresh kernel-only image, no LVM done), we look for an
+    unused separate data disk and pvcreate+vgcreate `bedrock` on it.
+    Legacy testbed path; kept for back-compat.
+    """
+    global VG
     if vg_exists():
+        # Persist the resolved VG so every tool agrees, even if the
+        # detection heuristic later sees a second VG appear.
+        cfg = _read_storage_json()
+        if cfg.get("vg") != VG:
+            cfg["vg"] = VG
+            _write_storage_json(cfg)
         return
+    # No VG with our preferred name. Are there ANY VGs?
+    existing = subprocess.run(
+        ["vgs", "--noheadings", "-o", "vg_name"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout.split()
+    existing = [v.strip() for v in existing if v.strip()]
+    if existing:
+        # Adopt the first/only VG already on the system. This is the
+        # AlmaLinux-installer path — typically `almalinux`.
+        VG = existing[0]
+        cfg = _read_storage_json()
+        cfg["vg"] = VG
+        _write_storage_json(cfg)
+        print(f"  [tier] Adopted existing VG {VG!r} (from OS install)")
+        return
+    # Truly greenfield. Try to find a usable separate disk to PV+VG on.
     disk = find_data_disk()
     print(f"  [tier] Creating PV+VG on {disk}")
-    # Force-zero the start of the disk to clear any old signatures
     run(f"wipefs -af {disk}", check=False)
     run(f"pvcreate -ff -y {disk}")
     run(f"vgcreate {VG} {disk}")
+    cfg = _read_storage_json()
+    cfg["vg"] = VG
+    _write_storage_json(cfg)
 
 
 def ensure_thinpool() -> None:
-    """Create the thin pool if it doesn't exist. Sized to fill the VG."""
+    """Create the thin pool if it doesn't exist. Sized to fill the VG.
+
+    On the typical AlmaLinux install path the VG starts almost full
+    (root LV + swap LV taking most of it). Bedrock removes the swap LV
+    upfront — swap-on-a-hypervisor is a footgun, the operator can opt
+    in to a small thin swap LV later via `bedrock storage swap-set`.
+    Removing swap typically frees a few GB; everything else has to be
+    operator-prepared (small root LV, no extra LVs) before bootstrap.
+    """
     ensure_vg()
     if thinpool_exists():
         return
 
-    # Available free space in VG, in MB
+    # 1. Drop the OS-installer's swap LV if present. Frees space and
+    #    removes the kernel-panic-on-pool-full risk that swap-on-thin
+    #    introduces. Operator can opt back in to swap on the thin pool
+    #    via `bedrock storage swap-set <gb>` (small, last-resort only).
+    swap_lvs = run(
+        f"lvs --noheadings -o lv_name -S 'vg_name={VG} && lv_role=public' "
+        f"2>/dev/null", check=False).split()
+    for lv in swap_lvs:
+        lv = lv.strip()
+        if not lv: continue
+        # Heuristic: name `swap` or attr starts with `s` (swap).
+        attr = run(f"lvs --noheadings -o lv_attr {VG}/{lv} 2>/dev/null",
+                   check=False).strip()
+        is_swap = lv.lower().startswith("swap") or attr.startswith("-")
+        if not is_swap:
+            continue
+        # Confirm via blkid TYPE
+        blk = run(f"blkid -s TYPE -o value /dev/{VG}/{lv} 2>/dev/null",
+                  check=False).strip()
+        if blk != "swap":
+            continue
+        print(f"  [tier] Removing OS swap LV {VG}/{lv} "
+              f"(swap-on-thin is opt-in only)")
+        run(f"swapoff /dev/{VG}/{lv}", check=False)
+        run(f"sed -i '\\|/dev/{VG}/{lv}|d; \\|UUID=.*swap|d' /etc/fstab",
+            check=False)
+        run(f"lvremove -y /dev/{VG}/{lv}", check=False)
+
+    # 2. Available free space in VG, in MB.
     out = run(f"vgs {VG} --units m -o vg_free --noheadings", check=False)
     try:
         free_mb = float(out.replace("m", "").strip())
     except ValueError:
         free_mb = 0.0
 
-    needed_mb = sum(TIER_SIZE_GB.values()) * 1024 + GARAGE_DATA_LV_GB * 1024 + 1024
+    needed_mb = sum(TIER_SIZE_GB.values()) * 1024 + 1024  # tiers + 1 GB slack
     if free_mb < needed_mb:
         raise RuntimeError(
             f"Not enough free space in VG {VG}: {free_mb:.0f}MB free, "
-            f"need {needed_mb}MB. Use a larger data disk.")
+            f"need {needed_mb}MB. Either install AlmaLinux with a smaller "
+            f"root LV (≤16 GB), or `lvremove` unused LVs in {VG} before "
+            f"re-running bedrock bootstrap.")
 
-    # Create thin pool with ~all free space minus a small headroom (512MB).
+    # 3. Create thin pool with ~all free space minus 512 MB safety
+    #    headroom (LVM keeps a small reserve for thin metadata growth).
     pool_size_mb = int(free_mb - 512)
+    print(f"  [tier] Creating thin pool {VG}/{THINPOOL} ({pool_size_mb} MB)")
     run(f"lvcreate -L {pool_size_mb}M -T {VG}/{THINPOOL} -y")
 
 

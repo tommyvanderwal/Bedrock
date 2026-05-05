@@ -358,3 +358,22 @@ export async function cronPreview(expr: string, n: number = 5): Promise<{
 	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
 	return r.json();
 }
+
+// ── Support / supportability ─────────────────────────────────────────────
+
+export interface SupportCheck {
+	id: string;
+	label: string;
+	status: 'ok' | 'warn' | 'fail';
+	note: string;
+	remediation: string;
+}
+
+export interface SupportChecksResponse {
+	checks: SupportCheck[];
+	overall: 'ok' | 'warn' | 'fail';
+}
+
+export async function getSupportChecks(): Promise<SupportChecksResponse> {
+	return apiGet('/api/support/checks');
+}

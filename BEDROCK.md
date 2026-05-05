@@ -21,15 +21,15 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - Separate box running Claude Code for development
 
 ## Software stack
-- **Base OS:** AlmaLinux 9 (NOT 10 — DRBD kmod has kernel crash bugs on 10's 6.12 kernel as of late 2025)
+- **Base OS:** AlmaLinux 10.1. (Earlier drafts targeted 9 because DRBD-kmod against the 10.0 kernel had open issues; ELRepo's `kmod-drbd9x-9.3.x` against el10_1 resolves that.)
 - **Hypervisor:** KVM/QEMU/libvirt (standard AlmaLinux packages)
-- **Storage:** LVM thin pool on NVMe, one DRBD resource per VM (disk) as raw block device. DRBD from ELRepo (kmod-drbd9x). Synchronous replication.
+- **Storage:** **One disk per node, one VG, one thin pool.** Everything dynamic — host root LV, optional swap LV, storage tiers, every VM disk — lives as a thin LV in that single pool. Boot needs ~1.5 GB outside (EFI + /boot); the rest is flexible and freely re-allocatable. TRIM/discard end-to-end so freed blocks return to the pool. DRBD per VM disk for pet/ViPet replication, on top of those thin LVs.
 - **Networking:** br0 bridge on management NIC for VM traffic. Dedicated private subnet on direct cable for DRBD replication.
 - **Orchestrator:** Python based. Most code should be python based. Only realtime critical items should potentially be rust components. e.q. a custom docker DRBD witness on Mikrotik, would probably be rust.
 
 ## Why AlmaLinux (not Debian, not Ubuntu)
 - RHEL machine type ABI stability for safe live migration across updates
-- 10-year lifecycle (to 2032 for version 9)
+- 10-year lifecycle (to 2035 for version 10)
 - Binary-compatible upgrade path to RHEL if commercial support needed
 - Conservative repos prevent cowboys from `apt install`-ing random stuff on the hypervisor
 - DRBD/LINBIT explicitly recommend AlmaLinux as the CentOS replacement
@@ -40,10 +40,12 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - PVE's opinions on storage/networking/HA don't align with our DRBD-per-VM architecture
 
 ## Storage architecture — critical decisions
-- **One DRBD resource per VM (disk), not a shared filesystem.** QEMU opens `/dev/drbd/by-res/vm-name-disk0/0` directly as raw block device.
-- **LVM thin provisioning from day one.** Each VM disk is a thin LV backing a DRBD resource. Thin pool on each node's NVMe.
-- **TRIM/discard must work end-to-end:** guest filesystem → QEMU (detect-zeroes, discard=unmap) → DRBD → LVM thin LV. Verify in phase 10.5.
-- **No NFS, no cluster filesystem, no shared-nothing copy during migration.** Both nodes already have every byte via DRBD.
+- **One disk → one VG → one thin pool, per node.** Mini-PC has one NVMe; we use it maximally. Boot needs a ~500 MB EFI partition + ~1 GB /boot outside the LVM; everything else (host root, optional swap, all storage tiers, every VM disk) is a thin LV in the single pool. Operator can reallocate space between any of these consumers without repartitioning.
+- **One DRBD resource per VM disk**, on top of that thin LV. QEMU opens `/dev/drbd/by-res/vm-name-disk0/0` as raw block device.
+- **TRIM/discard must work end-to-end:** guest FS → QEMU (`discard=unmap`) → DRBD (`discard-zeroes-if-aligned`) → LVM thin (`thin_pool_discards=passdown`) → NVMe. Bedrock-bootstrap configures every layer; the supportability dashboard verifies live.
+- **No artificial fill cap.** Operator can run the pool to 99% if that's what migrating data away requires. Monitoring signals at 70% (warn) and 80% (alarm); writes are NEVER refused on those thresholds.
+- **Swap is opt-in.** Default is none — swap-on-thin can panic the kernel when the pool fills, and swap-on-a-hypervisor is generally a footgun. Operator can request a small thin swap LV via `bedrock storage swap-set <gb>` for last-resort use on a 1-survivor-of-2-node-HA scenario.
+- **No NFS or cluster filesystem in the VM-disk path.** Both nodes already have every byte via DRBD.
 
 ## Live migration — how it works
 1. VM runs on node1. DRBD resource is Primary/Secondary.

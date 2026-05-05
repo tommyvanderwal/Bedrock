@@ -10,11 +10,16 @@ here. This includes the Python deps the mgmt FastAPI app needs
 because any node may take over the mgmt role via
 `tier_storage.transfer_mgmt_role()` and must be ready to start
 `bedrock-mgmt.service` immediately. (See lessons-log L17.)
+
+OS base: **AlmaLinux 10.1**. The previous "NOT 10" caveat in
+BEDROCK.md was tied to early 10.0 / kernel 6.12 DRBD-kmod gaps; ELRepo
+now ships kmod-drbd9x-9.3.x built against the el10_1 kernel, which is
+what we standardise on for v1.0.
 """
 
 import subprocess
 
-ELREPO_URL = "https://www.elrepo.org/elrepo-release-9.el9.elrepo.noarch.rpm"
+ELREPO_URL = "https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm"
 
 BASE_PACKAGES = [
     "qemu-kvm",

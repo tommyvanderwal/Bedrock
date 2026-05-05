@@ -27,14 +27,19 @@ NETWORKS_DIR = TESTBED / "networks"
 CLOUD_INIT_DIR = TESTBED / "cloud-init"
 STATE_DIR = TESTBED / "state"
 
-GOLDEN_IMG = IMAGES_DIR / "almalinux-9.qcow2"
-ALMA_URL = "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+GOLDEN_IMG = IMAGES_DIR / "almalinux-10.qcow2"
+ALMA_URL = "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
 
 MAX_NODES = 4
 NODE_RAM_MB = 12288
 NODE_VCPUS = 4
-NODE_DISK_GB = 30   # OS root disk (cloud image is XFS, no LVM)
-NODE_DATA_DISK_GB = 100   # second disk: bedrock VG (thin pool for tiers + DRBD + Garage)
+# Single disk per sim — mirrors the real-lab mini-PC layout (one
+# NVMe per node). AlmaLinux's cloud image installs the OS into XFS
+# straight on the partition (no LVM); bedrock-bootstrap converts the
+# layout to a single VG + thin pool taking the rest of the disk.
+# 130 GB gives the OS ~16 GB headroom plus ~110 GB of thin-pool space
+# for tiers + VM disks — the mini-PC equivalent at scale-down.
+NODE_DISK_GB = 130
 
 MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"
@@ -186,19 +191,16 @@ def create_node(i: int, all_indices: list[int]):
     node_state = STATE_DIR / hostname
     node_state.mkdir(exist_ok=True)
 
-    # Create thin qcow2 overlay on golden image (root disk)
+    # Single qcow2 backed by the AlmaLinux 10 golden image. The cloud
+    # image puts /, /boot, /boot/efi straight on partitions (XFS root
+    # on /dev/vda4 typically); bedrock-bootstrap then carves a single
+    # `bedrock` VG out of the unallocated tail of the disk and creates
+    # the thin pool inside it. One disk = one VG = one thin pool.
     disk_path = node_state / "root.qcow2"
     if not disk_path.exists():
-        print(f"  Creating {NODE_DISK_GB}GB root qcow2 for {hostname}...")
+        print(f"  Creating {NODE_DISK_GB}GB qcow2 for {hostname}...")
         run(f"qemu-img create -f qcow2 -F qcow2 -b {GOLDEN_IMG} "
             f"{disk_path} {NODE_DISK_GB}G", capture=False)
-
-    # Second qcow2: data disk for bedrock VG (tiers + DRBD + Garage)
-    data_path = node_state / "data.qcow2"
-    if not data_path.exists():
-        print(f"  Creating {NODE_DATA_DISK_GB}GB data qcow2 for {hostname}...")
-        run(f"qemu-img create -f qcow2 {data_path} {NODE_DATA_DISK_GB}G",
-            capture=False)
 
     # Generate cloud-init ISO
     iso_path = make_cloud_init(i, all_indices)
@@ -210,12 +212,11 @@ def create_node(i: int, all_indices: list[int]):
          "--memory", str(NODE_RAM_MB),
          "--vcpus", str(NODE_VCPUS),
          "--cpu", "host-passthrough",
-         "--disk", f"path={disk_path},format=qcow2,bus=virtio",
-         "--disk", f"path={data_path},format=qcow2,bus=virtio",
+         "--disk", f"path={disk_path},format=qcow2,bus=virtio,discard=unmap",
          "--disk", f"path={iso_path},device=cdrom",
          "--network", f"network={MGMT_NET},model=virtio",
          "--network", f"network={DRBD_NET},model=virtio",
-         "--os-variant", "almalinux9",
+         "--os-variant", "almalinux10",
          "--graphics", "none",
          "--console", "pty,target_type=serial",
          "--import",
