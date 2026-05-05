@@ -32,6 +32,7 @@ BASE_PACKAGES = [
     "qemu-guest-agent",
     "lvm2",
     "xfsprogs",
+    "gdisk",              # sgdisk: GPT manipulation for the boot-disk-tail PV carve
     "tuned",
     "python3-pip",
     "iputils",

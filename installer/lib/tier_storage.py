@@ -379,6 +379,111 @@ def find_data_disk() -> str:
         f"Attach a second virtual disk and re-run.")
 
 
+def _boot_disk() -> str:
+    """The single physical disk that holds /boot. We use this both to
+    place the EFI/boot partitions (already done by the OS installer)
+    and, in the cloud-image-no-LVM case, to carve a new partition out
+    of the unallocated tail for the bedrock VG."""
+    out = run("findmnt -no SOURCE /boot 2>/dev/null", check=False).strip()
+    if not out:
+        out = run("findmnt -no SOURCE / 2>/dev/null", check=False).strip()
+    if not out:
+        raise RuntimeError("can't find /boot or / mount source")
+    # /dev/vda3 → /dev/vda
+    import re
+    m = re.match(r"(/dev/[a-z]+|/dev/nvme\d+n\d+|/dev/mapper/.+)", out)
+    base = m.group(1) if m else out
+    # Strip partition suffix (vda3 → vda; nvme0n1p3 → nvme0n1)
+    base = re.sub(r"p?\d+$", "", base)
+    return base
+
+
+def carve_pv_from_boot_disk_tail() -> str:
+    """For cloud-image installs (xfs root straight on a partition, no
+    LVM): if there's unallocated space at the END of the boot disk
+    (cloud-init growpart was disabled, leaving the tail free), create
+    a new partition covering it and return its device path. We don't
+    touch the existing partitions — only the empty tail.
+
+    Returns the new partition path (e.g. `/dev/vda5`). Raises if no
+    free tail exists, or if the disk is already fully partitioned.
+    """
+    disk = _boot_disk()
+    # We use sfdisk (util-linux, always installed on AlmaLinux) instead
+    # of sgdisk (gdisk package — only in EPEL, not in stock AlmaLinux 10
+    # repos). sfdisk's `--append` for GPT disks rewrites the GPT
+    # secondary header at the actual end of the disk as a natural side
+    # effect, so the cloud-image-grew-qcow2 case fixes itself.
+
+    # 1. Inspect current partition table. sfdisk -d emits one line per
+    #    partition — the highest number tells us the next slot.
+    dump = run(f"sfdisk -d {disk} 2>/dev/null", check=False)
+    pnums: list[int] = []
+    import re
+    for line in dump.splitlines():
+        m = re.match(rf"{re.escape(disk)}p?(\d+)\s*:", line)
+        if m:
+            try: pnums.append(int(m.group(1)))
+            except ValueError: pass
+    next_n = (max(pnums) + 1) if pnums else 1
+
+    # 2. Free-space sanity. blockdev --getsz gives total disk sectors;
+    #    the highest existing partition's end gives the boundary.
+    total_s = int(run(f"blockdev --getsz {disk}").strip())
+    sector_b = int(run(f"blockdev --getss {disk}").strip())
+    last_end = 0
+    for line in dump.splitlines():
+        m = re.match(rf"{re.escape(disk)}p?\d+\s*:.*?start=\s*(\d+).*size=\s*(\d+)",
+                     line)
+        if m:
+            end = int(m.group(1)) + int(m.group(2))
+            if end > last_end: last_end = end
+    free_b = max(0, total_s - last_end - 34) * sector_b
+    if free_b < (1 << 30):
+        raise RuntimeError(
+            f"only {free_b // (1 << 20)} MB free at end of {disk}; "
+            f"need at least 1 GB. The cloud image's growpart probably "
+            f"ran — either re-deploy with growpart disabled, or attach "
+            f"a separate data disk.")
+
+    print(f"  [tier] Creating {disk} partition {next_n} for "
+          f"bedrock LVM PV ({free_b // (1 << 30)} GB)")
+
+    # 3. Append a new partition. sfdisk with no start/size fields uses
+    #    the next free sector and extends to end-of-disk. type=E6D6…
+    #    is the GPT GUID for "Linux LVM".
+    #
+    #    --force: the boot disk has /boot, /boot/efi, and / mounted;
+    #             sfdisk's safety check refuses to repartition a busy
+    #             disk by default. We're only ADDING a partition past
+    #             the end of all existing ones, so the kernel doesn't
+    #             need to re-read anything that's currently mounted.
+    #    --no-reread: kernel should not BLKRRPART (would fail with
+    #             EBUSY); partprobe afterwards picks up the new
+    #             partition without disturbing the mounts.
+    sfdisk_input = "type=E6D6D379-F507-44C2-A23C-238F2A3DF928 name=bedrock-pv\n"
+    r = subprocess.run(
+        ["sfdisk", "--append", "--force", "--no-reread", disk],
+        input=sfdisk_input, capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"sfdisk --append {disk} failed (rc={r.returncode}): "
+            f"{r.stderr.strip() or r.stdout.strip()}")
+    run("partprobe", check=False)
+    run("udevadm settle", check=False)
+
+    # 4. Resolve new partition device.
+    new_part = f"{disk}{next_n}"
+    if not Path(new_part).exists():
+        new_part = f"{disk}p{next_n}"  # nvme uses pN suffix
+    if not Path(new_part).exists():
+        raise RuntimeError(
+            f"created partition not visible under expected name "
+            f"({disk}{next_n} or {disk}p{next_n})")
+    return new_part
+
+
 def ensure_vg() -> None:
     """Adopt or create the VG bedrock uses for the thin pool + tier LVs +
     VM disks. Single-disk model: AlmaLinux's installer already created
@@ -416,12 +521,25 @@ def ensure_vg() -> None:
         _write_storage_json(cfg)
         print(f"  [tier] Adopted existing VG {VG!r} (from OS install)")
         return
-    # Truly greenfield. Try to find a usable separate disk to PV+VG on.
-    disk = find_data_disk()
-    print(f"  [tier] Creating PV+VG on {disk}")
-    run(f"wipefs -af {disk}", check=False)
-    run(f"pvcreate -ff -y {disk}")
-    run(f"vgcreate {VG} {disk}")
+    # Truly greenfield. Two paths:
+    #   (a) cloud image with no LVM (typical AlmaLinux 10 cloud image):
+    #       carve a new partition from the unallocated tail of the
+    #       boot disk and pvcreate that.
+    #   (b) legacy testbed with a separate data disk: pvcreate that.
+    # Try (a) first since v1.0 standardises on the cloud-image path.
+    try:
+        pv = carve_pv_from_boot_disk_tail()
+        print(f"  [tier] Greenfield: created PV on boot-disk tail {pv}")
+    except Exception as e:
+        print(f"  [tier] Boot-disk tail not usable ({e}); trying separate disk")
+        pv = find_data_disk()
+        print(f"  [tier] Greenfield: creating PV+VG on separate disk {pv}")
+        run(f"wipefs -af {pv}", check=False)
+    run(f"pvcreate -ff -y {pv}")
+    run(f"vgcreate {DEFAULT_VG} {pv}")
+    # Update the resolved VG name (the function-level `global VG`
+    # declaration at the top of ensure_vg covers this assignment).
+    VG = DEFAULT_VG
     cfg = _read_storage_json()
     cfg["vg"] = VG
     _write_storage_json(cfg)

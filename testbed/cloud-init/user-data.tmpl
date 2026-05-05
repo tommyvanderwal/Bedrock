@@ -3,6 +3,15 @@ hostname: {HOSTNAME}
 fqdn: {HOSTNAME}.bedrock.local
 manage_etc_hosts: true
 
+# Don't grow the root partition to fill the disk. We deliberately leave
+# the unallocated tail of /dev/vda free so bedrock-bootstrap can carve
+# /dev/vda5 there as the LVM PV for the bedrock VG (single-disk-one-VG
+# storage model). Without these flags, cloud-init's growpart + resizefs
+# would extend vda4 to the entire disk and there'd be no room left.
+growpart:
+  mode: false
+resize_rootfs: false
+
 users:
   - name: root
     lock_passwd: false
