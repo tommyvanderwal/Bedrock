@@ -94,15 +94,20 @@ echo "  source: $SRC_ISO ($(du -h "$SRC_ISO" | cut -f1))"
 if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     echo "[bedrock-iso] step 2/5: refreshing payload"
     rm -rf "$PAYLOAD_DIR"
-    mkdir -p "$PAYLOAD_DIR"/{lib,configs,rpms,wheels}
+    mkdir -p "$PAYLOAD_DIR"/{binaries,lib,configs,rpms,wheels}
 
-    # 2a. Bedrock files
+    # 2a. Bedrock files. Layout mirrors what install.sh expects from
+    #     a BEDROCK_REPO-style HTTP server — same paths whether the
+    #     operator's BEDROCK_REPO is a URL or `file:///…`. So
+    #     bedrock-rust goes under binaries/ (install.sh fetches
+    #     ${BEDROCK_REPO}/binaries/bedrock-rust), lib modules under
+    #     lib/, configs/ holds the systemd units.
     cp "$INSTALLER/install.sh"                 "$PAYLOAD_DIR/install.sh"
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
     cp "$INSTALLER/bedrock-fence-watchdog"     "$PAYLOAD_DIR/bedrock-fence-watchdog"
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
-    if [ -d "$INSTALLER/binaries" ]; then
-        cp "$INSTALLER/binaries/bedrock-rust"  "$PAYLOAD_DIR/bedrock-rust"
+    if [ -f "$INSTALLER/binaries/bedrock-rust" ]; then
+        cp "$INSTALLER/binaries/bedrock-rust"  "$PAYLOAD_DIR/binaries/bedrock-rust"
     else
         echo "  WARN: $INSTALLER/binaries/bedrock-rust not found — produce" >&2
         echo "        the rust binary first (cargo build --release in" >&2
