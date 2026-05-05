@@ -27,8 +27,19 @@ NETWORKS_DIR = TESTBED / "networks"
 CLOUD_INIT_DIR = TESTBED / "cloud-init"
 STATE_DIR = TESTBED / "state"
 
+# bedrock-install ISO is the canonical install medium — built once
+# by installer/iso-build/build-iso.sh, then sims and real hardware
+# use the same media for the same install path. The cloud-image
+# fallback (commented below) stays around for fast dev iteration when
+# the ISO doesn't need rebuilding.
+BEDROCK_ISO = (TESTBED.parent / "installer/iso-build/output/"
+                                "bedrock-install-almalinux-10.iso")
+# (Old cloud-image path — unused by default but useful when iterating
+# on bedrock-bootstrap WITHOUT rebuilding the ISO every time. Spawn
+# with BEDROCK_TESTBED_USE_CLOUD_IMG=1 to switch back.)
 GOLDEN_IMG = IMAGES_DIR / "almalinux-10.qcow2"
 ALMA_URL = "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
+USE_CLOUD_IMG = os.environ.get("BEDROCK_TESTBED_USE_CLOUD_IMG") == "1"
 
 MAX_NODES = 4
 NODE_RAM_MB = 12288
@@ -191,40 +202,83 @@ def create_node(i: int, all_indices: list[int]):
     node_state = STATE_DIR / hostname
     node_state.mkdir(exist_ok=True)
 
-    # Single qcow2 backed by the AlmaLinux 10 golden image. The cloud
-    # image puts /, /boot, /boot/efi straight on partitions (XFS root
-    # on /dev/vda4 typically); bedrock-bootstrap then carves a single
-    # `bedrock` VG out of the unallocated tail of the disk and creates
-    # the thin pool inside it. One disk = one VG = one thin pool.
+    if USE_CLOUD_IMG:
+        # Cloud-image fast path (BEDROCK_TESTBED_USE_CLOUD_IMG=1) —
+        # boots straight to a configured AlmaLinux, then bedrock-
+        # bootstrap carves the LVM PV from the unallocated tail.
+        # Useful when iterating on bedrock-bootstrap itself without
+        # rebuilding the ISO.
+        if not GOLDEN_IMG.exists():
+            print(f"  cloud image missing, run `spawn.py prereqs` first")
+            sys.exit(1)
+        disk_path = node_state / "root.qcow2"
+        if not disk_path.exists():
+            print(f"  Creating {NODE_DISK_GB}GB qcow2 (cloud-image overlay) for {hostname}...")
+            run(f"qemu-img create -f qcow2 -F qcow2 -b {GOLDEN_IMG} "
+                f"{disk_path} {NODE_DISK_GB}G", capture=False)
+        iso_path = make_cloud_init(i, all_indices)
+        print(f"  Defining {hostname} (cloud-image)...")
+        run(["sudo", "virt-install",
+             "--name", hostname,
+             "--memory", str(NODE_RAM_MB),
+             "--vcpus", str(NODE_VCPUS),
+             "--cpu", "host-passthrough",
+             "--disk", f"path={disk_path},format=qcow2,bus=virtio,discard=unmap",
+             "--disk", f"path={iso_path},device=cdrom",
+             "--network", f"network={MGMT_NET},model=virtio",
+             "--network", f"network={DRBD_NET},model=virtio",
+             "--os-variant", "almalinux10",
+             "--graphics", "none",
+             "--console", "pty,target_type=serial",
+             "--import",
+             "--noautoconsole",
+             "--noreboot",
+            ])
+        virsh("start", hostname, capture=False)
+        return
+
+    # Default: install via the bedrock-install ISO — same install
+    # path real hardware will use. virt-install boots the ISO,
+    # anaconda runs the kickstart, partitions per single-disk-VG-
+    # thinpool layout, %post stages the bedrock payload + arms
+    # bedrock-firstboot.service, reboots, firstboot runs install.sh
+    # against the local payload. Result: a node ready for
+    # `bedrock init` or `bedrock join` with no manual steps.
+    if not BEDROCK_ISO.exists():
+        print(f"  bedrock-install ISO missing: {BEDROCK_ISO}")
+        print(f"  build it first: ../installer/iso-build/build-iso.sh")
+        sys.exit(1)
+
     disk_path = node_state / "root.qcow2"
     if not disk_path.exists():
-        print(f"  Creating {NODE_DISK_GB}GB qcow2 for {hostname}...")
-        run(f"qemu-img create -f qcow2 -F qcow2 -b {GOLDEN_IMG} "
-            f"{disk_path} {NODE_DISK_GB}G", capture=False)
+        print(f"  Creating {NODE_DISK_GB}GB blank qcow2 for {hostname}...")
+        run(f"qemu-img create -f qcow2 {disk_path} {NODE_DISK_GB}G",
+            capture=False)
 
-    # Generate cloud-init ISO
-    iso_path = make_cloud_init(i, all_indices)
-
-    # virt-install the VM
-    print(f"  Defining {hostname}...")
+    print(f"  Defining {hostname} (bedrock-install ISO)...")
     run(["sudo", "virt-install",
          "--name", hostname,
          "--memory", str(NODE_RAM_MB),
          "--vcpus", str(NODE_VCPUS),
          "--cpu", "host-passthrough",
          "--disk", f"path={disk_path},format=qcow2,bus=virtio,discard=unmap",
-         "--disk", f"path={iso_path},device=cdrom",
+         "--cdrom", str(BEDROCK_ISO),
          "--network", f"network={MGMT_NET},model=virtio",
          "--network", f"network={DRBD_NET},model=virtio",
          "--os-variant", "almalinux10",
          "--graphics", "none",
          "--console", "pty,target_type=serial",
-         "--import",
          "--noautoconsole",
          "--noreboot",
         ])
-    # virt-install starts the domain but we want to start manually
-    virsh("start", hostname, capture=False)
+    # virt-install with --cdrom auto-starts the domain and runs the
+    # installer. After --noreboot, anaconda's `reboot --eject` shuts
+    # the VM off; we explicitly start it again to boot from the
+    # newly-installed disk.
+    # (No virsh start here — it would race with anaconda still
+    # finishing its post-install. Operator runs `spawn.py up N` again
+    # after install completes, OR uses `spawn.py wait <i>` — added
+    # below.)
 
 
 def destroy_node(i: int, wipe: bool = False):
