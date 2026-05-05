@@ -1,0 +1,22 @@
+START c02 x20 (RESET=1 on rep 1 only; rep 2..20 RESET=0) RustFS image on nodes should be docker.io/rustfs/rustfs:1.0.0-beta.1
+[1/20] v=0 hotf=0 coldf=0 strict_total=0 rc=0 dur=360.62s
+[2/20] v=1 hotf=0 coldf=0 strict_total=0 rc=0 dur=106.96s
+[3/20] v=2 hotf=0 coldf=0 strict_total=0 rc=0 dur=111.7s
+[4/20] v=3 hotf=0 coldf=0 strict_total=0 rc=0 dur=113.55s
+[5/20] v=0 hotf=0 coldf=0 strict_total=0 rc=0 dur=112.99s
+[6/20] v=1 hotf=0 coldf=0 strict_total=0 rc=0 dur=104.8s
+[7/20] v=2 hotf=0 coldf=0 strict_total=0 rc=0 dur=115.72s
+[8/20] v=3 hotf=0 coldf=0 strict_total=0 rc=0 dur=109.79s
+[9/20] v=0 hotf=0 coldf=0 strict_total=0 rc=0 dur=111.72s
+[10/20] v=1 hotf=0 coldf=0 strict_total=0 rc=0 dur=113.24s
+[11/20] v=2 hotf=0 coldf=0 strict_total=0 rc=0 dur=106.11s
+[12/20] v=3 hotf=0 coldf=0 strict_total=0 rc=0 dur=113.83s
+[13/20] v=0 hotf=0 coldf=0 strict_total=0 rc=0 dur=111.71s
+[14/20] v=1 hotf=0 coldf=0 strict_total=0 rc=0 dur=116.06s
+[15/20] v=2 hotf=0 coldf=0 strict_total=0 rc=0 dur=111.76s
+[16/20] v=3 hotf=0 coldf=0 strict_total=0 rc=0 dur=110.82s
+[17/20] v=0 hotf=0 coldf=0 strict_total=0 rc=0 dur=112.89s
+[18/20] v=1 hotf=0 coldf=0 strict_total=0 rc=0 dur=112.06s
+[19/20] v=2 hotf=0 coldf=0 strict_total=0 rc=0 dur=105.78s
+[20/20] v=3 hotf=0 coldf=0 strict_total=0 rc=0 dur=110.78s
+DONE strict=0/20 bad=0 csv=/home/tommy/pythonprojects/bedrock/installer/lib/rustfs-patches/sweep-results/sweep-4node-c02-beta1-20x-20260505T122955Z.csv
