@@ -361,6 +361,41 @@ def cmd_exec(args):
                       f"root@{ip}", cmd_str])
 
 
+def cmd_wait(args):
+    """Wait for anaconda install to complete on each running sim.
+
+    Anaconda's `reboot --eject` in the kickstart shuts the VM off
+    when the install finishes. We poll for that, then start the VM
+    again so it boots from the just-installed disk and runs the
+    bedrock-firstboot.service.
+    """
+    import time as _time
+    target = int(args.count)
+    if target < 1 or target > MAX_NODES:
+        print(f"count must be 1..{MAX_NODES}")
+        sys.exit(1)
+    deadline = _time.monotonic() + 1800  # 30 minutes
+    for i in range(1, target + 1):
+        name = node_name(i)
+        if not node_exists(i):
+            print(f"  {name}: not defined, skipping")
+            continue
+        print(f"  {name}: waiting for anaconda to finish (reboot --eject)…")
+        while _time.monotonic() < deadline:
+            out, _ = virsh("domstate", name)
+            if out.strip() == "shut off":
+                print(f"  {name}: install complete, starting…")
+                virsh("start", name, capture=False)
+                break
+            _time.sleep(15)
+        else:
+            print(f"  {name}: TIMEOUT after 30 min — anaconda may be stuck")
+            continue
+    print("All sims started for first-boot. Open serial console with:")
+    for i in range(1, target + 1):
+        print(f"  spawn.py ssh {i}        # once SSH is up")
+
+
 def cmd_reset(args):
     for i in range(MAX_NODES, 0, -1):
         if node_exists(i):
@@ -461,6 +496,13 @@ def main():
     exec_p.set_defaults(func=cmd_exec)
 
     sub.add_parser("reset").set_defaults(func=cmd_reset)
+
+    wait_p = sub.add_parser("wait",
+        help="Wait until a sim's anaconda install finishes "
+             "(VM shuts off via reboot --eject), then start the VM "
+             "to boot the just-installed system + run firstboot.")
+    wait_p.add_argument("count", help="Number of nodes to wait for (1..4)")
+    wait_p.set_defaults(func=cmd_wait)
 
     args = p.parse_args()
     args.func(args)
