@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Reproduce the upstream RustFS WRITERS_WAITING cancellation-safety leak
-# on a sim cluster (3-node or 4-node, stock alpha.99).
+# Reproduce contended-key read failures after killing the victim mid-burst
+# (historically tied to cancellation-safety around slow-path waiter counters).
 #
-# The leak is at crates/lock/src/fast_lock/shard.rs:193:
-#
-#   inc_writers_waiting()
-#   timeout(remaining, ...wait_for_write()).await   <-- cancellation point
-#   dec_writers_waiting()                            <-- skipped on Drop
+# Upstream main now uses `WaiterCounterGuard` in crates/lock/src/fast_lock/shard.rs
+# so dropped/cancelled waits decrement readers_waiting / writers_waiting via RAII.
+# This script still reports "WRITERS_WAITING" in the human summary whenever hot
+# reads fail while cold controls stay healthy — that text is diagnostic shorthand,
+# not a confirmed counter dump from the server.
 #
 # Triggering it requires per-key write-lock contention so the second-and-
 # later concurrent exclusive-lock attempts on a given key actually enter
