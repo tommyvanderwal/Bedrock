@@ -106,12 +106,21 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
     cp "$INSTALLER/bedrock-fence-watchdog"     "$PAYLOAD_DIR/bedrock-fence-watchdog"
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
-    if [ -f "$INSTALLER/binaries/bedrock-rust" ]; then
-        cp "$INSTALLER/binaries/bedrock-rust"  "$PAYLOAD_DIR/binaries/bedrock-rust"
-    else
-        echo "  WARN: $INSTALLER/binaries/bedrock-rust not found — produce" >&2
-        echo "        the rust binary first (cargo build --release in" >&2
-        echo "        rust/bedrock-rust/) and copy to installer/binaries/" >&2
+    # All cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
+    # node_exporter; rust daemon: bedrock-rust). install.sh copies the
+    # rust daemon to /usr/local/bin; mgmt_install + agent_install pull
+    # the rest from $BEDROCK_REPO/binaries/ when `bedrock init` /
+    # `bedrock join` runs.
+    for b in bedrock-rust victoria-metrics victoria-logs node_exporter; do
+        if [ -f "$INSTALLER/binaries/$b" ]; then
+            cp "$INSTALLER/binaries/$b" "$PAYLOAD_DIR/binaries/$b"
+        else
+            echo "  WARN: $INSTALLER/binaries/$b not found — produce it first" >&2
+        fi
+    done
+    # Python helper bundled alongside the static binaries.
+    if [ -f "$INSTALLER/binaries/vm_exporter.py" ]; then
+        cp "$INSTALLER/binaries/vm_exporter.py" "$PAYLOAD_DIR/binaries/vm_exporter.py"
     fi
     cp "$INSTALLER/lib/"*.py                   "$PAYLOAD_DIR/lib/"
     cp -r "$INSTALLER/configs/"*               "$PAYLOAD_DIR/configs/" 2>/dev/null || true
@@ -164,14 +173,14 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
         # Alpine for cattle-VM default boot disk
         if [ ! -f "$PAYLOAD_DIR/alpine.qcow2" ]; then
             echo "  fetching alpine.qcow2..."
-            ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.3-x86_64-bios-cloudinit-r0.qcow2"
+            ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.7-x86_64-bios-cloudinit-r0.qcow2"
             curl -fsSL -o "$PAYLOAD_DIR/alpine.qcow2" "$ALPINE_URL"
         fi
     fi
 
     chmod +x "$PAYLOAD_DIR"/install.sh "$PAYLOAD_DIR"/bedrock \
               "$PAYLOAD_DIR"/bedrock-fence-watchdog 2>/dev/null || true
-    [ -f "$PAYLOAD_DIR/bedrock-rust" ] && chmod +x "$PAYLOAD_DIR/bedrock-rust"
+    chmod +x "$PAYLOAD_DIR"/binaries/* 2>/dev/null || true
 fi
 
 PAYLOAD_SIZE=$(du -sh "$PAYLOAD_DIR" | cut -f1)
@@ -205,7 +214,31 @@ cp -r "$PAYLOAD_DIR" "$EXTRACT_DIR/bedrock"
 #                        so headless installs (testbed virt-install
 #                        --graphics none, USB-on-real-hw with a
 #                        serial port) work without a monitor.
-KS_ARG="inst.ks=cdrom:/dev/sr0:/ks.cfg console=tty0 console=ttyS0,115200n8"
+#   rd.live.check=0  — skip the boot-time ISO checksum (we rebuild
+#                      the ISO above; original implant no longer
+#                      matches; we re-implant a fresh one as the last
+#                      step, but rd.live.check=0 also suppresses the
+#                      90-second prompt that appears even when the
+#                      checksum is valid).
+#   inst.ks=hd:LABEL=…:/ks.cfg — load ks.cfg from the install medium
+#                      *without* the unmount/re-insert dance that
+#                      `inst.ks=cdrom:/dev/sr0:/ks.cfg` triggers (the
+#                      cdrom syntax pops the tray, expects an
+#                      operator to re-insert; on a one-medium install
+#                      that's a deadlock — the same disc holds both
+#                      ks.cfg AND stage2, so re-inserting is the only
+#                      way to proceed but anaconda can't auto-do it).
+KS_ARG="inst.ks=hd:LABEL=Bedrock-Install-${ALMA_VERSION}:/ks.cfg console=tty0 console=ttyS0,115200n8 rd.live.check=0"
+
+# In --quick mode the source is boot.iso, which carries NO package
+# repository on the disc — only kernel + initrd + stage2. The
+# kickstart says `cdrom` to remain valid for the DVD path, so we
+# override the actual install repo via `inst.repo=` kernel arg in
+# --quick mode. Real hardware offline installs use the DVD path
+# where the on-disc repo is sufficient and no override is needed.
+if [ "$QUICK" -eq 1 ]; then
+    KS_ARG="$KS_ARG inst.repo=https://repo.almalinux.org/almalinux/${ALMA_VERSION}/BaseOS/x86_64/os/"
+fi
 NEW_VOLID="Bedrock-Install-${ALMA_VERSION}"
 
 # Discover the source ISO's volume label so we can rewrite it.
@@ -259,6 +292,21 @@ xorriso \
     -update_r "$EXTRACT_DIR" / \
     -close on \
     -commit_eject all 2>&1 | tail -8
+
+# Implant a fresh isomd5 checksum so anaconda's built-in
+# checkisomd5@dev-sr0.service doesn't refuse to mount our ISO. The
+# installer's initrd embeds checkisomd5; without a valid implant it
+# halts with "Media check failed... System will halt in 12 hours"
+# even when rd.live.check=0 is on the cmdline (the prompt is
+# suppressed, but the failure path can still trip if the implant is
+# missing entirely).
+if command -v implantisomd5 >/dev/null 2>&1; then
+    echo "  implanting isomd5..."
+    implantisomd5 --supported-iso "$OUT_ISO" >/dev/null
+else
+    echo "  WARN: implantisomd5 not installed (apt: isomd5sum). The ISO" >&2
+    echo "        will boot but anaconda may complain about media check." >&2
+fi
 
 # ── Done ───────────────────────────────────────────────────────────
 SIZE=$(du -h "$OUT_ISO" | cut -f1)

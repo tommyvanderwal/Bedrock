@@ -32,7 +32,6 @@ BASE_PACKAGES = [
     "qemu-guest-agent",
     "lvm2",
     "xfsprogs",
-    "gdisk",              # sgdisk: GPT manipulation for the boot-disk-tail PV carve
     "tuned",
     "python3-pip",
     "iputils",
@@ -79,12 +78,12 @@ def install_base():
     # ELRepo (needed for DRBD)
     if not _rpm_installed("elrepo-release"):
         print("  Installing ELRepo...")
-        run(f"dnf install -y -q {ELREPO_URL} >/dev/null 2>&1")
+        run(f"dnf install -y -q {ELREPO_URL}")
 
     to_install = [p for p in BASE_PACKAGES + DRBD_PACKAGES if not _rpm_installed(p)]
     if to_install:
         print(f"  Installing {len(to_install)} packages...")
-        run(f"dnf install -y -q {' '.join(to_install)} >/dev/null 2>&1")
+        run(f"dnf install -y -q {' '.join(to_install)}")
 
     # Load DRBD module
     run("modprobe drbd 2>/dev/null || true", check=False)

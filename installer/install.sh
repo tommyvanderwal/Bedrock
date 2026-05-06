@@ -136,6 +136,23 @@ mkdir -p /etc/bedrock
 echo "BEDROCK_REPO=$BEDROCK_REPO" > /etc/bedrock/installer.env
 chmod 600 /etc/bedrock/installer.env
 
+# ── Hostname: ensure unique per-node identity ─────────────────────────────
+# The kickstart leaves the hostname at the default `localhost.localdomain`
+# (it can't know per-node names — same install image goes everywhere).
+# Cluster-mgmt uses hostname as the registration key, so multiple nodes
+# with the same hostname collide. Derive a unique one from the primary
+# NIC's MAC address. Operator can override later with `hostnamectl`.
+current_hn=$(hostname)
+if [ "$current_hn" = "localhost.localdomain" ] || [ "$current_hn" = "localhost" ]; then
+    primary_iface=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+    if [ -n "$primary_iface" ] && [ -f "/sys/class/net/$primary_iface/address" ]; then
+        mac_suffix=$(tr -d : < "/sys/class/net/$primary_iface/address" | cut -c7-)
+        new_hn="bedrock-${mac_suffix}"
+        log "Setting hostname: $new_hn (was $current_hn)"
+        hostnamectl set-hostname "$new_hn"
+    fi
+fi
+
 # ── Run the Python bootstrap ──────────────────────────────────────────────
 
 log "Running bedrock bootstrap..."

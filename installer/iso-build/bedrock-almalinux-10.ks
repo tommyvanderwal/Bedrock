@@ -23,7 +23,7 @@ timezone UTC --utc
 # Default root password is `bedrock`. **Change at first login** —
 # operator policy. We could randomise via %post but visibility
 # during initial bring-up matters for testbed + lab.
-rootpw --plaintext bedrock
+rootpw --plaintext --allow-ssh bedrock
 selinux --permissive
 firewall --disabled
 
@@ -43,7 +43,12 @@ zerombr
 clearpart --all --initlabel
 
 # Boot partitions — outside the LVM (bootloaders + kernel must be
-# directly readable by firmware/grub).
+# directly readable by firmware/grub). biosboot is a 1MiB unformatted
+# slot grub-bios uses to embed core.img on a GPT-labeled disk; ESP is
+# the EFI partition used in UEFI boot. We allocate BOTH so the same
+# install image works on legacy-BIOS and UEFI machines without an
+# operator-time choice. Cost: ~501 MiB on the boot disk, trivial.
+part biosboot  --fstype=biosboot --size=1
 part /boot/efi --fstype=efi --size=500 --asprimary
 part /boot     --fstype=xfs --size=1024 --asprimary
 
@@ -81,23 +86,36 @@ curl
 tar
 %end
 
-# ── Post-install: stage the bedrock payload from the ISO into the
-#    new system + arm a first-boot service that runs install.sh.
-#    --interpreter=/bin/bash keeps the script readable; --erroronfail
-#    aborts the whole install if the payload is missing (better than
-#    a silently broken first boot).
-%post --interpreter=/bin/bash --erroronfail --log=/var/log/bedrock-postinstall.log
+# ── Post-install (stage A — outside chroot): stage the bedrock
+#    payload from the ISO into the target system. This MUST run
+#    with `--nochroot` because the install media is only mounted in
+#    the installer environment at /run/install/repo, not inside the
+#    chroot the default %post enters. The chrooted second %post
+#    below then arms the first-boot service against the staged
+#    payload.
+%post --nochroot --interpreter=/bin/bash --erroronfail --log=/mnt/sysroot/var/log/bedrock-postinstall-stage-a.log
 
 set -euo pipefail
 
-# Anaconda mounts the ISO's payload at /run/install/repo for the
-# duration of %post. We copy bedrock/ into the target system so
-# first-boot can read it from disk after the ISO is ejected.
+# Anaconda mounts the ISO at /run/install/repo for %post. Target
+# system root is at /mnt/sysroot. Copy /bedrock from the ISO to
+# /var/lib/bedrock-install on the new system so first-boot can read
+# the payload after the ISO is ejected.
 SRC=/run/install/repo/bedrock
-DST=/var/lib/bedrock-install
+DST=/mnt/sysroot/var/lib/bedrock-install
+[ -d "$SRC" ] || { echo "ERROR: $SRC missing on install media"; ls -la /run/install/repo/; exit 1; }
 mkdir -p "$DST"
 cp -r "$SRC"/. "$DST/"
-chmod +x "$DST"/install.sh "$DST"/bedrock "$DST"/bedrock-rust 2>/dev/null || true
+chmod +x "$DST"/install.sh "$DST"/bedrock "$DST"/binaries/bedrock-rust 2>/dev/null || true
+echo "[stage-a] payload copied: $(du -sh "$DST" | cut -f1)"
+%end
+
+# ── Post-install (stage B — inside chroot): arm the first-boot
+#    bootstrap service + write the operator MOTD. Runs against the
+#    payload staged in stage A.
+%post --interpreter=/bin/bash --erroronfail --log=/var/log/bedrock-postinstall.log
+
+set -euo pipefail
 
 # First-boot one-shot service: runs install.sh against the local
 # payload. Self-disables after success so it never re-runs.
