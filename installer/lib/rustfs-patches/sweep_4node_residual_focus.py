@@ -11,6 +11,7 @@ Env:
   RESIDUAL_SEED   seed for jitter + hypothesis picks (default 2805991)
   RESIDUAL_DRY_RUN=1  print schedule counts and exit
   MONTE_INITIAL_RESET / RESET same semantics as sweep_4node_monte200.py (iter 1 only if set)
+  SWEEP_* optional tuning — see sweep_common.py (repro timeout, PUT timeout, readiness waits).
 
 Usage:
   cd installer/lib/rustfs-patches && PYTHONUNBUFFERED=1 python3 sweep_4node_residual_focus.py
@@ -27,6 +28,13 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+from sweep_common import (
+    put_timeout_s,
+    repro_timeout_s,
+    run_repro_script,
+    wait_min_nodes_ready,
+)
 
 ENDPOINTS = ["192.168.2.189", "192.168.2.190", "192.168.2.191", "192.168.2.192"]
 REPRO = Path(__file__).resolve().parent / "reproduce-leak.sh"
@@ -138,24 +146,17 @@ def restart_victim(ip: str) -> None:
     )
 
 
-def wait_cluster_ready(profile: str = "rustfs", timeout_s: int = 240) -> bool:
-    need = max(1, len(ENDPOINTS) - 1)
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        ok_n = 0
-        for ep in ENDPOINTS:
-            cmd = (
-                f"timeout 12 aws --profile {shlex.quote(profile)} "
-                f"--endpoint-url http://{ep}:9000 "
-                f"--cli-read-timeout 5 --cli-connect-timeout 3 "
-                "s3api list-buckets >/dev/null 2>&1"
-            )
-            if subprocess.run(["bash", "-lc", cmd], capture_output=True).returncode == 0:
-                ok_n += 1
-        if ok_n >= need:
-            return True
-        time.sleep(6)
-    return False
+def wait_cluster_ready(profile: str = "rustfs", timeout_s: int | None = None) -> bool:
+    """All nodes must answer: victim handles populate PUTs."""
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("SWEEP_CLUSTER_WAIT_S", "240"))
+    return wait_min_nodes_ready(
+        ENDPOINTS,
+        profile=profile,
+        min_ok=len(ENDPOINTS),
+        timeout_s=timeout_s,
+        poll_s=3.0,
+    )
 
 
 def cleanup_bucket(bucket: str, profile: str = "rustfs") -> None:
@@ -196,7 +197,7 @@ def micro_jitter(base: dict, rng: random.Random) -> dict:
     v["kill"] = round(max(0.38, min(0.88, base["kill"] + dk)), 2)
     v["settle"] = max(6, min(16, base["settle"] + rng.choice([-2, 0, 2])))
     v["pop_par"] = max(4, min(8, base["pop_par"] + rng.choice([-2, 0, 2])))
-    v["post_pop"] = max(6, min(12, base["post_pop"] + rng.choice([-2, 0, 2])))
+    v["post_pop"] = max(5, min(12, base["post_pop"] + rng.choice([-2, 0, 2])))
     v["id"] = variant_id(v)
     return v
 
@@ -291,7 +292,7 @@ def run_one(gi: int, v: dict) -> dict:
             "SETTLE": str(v["settle"]),
             "READ_TIMEOUT": str(v.get("read_timeout", 9)),
             "READ_TIMEOUT_GRACE": str(v.get("read_timeout_grace", 4)),
-            "PUT_TIMEOUT": "120",
+            "PUT_TIMEOUT": put_timeout_s(),
             "POPULATE_PARALLEL": str(v["pop_par"]),
             "POST_POPULATE_SETTLE": str(v["post_pop"]),
             "RESET": (
@@ -311,15 +312,8 @@ def run_one(gi: int, v: dict) -> dict:
         }
     )
     t0 = time.time()
-    proc = subprocess.run(
-        ["bash", str(REPRO)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    rc, out = run_repro_script(REPRO, env, repro_timeout_s())
     dt = round(time.time() - t0, 2)
-    out = proc.stdout + "\n" + proc.stderr
     mh, mc, mb = HOT_RE.search(out), COLD_RE.search(out), BASE_RE.search(out)
     hot_fail = int(mh.group(1)) if mh else -1
     cold_fail = int(mc.group(1)) if mc else -1
@@ -346,7 +340,7 @@ def run_one(gi: int, v: dict) -> dict:
         "read_timeout": v.get("read_timeout", 9),
         "read_timeout_grace": v.get("read_timeout_grace", 4),
         "duration_s": dt,
-        "exit_code": proc.returncode,
+        "exit_code": rc,
         "baseline_fail": base_fail,
         "hot_fail": hot_fail,
         "cold_fail": cold_fail,
@@ -423,35 +417,7 @@ def main() -> None:
                 if not wait_cluster_ready():
                     time.sleep(8)
                     continue
-                try:
-                    row = run_one(gi, v)
-                except subprocess.TimeoutExpired:
-                    row = {
-                        "iter": gi,
-                        "schedule_bucket": bucket,
-                        "hypothesis_tag": v.get("hypothesis_tag", ""),
-                        "anchor": v.get("anchor", ""),
-                        "variant_id": v["id"],
-                        "victim_idx": int(v["victim"]),
-                        "hot_keys": v["hot"],
-                        "writers_per_key": v["writers"],
-                        "payload_mib": v["payload"],
-                        "kill_delay_s": v["kill"],
-                        "read_rounds": v["rounds"],
-                        "settle_s": v["settle"],
-                        "populate_parallel": v["pop_par"],
-                        "post_populate_settle": v["post_pop"],
-                        "read_timeout": v.get("read_timeout", 9),
-                        "read_timeout_grace": v.get("read_timeout_grace", 4),
-                        "duration_s": 900,
-                        "exit_code": 124,
-                        "baseline_fail": -1,
-                        "hot_fail": -1,
-                        "cold_fail": -1,
-                        "reproduced_strict": 0,
-                        "reproduced_hot_any": 0,
-                        "raw_tail": "timeout",
-                    }
+                row = run_one(gi, v)
                 if is_infra_failure(
                     row["raw_tail"],
                     row["exit_code"],
@@ -505,8 +471,14 @@ def main() -> None:
                 row["cold_fail"],
             ):
                 restart_victim(ENDPOINTS[int(row["victim_idx"])])
-                time.sleep(6)
-                wait_cluster_ready(timeout_s=120)
+                time.sleep(4)
+                wait_min_nodes_ready(
+                    ENDPOINTS,
+                    profile="rustfs",
+                    min_ok=len(ENDPOINTS),
+                    timeout_s=int(os.environ.get("SWEEP_POST_RESTART_WAIT_S", "90")),
+                    poll_s=2.0,
+                )
 
             bk = row["schedule_bucket"]
             by_bucket[bk]["n"] += 1

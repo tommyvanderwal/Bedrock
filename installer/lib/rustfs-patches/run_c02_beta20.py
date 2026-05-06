@@ -4,6 +4,8 @@ import csv, os, re, shlex, subprocess, time
 from datetime import datetime
 from pathlib import Path
 
+from sweep_common import put_timeout_s, repro_timeout_s, run_repro_script, wait_min_nodes_ready
+
 ENDPOINTS = ["192.168.2.189", "192.168.2.190", "192.168.2.191", "192.168.2.192"]
 REPRO = Path(__file__).resolve().parent / "reproduce-leak.sh"
 OUTDIR = Path(__file__).resolve().parent / "sweep-results"
@@ -43,25 +45,16 @@ def restart_victim(ip: str) -> None:
     )
 
 
-def wait_cluster_ready(profile: str = "rustfs", timeout_s: int = 240) -> bool:
-    """EC cluster may briefly return 503 on one peer after coordinated restarts."""
-    need = max(1, len(ENDPOINTS) - 1)
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        ok_n = 0
-        for ep in ENDPOINTS:
-            cmd = (
-                f"timeout 12 aws --profile {shlex.quote(profile)} "
-                f"--endpoint-url http://{ep}:9000 "
-                f"--cli-read-timeout 5 --cli-connect-timeout 3 "
-                "s3api list-buckets >/dev/null 2>&1"
-            )
-            if subprocess.run(["bash", "-lc", cmd], capture_output=True).returncode == 0:
-                ok_n += 1
-        if ok_n >= need:
-            return True
-        time.sleep(6)
-    return False
+def wait_cluster_ready(profile: str = "rustfs", timeout_s: int | None = None) -> bool:
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("SWEEP_CLUSTER_WAIT_S", "240"))
+    return wait_min_nodes_ready(
+        ENDPOINTS,
+        profile=profile,
+        min_ok=len(ENDPOINTS),
+        timeout_s=timeout_s,
+        poll_s=3.0,
+    )
 
 
 def cleanup_bucket(bucket: str, profile: str = "rustfs") -> None:
@@ -106,7 +99,7 @@ def run_one(iter_idx: int, rep: int) -> dict:
             "SETTLE": str(VARIANT["settle"]),
             "READ_TIMEOUT": "9",
             "READ_TIMEOUT_GRACE": "4",
-            "PUT_TIMEOUT": "120",
+            "PUT_TIMEOUT": put_timeout_s(),
             "POPULATE_PARALLEL": "6",
             "POST_POPULATE_SETTLE": "8",
             # Full-cluster RESET once per suite: 20× stop/start cycles reliably
@@ -120,15 +113,8 @@ def run_one(iter_idx: int, rep: int) -> dict:
         }
     )
     t0 = time.time()
-    proc = subprocess.run(
-        ["bash", str(REPRO)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    rc, out = run_repro_script(REPRO, env, repro_timeout_s())
     dt = round(time.time() - t0, 2)
-    out = proc.stdout + "\n" + proc.stderr
     mh, mc, mb = HOT_RE.search(out), COLD_RE.search(out), BASE_RE.search(out)
     hot_fail = int(mh.group(1)) if mh else -1
     cold_fail = int(mc.group(1)) if mc else -1
@@ -147,7 +133,7 @@ def run_one(iter_idx: int, rep: int) -> dict:
         "payload_mib": VARIANT["payload"],
         "kill_delay_s": VARIANT["kill"],
         "duration_s": dt,
-        "exit_code": proc.returncode,
+        "exit_code": rc,
         "baseline_fail": base_fail,
         "hot_fail": hot_fail,
         "cold_fail": cold_fail,
@@ -187,26 +173,7 @@ def main() -> None:
             if not wait_cluster_ready():
                 time.sleep(8)
                 continue
-            try:
-                row = run_one(rep, rep)
-            except subprocess.TimeoutExpired:
-                row = {
-                    "iter": rep,
-                    "rep": rep,
-                    "variant_id": VARIANT["id"],
-                    "victim_idx": (rep - 1) % 4,
-                    "hot_keys": VARIANT["hot"],
-                    "writers_per_key": VARIANT["writers"],
-                    "payload_mib": VARIANT["payload"],
-                    "kill_delay_s": VARIANT["kill"],
-                    "duration_s": 900,
-                    "exit_code": 124,
-                    "baseline_fail": -1,
-                    "hot_fail": -1,
-                    "cold_fail": -1,
-                    "reproduced_strict": 0,
-                    "raw_tail": "timeout",
-                }
+            row = run_one(rep, rep)
             if is_infra_failure(
                 row.get("raw_tail", ""),
                 row["exit_code"],

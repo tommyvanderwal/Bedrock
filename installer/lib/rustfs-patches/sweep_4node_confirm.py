@@ -3,9 +3,12 @@ import csv, os, random, re, shlex, subprocess, time
 from datetime import datetime
 from pathlib import Path
 
+from sweep_common import put_timeout_s, repro_timeout_s, run_repro_script
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
 ENDPOINTS=["192.168.2.189","192.168.2.190","192.168.2.191","192.168.2.192"]
-REPRO=Path('/home/tommy/pythonprojects/bedrock/installer/lib/rustfs-patches/reproduce-leak.sh')
-OUTDIR=Path('/home/tommy/pythonprojects/bedrock/installer/lib/rustfs-patches/sweep-results')
+REPRO=_SCRIPT_DIR / "reproduce-leak.sh"
+OUTDIR=_SCRIPT_DIR / "sweep-results"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 STAMP=datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
 CSV_PATH=OUTDIR/f'sweep-4node-confirm-{STAMP}.csv'
@@ -91,7 +94,7 @@ def run_one(global_iter:int, variant:dict, rep:int):
         'SETTLE':str(variant['settle']),
         'READ_TIMEOUT':'9',
         'READ_TIMEOUT_GRACE':'4',
-        'PUT_TIMEOUT':'120',
+        'PUT_TIMEOUT':put_timeout_s(),
         'POPULATE_PARALLEL':'6',
         'POST_POPULATE_SETTLE':'8',
         'RESET':'1',
@@ -103,9 +106,8 @@ def run_one(global_iter:int, variant:dict, rep:int):
     })
 
     t0=time.time()
-    proc=subprocess.run(['bash',str(REPRO)],env=env,capture_output=True,text=True,timeout=900)
+    rc, out = run_repro_script(REPRO, env, repro_timeout_s())
     dt=round(time.time()-t0,2)
-    out=proc.stdout+'\n'+proc.stderr
     mh=HOT_RE.search(out); mc=COLD_RE.search(out); mb=BASE_RE.search(out)
     hot_fail=int(mh.group(1)) if mh else -1
     cold_fail=int(mc.group(1)) if mc else -1
@@ -119,7 +121,7 @@ def run_one(global_iter:int, variant:dict, rep:int):
     return {
       'iter':global_iter,'variant_id':variant['id'],'repeat':rep,'victim_idx':victim_idx,
       'hot_keys':variant['hot'],'writers_per_key':variant['writers'],'payload_mib':variant['payload'],'kill_delay_s':variant['kill'],
-      'read_rounds':variant['rounds'],'settle_s':variant['settle'],'duration_s':dt,'exit_code':proc.returncode,
+      'read_rounds':variant['rounds'],'settle_s':variant['settle'],'duration_s':dt,'exit_code':rc,
       'baseline_fail':base_fail,'hot_fail':hot_fail,'cold_fail':cold_fail,
       'reproduced_strict':strict,'reproduced_hot_any':anyh,
       'raw_tail':'\\n'.join(out.strip().splitlines()[-14:])
@@ -150,15 +152,7 @@ def main():
                 if not wait_cluster_ready(timeout_s=180):
                     infra_retries += 1
                     continue
-                try:
-                    row=run_one(gi,v,rep)
-                except subprocess.TimeoutExpired:
-                    row={
-                      'iter':gi,'variant_id':v['id'],'repeat':rep,'victim_idx':gi%4,
-                      'hot_keys':v['hot'],'writers_per_key':v['writers'],'payload_mib':v['payload'],'kill_delay_s':v['kill'],
-                      'read_rounds':v['rounds'],'settle_s':v['settle'],'duration_s':900,'exit_code':124,
-                      'baseline_fail':-1,'hot_fail':-1,'cold_fail':-1,'reproduced_strict':0,'reproduced_hot_any':0,'raw_tail':'timeout'
-                    }
+                row=run_one(gi,v,rep)
                 if is_infra_failure(row['raw_tail'], row['exit_code'], row['baseline_fail'], row['hot_fail'], row['cold_fail']):
                     infra_retries += 1
                     time.sleep(6)
