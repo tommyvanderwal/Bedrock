@@ -18,8 +18,15 @@ what we standardise on for v1.0.
 """
 
 import subprocess
+from pathlib import Path
 
 ELREPO_URL = "https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm"
+
+# install.sh stages the bundled ISO payload here; rpms/ holds the
+# pinned ELRepo + DRBD packages so we don't depend on elrepo.org's
+# slow mirrors for `bedrock bootstrap`. See iso-build/build-iso.sh
+# step 2b for what gets dropped in.
+LOCAL_PAYLOAD_RPMS = Path("/var/lib/bedrock-install/rpms")
 
 BASE_PACKAGES = [
     "qemu-kvm",
@@ -73,16 +80,54 @@ def _rpm_installed(pkg: str) -> bool:
     return r.returncode == 0
 
 
+def _local_rpms_dir():
+    """Return Path to the bundled rpms dir if it has any RPMs, else None."""
+    if LOCAL_PAYLOAD_RPMS.is_dir() and any(LOCAL_PAYLOAD_RPMS.glob("*.rpm")):
+        return LOCAL_PAYLOAD_RPMS
+    return None
+
+
+def _local_rpm(rpms_dir: Path, pkg: str):
+    """Find the first matching <pkg>-*.rpm file in rpms_dir, or None."""
+    matches = sorted(rpms_dir.glob(f"{pkg}-*.rpm"))
+    return matches[0] if matches else None
+
+
 def install_base():
     """Install base packages required on every Bedrock node."""
-    # ELRepo (needed for DRBD)
-    if not _rpm_installed("elrepo-release"):
-        print("  Installing ELRepo...")
-        run(f"dnf install -y -q {ELREPO_URL}")
+    local_rpms = _local_rpms_dir()
 
-    to_install = [p for p in BASE_PACKAGES + DRBD_PACKAGES if not _rpm_installed(p)]
+    # ELRepo registration (the .repo file + GPG key). The local copy is
+    # preferred because elrepo.org's HTTP mirrors are unreliable and slow;
+    # this is just the metadata RPM, not the kmod, so falling back to the
+    # network is harmless.
+    if not _rpm_installed("elrepo-release"):
+        local = _local_rpm(local_rpms, "elrepo-release") if local_rpms else None
+        src = str(local) if local else ELREPO_URL
+        print(f"  Installing ELRepo from {'bundled payload' if local else 'elrepo.org'}...")
+        run(f"dnf install -y -q {src}")
+
+    # DRBD (kmod + utils) — install the pinned RPMs from the payload when
+    # available. ELRepo's mirrors are the slowest leg of the bootstrap, and
+    # we already ship the exact tested versions, so going to the network
+    # for these is pure latency. If the payload is missing for some reason
+    # (manual installer, old image), fall through to the dnf path below
+    # which will pull them from the elrepo repo we just registered.
+    drbd_remaining = [p for p in DRBD_PACKAGES if not _rpm_installed(p)]
+    if drbd_remaining and local_rpms:
+        files = [str(_local_rpm(local_rpms, p)) for p in drbd_remaining
+                 if _local_rpm(local_rpms, p)]
+        if len(files) == len(drbd_remaining):
+            print(f"  Installing DRBD from bundled payload "
+                  f"({len(files)} RPMs, ~{sum(p.stat().st_size for p in map(Path, files))//1024} KB)...")
+            run(f"dnf install -y -q {' '.join(files)}")
+            drbd_remaining = []
+
+    # Everything else (BASE_PACKAGES + any DRBD that didn't come from the
+    # payload) comes from the upstream repos.
+    to_install = [p for p in BASE_PACKAGES if not _rpm_installed(p)] + drbd_remaining
     if to_install:
-        print(f"  Installing {len(to_install)} packages...")
+        print(f"  Installing {len(to_install)} packages from network repos...")
         run(f"dnf install -y -q {' '.join(to_install)}")
 
     # Load DRBD module
