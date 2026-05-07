@@ -1853,6 +1853,118 @@ def garage_drain_node(
     print(f"  [garage] drain complete. Surviving cluster has all data.")
 
 
+def _transfer_mgmt_role_n1(
+    old_master_host: str,
+    new_master_host: str,
+    other_peer_hosts: list[str],
+) -> None:
+    """N=1 mgmt-role transfer (no DRBD, no NFS-of-tiers).
+
+    The N≥2 ten-step playbook in transfer_mgmt_role assumes DRBD
+    primary/secondary swap + tier-NFS re-export, neither of which
+    exists in N=1. The actual moves needed are smaller:
+
+      1. Stop bedrock-{mgmt,vm,vl} + nfs-server on the old master
+      2. rsync /opt/bedrock/{mgmt,iso,data,bin} + scrape.yml
+      3. rsync /etc/bedrock/cluster.json + the bedrock-rust log dir
+      4. Copy systemd unit files; daemon-reload on new
+      5. Re-export the ISO library (the only NFS export in N=1) on new
+      6. Start bedrock-{vm,vl,mgmt} + mnt-isos.mount on new
+      7. Re-point ISO-library mount-units on every other peer
+      8. Append MGMT_MASTER → propagation flips daemon.toml on every
+         peer, restarts bedrock-rust, and joiners now dial the new
+         master automatically.
+    """
+    print(f"  [mgmt] N=1 transfer mgmt role: {old_master_host} → {new_master_host}")
+
+    # 1. Stop services on old master (best-effort: may already be down).
+    ssh(old_master_host,
+        "systemctl stop bedrock-mgmt bedrock-vm bedrock-vl "
+        "nfs-server mnt-isos.mount 2>/dev/null", check=False)
+
+    # 2. rsync /opt/bedrock data subtrees old → new (pull from new).
+    for sub in ("mgmt", "iso", "data", "bin"):
+        ssh(new_master_host,
+            f"mkdir -p /opt/bedrock/{sub} && "
+            f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
+            f"root@{old_master_host}:/opt/bedrock/{sub}/ "
+            f"/opt/bedrock/{sub}/", check=False, timeout=600)
+    ssh(new_master_host,
+        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+        f"root@{old_master_host}:/opt/bedrock/scrape.yml "
+        f"/opt/bedrock/ 2>/dev/null", check=False)
+
+    # 3. Cluster state — cluster.json is the canonical view; the log
+    #    directory is bedrock-rust's append-only source-of-truth that
+    #    drives both view_builder and replication. Seeding both lets
+    #    the new master serve correct status the moment it comes up,
+    #    rather than waiting for a fresh replication round-trip.
+    ssh(new_master_host,
+        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+        f"root@{old_master_host}:/etc/bedrock/cluster.json "
+        f"/etc/bedrock/cluster.json", check=False)
+    ssh(new_master_host,
+        f"mkdir -p /var/lib/bedrock/log && "
+        f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
+        f"root@{old_master_host}:/var/lib/bedrock/log/ "
+        f"/var/lib/bedrock/log/", check=False)
+
+    # 4. Systemd units (in case the new master never had them — e.g.
+    #    a peer that joined a single-node cluster).
+    for unit in ("bedrock-mgmt.service", "bedrock-vm.service",
+                 "bedrock-vl.service", "mnt-isos.mount"):
+        ssh(new_master_host,
+            f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
+            f"root@{old_master_host}:/etc/systemd/system/{unit} "
+            f"/etc/systemd/system/{unit} 2>/dev/null", check=False)
+    ssh(new_master_host, "systemctl daemon-reload")
+
+    # 5. Re-export the ISO library on the new master. (The only NFS
+    #    export in N=1; tier-bulk/tier-critical are local LVs, not
+    #    exported.)
+    ssh(new_master_host,
+        "mkdir -p /etc/exports.d && "
+        "echo '/opt/bedrock/iso 192.168.2.0/24(ro,sync,no_subtree_check)' "
+        "> /etc/exports.d/bedrock-iso.exports && "
+        "systemctl enable --now nfs-server >/dev/null 2>&1 && "
+        "exportfs -ra", check=False)
+
+    # 6. Start mgmt + observability + ISO-library automount on new.
+    ssh(new_master_host,
+        "systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt "
+        "mnt-isos.mount", check=False)
+
+    # 7. Re-point peers' ISO-library NFS mount unit. Lazy umount — the
+    #    automount remounts on next access against the new server.
+    for peer in other_peer_hosts:
+        ssh(peer,
+            f"sed -i 's|{old_master_host}:/opt/bedrock/iso|"
+            f"{new_master_host}:/opt/bedrock/iso|g' "
+            f"/etc/systemd/system/mnt-isos.mount", check=False)
+        ssh(peer, "systemctl daemon-reload", check=False)
+        ssh(peer, "umount -l /mnt/isos 2>/dev/null", check=False)
+
+    # 8. Append MGMT_MASTER from the new master so peers learn the
+    #    change via replication. view_builder.fold flips the role
+    #    field on every peer + render_from_snapshot regens daemon.toml,
+    #    which restarts bedrock-rust pointing at the new master.
+    new_master_name = ssh(new_master_host,
+                          "hostname --fqdn 2>/dev/null || hostname",
+                          check=False).strip()
+    if new_master_name:
+        ssh(new_master_host,
+            f"python3 -c \"import sys; sys.path.insert(0, "
+            f"'/usr/local/lib/bedrock'); from lib import log_entries as le, "
+            f"rust_ipc; "
+            f"d = rust_ipc.Daemon(); d.__enter__(); "
+            f"idx,_ = d.append(le.mgmt_master('{new_master_name}')); "
+            f"print('mgmt_master idx=' + str(idx))\"",
+            check=False, timeout=30)
+
+    print(f"  [mgmt] N=1 transfer complete. New master: "
+          f"{new_master_host} ({new_master_name or '?'})")
+
+
 def transfer_mgmt_role(
     old_master_host: str,
     new_master_host: str,
@@ -1897,6 +2009,25 @@ def transfer_mgmt_role(
         old_master_drbd_ip: old master's IP on the DRBD ring; if None,
                             looked up from cluster.json
     """
+    # N=1 fast path: when no tier is in DRBD mode there's no DRBD
+    # plumbing or NFS-of-DRBD to swap, so the ten-step playbook below
+    # collapses to a much smaller set of moves: stop services on old,
+    # rsync /opt/bedrock + cluster state, start services on new,
+    # re-point peers' ISO-library mount, append MGMT_MASTER. We dispatch
+    # to a separate helper here both because the steps are different
+    # AND because the original code would have raised "could not
+    # resolve drbd ip" on the very next line in N=1, since drbd_ip is
+    # always empty when there's no DRBD ring.
+    cluster = load_cluster()
+    tiers = cluster.get("tiers") or {}
+    is_n1 = all(
+        (tiers.get(t) or {}).get("mode") in (None, "local", "local-thin")
+        for t in ("bulk", "critical")
+    )
+    if is_n1:
+        return _transfer_mgmt_role_n1(
+            old_master_host, new_master_host, other_peer_hosts)
+
     print(f"  [mgmt] transfer mgmt+NFS role: {old_master_host} → {new_master_host}")
 
     # 0. Resolve old master's DRBD ip if not given (needed for fstab sed)

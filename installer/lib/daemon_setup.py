@@ -120,21 +120,39 @@ def render_from_snapshot(snapshot: dict, this_node: str,
     nodes = snapshot.get("nodes", {})
     name_list = sorted(nodes.keys())   # deterministic order
 
-    if this_node in name_list:
-        my_idx = name_list.index(this_node) + 1
-    else:
-        my_idx = 1
+    # Bail out on a bootstrap-empty snapshot. This happens to a freshly
+    # joined follower whose log hasn't replicated yet: the orchestrator
+    # subscriber on the joiner fires render_from_snapshot before the
+    # leader has shipped any entries, so `nodes` is empty and `master`
+    # is None. The previous behaviour (re-render with `peer=[]` +
+    # `role=leader`) hard-bricked replication: bedrock-rust restarted
+    # as a standalone leader, stopped dialing the master, and the log
+    # never caught up. Preserving the agent_install bootstrap toml
+    # until *some* membership entry has replicated is correct: the
+    # next subscriber tick after the first NODE_REGISTER arrives will
+    # produce a populated snapshot and a real config.
+    if not name_list or this_node not in name_list:
+        return
+
+    my_idx = name_list.index(this_node) + 1
     # All other nodes' sender_ids → peer_sender_ids list. The Rust
     # weighted-vote election counts these (10 votes per node + 1 for
     # witness) to decide quorum at N≥3. Empty for standalone.
-    peers_drbd = []
+    #
+    # Peer dial address: prefer drbd_ip (the dedicated peer-link
+    # network at N≥2 — separate cable, redundant) but fall back to
+    # `host` (the mgmt LAN) when drbd_ip is empty. drbd_ip stays
+    # empty in N=1 mode forever, so without this fallback peer=[]
+    # and replication never starts.
+    peer_addrs: list[str] = []
     peer_sender_ids: list[int] = []
     for nm in name_list:
         if nm == this_node:
             continue
         n = nodes[nm]
-        if n.get("drbd_ip"):
-            peers_drbd.append(f"{n['drbd_ip']}:8200")
+        addr = n.get("drbd_ip") or n.get("host", "")
+        if addr:
+            peer_addrs.append(f"{addr}:8200")
         peer_sender_ids.append(name_list.index(nm) + 1)
 
     witnesses = []
@@ -152,8 +170,14 @@ def render_from_snapshot(snapshot: dict, this_node: str,
             "pubkey_hex": w.get("witness_pubkey", ""),
         })
 
+    # Role: master ⇒ leader, anyone else ⇒ follower. master=None can't
+    # happen here — the early-return above guarantees this_node is in
+    # the snapshot, which only occurs after at least one MGMT_MASTER
+    # entry has folded into the view. (If master truly is missing
+    # despite a populated nodes map, treat ourselves as follower so we
+    # keep dialing peers instead of going silent as a phantom leader.)
     master = snapshot.get("mgmt_master")
-    role = "leader" if master == this_node or master is None else "follower"
+    role = "leader" if master == this_node else "follower"
 
     # Peer-in-maintenance: when our peer node has maintenance=true in
     # the snapshot, the daemon treats peer silence as expected — we
@@ -172,7 +196,7 @@ def render_from_snapshot(snapshot: dict, this_node: str,
         sender_id=my_idx,
         peer_sender_ids=peer_sender_ids,
         peer_listen=["0.0.0.0:8200"],
-        peer=peers_drbd,
+        peer=peer_addrs,
         fence_interfaces=fence_interfaces or [],
         witnesses=witnesses,
         role=role,
