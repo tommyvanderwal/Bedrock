@@ -684,11 +684,19 @@ def register_node(req: NodeRegister):
             cluster_key_hex = ck.read_bytes().hex()
     except Exception:
         pass
+    # Address the joiner's bedrock-rust should dial to start log
+    # replication. Prefer drbd_ip (the dedicated peer-link at N≥2 —
+    # separate cable, redundant) but fall back to host (mgmt LAN) when
+    # drbd_ip is empty. drbd_ip is always empty in N=1 (no DRBD ring),
+    # so without this fallback the joiner gets `peer=[":8200"]` and
+    # never replicates the log. Field name is kept as `master_drbd_ip`
+    # for wire-format compatibility with older joiners.
     master_drbd_ip = ""
     for n_name, n in cluster.get("nodes", {}).items():
-        if "mgmt" in n.get("role", "") and n.get("drbd_ip"):
-            master_drbd_ip = n["drbd_ip"]
-            break
+        if "mgmt" in n.get("role", ""):
+            master_drbd_ip = n.get("drbd_ip") or n.get("host", "")
+            if master_drbd_ip:
+                break
 
     return {"status": "registered", "cluster": cluster.get("cluster_name"),
             "cluster_uuid": cluster.get("cluster_uuid", ""),

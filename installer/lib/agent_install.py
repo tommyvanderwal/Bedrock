@@ -153,7 +153,10 @@ def install(witness: str, cluster_info: dict, repo: str):
             print("  WARN: master did not send cluster_key_hex; daemon will start without witness auth")
             daemon_setup.write_cluster_key()  # fresh, won't match master
         daemon_setup.init_log_if_needed(s["cluster_uuid"])
-        master_drbd = result.get("master_drbd_ip", witness)
+        # `or witness` (not `.get(..., witness)`) so an empty-string
+        # value from mgmt also falls through. mgmt sends "" when the
+        # current master has no drbd_ip — the always-true case in N=1.
+        master_drbd = result.get("master_drbd_ip") or witness
         daemon_setup.render_daemon_toml(
             # Initial daemon.toml gets bedrock-rust talking to the master.
             # The watcher overwrites this from the replicated snapshot
