@@ -72,6 +72,16 @@ log "Downloading bedrock-rust daemon..."
 curl -fsSL "${BEDROCK_REPO}/binaries/bedrock-rust" -o "${INSTALL_DIR}/bedrock-rust"
 chmod +x "${INSTALL_DIR}/bedrock-rust"
 
+log "Downloading bedrock-net (mesh discovery + routing daemon)..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-net" -o "${INSTALL_DIR}/bedrock-net"
+chmod +x "${INSTALL_DIR}/bedrock-net"
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-net.service" \
+    -o /etc/systemd/system/bedrock-net.service
+# Service unit is enabled by `bedrock init` / `bedrock join` once
+# loopback_ip is allocated, not now (the daemon needs cluster state
+# to do anything useful, and starting it pre-init would just no-op
+# in a tight retry loop).
+
 log "Installing bedrock-rust systemd unit..."
 mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock/log
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rust.service" \
@@ -124,6 +134,7 @@ LIB_FILES=(
     rust_ipc.py
     view_builder.py
     dashboard_install.py
+    netd.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""bedrock-net — mesh discovery + routing daemon entry point.
+
+Thin wrapper around netd.run_daemon(). All the logic lives in
+/usr/local/lib/bedrock/lib/netd.py.
+"""
+
+import sys
+
+sys.path.insert(0, "/usr/local/lib/bedrock")
+
+from lib import netd  # noqa: E402
+
+
+if __name__ == "__main__":
+    netd.main()

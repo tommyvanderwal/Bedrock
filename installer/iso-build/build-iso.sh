@@ -104,6 +104,7 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     #     lib/, configs/ holds the systemd units.
     cp "$INSTALLER/install.sh"                 "$PAYLOAD_DIR/install.sh"
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
+    cp "$INSTALLER/bedrock-net"                "$PAYLOAD_DIR/bedrock-net"
     cp "$INSTALLER/bedrock-fence-watchdog"     "$PAYLOAD_DIR/bedrock-fence-watchdog"
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
     # All cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
@@ -179,6 +180,7 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     fi
 
     chmod +x "$PAYLOAD_DIR"/install.sh "$PAYLOAD_DIR"/bedrock \
+              "$PAYLOAD_DIR"/bedrock-net \
               "$PAYLOAD_DIR"/bedrock-fence-watchdog 2>/dev/null || true
     chmod +x "$PAYLOAD_DIR"/binaries/* 2>/dev/null || true
 fi

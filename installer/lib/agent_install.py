@@ -86,6 +86,11 @@ def install(witness: str, cluster_info: dict, repo: str):
         "mgmt_url": mgmt_url,
         "mgmt_ip": mgmt_ip,
         "drbd_ip": drbd_ip,
+        # Cluster identity for the mesh layer. mgmt allocated this in
+        # the register response; bedrock-net.service reads it from
+        # state.json on next start to pin the /32 on `lo`. Empty if
+        # mgmt is on an older version that didn't allocate one.
+        "loopback_ip": result.get("loopback_ip", ""),
     })
     state.save(s)
 
@@ -175,6 +180,30 @@ def install(witness: str, cluster_info: dict, repo: str):
         print(f"  bedrock-rust running as follower, dialing {master_drbd}:8200")
     except Exception as e:
         print(f"  WARN: bedrock-rust setup failed: {e}")
+
+    # bedrock-net mesh discovery + routing daemon. Picks up the
+    # loopback_ip we just wrote to state.json, claims it as /32 on
+    # `lo`, starts probing every up interface for peer cluster members.
+    print("  Starting bedrock-net daemon (mesh discovery + routing)...")
+    try:
+        # systemd unit was placed by install.sh; we just enable+start.
+        subprocess.run("systemctl daemon-reload", shell=True, check=False)
+        subprocess.run(
+            "systemctl enable --now bedrock-net.service",
+            shell=True, check=False, capture_output=True,
+        )
+        # Allow rp_filter loose mode so async return paths through
+        # different NICs survive Linux's strict reverse-path check.
+        # The mesh layer relies on this — without it, any path that
+        # isn't symmetric drops on the receiver.
+        subprocess.run(
+            "sysctl -wq net.ipv4.conf.all.rp_filter=2 "
+            "net.ipv4.conf.default.rp_filter=2 "
+            "net.ipv4.ip_forward=1",
+            shell=True, check=False,
+        )
+    except Exception as e:
+        print(f"  WARN: bedrock-net start failed: {e}")
 
     # Install + start the dashboard (FastAPI + Svelte UI). Reachable
     # at http://<this-node>:8080. The follower's mgmt API serves the

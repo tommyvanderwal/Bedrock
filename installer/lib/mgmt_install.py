@@ -203,6 +203,9 @@ WantedBy=multi-user.target
     s["witness_host"] = witness_host
     s["mgmt_ip"] = _pick_mgmt_ip(hw)
     s["mgmt_url"] = f"http://{s['mgmt_ip']}:8080"
+    # Mgmt master gets the lowest cluster identity. Joiners get the
+    # next free .2, .3, … allocated by the register endpoint.
+    s["loopback_ip"] = "10.99.0.1"
     state.save(s)
 
     # Initialise /etc/bedrock/cluster.json with this node registered
@@ -221,6 +224,7 @@ WantedBy=multi-user.target
                 "tb_ip": drbd_ip,
                 "eno_ip": drbd_ip,
                 "role": "mgmt+compute",
+                "loopback_ip": s["loopback_ip"],
                 "cockpit": f"https://{s['mgmt_ip']}:9090",
             }
         },
@@ -289,7 +293,30 @@ WantedBy=multi-user.target
                     pubkey="",   # filled in on rotation
                 ))
                 d.append(_le.mgmt_master(node_name=s["node_name"]))
+                d.append(_le.node_loopback(
+                    node_name=s["node_name"],
+                    loopback_ip=s["loopback_ip"],
+                ))
         except Exception as e:
             print(f"  WARN: master node_register log-append skipped: {e}")
     except Exception as e:
         print(f"  WARN: bedrock-rust setup failed: {e}")
+
+    # bedrock-net mesh discovery + routing daemon. Picks up the
+    # loopback_ip from state.json, claims it on `lo`, starts probing
+    # peer interfaces. systemd unit is in installer/configs/.
+    print()
+    print("Starting bedrock-net daemon (mesh discovery + routing)...")
+    try:
+        import subprocess as _sp
+        _sp.run("systemctl daemon-reload", shell=True, check=False)
+        _sp.run("systemctl enable --now bedrock-net.service",
+                shell=True, check=False, capture_output=True)
+        _sp.run(
+            "sysctl -wq net.ipv4.conf.all.rp_filter=2 "
+            "net.ipv4.conf.default.rp_filter=2 "
+            "net.ipv4.ip_forward=1",
+            shell=True, check=False,
+        )
+    except Exception as e:
+        print(f"  WARN: bedrock-net start failed: {e}")

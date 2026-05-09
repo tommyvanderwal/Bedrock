@@ -609,12 +609,26 @@ def register_node(req: NodeRegister):
     prior_peers = [(name, n) for name, n in cluster["nodes"].items()
                    if n.get("host") and n["host"] != req.host]
 
+    # Allocate a cluster identity (loopback IP) for the joiner. We
+    # number from 10.99.0.1 upwards: the mgmt master gets .1 (assigned
+    # at `bedrock init`), joiners get the lowest free /32 in the /24.
+    # /24 is enough for 250+ nodes; we'll panic loudly if we ever run
+    # out, but the design ceiling is well below that.
+    used_loopbacks = {n.get("loopback_ip") for n in cluster["nodes"].values()}
+    next_loopback = ""
+    for i in range(1, 250):
+        candidate = f"10.99.0.{i}"
+        if candidate not in used_loopbacks:
+            next_loopback = candidate
+            break
+
     cluster["nodes"][req.name] = {
         "host": req.host,
         "drbd_ip": req.drbd_ip or "",
         "tb_ip": req.drbd_ip or "",  # use DRBD for migration URI (no USB4 in testbed)
         "eno_ip": req.drbd_ip or "",
         "role": req.role,
+        "loopback_ip": next_loopback,
         "cockpit": f"https://{req.host}:9090",
         "pubkey": (req.pubkey or "").strip(),
     }
@@ -662,6 +676,11 @@ def register_node(req: NodeRegister):
                     role="compute",
                     pubkey=req.pubkey or "",
                 ))
+                if next_loopback:
+                    d.append(_le.node_loopback(
+                        node_name=req.name,
+                        loopback_ip=next_loopback,
+                    ))
     except Exception as e:
         log.warning(f"node_register log-append skipped: {e}")
 
@@ -701,6 +720,7 @@ def register_node(req: NodeRegister):
     return {"status": "registered", "cluster": cluster.get("cluster_name"),
             "cluster_uuid": cluster.get("cluster_uuid", ""),
             "nodes": list(cluster["nodes"].keys()),
+            "loopback_ip": next_loopback,
             "peer_ips": sorted(set(peer_ips)),
             "peer_pubkeys": peer_pubkeys,
             "cluster_key_hex": cluster_key_hex,

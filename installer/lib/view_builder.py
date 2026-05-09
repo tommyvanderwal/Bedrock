@@ -439,6 +439,9 @@ def _state_view(v: dict, node_name: str) -> dict:
         "role": me.get("role", "compute"),
         "mgmt_ip": me.get("host", ""),
         "drbd_ip": me.get("drbd_ip", ""),
+        # Mesh identity — read by bedrock-net.service to know which /32
+        # to claim on `lo` and to advertise in probes.
+        "loopback_ip": me.get("loopback_ip", ""),
         "mgmt_url": f"http://{master_host}:8080" if master_host else "",
         "witness_host": master_host,  # v0.1 — phase 6 swaps in real witnesses
     }
