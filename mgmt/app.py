@@ -614,7 +614,29 @@ def register_node(req: NodeRegister):
     # at `bedrock init`), joiners get the lowest free /32 in the /24.
     # /24 is enough for 250+ nodes; we'll panic loudly if we ever run
     # out, but the design ceiling is well below that.
-    used_loopbacks = {n.get("loopback_ip") for n in cluster["nodes"].values()}
+    #
+    # Source of truth is the LOG, not cluster.json. cluster.json is a
+    # derived view that the orchestrator's fold transiently rewrites
+    # — between the node_register and node_loopback entries for the
+    # master at init time, the file briefly lacks the master's
+    # loopback_ip, and a concurrent register would dup-allocate .1.
+    # The log-direct read avoids that race entirely.
+    used_loopbacks: set[str] = set()
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import rust_ipc as _ipc, log_entries as _le
+        with _ipc.Daemon() as _d:
+            for _e in _d.read(from_index=1):
+                _p = _le.decode(_e["payload"])
+                if _p.get("t") == _le.NODE_LOOPBACK:
+                    lb = _p.get("loopback_ip", "")
+                    if lb:
+                        used_loopbacks.add(lb)
+    except Exception as _e:
+        log.warning(f"register: log-fold for used_loopbacks failed: {_e}; "
+                    f"falling back to cluster.json")
+        used_loopbacks = {n.get("loopback_ip") for n in cluster["nodes"].values()}
     next_loopback = ""
     for i in range(1, 250):
         candidate = f"10.99.0.{i}"

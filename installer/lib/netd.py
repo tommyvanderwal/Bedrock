@@ -158,11 +158,23 @@ def decode_probe(buf: bytes, *, key: bytes) -> Optional[dict]:
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def is_bridge_slave(nic: str) -> bool:
+    """A bridge port has /sys/class/net/<nic>/master pointing at the
+    bridge interface. We never address such NICs ourselves — assigning
+    them an IP fights the bridge and breaks the LAN side. The bridge
+    itself (e.g. br0) is what we treat as the routable endpoint."""
+    return Path(f"/sys/class/net/{nic}/master").is_symlink() or \
+           Path(f"/sys/class/net/{nic}/brport").exists()
+
+
 def list_interfaces() -> list[str]:
-    """All non-blocklisted up interfaces."""
+    """All non-blocklisted up interfaces that are usable as path
+    endpoints (i.e. not bridge slaves and not in the prefix blocklist)."""
     out: list[str] = []
     for nic in sorted(os.listdir("/sys/class/net")):
         if any(nic.startswith(p) for p in INTERFACE_BLOCKLIST_PREFIXES):
+            continue
+        if is_bridge_slave(nic):
             continue
         oper = Path(f"/sys/class/net/{nic}/operstate").read_text().strip()
         if oper != "up":
@@ -329,12 +341,20 @@ class Daemon:
 def open_send_socket(nic: str) -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, PROBE_TTL)
-    # Bind multicast egress to this nic by index. SO_BINDTODEVICE
-    # would also work but requires CAP_NET_RAW; the IP_MULTICAST_IF
-    # path is universal and matches what we want (same nic, every
-    # probe).
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    # Bind multicast egress to this nic by index. The kernel's
+    # `struct ip_mreqn` is 12 bytes: 4 (multiaddr) + 4 (local ifaddr)
+    # + 4 (ifindex). The "I" code in Python struct guarantees 4-byte
+    # unsigned int regardless of platform LP-size — using "L" (which
+    # is 8 bytes on x86_64 Linux) silently produces a 16-byte option
+    # value, the kernel rejects it as too long, and IP_MULTICAST_IF
+    # falls back to "default outgoing interface". That's how we got
+    # probes being cross-attributed between mesh planes earlier.
     if_index = socket.if_nametoindex(nic)
-    mreq = struct.pack("4sLi", socket.inet_aton("0.0.0.0"), 0, if_index)
+    mreq = struct.pack("4s4sI",
+                        socket.inet_aton("0.0.0.0"),
+                        socket.inet_aton("0.0.0.0"),
+                        if_index)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
     return s
 
@@ -346,8 +366,46 @@ def open_recv_socket() -> socket.socket:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     except OSError:
         pass
+    # IP_PKTINFO lets recvmsg() report which local interface the
+    # packet was received on. Critical: we need to know "this probe
+    # came in on enp3s0" not just "this probe came from 10.42.7.42",
+    # because all our mesh NICs share the same /16 throwaway prefix
+    # and source-IP alone can't tell us which physical link delivered
+    # the frame.
+    IP_PKTINFO = 8  # not exposed in py stdlib
+    s.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
     s.bind(("", PROBE_PORT))
     return s
+
+
+def recv_with_ifindex(sock: socket.socket) -> tuple[bytes, str, int] | tuple[None, None, None]:
+    """recvmsg + parse IP_PKTINFO. Returns (data, sender_addr, ifindex)
+    or (None, None, None) if no packet ready / error.
+    """
+    IP_PKTINFO = 8
+    try:
+        data, ancdata, _, src = sock.recvmsg(2048, socket.CMSG_LEN(64))
+    except (BlockingIOError, socket.timeout):
+        return None, None, None
+    except OSError:
+        return None, None, None
+    ifindex = 0
+    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+        if cmsg_level == socket.IPPROTO_IP and cmsg_type == IP_PKTINFO:
+            # struct in_pktinfo { int ipi_ifindex; struct in_addr ipi_spec_dst; struct in_addr ipi_addr; }
+            ifindex = struct.unpack_from("i", cmsg_data, 0)[0]
+            break
+    return data, src[0], ifindex
+
+
+def ifname_for_index(ifindex: int) -> str:
+    """ifindex → name. Returns '' if not found."""
+    if ifindex <= 0:
+        return ""
+    try:
+        return socket.if_indextoname(ifindex)
+    except OSError:
+        return ""
 
 
 def join_group_on(sock: socket.socket, nic: str) -> None:
@@ -356,7 +414,10 @@ def join_group_on(sock: socket.socket, nic: str) -> None:
     so we swallow the EADDRINUSE."""
     try:
         if_index = socket.if_nametoindex(nic)
-        mreq = struct.pack("4sLi", socket.inet_aton(PROBE_GROUP), 0, if_index)
+        mreq = struct.pack("4s4sI",
+                            socket.inet_aton(PROBE_GROUP),
+                            socket.inet_aton("0.0.0.0"),
+                            if_index)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     except OSError as e:
         if "Address already in use" in str(e) or e.errno == 98:
@@ -367,7 +428,10 @@ def join_group_on(sock: socket.socket, nic: str) -> None:
 def leave_group_on(sock: socket.socket, nic: str) -> None:
     try:
         if_index = socket.if_nametoindex(nic)
-        mreq = struct.pack("4sLi", socket.inet_aton(PROBE_GROUP), 0, if_index)
+        mreq = struct.pack("4s4sI",
+                            socket.inet_aton(PROBE_GROUP),
+                            socket.inet_aton("0.0.0.0"),
+                            if_index)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
     except OSError:
         pass
@@ -464,22 +528,23 @@ def run_daemon():
 
 
 def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
-    # Drain any waiting probes (non-blocking thanks to settimeout).
+    # Drain any waiting probes. recvmsg + IP_PKTINFO so we know which
+    # local NIC each probe arrived on — the only reliable way when all
+    # mesh NICs share the same /16 throwaway prefix.
     while True:
-        try:
-            buf, addr = d.recv_sock.recvfrom(2048)
-        except (socket.timeout, BlockingIOError):
+        data, src_addr, ifindex = recv_with_ifindex(d.recv_sock)
+        if data is None:
             break
-        except OSError:
-            break
-        body = decode_probe(buf, key=d.cluster_key)
+        body = decode_probe(data, key=d.cluster_key)
         if not body:
             continue
         if body.get("cluster_uuid") != d.cluster_uuid:
             continue
         if body.get("node") == d.my_node:
             continue  # don't talk to ourselves
-        process_probe(d, body, sender_link_addr=addr[0])
+        my_nic = ifname_for_index(ifindex) if ifindex else ""
+        process_probe(d, body, sender_link_addr=src_addr or "",
+                      my_nic_hint=my_nic)
 
     # Refresh loopback assignment if we couldn't on startup.
     if not d.my_loopback:
@@ -549,21 +614,27 @@ def send_probes(d: Daemon, now: float) -> None:
             pass
 
 
-def process_probe(d: Daemon, body: dict, sender_link_addr: str) -> None:
+def process_probe(d: Daemon, body: dict, sender_link_addr: str,
+                  my_nic_hint: str = "") -> None:
     """Update or insert a Neighbour for an incoming probe. Schedules
-    nothing; the hysteresis sweep decides when to emit log entries."""
+    nothing; the hysteresis sweep decides when to emit log entries.
+
+    `my_nic_hint` comes from IP_PKTINFO and is the source of truth for
+    which interface received this probe. The IP-subnet fallback is
+    only a safety net for kernels/configs that don't report PKTINFO.
+    """
     peer_node = body["node"]
     peer_nic  = body["nic"]
     peer_loopback = body["loopback"]
     peer_link_addr = body.get("link_addr", "") or sender_link_addr
-    # Which of OUR nics did this probe arrive on? We can derive it by
-    # finding which nic's throwaway-prefix subnet contains the
-    # sender_link_addr (cheap and works because every nic is on its
-    # own L2 segment with our throwaway scheme). Fallback: pick the
-    # nic whose existing neighbour set claims this peer most recently.
-    my_nic = nic_for_sender(d, sender_link_addr)
+    my_nic = my_nic_hint or nic_for_sender(d, sender_link_addr)
     if not my_nic:
         return
+    if my_nic not in d.nic_addrs:
+        # Probe arrived on an interface we haven't claimed yet —
+        # could be the LAN side which has no throwaway. Still record
+        # it; tick will reconcile nic_addrs on the next sweep.
+        pass
 
     key = (peer_node, peer_nic, my_nic)
     now = time.time()
@@ -638,12 +709,14 @@ def sweep_hysteresis(d: Daemon) -> None:
             continue
 
         # Up hysteresis: continuously seen for the up threshold AND not
-        # yet logged → emit LINK_UP.
+        # yet logged → emit LINK_UP. Set logged_up only on append
+        # success; transient IPC failures (bedrock-rust restart, etc.)
+        # then retry on the next sweep.
         age_since_first = now - (n.first_seen or 0.0)
         if not n.logged_up and age_since_first >= UP_HYSTERESIS_S:
-            n.logged_up = True
-            emit_link_event("up", d, n)
-            n.last_quality_log = now
+            if emit_link_event("up", d, n):
+                n.logged_up = True
+                n.last_quality_log = now
             continue
 
         # Quality refresh: stable + ≥ refresh interval since last log
@@ -660,11 +733,13 @@ def sweep_hysteresis(d: Daemon) -> None:
         d.neighbours.pop(key, None)
 
 
-def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> None:
+def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> bool:
     """Append a LINK_UP / LINK_DOWN / LINK_QUALITY entry to the log via
-    rust_ipc. Best-effort: if the daemon socket is missing or the
-    write fails, log to stderr — we'll catch up on the next sweep
-    once the daemon is reachable."""
+    rust_ipc. Returns True on a successful append, False if the IPC
+    failed (caller decides whether to retry next sweep). Errors at this
+    layer are usually transient — bedrock-rust restart, daemon.toml
+    reload, etc. — so callers should NOT mark the event as 'logged'
+    unless we successfully persisted it."""
     try:
         from . import log_entries as le, rust_ipc
     except ImportError:
@@ -697,21 +772,20 @@ def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> Non
             observed_at=ts,
         )
     else:
-        return
+        return False
 
     try:
         with rust_ipc.Daemon() as drd:
             idx, _h = drd.append(payload)
         print(f"bedrock-net: {kind} {n.peer_node}.{n.peer_nic}↔{d.my_node}.{n.my_nic} idx={idx}",
               file=sys.stderr, flush=True)
+        return True
     except Exception as e:
-        # The append is symmetric — if both ends emit on different
-        # ticks we'll get two entries. The fold is idempotent on
-        # repeats of the same (a,b,nic_a,nic_b) so this is harmless.
-        # We use a try/except because in N=1 the daemon is leader on
-        # every node, and we don't want a transient IPC error to
-        # crash the daemon — next sweep retries.
+        # Transient IPC error — caller should retry next sweep. Don't
+        # spam the journal: rate-limit the log line to once per minute
+        # per (kind, peer) by stashing on Neighbour.
         sys.stderr.write(f"bedrock-net: append {kind} failed: {e!r}\n")
+        return False
 
 
 # ── Routing ──────────────────────────────────────────────────────────
