@@ -54,6 +54,13 @@ NODE_DISK_GB = 130
 
 MGMT_NET = "bedrock-mgmt"
 DRBD_NET = "bedrock-drbd"
+# Mesh networks: every sim plugs into all three. Each is an isolated L2
+# segment, so every sim pair shares a path through each of them. Yank
+# any one with `virsh net-destroy bedrock-mesh-<n>` to simulate a cable
+# pull on that plane; restore with `net-start`. Three planes is enough
+# to exercise multi-path discovery, prio ordering, and chaos failover
+# without making the libvirt domain XML unreasonable.
+MESH_NETS = ["bedrock-mesh-1", "bedrock-mesh-2", "bedrock-mesh-3"]
 DRBD_PREFIX = "10.99.0"  # node i gets DRBD_PREFIX + .{10+i-1}
 
 # Static LAN IPs for the sims (br0). The home router's DHCP pool ends
@@ -227,6 +234,8 @@ def create_node(i: int, all_indices: list[int]):
              "--disk", f"path={iso_path},device=cdrom",
              "--network", f"network={MGMT_NET},model=virtio",
              "--network", f"network={DRBD_NET},model=virtio",
+             *[a for mesh in MESH_NETS
+                 for a in ("--network", f"network={mesh},model=virtio")],
              "--os-variant", "almalinux10",
              "--graphics", "none",
              "--console", "pty,target_type=serial",
@@ -256,6 +265,16 @@ def create_node(i: int, all_indices: list[int]):
             capture=False)
 
     print(f"  Defining {hostname} (bedrock-install ISO)...")
+    # Network NIC order matters for predictable interface naming inside the
+    # guest: enp1s0 = mgmt LAN, enp2s0 = legacy DRBD bridge (kept for
+    # transitional state — bedrock-net will treat it as just another mesh
+    # plane), enp3s0/4/5 = bedrock-mesh-{1,2,3}. Every sim is on every mesh
+    # plane, giving 4 paths between every pair plus the LAN.
+    net_args = []
+    net_args += ["--network", f"network={MGMT_NET},model=virtio"]
+    net_args += ["--network", f"network={DRBD_NET},model=virtio"]
+    for mesh in MESH_NETS:
+        net_args += ["--network", f"network={mesh},model=virtio"]
     run(["sudo", "virt-install",
          "--name", hostname,
          "--memory", str(NODE_RAM_MB),
@@ -263,8 +282,7 @@ def create_node(i: int, all_indices: list[int]):
          "--cpu", "host-passthrough",
          "--disk", f"path={disk_path},format=qcow2,bus=virtio,discard=unmap",
          "--cdrom", str(BEDROCK_ISO),
-         "--network", f"network={MGMT_NET},model=virtio",
-         "--network", f"network={DRBD_NET},model=virtio",
+         *net_args,
          "--os-variant", "almalinux10",
          "--graphics", "none",
          "--console", "pty,target_type=serial",

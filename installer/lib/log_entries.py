@@ -52,6 +52,22 @@ PARAM_CHANGE          = "param_change"
 # running without witness arbitration. Reverse on `off`.
 NODE_MAINTENANCE      = "node_maintenance_set"
 
+# Mesh-network path table (bedrock-net daemon). The gossip layer
+# (signed UDP probes) keeps a sub-second view in memory; only durable
+# topology *transitions* — link came up and stayed up past the up-
+# hysteresis window, or stayed down past the down-hysteresis window —
+# get logged. LINK_QUALITY is rate-limited (≤1/min stable, immediate
+# on >25% change in observed speed/RTT) so the log doesn't become a
+# stream of small numerical fluctuations.
+LINK_UP               = "link_up"
+LINK_DOWN             = "link_down"
+LINK_QUALITY          = "link_quality"
+
+# Loopback identity per node (one /32 on `lo`). Set at init/join.
+# Stays in cluster.json forever; per-NIC IPs are throwaway and never
+# logged. View_builder folds NODE_LOOPBACK into nodes[name].loopback_ip.
+NODE_LOOPBACK         = "node_loopback"
+
 # VM task lifecycle (L47). Facts/events: append history, sequence
 # matters. After a crash these let "what was running here when it
 # went down?" be answered from the log alone.
@@ -204,6 +220,52 @@ def vm_state_change(name: str, host: str, state: str) -> bytes:
 
 def node_maintenance(node_name: str, on: bool) -> bytes:
     return encode(NODE_MAINTENANCE, node_name=node_name, on=bool(on))
+
+
+# ── mesh path table (bedrock-net) ─────────────────────────────────────
+
+def link_up(node_a: str, nic_a: str, node_b: str, nic_b: str,
+            speed_mbps: int = 0, rtt_us: int = 0,
+            observed_at: float = 0.0) -> bytes:
+    """A path between (node_a, nic_a) ↔ (node_b, nic_b) has been
+    continuously reachable past the up-hysteresis window. Speed/RTT
+    are *bucketed* observed values (not measured-at-this-instant) so
+    every node folding the log gets the same numbers."""
+    return encode(LINK_UP, node_a=node_a, nic_a=nic_a,
+                  node_b=node_b, nic_b=nic_b,
+                  speed_mbps=int(speed_mbps), rtt_us=int(rtt_us),
+                  observed_at=float(observed_at))
+
+
+def link_down(node_a: str, nic_a: str, node_b: str, nic_b: str,
+              reason: str = "", observed_at: float = 0.0) -> bytes:
+    """A previously-up path has been continuously unreachable past the
+    down-hysteresis window. Removes the path from the snapshot."""
+    return encode(LINK_DOWN, node_a=node_a, nic_a=nic_a,
+                  node_b=node_b, nic_b=nic_b,
+                  reason=reason, observed_at=float(observed_at))
+
+
+def link_quality(node_a: str, nic_a: str, node_b: str, nic_b: str,
+                 speed_mbps: int = 0, rtt_us: int = 0,
+                 observed_at: float = 0.0) -> bytes:
+    """Updated speed/RTT for an up path. Rate-limited per-pair so the
+    log doesn't become a stream of small fluctuations. Bucketed so two
+    nodes don't disagree on tiebreak ordering."""
+    return encode(LINK_QUALITY, node_a=node_a, nic_a=nic_a,
+                  node_b=node_b, nic_b=nic_b,
+                  speed_mbps=int(speed_mbps), rtt_us=int(rtt_us),
+                  observed_at=float(observed_at))
+
+
+def node_loopback(node_name: str, loopback_ip: str) -> bytes:
+    """The cluster identity IP for a node (one /32 on `lo`). Set once
+    at `bedrock init` / `bedrock join` and never changes for the life
+    of the node's membership. All cluster-internal traffic (DRBD,
+    libvirt migration, NFS, SSH) uses this IP as the destination; the
+    routing layer steers it through whichever physical NIC is best."""
+    return encode(NODE_LOOPBACK, node_name=node_name,
+                  loopback_ip=loopback_ip)
 
 
 # ── backup ─────────────────────────────────────────────────────────────

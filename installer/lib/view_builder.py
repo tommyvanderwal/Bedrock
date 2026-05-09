@@ -42,8 +42,24 @@ def empty_snapshot() -> dict:
         "mgmt_master": None,
         "vms": {},
         "backup_targets": {},
+        # paths: keyed by canonical-form (a < b alphabetically) so each
+        # path appears exactly once. Direction-symmetric.
+        # Key = "node_a|nic_a|node_b|nic_b" (always in canonical order).
+        # Value = {speed_mbps, rtt_us, observed_at}.
+        "paths": {},
         "log_index": 0,
     }
+
+
+def _path_key(node_a: str, nic_a: str, node_b: str, nic_b: str) -> str:
+    """Canonical-order key for path table dedup. Sort by (node, nic) tuple
+    so the same physical path is identified the same way no matter which
+    end first reported it."""
+    a = (node_a, nic_a)
+    b = (node_b, nic_b)
+    if a > b:
+        a, b = b, a
+    return f"{a[0]}|{a[1]}|{b[0]}|{b[1]}"
 
 
 def fold(entries: list[dict]) -> dict:
@@ -215,6 +231,35 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
             if n is not None:
                 n["maintenance"] = bool(payload.get("on", False))
 
+        # ── mesh path table ──────────────────────────────────────────
+        elif kind == le.NODE_LOOPBACK:
+            n = out["nodes"].setdefault(payload["node_name"], {})
+            n["loopback_ip"] = payload["loopback_ip"]
+
+        elif kind in (le.LINK_UP, le.LINK_QUALITY):
+            key = _path_key(payload["node_a"], payload["nic_a"],
+                            payload["node_b"], payload["nic_b"])
+            entry_age = float(payload.get("observed_at", 0.0))
+            existing = out["paths"].get(key, {})
+            # LINK_UP creates the entry; LINK_QUALITY only updates if
+            # the entry already exists (we don't want a quality update
+            # to resurrect a path that was explicitly torn down).
+            if kind == le.LINK_QUALITY and not existing:
+                continue
+            out["paths"][key] = {
+                "node_a": payload["node_a"], "nic_a": payload["nic_a"],
+                "node_b": payload["node_b"], "nic_b": payload["nic_b"],
+                "speed_mbps": int(payload.get("speed_mbps", 0)),
+                "rtt_us": int(payload.get("rtt_us", 0)),
+                "observed_at": entry_age,
+                "up_since": existing.get("up_since", entry_age) if kind == le.LINK_QUALITY else entry_age,
+            }
+
+        elif kind == le.LINK_DOWN:
+            key = _path_key(payload["node_a"], payload["nic_a"],
+                            payload["node_b"], payload["nic_b"])
+            out["paths"].pop(key, None)
+
         # ── backup ─────────────────────────────────────────────────
         elif kind == le.BACKUP_TARGET_SET:
             targets = out.setdefault("backup_targets", {})
@@ -372,6 +417,10 @@ def _cluster_view(v: dict) -> dict:
         "params":         v["params"],
         "vms":            v.get("vms", {}),
         "backup_targets": v.get("backup_targets", {}),
+        # Mesh path table — replicated topology, not per-node liveness.
+        # Each node's bedrock-net daemon also keeps a sub-second gossip
+        # view in memory; only durable transitions land here.
+        "paths":          v.get("paths", {}),
         "log_index":      v["log_index"],
     }
 

@@ -1,0 +1,4 @@
+<network>
+  <name>bedrock-mesh-2</name>
+  <bridge name='br-bedmesh2' stp='off' delay='0'/>
+</network>
