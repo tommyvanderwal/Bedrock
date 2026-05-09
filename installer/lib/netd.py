@@ -733,13 +733,31 @@ def sweep_hysteresis(d: Daemon) -> None:
         d.neighbours.pop(key, None)
 
 
+def i_am_mgmt_master(d: Daemon) -> bool:
+    """True if this node currently holds the mgmt-master role per
+    state.json (single-writer source of truth). Followers' bedrock-net
+    keeps its in-memory neighbour table for local routing decisions
+    but does not write to the log — master is the only writer per
+    the cluster's single-writer invariant."""
+    try:
+        state = json.loads(STATE_JSON.read_text())
+        return "mgmt" in (state.get("role") or "")
+    except Exception:
+        return False
+
+
 def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> bool:
     """Append a LINK_UP / LINK_DOWN / LINK_QUALITY entry to the log via
-    rust_ipc. Returns True on a successful append, False if the IPC
-    failed (caller decides whether to retry next sweep). Errors at this
-    layer are usually transient — bedrock-rust restart, daemon.toml
-    reload, etc. — so callers should NOT mark the event as 'logged'
-    unless we successfully persisted it."""
+    rust_ipc. Only the mgmt master writes; followers return True
+    immediately so the hysteresis state machine still records "logged"
+    locally and doesn't keep retrying. The cluster-wide path table is
+    populated by the master observing its own paths and emitting
+    accordingly; followers' own paths reach cluster.json via the
+    master's reciprocal observation. Returns True on success or
+    follower-skip, False on master IPC failure (caller retries next
+    sweep)."""
+    if not i_am_mgmt_master(d):
+        return True  # follower: don't append, but mark as logged
     try:
         from . import log_entries as le, rust_ipc
     except ImportError:
