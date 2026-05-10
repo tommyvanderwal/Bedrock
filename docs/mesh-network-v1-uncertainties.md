@@ -142,6 +142,17 @@ The fix is two simple things: include the sender's `ethtool` speed in
 the probe payload (so receivers learn the peer's link speed, not their
 own), and timestamp send/receive in probes for RTT. Maybe a day's work.
 
+**UPDATE 2026-05-10**: Per-NIC link addresses are now in the path
+table (`link_addr_a` / `link_addr_b` in `LINK_UP` / `LINK_QUALITY`),
+emitted by netd from the actual NIC IPs and folded into the snapshot
+canonicalised. DRBD's `path` blocks now list distinct per-NIC
+addresses (e.g. `10.42.10.1` ↔ `10.42.10.2` for the enp3s0 pair, etc.),
+so DRBD does its own path-level failure detection independently of
+kernel routing. A loopback-fallback path block is still appended last
+as the "if every direct path fails" safety net. Verified live: the
+master's generated drbd.conf has 5 direct path blocks per master-peer
+pair on the testbed, each with the correct per-NIC address pair.
+
 ## 9. IPv6 not supported
 
 Probe codec, route emitter, loopback identity — all hard-coded to IPv4.

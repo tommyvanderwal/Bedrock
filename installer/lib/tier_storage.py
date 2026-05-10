@@ -863,44 +863,46 @@ def _peer_link_addr(snapshot: dict, node: str, nic: str) -> str:
 def render_drbd_res_mesh(resource: str, minor: int,
                           peers: list[dict],
                           snapshot: dict) -> str:
-    """Render a DRBD 9 resource config that uses the cluster's loopback
-    identity addresses for replication. The mesh path table drives
-    *kernel routing* (via bedrock-net's metric-ordered host routes),
-    not DRBD's own multi-path feature.
+    """Render a DRBD 9 multi-path resource config from the mesh path
+    table.
 
-    Why one path, not many: DRBD's multi-path requires each `path`
-    block to list two genuinely-different addresses (one per side) so
-    DRBD can detect path-level failure independently. Without per-NIC
-    link addresses in the path table, every block we'd emit would
-    list the same loopback pair — DRBD would treat them as redundant
-    no-ops or, worse, send out duplicate replication traffic. Cleaner
-    layering: DRBD opens one connection to peer.loopback_ip; the
-    kernel route to that loopback is whichever physical NIC bedrock-
-    net picked; if that NIC dies, the kernel auto-promotes the next
-    metric route within ~1 s and the same TCP connection can survive
-    or DRBD reconnects on its own next probe.
+    Per peer pair, emits one `connection` with one `path` block per
+    direct (nic_a, nic_b) pair the path table observed — each path's
+    addresses are the actual per-NIC link IPs (10.42.X.Y throwaways
+    or DHCP IPs on the LAN). DRBD treats each path as a genuinely
+    independent transport: separate TCP, separate keepalives, its
+    own carrier/timeout detection. Failover between paths is DRBD's
+    job at this point; the kernel routing layer is bypassed for the
+    physical NIC choice on these paths.
 
-    A future commit will add per-NIC link addresses to LINK_QUALITY
-    so this function can emit truly-distinct `path` blocks and let
-    DRBD do its own path-level failure detection — until then,
-    composing kernel routing under DRBD is correct and verifiable.
+    A final loopback-fallback path block is always appended last:
+    `host A address <A.loopback>:port; host B address <B.loopback>:port;`.
+    This relies on the kernel route table (driven by bedrock-net's
+    panic-neighbour catch-all) so DRBD can still reach the peer even
+    when every direct path is down — including via transit through a
+    third node. The loopback-fallback path is at the end of the list,
+    so DRBD only uses it after all direct paths fail.
+
+    Both halves contribute to robustness:
+      - direct path blocks → DRBD's own failover, which can detect
+        a NIC that's link-up-but-dead in ms (TCP keepalive)
+      - loopback fallback → the catch-all that survives transit
+        topologies and arbitrary NIC layouts
 
     Inputs:
-      peers — [{name, drbd_ip, loopback_ip}, ...]; drbd_ip kept as
-              the canonical address for the `on` block; loopback_ip
-              is preferred for the connection (so the bedrock-net
-              routing layer is what steers replication), with
-              drbd_ip as a fallback when no loopback is allocated.
-      snapshot — kept in the signature for the future per-NIC variant;
-                 currently only used to count discovered paths for
-                 the comment header (visibility, not config).
+      peers — [{name, drbd_ip, loopback_ip}, ...]
+      snapshot — view_builder.fold output, must include `paths`
     """
     on_blocks = []
     peer_ids: dict[str, int] = {}
     for p in peers:
         nid = get_drbd_node_id(resource, p["name"])
         peer_ids[p["name"]] = nid
-        anchor_addr = p.get("drbd_ip") or p.get("loopback_ip", "")
+        # `on` block keeps a single address (DRBD requires it). We
+        # use loopback so the address is stable across NIC churn —
+        # peers that need to dial this node use whichever path is
+        # best per the kernel routing layer.
+        anchor_addr = p.get("loopback_ip", "") or p.get("drbd_ip", "")
         on_blocks.append(
             f'  on {p["name"]} {{\n'
             f'    node-id   {nid};\n'
@@ -917,28 +919,60 @@ def render_drbd_res_mesh(resource: str, minor: int,
     for i in range(len(peers)):
         for j in range(i + 1, len(peers)):
             a, b = peers[i], peers[j]
-            # Prefer loopback for the replication target — that way
-            # the kernel routing layer (driven by bedrock-net) picks
-            # the actual physical NIC. drbd_ip is the fallback for
-            # nodes whose loopback hasn't been allocated yet (e.g.
-            # mid-join).
-            addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
-            addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
-            n_observed = len(_direct_paths_between(snapshot, a["name"], b["name"]))
-            comment = (
-                f'    # {n_observed} direct mesh path(s) observed between '
-                f'{a["name"]}↔{b["name"]}; replication uses the loopback '
-                f'address pair, kernel routing chooses the physical NIC.\n'
-                if n_observed
-                else
-                f'    # No direct mesh paths observed yet; relying on the '
-                f'panic-neighbour catch-all route from bedrock-net.\n'
-            )
+            paths = _direct_paths_between(snapshot, a["name"], b["name"])
+            path_blocks: list[str] = []
+            seen_pairs: set[tuple[str, str, str, str]] = set()
+
+            for p in paths:
+                # Path entries are stored canonically (node_a < node_b),
+                # so map a/b in our loop to the entry's a/b.
+                if p.get("node_a") == a["name"]:
+                    nic_a = p.get("nic_a", "")
+                    nic_b = p.get("nic_b", "")
+                    addr_a = p.get("link_addr_a", "")
+                    addr_b = p.get("link_addr_b", "")
+                else:
+                    nic_a = p.get("nic_b", "")
+                    nic_b = p.get("nic_a", "")
+                    addr_a = p.get("link_addr_b", "")
+                    addr_b = p.get("link_addr_a", "")
+                # Skip if we don't have both addresses — fold's
+                # backwards-compat path leaves them empty when
+                # observing an old log entry without link_addr_*.
+                if not addr_a or not addr_b:
+                    continue
+                key = (nic_a, addr_a, nic_b, addr_b)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                path_blocks.append(
+                    f'    path {{\n'
+                    f'      # via {nic_a}↔{nic_b}\n'
+                    f'      host {a["name"]} address {addr_a}:{port};\n'
+                    f'      host {b["name"]} address {addr_b}:{port};\n'
+                    f'    }}\n'
+                )
+
+            # Always-last loopback fallback. Uses peer.loopback_ip on
+            # both sides; the kernel route to that /32 is the panic-
+            # neighbour catch-all when no direct path is healthy. This
+            # ensures DRBD can still establish the connection even
+            # when every direct mesh path is down or hasn't been
+            # observed yet (fresh cluster, mid-rejoin, etc.).
+            lb_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
+            lb_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
+            if lb_a and lb_b:
+                path_blocks.append(
+                    f'    path {{\n'
+                    f'      # loopback fallback (kernel routes via best NIC)\n'
+                    f'      host {a["name"]} address {lb_a}:{port};\n'
+                    f'      host {b["name"]} address {lb_b}:{port};\n'
+                    f'    }}\n'
+                )
+
             conn_blocks.append(
                 f'  connection {{\n' +
-                comment +
-                f'    host {a["name"]} address {addr_a}:{port};\n'
-                f'    host {b["name"]} address {addr_b}:{port};\n'
+                ''.join(path_blocks) +
                 f'  }}\n'
             )
 

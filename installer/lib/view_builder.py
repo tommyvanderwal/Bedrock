@@ -237,8 +237,18 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
             n["loopback_ip"] = payload["loopback_ip"]
 
         elif kind in (le.LINK_UP, le.LINK_QUALITY):
-            key = _path_key(payload["node_a"], payload["nic_a"],
-                            payload["node_b"], payload["nic_b"])
+            # Canonicalise (a, b) so the same physical path is always
+            # stored with the same orientation. Whoever wrote the
+            # entry got to pick "I'm node_a", but folding swaps them
+            # to alphabetical order so per-side addresses line up
+            # with whichever node the consumer cares about.
+            na, nia = payload["node_a"], payload["nic_a"]
+            nb, nib = payload["node_b"], payload["nic_b"]
+            la = payload.get("link_addr_a", "") or ""
+            lb = payload.get("link_addr_b", "") or ""
+            if (na, nia) > (nb, nib):
+                na, nia, la, nb, nib, lb = nb, nib, lb, na, nia, la
+            key = _path_key(na, nia, nb, nib)
             entry_age = float(payload.get("observed_at", 0.0))
             existing = out["paths"].get(key, {})
             # LINK_UP creates the entry; LINK_QUALITY only updates if
@@ -247,8 +257,8 @@ def fold_into(out: dict, entries: list[dict]) -> dict:
             if kind == le.LINK_QUALITY and not existing:
                 continue
             out["paths"][key] = {
-                "node_a": payload["node_a"], "nic_a": payload["nic_a"],
-                "node_b": payload["node_b"], "nic_b": payload["nic_b"],
+                "node_a": na, "nic_a": nia, "link_addr_a": la,
+                "node_b": nb, "nic_b": nib, "link_addr_b": lb,
                 "speed_mbps": int(payload.get("speed_mbps", 0)),
                 "rtt_us": int(payload.get("rtt_us", 0)),
                 "observed_at": entry_age,

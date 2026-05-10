@@ -768,10 +768,12 @@ def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> boo
         from lib import log_entries as le, rust_ipc  # type: ignore
 
     ts = time.time()
+    my_link_addr = d.nic_addrs.get(n.my_nic, "")
     if kind == "up":
         payload = le.link_up(
             node_a=d.my_node, nic_a=n.my_nic,
             node_b=n.peer_node, nic_b=n.peer_nic,
+            link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
             speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
             observed_at=ts,
         )
@@ -786,6 +788,7 @@ def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> boo
         payload = le.link_quality(
             node_a=d.my_node, nic_a=n.my_nic,
             node_b=n.peer_node, nic_b=n.peer_nic,
+            link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
             speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
             observed_at=ts,
         )

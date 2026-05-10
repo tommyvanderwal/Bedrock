@@ -225,14 +225,26 @@ def node_maintenance(node_name: str, on: bool) -> bytes:
 # ── mesh path table (bedrock-net) ─────────────────────────────────────
 
 def link_up(node_a: str, nic_a: str, node_b: str, nic_b: str,
+            link_addr_a: str = "", link_addr_b: str = "",
             speed_mbps: int = 0, rtt_us: int = 0,
             observed_at: float = 0.0) -> bytes:
     """A path between (node_a, nic_a) ↔ (node_b, nic_b) has been
-    continuously reachable past the up-hysteresis window. Speed/RTT
-    are *bucketed* observed values (not measured-at-this-instant) so
+    continuously reachable past the up-hysteresis window.
+
+    link_addr_a / link_addr_b are the per-NIC IPs each side uses on
+    that L2 segment (typically a 10.42.X.Y throwaway, sometimes a
+    DHCP-assigned LAN IP). They are the actual addresses that
+    multi-path-aware protocols like DRBD need in their `path` blocks
+    so the protocol can detect path-level failure independently of
+    kernel routing. Empty strings are accepted for backwards-compat
+    with older bedrock-net versions; the fold treats them as 'use
+    loopback as fallback'.
+
+    Speed/RTT are bucketed values, not measured-at-this-instant, so
     every node folding the log gets the same numbers."""
     return encode(LINK_UP, node_a=node_a, nic_a=nic_a,
                   node_b=node_b, nic_b=nic_b,
+                  link_addr_a=link_addr_a, link_addr_b=link_addr_b,
                   speed_mbps=int(speed_mbps), rtt_us=int(rtt_us),
                   observed_at=float(observed_at))
 
@@ -247,13 +259,16 @@ def link_down(node_a: str, nic_a: str, node_b: str, nic_b: str,
 
 
 def link_quality(node_a: str, nic_a: str, node_b: str, nic_b: str,
+                 link_addr_a: str = "", link_addr_b: str = "",
                  speed_mbps: int = 0, rtt_us: int = 0,
                  observed_at: float = 0.0) -> bytes:
-    """Updated speed/RTT for an up path. Rate-limited per-pair so the
-    log doesn't become a stream of small fluctuations. Bucketed so two
-    nodes don't disagree on tiebreak ordering."""
+    """Updated speed/RTT (and refreshed link addresses) for an up
+    path. Per-NIC IPs may legitimately drift between probes (DHCP
+    lease change, throwaway re-derivation after MAC change), so
+    LINK_QUALITY carries them too — the fold uses the latest values."""
     return encode(LINK_QUALITY, node_a=node_a, nic_a=nic_a,
                   node_b=node_b, nic_b=nic_b,
+                  link_addr_a=link_addr_a, link_addr_b=link_addr_b,
                   speed_mbps=int(speed_mbps), rtt_us=int(rtt_us),
                   observed_at=float(observed_at))
 
