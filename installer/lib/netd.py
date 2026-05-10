@@ -743,6 +743,13 @@ def _nic_in_subnet(d: Daemon, sender_addr: str, mask_len: int) -> str:
     return ""
 
 
+def _peer_in_local_subnet(d: Daemon, peer_addr: str) -> bool:
+    """True if peer_addr is on the same /24 as one of our own NIC IPs.
+    Used to skip installing a /32 host route when the kernel's
+    connected-route handles it already (typical LAN bridge case)."""
+    return bool(_nic_in_subnet(d, peer_addr, 24))
+
+
 # ── Hysteresis + log emission ────────────────────────────────────────
 
 def sweep_hysteresis(d: Daemon) -> None:
@@ -909,8 +916,23 @@ def emit_routes(d: Daemon) -> None:
 
 def compute_routes(d: Daemon) -> list[str]:
     """Return a list of route specs (each is a string usable as the
-    args to `ip route replace`). Loopback /32 per peer with monotonic
-    metrics + a panic /24 catch-all."""
+    args to `ip route replace`). Two route classes:
+
+      1. **Per-peer-link host routes.** For every observed direct
+         path, install `<peer_link_addr>/32 dev <my_nic> scope link`.
+         This is what makes DRBD's `path { host A address 169.254.X.Y }`
+         resolve to the correct physical exit interface — without
+         these /32s, the kernel's auto-installed `169.254.0.0/16
+         dev <some_nic>` routes are ambiguous when multiple NICs
+         have link-local addresses, and the kernel could send a
+         peer-bound packet out the wrong wire (where ARP fails).
+         The /32 is more specific than the /16 and wins by
+         longest-prefix-match regardless of metric.
+      2. **Loopback /32 per peer with monotonic metrics + panic /24
+         catch-all.** Drives general cluster traffic to the right
+         physical NIC for protocols that talk to peer.loopback_ip
+         (libvirt migration, NFS, SSH, garage, the bedrock dashboard).
+    """
     routes: list[str] = []
 
     # Group neighbours by peer_node, sorted by speed desc, rtt asc.
@@ -922,7 +944,23 @@ def compute_routes(d: Daemon) -> list[str]:
             continue
         by_peer.setdefault(n.peer_node, []).append(n)
 
-    # Stable sort across nodes for determinism.
+    # 1. Per-peer-link host routes (scope link, no via — ARP target).
+    #    Bind each peer link address to the local NIC that observed
+    #    its probe so DRBD's path blocks resolve unambiguously.
+    for n in d.neighbours.values():
+        if not n.logged_up or not n.peer_link_addr:
+            continue
+        # Don't install a /32 for an address that lives on the same
+        # /24 as one of our own NICs (typical LAN bridge case): the
+        # kernel's auto-route already handles it. Skipping avoids
+        # fighting the kernel's connected-route logic.
+        if not n.peer_link_addr.startswith("169.254.") and \
+           _peer_in_local_subnet(d, n.peer_link_addr):
+            continue
+        spec = f"{n.peer_link_addr}/32 dev {n.my_nic} scope link"
+        routes.append(spec)
+
+    # 2. Stable sort across nodes for determinism, then loopback /32s.
     for peer, lst in by_peer.items():
         lst.sort(key=lambda x: (
             -x.speed_mbps if x.speed_mbps else 0,
@@ -957,24 +995,37 @@ def compute_routes(d: Daemon) -> list[str]:
 
 def current_cluster_routes() -> list[str]:
     """Read existing kernel routes that bedrock-net manages. We
-    identify our routes by destination match: 10.99.0.0/24 (panic) or
-    any /32 inside 10.99.0.0/24 (per-peer)."""
+    identify our routes by destination match:
+      * 10.99.0.0/24 panic catch-all
+      * /32 inside 10.99.0.0/24 (per-peer loopback)
+      * /32 inside 169.254.0.0/16 with `scope link` (per-peer
+        link-local — the kernel's auto-installed /16 connected
+        routes don't have a /32 prefix, so we don't trip on them)
+    """
     out = subprocess.run(
         ["ip", "-4", "route", "show"],
         capture_output=True, text=True,
     ).stdout
     keep = []
     for line in out.splitlines():
-        # Lines look like: "10.99.0.5 via 10.42.7.42 dev enp3s0 metric 10"
-        # or "10.99.0.0/24 via ... metric 999"
-        if not line.startswith(("10.99.0.")):
+        # Lines look like:
+        #   "10.99.0.5 via 169.254.42.7 dev enp3s0 metric 10"
+        #   "10.99.0.0/24 via ... metric 999"
+        #   "169.254.165.122 dev enp2s0 scope link"  (our peer-link /32)
+        line = line.strip()
+        if line.startswith("10.99.0."):
+            if " src " in line:  # someone added a src that isn't ours
+                continue
+            keep.append(line)
             continue
-        if " src " in line:  # someone added a src that isn't ours
+        if line.startswith("169.254.") and " scope link" in line:
+            # Only /32 host routes are ours; the kernel's auto
+            # /16 connected route shows up as "169.254.0.0/16 dev …"
+            # which we leave alone.
+            head = line.split()[0]
+            if "/" not in head:  # bare IP (no prefix shown) → /32
+                keep.append(line)
             continue
-        # Drop the leading proto/scope fields ip route show inserts
-        # for static routes — `ip route replace` accepts the simple
-        # form. We canonicalise to "<dest> via <gw> dev <if> metric N".
-        keep.append(line.strip())
     return keep
 
 
