@@ -750,6 +750,117 @@ def _peer_in_local_subnet(d: Daemon, peer_addr: str) -> bool:
     return bool(_nic_in_subnet(d, peer_addr, 24))
 
 
+def arp_force_renumber(target_addr: str, dev: str) -> None:
+    """RFC 3927 §2.5 countermeasure for a cross-segment IPv4 link-local
+    collision.
+
+    Two peers on different L2 segments — say peer_X on mesh-1 and
+    peer_Y on mesh-2 — independently negotiated the same 169.254.X.Y.
+    Within-segment ARP didn't catch it because the segments are
+    isolated; bedrock-net detected it by a /32 host-route conflict on
+    THIS node (which has interfaces on both segments).
+
+    The cleanest way to break the tie is to use APIPA's own defense
+    mechanism: emit a gratuitous ARP announcement on the loser's
+    segment claiming `target_addr`. The loser's stack sees a
+    different MAC asserting its own IP, defends once per RFC 3927,
+    sees the announcement persist on retry, and renumbers via fresh
+    ARP-probe round.
+
+    We use OUR OWN MAC for the announcement. Two IPs on one MAC is
+    legal — the loser's stack only cares that the MAC differs from
+    its own, not whether the announcer "really" owns the address.
+    Logged loud so an operator inspecting the journal sees what
+    happened.
+
+    Sends two announcements 0.5 s apart — first triggers the loser's
+    one-shot defense, second pushes them into the renumber path.
+    """
+    if not target_addr.startswith("169.254."):
+        return  # not a link-local target; nothing to renumber
+    my_mac_str = get_mac(dev)
+    if not my_mac_str:
+        return
+    try:
+        my_mac = bytes.fromhex(my_mac_str.replace(":", ""))
+    except ValueError:
+        return
+    bcast = b"\xff" * 6
+    addr_bytes = socket.inet_aton(target_addr)
+
+    # Gratuitous ARP announcement (op=2/reply, sender_ip == target_ip):
+    #   "I am <target_addr> at <my_mac>".
+    # RFC 3927 §2.4 + §2.5: any host claiming the same address sees
+    # this and either defends once (which we ignore) or renumbers.
+    arp = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1,       # htype = Ethernet
+        0x0800,  # ptype = IPv4
+        6, 4,    # hlen / plen
+        2,       # op = reply
+        my_mac, addr_bytes,   # sender hw / proto
+        bcast,   addr_bytes,  # target hw / proto (broadcast)
+    )
+    frame = bcast + my_mac + b"\x08\x06" + arp
+
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    try:
+        s.bind((dev, 0x0806))
+        for _ in range(2):
+            s.send(frame)
+            time.sleep(0.5)
+    finally:
+        s.close()
+
+
+# Per-/32 deduplication state — addrs we've already either installed
+# or engaged the renumber countermeasure on this sweep. Reset each
+# call to compute_routes(); persisting across sweeps would re-engage
+# every tick while the colliding peer is still mid-renumber.
+def _detect_and_handle_ll_collision(routes: list[str], seen: dict[str, str],
+                                     n: "Neighbour", d: "Daemon") -> bool:
+    """Decide whether to add the /32 for `n.peer_link_addr` to `routes`.
+
+    - First time we see this address: record (addr → my_nic) in `seen`,
+      append the /32, return True.
+    - Same address, same nic: duplicate entry within sweep, skip.
+    - Same address, different nic: cross-segment collision. Engage
+      ARP-based renumber countermeasure (RFC 3927 §2.5) on the
+      newly-arrived path's nic. Don't append a /32 — the peer will
+      renumber within ~5 s and the next sweep will install fresh.
+    """
+    addr = n.peer_link_addr
+    if not addr:
+        return False
+    prev_nic = seen.get(addr)
+    if prev_nic is None:
+        seen[addr] = n.my_nic
+        routes.append(f"{addr}/32 dev {n.my_nic} scope link")
+        return True
+    if prev_nic == n.my_nic:
+        return False  # duplicate within sweep
+    # Cross-segment collision.
+    sys.stderr.write(
+        f"bedrock-net: LL COLLISION DETECTED — {addr} reachable via "
+        f"both {prev_nic} (first peer) and {n.my_nic} (peer "
+        f"{n.peer_node}.{n.peer_nic}); engaging ARP-defense "
+        f"countermeasure on {n.my_nic} to force renumber.\n"
+    )
+    try:
+        arp_force_renumber(addr, n.my_nic)
+        sys.stderr.write(
+            f"bedrock-net: countermeasure complete on {n.my_nic}; "
+            f"expecting peer to renumber within ~5 s.\n"
+        )
+    except OSError as e:
+        sys.stderr.write(
+            f"bedrock-net: ARP countermeasure failed on {n.my_nic}: "
+            f"{e}; cluster will keep working via other paths but "
+            f"this peer-link stays unrouted until renumber.\n"
+        )
+    return False
+
+
 # ── Hysteresis + log emission ────────────────────────────────────────
 
 def sweep_hysteresis(d: Daemon) -> None:
@@ -947,18 +1058,18 @@ def compute_routes(d: Daemon) -> list[str]:
     # 1. Per-peer-link host routes (scope link, no via — ARP target).
     #    Bind each peer link address to the local NIC that observed
     #    its probe so DRBD's path blocks resolve unambiguously.
+    #    Cross-segment LL collisions get caught here and resolved by
+    #    ARP-defense countermeasure (see arp_force_renumber).
+    seen_link_addrs: dict[str, str] = {}
     for n in d.neighbours.values():
         if not n.logged_up or not n.peer_link_addr:
             continue
-        # Don't install a /32 for an address that lives on the same
-        # /24 as one of our own NICs (typical LAN bridge case): the
-        # kernel's auto-route already handles it. Skipping avoids
-        # fighting the kernel's connected-route logic.
         if not n.peer_link_addr.startswith("169.254.") and \
            _peer_in_local_subnet(d, n.peer_link_addr):
+            # LAN bridge case — kernel's connected /24 already handles
+            # it; our /32 would just duplicate.
             continue
-        spec = f"{n.peer_link_addr}/32 dev {n.my_nic} scope link"
-        routes.append(spec)
+        _detect_and_handle_ll_collision(routes, seen_link_addrs, n, d)
 
     # 2. Stable sort across nodes for determinism, then loopback /32s.
     for peer, lst in by_peer.items():
