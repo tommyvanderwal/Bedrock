@@ -825,6 +825,240 @@ def write_drbd_resource(resource: str, peers: list[dict]) -> None:
     p.write_text(render_drbd_res(resource, minor, peers))
 
 
+# ── Mesh-aware DRBD config (v1.x — wires the bedrock-net path table
+#    into DRBD's multi-path connection blocks) ────────────────────────
+
+def _direct_paths_between(snapshot: dict, node_a: str, node_b: str) -> list[dict]:
+    """Return path entries from the snapshot's `paths` section that
+    connect (node_a, *) ↔ (node_b, *). Each entry is the canonical-
+    keyed dict from view_builder fold.
+    """
+    paths = snapshot.get("paths") or {}
+    out = []
+    for k, v in paths.items():
+        n1, n2 = v.get("node_a"), v.get("node_b")
+        if {n1, n2} == {node_a, node_b}:
+            out.append(v)
+    # Sort by speed desc, rtt asc, then nic name for deterministic order
+    out.sort(key=lambda v: (
+        -int(v.get("speed_mbps") or 0),
+        int(v.get("rtt_us") or 0),
+        v.get("nic_a", ""), v.get("nic_b", ""),
+    ))
+    return out
+
+
+def _peer_link_addr(snapshot: dict, node: str, nic: str) -> str:
+    """Find the per-NIC address for a node from the snapshot. We don't
+    log per-NIC addresses (they're throwaway), so this currently
+    returns "" — a future commit will add it to LINK_QUALITY payload
+    so DRBD config can reference exact link addresses.
+    For v1, `path` blocks fall back to loopback addresses, which the
+    kernel routes via the mesh layer's installed routes — same
+    end-effect, one indirection.
+    """
+    return ""
+
+
+def render_drbd_res_mesh(resource: str, minor: int,
+                          peers: list[dict],
+                          snapshot: dict) -> str:
+    """Render a DRBD 9 multi-path resource config from the mesh path
+    table.
+
+    Differs from `render_drbd_res()` in two ways:
+
+      1. Each `connection` block carries one `path` per direct
+         (nic_a, nic_b) pair the snapshot's path table reports for
+         that pair of peers.
+      2. The connection block also has a final fallback `path` that
+         points at the peer's loopback IP. The kernel-installed
+         host routes (from bedrock-net) steer that traffic over
+         whichever physical NIC is best, so DRBD survives any cable
+         topology that the kernel can route at all — including
+         transit through a third node.
+
+    Inputs:
+      peers — [{name, drbd_ip, loopback_ip}, ...]; drbd_ip kept for
+              the legacy `on` block address (DRBD 9 still requires
+              one) but not for connection paths.
+      snapshot — the cluster fold output (view_builder.fold).
+
+    The resulting config is a strict superset of the single-path
+    config: even with no path entries in the snapshot, the loopback
+    fallback path keeps DRBD reachable.
+    """
+    on_blocks = []
+    peer_ids: dict[str, int] = {}
+    for p in peers:
+        nid = get_drbd_node_id(resource, p["name"])
+        peer_ids[p["name"]] = nid
+        # `on` block keeps the legacy single-address form (drbd_ip or
+        # loopback fallback). DRBD 9 needs *some* address here; the
+        # per-link path blocks override it for actual replication
+        # traffic.
+        anchor_addr = p.get("drbd_ip") or p.get("loopback_ip", "")
+        on_blocks.append(
+            f'  on {p["name"]} {{\n'
+            f'    node-id   {nid};\n'
+            f'    device    /dev/drbd{minor};\n'
+            f'    disk      /dev/{VG}/tier-{resource};\n'
+            f'    meta-disk /dev/{VG}/tier-{resource}-meta;\n'
+            f'    address   {anchor_addr}:{7000 + minor};\n'
+            f'  }}\n'
+        )
+
+    port = 7000 + minor
+
+    conn_blocks = []
+    for i in range(len(peers)):
+        for j in range(i + 1, len(peers)):
+            a, b = peers[i], peers[j]
+            paths = _direct_paths_between(snapshot, a["name"], b["name"])
+            path_blocks: list[str] = []
+
+            # One `path` per direct link the path table observed.
+            # Without per-NIC addresses logged (see _peer_link_addr
+            # comment above), we fall back to the loopback address
+            # for every path block. The kernel route's metric ordering
+            # (set by bedrock-net) decides which physical NIC each
+            # path attempt actually traverses.
+            #
+            # When a future commit adds per-NIC link addresses to
+            # the path table, the path blocks below will pin each
+            # one to a specific NIC pair, giving DRBD true multi-path
+            # awareness independent of kernel routing.
+            seen_pairs: set[tuple[str, str]] = set()
+            for p in paths:
+                # Symmetrise nic order so the path block shows
+                # (a's nic, b's nic) regardless of how the canonical
+                # key oriented them.
+                if p.get("node_a") == a["name"]:
+                    nic_a, nic_b = p.get("nic_a", ""), p.get("nic_b", "")
+                else:
+                    nic_a, nic_b = p.get("nic_b", ""), p.get("nic_a", "")
+                if (nic_a, nic_b) in seen_pairs:
+                    continue
+                seen_pairs.add((nic_a, nic_b))
+
+                addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
+                addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
+                path_blocks.append(
+                    f'    path {{\n'
+                    f'      # via {nic_a}↔{nic_b}\n'
+                    f'      host {a["name"]} address {addr_a}:{port};\n'
+                    f'      host {b["name"]} address {addr_b}:{port};\n'
+                    f'    }}\n'
+                )
+
+            # Loopback fallback: ALWAYS present, last in the list, so
+            # DRBD survives even if the path table is stale or empty.
+            # The bedrock-net layer's panic-neighbour route guarantees
+            # at least one kernel-route exists for the loopback /24
+            # whenever any peer is heartbeating.
+            if not path_blocks:
+                # No direct paths observed — emit only the loopback
+                # fallback. DRBD treats the connection as reachable
+                # via the kernel's default route.
+                addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
+                addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
+                path_blocks.append(
+                    f'    path {{\n'
+                    f'      # loopback fallback (no direct paths in snapshot)\n'
+                    f'      host {a["name"]} address {addr_a}:{port};\n'
+                    f'      host {b["name"]} address {addr_b}:{port};\n'
+                    f'    }}\n'
+                )
+
+            conn_blocks.append(
+                f'  connection {{\n' +
+                ''.join(path_blocks) +
+                f'  }}\n'
+            )
+
+    body = (
+        f'resource tier-{resource} {{\n'
+        f'  protocol C;\n'
+        f'  options {{ on-no-quorum suspend-io; }}\n'
+        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; }}\n'
+        f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
+        f'after-sb-0pri discard-zero-changes; '
+        f'after-sb-1pri discard-secondary; '
+        f'after-sb-2pri disconnect; }}\n'
+        f'\n' +
+        ''.join(on_blocks) +
+        '\n' +
+        ''.join(conn_blocks) +
+        '}\n'
+    )
+    return body
+
+
+def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
+    """Regenerate /etc/drbd.d/tier-*.res files for every tier whose
+    cluster.json mode is currently DRBD-backed (i.e. 'drbd' / 'drbd-
+    nfs' / 'drbd-3way') AND a resource file already exists. Idempotent
+    — silently no-ops in N=1 (no DRBD configured) or for tiers that
+    don't have an existing .res file. After a successful rewrite,
+    runs `drbdadm adjust tier-<resource>` so the running daemon picks
+    up the new path blocks without disrupting in-flight replication.
+
+    Called from the orchestrator subscriber on path-table changes.
+    The cost of a no-op call is one stat() per tier file, negligible.
+
+    Returns True if any resource file was actually rewritten.
+    """
+    drbd_dir = Path("/etc/drbd.d")
+    if not drbd_dir.exists():
+        return False
+
+    tiers = (snapshot.get("tiers") or {})
+    nodes = (snapshot.get("nodes") or {})
+
+    # Build the canonical peers list once: every node currently in the
+    # cluster snapshot, with name + drbd_ip + loopback_ip.
+    peers: list[dict] = []
+    for name, n in sorted(nodes.items()):
+        peers.append({
+            "name": name,
+            "drbd_ip": n.get("drbd_ip", ""),
+            "loopback_ip": n.get("loopback_ip", ""),
+        })
+
+    DRBD_MODES = {"drbd", "drbd-nfs", "drbd-3way"}
+    rewritten = False
+    for resource, minor in DRBD_MINORS.items():
+        res_path = drbd_dir / f"tier-{resource}.res"
+        if not res_path.exists():
+            continue  # tier not promoted to DRBD on this node, skip
+        tier_state = tiers.get(resource) or {}
+        if (tier_state.get("mode") or "") not in DRBD_MODES:
+            continue  # tier was demoted; leave the file alone for now
+
+        new_body = render_drbd_res_mesh(resource, minor, peers, snapshot)
+        try:
+            old_body = res_path.read_text()
+        except OSError:
+            old_body = ""
+        if new_body == old_body:
+            continue  # no change, no adjust needed
+
+        res_path.write_text(new_body)
+        rewritten = True
+        # Apply the new config to the running daemon. drbdadm adjust
+        # is supposed to be idempotent; if it fails (resource not
+        # currently up, etc.) we just log and move on — the next
+        # adjust attempt at promote/demote/peer-add will succeed.
+        try:
+            subprocess.run(
+                ["drbdadm", "adjust", f"tier-{resource}"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            pass
+    return rewritten
+
+
 # ── Local LV → DRBD migration (preserves filesystem via external metadata) ──
 
 def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:

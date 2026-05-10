@@ -263,6 +263,28 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
             return last_toml_hash
         last_toml_hash = new_hash
 
+    # Mesh path-table changes also drive DRBD's multi-path config:
+    # when a LINK_UP / LINK_DOWN / LINK_QUALITY entry folds in, the
+    # snapshot's `paths` section shifts, and any tier currently in
+    # DRBD mode regenerates its tier-<resource>.res file with fresh
+    # `path` blocks. Idempotent + a no-op in N=1 (no DRBD configured),
+    # so it's cheap to call on every entry.
+    try:
+        from installer.lib import tier_storage as _ts  # type: ignore
+    except ImportError:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import tier_storage as _ts  # type: ignore
+        except Exception:
+            _ts = None
+    if _ts is not None:
+        try:
+            _ts.regen_drbd_configs_from_snapshot(_SNAPSHOT)
+        except Exception as e:
+            log.warning("subscriber: drbd config regen at idx %d: %s",
+                        entry["index"], e)
+
     try:
         loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(
