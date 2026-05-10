@@ -210,6 +210,58 @@ fast; the Rust port is a v1.x cleanup item.
 - The path-table fold logic (canonical-key dedup, observed_at
   preservation across LINK_QUALITY).
 
+## Test run — 2026-05-09/10
+
+Final cleaned 4-node testbed:
+
+```
+=== Per-node view (post chaos) ===
+  bedrock-c51a36 (192.168.2.60, master): loopback=10.99.0.1/32
+  bedrock-4807f4 (192.168.2.62)        : loopback=10.99.0.2/32
+  bedrock-606941 (192.168.2.61)        : loopback=10.99.0.3/32
+  bedrock-0acd31 (192.168.2.63)        : loopback=10.99.0.4/32
+
+=== Path-table on master ===
+  paths: 15            (5 NIC types × 3 peers)
+  by NIC pair:
+    (br0,    br0   ): 3   ← LAN bridge
+    (enp2s0, enp2s0): 3   ← bedrock-drbd plane
+    (enp3s0, enp3s0): 3   ← bedrock-mesh-1 plane
+    (enp4s0, enp4s0): 3   ← bedrock-mesh-2 plane
+    (enp5s0, enp5s0): 3   ← bedrock-mesh-3 plane
+
+=== Routes on master (per-peer multipath) ===
+  10.99.0.0/24 via 10.42.65.232 dev enp5s0 metric 999  (panic catchall)
+  10.99.0.2 via 192.168.2.62 dev br0    metric 10
+  10.99.0.2 via 10.42.209.61 dev enp2s0 metric 11
+  10.99.0.2 via 10.42.44.253 dev enp3s0 metric 12
+  10.99.0.2 via 10.42.63.196 dev enp4s0 metric 13
+  10.99.0.2 via 10.42.65.232 dev enp5s0 metric 14
+  ... (same metric-ordered chain for .3, .4)
+
+=== Cross-loopback ping (post-chaos) ===
+  16/16 OK (every node → every loopback including self)
+
+=== Chaos run ===
+  events: 32 (random yank/restore via ip-link, mixed planes)
+  validation failures: 0
+  reconvergence: avg 6.2 s, max 15.2 s
+  final state: ok
+```
+
+## Known issue surfaced during the run (not a blocker, worth noting)
+
+- After init, the mgmt master's log had NODE_LOOPBACK entries for 3
+  of 4 nodes — one was lost because the register endpoint's log
+  append silently swallowed an IPC connection error (bedrock-rust
+  was momentarily restarting via the orchestrator's render-on-entry
+  loop). The joiner still got its loopback_ip in the register
+  response and claimed it on `lo`; cross-loopback ping works
+  (16/16). But cluster.json's nodes section shows only 3 loopback
+  IPs because the missing entry never replicated. Easy fix: retry
+  the append in register up to N times with exponential backoff.
+  Untouched in this commit cycle.
+
 ## Next moves
 
 1. Fix the multicast-bridge-forwarding for real hardware (querier or
