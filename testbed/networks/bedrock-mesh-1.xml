@@ -1,8 +1,6 @@
 <network>
   <name>bedrock-mesh-1</name>
-  <!-- Isolated L2 mesh plane #1. All sims plug into this; every pair
-       shares a path through it. Yankable per-bridge for chaos tests
-       (virsh net-destroy / net-start). No NAT, no DHCP — peer
-       discovery + APIPA-or-cluster-scheme assigns IPs at runtime. -->
-  <bridge name='br-bedmesh1' stp='off' delay='0'/>
+  <bridge name='br-bedmesh1' stp='off' delay='0' macTableManager='kernel'/>
+  <!-- multicast_snooping disabled at runtime via spawn.py prereq;
+       libvirt's bridge XML schema doesn't expose the knob directly. -->
 </network>

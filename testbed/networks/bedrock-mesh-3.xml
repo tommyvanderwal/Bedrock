@@ -1,4 +1,6 @@
 <network>
   <name>bedrock-mesh-3</name>
-  <bridge name='br-bedmesh3' stp='off' delay='0'/>
+  <bridge name='br-bedmesh3' stp='off' delay='0' macTableManager='kernel'/>
+  <!-- multicast_snooping disabled at runtime via spawn.py prereq;
+       libvirt's bridge XML schema doesn't expose the knob directly. -->
 </network>

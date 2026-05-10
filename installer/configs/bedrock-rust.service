@@ -8,7 +8,16 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/bedrock-rust --log-dir /var/lib/bedrock/log --ipc-sock /run/bedrock-rust.sock daemon --config /etc/bedrock/daemon.toml
 Restart=on-failure
-RestartSec=5
+RestartSec=2
+# During init, mgmt_install appends 4-6 log entries in <1 s and the
+# mgmt orchestrator's subscriber renders+restarts bedrock-rust on
+# each daemon.toml-changing entry. Default systemd start-limit
+# (5/10s) trips and refuses to start the daemon. Bumped here to
+# absorb the burst until orchestrator gets proper debouncing
+# (v1.x). The drop-in /etc/systemd/system/bedrock-rust.service.d/
+# is also applied at install for live nodes.
+StartLimitBurst=20
+StartLimitIntervalSec=60
 # Daemon does ip-link manipulation on self-fence and writes the fence
 # marker / role file. On fence the daemon does NOT exit — it stays
 # running and idles until bedrock-mgmt has cleaned up + cleared the

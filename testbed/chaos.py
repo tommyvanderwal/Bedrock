@@ -89,15 +89,29 @@ def status():
 
 
 def yank(n: int):
-    name = f"bedrock-mesh-{n}"
-    print(f"  yanking {name}...")
-    virsh("net-destroy", name)
+    """Simulate a cable yank by taking the bridge interface down. We
+    avoid `virsh net-destroy` because that detaches the VM vnets from
+    the bridge entirely; restoring with `net-start` doesn't re-attach
+    them and the VMs end up isolated. `ip link set <br> down` keeps
+    libvirt's view intact, drops carrier on every attached vnet, and
+    cleanly comes back up."""
+    bridge = f"br-bedmesh{n}"
+    print(f"  yanking bridge {bridge}...")
+    subprocess.run(["sudo", "ip", "link", "set", bridge, "down"],
+                   capture_output=True)
 
 
 def restore(n: int):
-    name = f"bedrock-mesh-{n}"
-    print(f"  restoring {name}...")
-    virsh("net-start", name)
+    bridge = f"br-bedmesh{n}"
+    print(f"  restoring bridge {bridge}...")
+    subprocess.run(["sudo", "ip", "link", "set", bridge, "up"],
+                   capture_output=True)
+    # Re-disable multicast snooping after up — the kernel resets some
+    # bridge knobs on transition and we need snooping=0 for our
+    # multicast probe to forward correctly.
+    snoop_path = f"/sys/class/net/{bridge}/bridge/multicast_snooping"
+    subprocess.run(["sudo", "sh", "-c", f"echo 0 > {snoop_path}"],
+                   capture_output=True)
 
 
 def validate(deadline_s: float = 60.0) -> bool:

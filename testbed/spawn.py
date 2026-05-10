@@ -321,11 +321,44 @@ def list_nodes():
 
 # ── CLI commands ───────────────────────────────────────────────────────────
 
+def disable_mesh_snooping():
+    """Linux bridges with multicast_snooping=1 + no IGMP querier silently
+    drop multicast to ports that haven't sent IGMP joins. The mesh
+    bridges in the testbed have no querier (libvirt isolated networks
+    don't run one), so probes don't cross the bridge between vnets.
+
+    Safe to call repeatedly — virsh net-start resets the bridge knobs,
+    so the chaos harness also calls this on each restore."""
+    for n in MESH_NETS:
+        # MESH_NETS list has libvirt names like "bedrock-mesh-1"; the
+        # bridge is br-bedmesh<n> per the XML.
+        bridge = "br-bed" + n.replace("bedrock-", "").replace("-", "")
+        path = f"/sys/class/net/{bridge}/bridge/multicast_snooping"
+        try:
+            with open(path) as f:
+                if f.read().strip() != "0":
+                    subprocess.run(["sudo", "sh", "-c", f"echo 0 > {path}"],
+                                   capture_output=True, check=False)
+        except Exception:
+            pass
+    # Also for bedrock-drbd which is another isolated bridge.
+    for path in ("/sys/class/net/br-beddrbd/bridge/multicast_snooping",):
+        try:
+            with open(path) as f:
+                if f.read().strip() != "0":
+                    subprocess.run(["sudo", "sh", "-c", f"echo 0 > {path}"],
+                                   capture_output=True, check=False)
+        except Exception:
+            pass
+
+
 def cmd_up(args):
     target = int(args.count)
     if target < 0 or target > MAX_NODES:
         print(f"N must be 0..{MAX_NODES}")
         sys.exit(1)
+    # Make sure mesh bridges forward multicast (probe traffic).
+    disable_mesh_snooping()
 
     # Destroy nodes above target
     for i in range(target + 1, MAX_NODES + 1):
