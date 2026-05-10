@@ -69,8 +69,8 @@ echo "=== Per-node view ==="
 for ip in "$SIM1" "$SIM2" "$SIM3" "$SIM4"; do
     name=$(ssh_run "$ip" 'hostname' 2>/dev/null)
     paths=$(ssh_run "$ip" 'python3 -c "import json; d=json.load(open(\"/etc/bedrock/cluster.json\")); print(len(d.get(\"paths\", {})))"' 2>/dev/null)
-    routes=$(ssh_run "$ip" 'ip -4 route show | grep -c "10.99.0"' 2>/dev/null || echo 0)
-    lo=$(ssh_run "$ip" "ip -o -4 addr show dev lo | awk '/10.99.0/{print \$4}' | head -1" 2>/dev/null)
+    routes=$(ssh_run "$ip" 'ip -4 route show | grep -cE "100\.[0-9]+\.[0-9]+\."' 2>/dev/null || echo 0)
+    lo=$(ssh_run "$ip" "python3 -c 'import json; d=json.load(open(\"/etc/bedrock/state.json\")); print(d.get(\"loopback_ip\",\"\"))'" 2>/dev/null)
     echo "  $name ($ip): paths=$paths routes=$routes loopback=$lo"
 done
 
@@ -79,7 +79,7 @@ echo "=== loopback ↔ loopback ping matrix ==="
 declare -A LOOPS
 for i in 1 2 3 4; do
     eval ip=\$SIM$i
-    LOOPS[$i]=$(ssh_run "$ip" "ip -o -4 addr show dev lo | awk '/10.99.0/{print \$4}' | head -1 | cut -d/ -f1" 2>/dev/null)
+    LOOPS[$i]=$(ssh_run "$ip" "python3 -c 'import json; d=json.load(open(\"/etc/bedrock/state.json\")); print(d.get(\"loopback_ip\",\"\"))'" 2>/dev/null)
 done
 fail=0
 for src in 1 2 3 4; do

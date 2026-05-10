@@ -20,10 +20,11 @@ loopback IP." The architecture rationale lives in BEDROCK.md
     link-down. Black-hole gateway detection comes from this daemon's
     own probe-loss → it `ip route del` the dead route, the
     next-metric one auto-promotes.
-  * A panic-neighbour catch-all `10.99.0.0/24 via <freshest peer>
+  * A panic-neighbour catch-all `<cluster /24> via <freshest peer>
     metric 999` is always installed when at least one neighbour is
-    reachable. Loops are bounded by IP TTL; TCP backoff and UDP's
-    low volume keep the worst case from being noisy.
+    reachable. Cluster /24 is derived from cluster_uuid (RFC 6598
+    100.64.0.0/10). Loops are bounded by IP TTL; TCP backoff and
+    UDP's low volume keep the worst case from being noisy.
 
 Concretely this file holds:
   * `NetDaemon` — the run-loop. Started by /usr/local/bin/bedrock-net
@@ -76,10 +77,11 @@ UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 DOWN_HYSTERESIS_S = 30.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 
-# Loopback identity prefix. Each node gets a /32 in this /24 from a
-# deterministic derivation when init/join runs.
-LOOPBACK_PREFIX = "10.99.0"
-LOOPBACK_RANGE_NET = "10.99.0.0/24"
+# Loopback identity range — derived per-cluster from cluster_uuid via
+# cluster_addr.cluster_loopback_prefix(). Lives in RFC 6598 Shared
+# Address Space (100.64.0.0/10) so it can't collide with operator
+# LANs. Computed at daemon startup; used here only for legacy log
+# strings — the actual values come from Daemon state at runtime.
 
 # Per-NIC link-layer IPs come from IPv4 link-local (169.254.0.0/16,
 # RFC 3927). NetworkManager handles the actual assignment — ARP
@@ -109,10 +111,6 @@ INTERFACE_BLOCKLIST_PREFIXES = (
 METRIC_DIRECT_BASE  = 10
 METRIC_TRANSIT_BASE = 100
 METRIC_PANIC        = 999
-
-# Cluster prefix for bedrock-net managed routing. Every loopback IP
-# is in this block, so the panic route can match the whole space.
-CLUSTER_LOOPBACK_NET = "10.99.0.0/24"
 
 
 # ── Codec ────────────────────────────────────────────────────────────
@@ -1061,9 +1059,11 @@ def emit_routes(d: Daemon) -> None:
         return
 
     # Gather currently installed routes for the cluster prefix so we
-    # can diff. We only own routes whose dest is in 10.99.0.0/24 OR
-    # the panic catch-all. Other routes are operator's, never touched.
-    current = current_cluster_routes()
+    # can diff. We only own routes whose dest is in this cluster's
+    # /24 (derived from cluster_uuid via cluster_addr) plus our
+    # 169.254.x.y /32 host routes. Other routes are operator's,
+    # never touched.
+    current = current_cluster_routes(d.cluster_uuid)
     desired_set = set(desired)
     current_set = set(current)
 
@@ -1149,44 +1149,45 @@ def compute_routes(d: Daemon) -> list[str]:
             default=None,
         )
         if freshest:
+            from . import cluster_addr as _ca
+            net = _ca.cluster_loopback_net(d.cluster_uuid)
             routes.append(
-                f"{CLUSTER_LOOPBACK_NET} via {freshest.peer_link_addr} "
+                f"{net} via {freshest.peer_link_addr} "
                 f"dev {freshest.my_nic} metric {METRIC_PANIC}"
             )
     return routes
 
 
-def current_cluster_routes() -> list[str]:
-    """Read existing kernel routes that bedrock-net manages. We
-    identify our routes by destination match:
-      * 10.99.0.0/24 panic catch-all
-      * /32 inside 10.99.0.0/24 (per-peer loopback)
+def current_cluster_routes(cluster_uuid: str) -> list[str]:
+    """Read existing kernel routes that bedrock-net manages, scoped
+    to this cluster's address block. We identify our routes by
+    destination match:
+      * <cluster_prefix>.0/24 panic catch-all
+      * /32 inside <cluster_prefix>.0/24 (per-peer loopback)
       * /32 inside 169.254.0.0/16 with `scope link` (per-peer
         link-local — the kernel's auto-installed /16 connected
         routes don't have a /32 prefix, so we don't trip on them)
+    The cluster_prefix is derived deterministically from cluster_uuid
+    (cluster_addr.cluster_loopback_prefix), so we don't touch any
+    address outside our own /24.
     """
+    from . import cluster_addr as _ca
+    prefix = _ca.cluster_loopback_prefix(cluster_uuid) + "."
     out = subprocess.run(
         ["ip", "-4", "route", "show"],
         capture_output=True, text=True,
     ).stdout
     keep = []
     for line in out.splitlines():
-        # Lines look like:
-        #   "10.99.0.5 via 169.254.42.7 dev enp3s0 metric 10"
-        #   "10.99.0.0/24 via ... metric 999"
-        #   "169.254.165.122 dev enp2s0 scope link"  (our peer-link /32)
         line = line.strip()
-        if line.startswith("10.99.0."):
-            if " src " in line:  # someone added a src that isn't ours
+        if line.startswith(prefix):
+            if " src " in line:
                 continue
             keep.append(line)
             continue
         if line.startswith("169.254.") and " scope link" in line:
-            # Only /32 host routes are ours; the kernel's auto
-            # /16 connected route shows up as "169.254.0.0/16 dev …"
-            # which we leave alone.
             head = line.split()[0]
-            if "/" not in head:  # bare IP (no prefix shown) → /32
+            if "/" not in head:
                 keep.append(line)
             continue
     return keep

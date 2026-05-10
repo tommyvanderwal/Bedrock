@@ -204,8 +204,12 @@ WantedBy=multi-user.target
     s["mgmt_ip"] = _pick_mgmt_ip(hw)
     s["mgmt_url"] = f"http://{s['mgmt_ip']}:8080"
     # Mgmt master gets the lowest cluster identity. Joiners get the
-    # next free .2, .3, … allocated by the register endpoint.
-    s["loopback_ip"] = "10.99.0.1"
+    # next free index allocated by the register endpoint. The /24
+    # comes from cluster_addr.node_loopback_ip(uuid, N) — derived
+    # from cluster_uuid, lives in RFC 6598 (100.64.0.0/10), can't
+    # collide with operator LANs.
+    from . import cluster_addr as _ca
+    s["loopback_ip"] = _ca.node_loopback_ip(s["cluster_uuid"], 1)
     state.save(s)
 
     # Initialise /etc/bedrock/cluster.json with this node registered

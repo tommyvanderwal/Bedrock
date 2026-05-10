@@ -170,12 +170,8 @@ def validate(deadline_s: float = 60.0) -> bool:
         #    addressable from inside the cluster).
         loopbacks_per_sim = {}
         for i, ip in running:
-            out, rc = ssh(ip, "hostname; ip -o -4 addr show lo | awk '/10.99.0/{print $4}'", timeout=5)
-            lo = ""
-            for line in out.splitlines():
-                if "/" in line and line.startswith("10.99.0"):
-                    lo = line.split("/")[0]
-                    break
+            out, rc = ssh(ip, "python3 -c 'import json; d=json.load(open(\"/etc/bedrock/state.json\")); print(d.get(\"loopback_ip\",\"\"))'", timeout=5)
+            lo = out.strip() if out else ""
             loopbacks_per_sim[i] = (ip, lo)
 
         ping_failures = []

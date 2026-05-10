@@ -637,9 +637,15 @@ def register_node(req: NodeRegister):
         log.warning(f"register: log-fold for used_loopbacks failed: {_e}; "
                     f"falling back to cluster.json")
         used_loopbacks = {n.get("loopback_ip") for n in cluster["nodes"].values()}
+    # Cluster's /24 lives in RFC 6598 Shared Address Space, derived
+    # from cluster_uuid (cluster_addr.cluster_loopback_prefix). Each
+    # joiner gets the lowest free /32 index.
+    import sys as _sys2
+    _sys2.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import cluster_addr as _ca
     next_loopback = ""
     for i in range(1, 250):
-        candidate = f"10.99.0.{i}"
+        candidate = _ca.node_loopback_ip(cluster.get("cluster_uuid", ""), i)
         if candidate not in used_loopbacks:
             next_loopback = candidate
             break
