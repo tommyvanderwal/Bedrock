@@ -863,40 +863,43 @@ def _peer_link_addr(snapshot: dict, node: str, nic: str) -> str:
 def render_drbd_res_mesh(resource: str, minor: int,
                           peers: list[dict],
                           snapshot: dict) -> str:
-    """Render a DRBD 9 multi-path resource config from the mesh path
-    table.
+    """Render a DRBD 9 resource config that uses the cluster's loopback
+    identity addresses for replication. The mesh path table drives
+    *kernel routing* (via bedrock-net's metric-ordered host routes),
+    not DRBD's own multi-path feature.
 
-    Differs from `render_drbd_res()` in two ways:
+    Why one path, not many: DRBD's multi-path requires each `path`
+    block to list two genuinely-different addresses (one per side) so
+    DRBD can detect path-level failure independently. Without per-NIC
+    link addresses in the path table, every block we'd emit would
+    list the same loopback pair — DRBD would treat them as redundant
+    no-ops or, worse, send out duplicate replication traffic. Cleaner
+    layering: DRBD opens one connection to peer.loopback_ip; the
+    kernel route to that loopback is whichever physical NIC bedrock-
+    net picked; if that NIC dies, the kernel auto-promotes the next
+    metric route within ~1 s and the same TCP connection can survive
+    or DRBD reconnects on its own next probe.
 
-      1. Each `connection` block carries one `path` per direct
-         (nic_a, nic_b) pair the snapshot's path table reports for
-         that pair of peers.
-      2. The connection block also has a final fallback `path` that
-         points at the peer's loopback IP. The kernel-installed
-         host routes (from bedrock-net) steer that traffic over
-         whichever physical NIC is best, so DRBD survives any cable
-         topology that the kernel can route at all — including
-         transit through a third node.
+    A future commit will add per-NIC link addresses to LINK_QUALITY
+    so this function can emit truly-distinct `path` blocks and let
+    DRBD do its own path-level failure detection — until then,
+    composing kernel routing under DRBD is correct and verifiable.
 
     Inputs:
-      peers — [{name, drbd_ip, loopback_ip}, ...]; drbd_ip kept for
-              the legacy `on` block address (DRBD 9 still requires
-              one) but not for connection paths.
-      snapshot — the cluster fold output (view_builder.fold).
-
-    The resulting config is a strict superset of the single-path
-    config: even with no path entries in the snapshot, the loopback
-    fallback path keeps DRBD reachable.
+      peers — [{name, drbd_ip, loopback_ip}, ...]; drbd_ip kept as
+              the canonical address for the `on` block; loopback_ip
+              is preferred for the connection (so the bedrock-net
+              routing layer is what steers replication), with
+              drbd_ip as a fallback when no loopback is allocated.
+      snapshot — kept in the signature for the future per-NIC variant;
+                 currently only used to count discovered paths for
+                 the comment header (visibility, not config).
     """
     on_blocks = []
     peer_ids: dict[str, int] = {}
     for p in peers:
         nid = get_drbd_node_id(resource, p["name"])
         peer_ids[p["name"]] = nid
-        # `on` block keeps the legacy single-address form (drbd_ip or
-        # loopback fallback). DRBD 9 needs *some* address here; the
-        # per-link path blocks override it for actual replication
-        # traffic.
         anchor_addr = p.get("drbd_ip") or p.get("loopback_ip", "")
         on_blocks.append(
             f'  on {p["name"]} {{\n'
@@ -914,65 +917,28 @@ def render_drbd_res_mesh(resource: str, minor: int,
     for i in range(len(peers)):
         for j in range(i + 1, len(peers)):
             a, b = peers[i], peers[j]
-            paths = _direct_paths_between(snapshot, a["name"], b["name"])
-            path_blocks: list[str] = []
-
-            # One `path` per direct link the path table observed.
-            # Without per-NIC addresses logged (see _peer_link_addr
-            # comment above), we fall back to the loopback address
-            # for every path block. The kernel route's metric ordering
-            # (set by bedrock-net) decides which physical NIC each
-            # path attempt actually traverses.
-            #
-            # When a future commit adds per-NIC link addresses to
-            # the path table, the path blocks below will pin each
-            # one to a specific NIC pair, giving DRBD true multi-path
-            # awareness independent of kernel routing.
-            seen_pairs: set[tuple[str, str]] = set()
-            for p in paths:
-                # Symmetrise nic order so the path block shows
-                # (a's nic, b's nic) regardless of how the canonical
-                # key oriented them.
-                if p.get("node_a") == a["name"]:
-                    nic_a, nic_b = p.get("nic_a", ""), p.get("nic_b", "")
-                else:
-                    nic_a, nic_b = p.get("nic_b", ""), p.get("nic_a", "")
-                if (nic_a, nic_b) in seen_pairs:
-                    continue
-                seen_pairs.add((nic_a, nic_b))
-
-                addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
-                addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
-                path_blocks.append(
-                    f'    path {{\n'
-                    f'      # via {nic_a}↔{nic_b}\n'
-                    f'      host {a["name"]} address {addr_a}:{port};\n'
-                    f'      host {b["name"]} address {addr_b}:{port};\n'
-                    f'    }}\n'
-                )
-
-            # Loopback fallback: ALWAYS present, last in the list, so
-            # DRBD survives even if the path table is stale or empty.
-            # The bedrock-net layer's panic-neighbour route guarantees
-            # at least one kernel-route exists for the loopback /24
-            # whenever any peer is heartbeating.
-            if not path_blocks:
-                # No direct paths observed — emit only the loopback
-                # fallback. DRBD treats the connection as reachable
-                # via the kernel's default route.
-                addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
-                addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
-                path_blocks.append(
-                    f'    path {{\n'
-                    f'      # loopback fallback (no direct paths in snapshot)\n'
-                    f'      host {a["name"]} address {addr_a}:{port};\n'
-                    f'      host {b["name"]} address {addr_b}:{port};\n'
-                    f'    }}\n'
-                )
-
+            # Prefer loopback for the replication target — that way
+            # the kernel routing layer (driven by bedrock-net) picks
+            # the actual physical NIC. drbd_ip is the fallback for
+            # nodes whose loopback hasn't been allocated yet (e.g.
+            # mid-join).
+            addr_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
+            addr_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
+            n_observed = len(_direct_paths_between(snapshot, a["name"], b["name"]))
+            comment = (
+                f'    # {n_observed} direct mesh path(s) observed between '
+                f'{a["name"]}↔{b["name"]}; replication uses the loopback '
+                f'address pair, kernel routing chooses the physical NIC.\n'
+                if n_observed
+                else
+                f'    # No direct mesh paths observed yet; relying on the '
+                f'panic-neighbour catch-all route from bedrock-net.\n'
+            )
             conn_blocks.append(
                 f'  connection {{\n' +
-                ''.join(path_blocks) +
+                comment +
+                f'    host {a["name"]} address {addr_a}:{port};\n'
+                f'    host {b["name"]} address {addr_b}:{port};\n'
                 f'  }}\n'
             )
 
