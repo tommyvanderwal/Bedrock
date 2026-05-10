@@ -384,6 +384,13 @@ class Daemon:
     # Last route table we emitted (string), so we don't fight the
     # kernel with no-op writes.
     last_routes_signature: str = ""
+    # Cooldown for the ARP-defense collision countermeasure: keyed by
+    # (peer_link_addr, my_nic) → last-fire timestamp. Each entry has
+    # a 30 s "respect-renumber-window" before we'll fire again. Stops
+    # us from sending fresh ARP rounds every sweep while the loser is
+    # still mid-NM-renumber. Multiple discoverers in parallel are
+    # still fine — each maintains its own cooldown.
+    last_arp_renumber: dict = field(default_factory=dict)
     # Stop flag for clean shutdown.
     stopped: bool = False
 
@@ -820,40 +827,82 @@ def arp_force_renumber(target_addr: str, dev: str) -> None:
 # or engaged the renumber countermeasure on this sweep. Reset each
 # call to compute_routes(); persisting across sweeps would re-engage
 # every tick while the colliding peer is still mid-renumber.
-def _detect_and_handle_ll_collision(routes: list[str], seen: dict[str, str],
+def _detect_and_handle_ll_collision(routes: list[str],
+                                     seen: dict[str, tuple],
                                      n: "Neighbour", d: "Daemon") -> bool:
     """Decide whether to add the /32 for `n.peer_link_addr` to `routes`.
 
-    - First time we see this address: record (addr → my_nic) in `seen`,
-      append the /32, return True.
-    - Same address, same nic: duplicate entry within sweep, skip.
-    - Same address, different nic: cross-segment collision. Engage
-      ARP-based renumber countermeasure (RFC 3927 §2.5) on the
-      newly-arrived path's nic. Don't append a /32 — the peer will
-      renumber within ~5 s and the next sweep will install fresh.
+    Discriminates three cases by `(peer_node, peer_nic, my_nic)`:
+
+      1. First time we see this address: record + append /32, return.
+      2. Same `(peer_node, peer_nic)` already seen on a different
+         `my_nic` → segment merge, NOT a real collision. The same
+         peer interface is reachable via two of our NICs because
+         the operator (or a switch loop) bridged two L2s together.
+         The legitimate peer keeps its IP; we skip the /32 for our
+         second NIC and log clearly. Firing the countermeasure here
+         would chase a valid peer off its address and cascade.
+      3. Same address, DIFFERENT `(peer_node, peer_nic)`, different
+         `my_nic` → real cross-segment LL birthday-paradox collision.
+         Engage ARP-defense countermeasure to force renumber.
+      4. Same address, same nic → duplicate entry within sweep, skip.
+
+    The `(peer_node, peer_nic)` discriminator is in the probe payload
+    (signed by cluster_key, so a malicious actor can't forge it), and
+    it's already in our Neighbour state — we don't need an ARP-cache
+    lookup to tell merges from real collisions.
     """
     addr = n.peer_link_addr
     if not addr:
         return False
-    prev_nic = seen.get(addr)
-    if prev_nic is None:
-        seen[addr] = n.my_nic
+    prev = seen.get(addr)
+    if prev is None:
+        seen[addr] = (n.my_nic, n.peer_node, n.peer_nic)
         routes.append(f"{addr}/32 dev {n.my_nic} scope link")
         return True
-    if prev_nic == n.my_nic:
-        return False  # duplicate within sweep
-    # Cross-segment collision.
+    prev_my_nic, prev_peer_node, prev_peer_nic = prev
+
+    # Case 2: same peer interface, multiple of our nics — segment merge.
+    if (n.peer_node, n.peer_nic) == (prev_peer_node, prev_peer_nic):
+        sys.stderr.write(
+            f"bedrock-net: same peer interface "
+            f"({n.peer_node}.{n.peer_nic}) reachable via both our "
+            f"{prev_my_nic} and {n.my_nic} — looks like an L2 bridge "
+            f"merge, NOT a cross-segment collision. Skipping ARP "
+            f"countermeasure (firing it would chase a legitimate peer "
+            f"off its address).\n"
+        )
+        return False
+
+    # Case 4: redundant within-sweep entry.
+    if prev_my_nic == n.my_nic:
+        return False
+
+    # Case 3: real cross-segment collision (same address, different
+    # peer interfaces, different segments). Per-(addr, nic) cooldown
+    # prevents multiple consecutive sweeps from re-firing while the
+    # loser is still mid-renumber. Multiple discoverers in parallel
+    # each fire once because each maintains its own cooldown — by
+    # design, three frames-per-discoverer × N discoverers is fine
+    # since RFC 3927 defense is idempotent.
+    now = time.time()
+    cooldown_key = (addr, n.my_nic)
+    last_fired = d.last_arp_renumber.get(cooldown_key, 0.0)
+    if now - last_fired < 30.0:
+        return False
     sys.stderr.write(
         f"bedrock-net: LL COLLISION DETECTED — {addr} reachable via "
-        f"both {prev_nic} (first peer) and {n.my_nic} (peer "
-        f"{n.peer_node}.{n.peer_nic}); engaging ARP-defense "
-        f"countermeasure on {n.my_nic} to force renumber.\n"
+        f"both {prev_my_nic} (peer {prev_peer_node}.{prev_peer_nic}) "
+        f"and {n.my_nic} (peer {n.peer_node}.{n.peer_nic}); engaging "
+        f"ARP-defense countermeasure on {n.my_nic} to force renumber.\n"
     )
+    d.last_arp_renumber[cooldown_key] = now
     try:
         arp_force_renumber(addr, n.my_nic)
         sys.stderr.write(
             f"bedrock-net: countermeasure complete on {n.my_nic}; "
-            f"expecting peer to renumber within ~5 s.\n"
+            f"expecting peer to renumber within ~5 s "
+            f"(cooldown 30 s before re-fire).\n"
         )
     except OSError as e:
         sys.stderr.write(
