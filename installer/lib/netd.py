@@ -81,10 +81,19 @@ QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 LOOPBACK_PREFIX = "10.99.0"
 LOOPBACK_RANGE_NET = "10.99.0.0/24"
 
-# Per-NIC throwaway IPs come from this /16, derived from
-# sha256(cluster_uuid|nic_mac). Throwaway is the right word — the
-# value of these IPs is "give the kernel an ARP target," nothing more.
-THROWAWAY_PREFIX = "10.42"
+# Per-NIC link-layer IPs come from IPv4 link-local (169.254.0.0/16,
+# RFC 3927). NetworkManager handles the actual assignment — ARP
+# probes for collisions, picks a free address in the LL block,
+# retries on conflict, persists the choice across reboots. We just
+# create a per-NIC `con` profile with `ipv4.method=link-local`.
+#
+# Why not assign IPs ourselves: the LL block is reserved by IANA so
+# operators' real LANs can't be in it (unlike picking a random RFC
+# 1918 prefix and hoping); NM's RFC-3927 implementation has the
+# probe-retry-stable-across-reboot guarantees we'd otherwise have
+# to write from scratch; and we keep one source of truth for what
+# IP each NIC has — the kernel.
+LINK_LOCAL_PROFILE_PREFIX = "bedrock-mesh-"
 
 # Interfaces we never touch (loopback, virbr*, docker, etc.). Anything
 # matching one of these prefixes is left alone — operator-configured
@@ -221,8 +230,9 @@ def bucket_rtt(us: int) -> int:
 
 
 def first_inet_addr(nic: str) -> str:
-    """Return the first non-link-local-or-loopback IPv4 on `nic`, or
-    a 169.254.x.x if that's all there is, or '' if no IPv4 at all."""
+    """Return the first IPv4 on `nic` — preferring real (DHCP-assigned
+    or operator-static) over link-local — or '' if no IPv4 at all.
+    Loopback addresses are excluded."""
     try:
         out = subprocess.run(
             ["ip", "-4", "-o", "addr", "show", "dev", nic],
@@ -253,42 +263,84 @@ def first_inet_addr(nic: str) -> str:
     return ""
 
 
-def derive_throwaway_ip(cluster_uuid: str, mac: str) -> str:
-    """Throwaway 10.42.X.Y/16 derived from cluster_uuid + mac. Two
-    nodes derive distinct values because the MAC differs; collisions
-    inside one cluster have probability ≈ 1/65535 per pair, fine for
-    the testbed and acceptable in production (we ARP-probe before
-    using and we'd just regenerate on conflict — out of scope for v1).
-    """
-    h = hashlib.sha256(f"{cluster_uuid}:{mac}".encode()).digest()
-    # Avoid x.0 and x.255 just in case of broadcast quirks.
-    second = h[0]
-    third = h[1] if h[1] not in (0, 255) else 1
-    return f"{THROWAWAY_PREFIX}.{second}.{third}"
+def _nmcli_con_exists(name: str) -> bool:
+    r = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME", "con", "show"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if r.returncode != 0:
+        return False
+    return name in r.stdout.splitlines()
 
 
-def ip_addr_assigned(nic: str) -> bool:
-    """True if the interface has any non-loopback IPv4 already."""
-    return bool(first_inet_addr(nic))
+def ensure_link_local(nic: str) -> str:
+    """Make sure `nic` has an IPv4 address — creating a NetworkManager
+    connection profile with `ipv4.method=link-local` if no profile
+    yet exists for this NIC. NM does the actual assignment: ARP
+    probes the LL block, picks a free 169.254.x.y, retries on
+    collision, persists the choice across reboots. We just trigger
+    the request.
 
+    Idempotent. If the NIC already has an IPv4 (DHCP from the LAN
+    bridge, operator-configured static, or NM has already brought up
+    a previously-created link-local profile), leave it alone — that
+    address is what the cluster mesh will use.
 
-def assign_throwaway(nic: str, cluster_uuid: str) -> str:
-    """Idempotent. If the NIC already has any IPv4, leave it. Otherwise
-    pin a throwaway IP from the deterministic 10.42 scheme. Returns the
-    final address either way."""
+    Returns the resulting IPv4 address, or '' if NM isn't installed
+    or the NIC didn't pick up an address within the wait window."""
     existing = first_inet_addr(nic)
     if existing:
         return existing
-    mac = get_mac(nic)
-    if not mac:
-        return ""
-    addr = derive_throwaway_ip(cluster_uuid, mac)
-    cidr = f"{addr}/16"
+
+    if not subprocess.run(["which", "nmcli"], capture_output=True).returncode == 0:
+        # No NM — fall back to a kernel-only LL claim. RFC 3927 says
+        # ARP-probe before claiming, but at minimum we can stick *some*
+        # address on so the mesh layer can send/receive. The hash
+        # gives us a stable seed; the chance of a real collision on
+        # an isolated mesh segment is small in practice. Operators
+        # with no NM SHOULD install systemd-networkd and configure
+        # `LinkLocalAddressing=ipv4`, which we'll detect on a future
+        # boot.
+        mac = get_mac(nic)
+        if not mac:
+            return ""
+        h = hashlib.sha256(mac.encode()).digest()
+        # Skip the reserved RFC 3927 boundary subnets.
+        second = max(1, min(254, h[0]))
+        third  = h[1] if h[1] not in (0, 255) else 1
+        addr = f"169.254.{second}.{third}"
+        subprocess.run(["ip", "addr", "add", f"{addr}/16", "dev", nic],
+                       capture_output=True, text=True)
+        return addr
+
+    profile = LINK_LOCAL_PROFILE_PREFIX + nic
+    if not _nmcli_con_exists(profile):
+        subprocess.run([
+            "nmcli", "con", "add",
+            "type", "ethernet",
+            "ifname", nic,
+            "con-name", profile,
+            "ipv4.method", "link-local",
+            "ipv6.method", "ignore",
+            "connection.autoconnect", "yes",
+        ], capture_output=True, text=True, timeout=10)
+
+    # Bring it up. `nmcli con up` blocks until the connection is
+    # active OR fails; since LL doesn't need DHCP we expect activation
+    # within 1–2 s after the ARP probe completes.
     subprocess.run(
-        ["ip", "addr", "add", cidr, "dev", nic],
-        capture_output=True, text=True,
+        ["nmcli", "con", "up", profile],
+        capture_output=True, text=True, timeout=15,
     )
-    return addr
+
+    # Wait up to ~15 s for an address to appear (covers RFC 3927's
+    # 4 ARP probes × 1 s probe interval + announcement window).
+    for _ in range(30):
+        addr = first_inet_addr(nic)
+        if addr:
+            return addr
+        time.sleep(0.5)
+    return ""
 
 
 # ── Daemon state ─────────────────────────────────────────────────────
@@ -322,7 +374,7 @@ class Daemon:
     my_loopback: str
     # Map (peer_node, peer_nic, my_nic) → Neighbour
     neighbours: dict = field(default_factory=dict)
-    # Map nic → throwaway IP we assigned
+    # Map nic → IPv4 address (link-local from NM, or DHCP for the LAN side)
     nic_addrs: dict = field(default_factory=dict)
     # Probe sockets per nic (reused across loop iterations)
     probe_send_socks: dict = field(default_factory=dict)
@@ -368,9 +420,9 @@ def open_recv_socket() -> socket.socket:
         pass
     # IP_PKTINFO lets recvmsg() report which local interface the
     # packet was received on. Critical: we need to know "this probe
-    # came in on enp3s0" not just "this probe came from 10.42.7.42",
-    # because all our mesh NICs share the same /16 throwaway prefix
-    # and source-IP alone can't tell us which physical link delivered
+    # came in on enp3s0" not just "this probe came from 169.254.X.Y",
+    # because all our mesh NICs share the same /16 (link-local) and
+    # source-IP alone can't tell us which physical link delivered
     # the frame.
     IP_PKTINFO = 8  # not exposed in py stdlib
     s.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
@@ -529,8 +581,8 @@ def run_daemon():
 
 def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
     # Drain any waiting probes. recvmsg + IP_PKTINFO so we know which
-    # local NIC each probe arrived on — the only reliable way when all
-    # mesh NICs share the same /16 throwaway prefix.
+    # local NIC each probe arrived on — the only reliable way when
+    # multiple mesh NICs share the same /16 (link-local).
     while True:
         data, src_addr, ifindex = recv_with_ifindex(d.recv_sock)
         if data is None:
@@ -559,12 +611,14 @@ def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
         except Exception:
             pass
 
-    # Maintain interface set: assign throwaway IPs to fresh nics, ensure
-    # multicast group joined, drop neighbours whose nic disappeared.
+    # Maintain interface set: drive NetworkManager to assign IPv4
+    # link-local on fresh NICs (or pick up whatever address the OS
+    # already has), ensure multicast group joined, drop neighbours
+    # whose nic disappeared.
     nics = list_interfaces()
     for nic in nics:
         if nic not in d.nic_addrs:
-            addr = assign_throwaway(nic, d.cluster_uuid)
+            addr = ensure_link_local(nic)
             if addr:
                 d.nic_addrs[nic] = addr
                 join_group_on(d.recv_sock, nic)
@@ -632,8 +686,8 @@ def process_probe(d: Daemon, body: dict, sender_link_addr: str,
         return
     if my_nic not in d.nic_addrs:
         # Probe arrived on an interface we haven't claimed yet —
-        # could be the LAN side which has no throwaway. Still record
-        # it; tick will reconcile nic_addrs on the next sweep.
+        # could be a NIC whose NM activation lags our discovery.
+        # Still record the neighbour; tick will reconcile next sweep.
         pass
 
     key = (peer_node, peer_nic, my_nic)
@@ -655,18 +709,18 @@ def process_probe(d: Daemon, body: dict, sender_link_addr: str,
 
 
 def nic_for_sender(d: Daemon, sender_addr: str) -> str:
-    """Map an incoming-packet source IP to the local nic that's on
-    the same /16 of our throwaway prefix. If the sender is on the
-    LAN (mgmt) side we still want a match — the LAN nic gets a real
-    DHCP address, not a throwaway, so we use sender's same /24 as a
-    fallback heuristic.
+    """Best-effort fallback for receivers that don't get IP_PKTINFO
+    (kernel/config quirk). Maps an incoming-packet source IP to a
+    local NIC by shared subnet. The primary path is always the
+    PKTINFO ifindex from recvmsg — this fallback is here so we
+    degrade gracefully if PKTINFO is missing for some reason.
+    Link-local senders share a /16 (169.254.0.0/16); LAN senders
+    share a /24 with our DHCP NIC; everything else is a guess.
     """
     if not sender_addr:
         return ""
-    if sender_addr.startswith(THROWAWAY_PREFIX + "."):
-        # Same /16 → match by NIC that has its throwaway in this /16.
+    if sender_addr.startswith("169.254."):
         return _nic_in_subnet(d, sender_addr, mask_len=16)
-    # Fallback: NIC sharing /24 with sender's address.
     return _nic_in_subnet(d, sender_addr, mask_len=24)
 
 
