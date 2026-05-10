@@ -773,8 +773,11 @@ def arp_force_renumber(target_addr: str, dev: str) -> None:
     Logged loud so an operator inspecting the journal sees what
     happened.
 
-    Sends two announcements 0.5 s apart — first triggers the loser's
-    one-shot defense, second pushes them into the renumber path.
+    Sends three announcements 0.5 s apart — first triggers the
+    loser's one-shot defense, second confirms the conflict (renumber
+    path), third is plain belt-and-suspenders for the case where one
+    frame gets lost on the wire. Total time on segment: ~1.5 s, ~3×
+    42 B = 126 B.
     """
     if not target_addr.startswith("169.254."):
         return  # not a link-local target; nothing to renumber
@@ -806,7 +809,7 @@ def arp_force_renumber(target_addr: str, dev: str) -> None:
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
     try:
         s.bind((dev, 0x0806))
-        for _ in range(2):
+        for _ in range(3):
             s.send(frame)
             time.sleep(0.5)
     finally:
