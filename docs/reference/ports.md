@@ -10,9 +10,11 @@ All ports Bedrock listens on, speaks to, or crosses between nodes.
 | 9090 | TCP | Cockpit | all IPs | Optional per-node web console |
 | 9100 | TCP | node_exporter | all IPs | Prometheus metrics, scraped by mgmt |
 | 9177 | TCP | vm_exporter | all IPs | Bedrock-specific libvirt + DRBD metrics |
-| 7000-7999 | TCP | DRBD replication | **DRBD NIC only** | Port = `7000 + minor`; one per resource |
+| 7000-7999 | TCP | DRBD replication | per-NIC mesh paths | Port = `7000 + minor`; multi-path via mesh layer — DRBD opens one path per direct `(nic_a, nic_b)` pair the bedrock-net path table observed, plus a loopback fallback as last resort. See `docs/06-mesh-network.md`. |
+| 7732 | UDP | bedrock-net probe (multicast) | all mesh NICs | Signed multicast on `239.7.7.7`, TTL=1, every 1 s per up NIC. HMAC-SHA256-signed by cluster_key. |
+| 8200 | TCP | bedrock-rust peer link | per-NIC mesh paths | Cluster-protocol log replication. Each follower dials the master here. |
 | 5900-5999 | TCP | QEMU VNC | all IPs | One per running VM (display :0 → 5900, :1 → 5901, ...) |
-| 49152-49215 | TCP | QEMU live-migrate | **DRBD NIC** via `--migrateuri` | libvirt's default migration port range |
+| 49152-49215 | TCP | QEMU live-migrate | per-NIC mesh paths via peer's `loopback_ip` | libvirt's default migration port range; the kernel route to the peer's `/32` picks the best NIC. |
 
 ## Mgmt-node additional ports
 
@@ -32,40 +34,59 @@ Only the node running `bedrock-mgmt.service` (init'd node, or a future HA mgmt):
 |---|---|---|---|
 | 9443 | bedrock-witness | MikroTik container / any 3rd host | `/health`, `/cluster-info`, `/register`, `/status`; used by failover quorum |
 
-## Networks
+## Networks (mesh model)
 
-Bedrock assumes two distinct networks per node, with br0 and eth1
-separation:
+Bedrock no longer presumes a fixed mgmt-vs-DRBD network split.
+Every NIC is a path candidate; bedrock-net discovers them, picks
+the best per-peer at the kernel routing layer, and feeds the
+multi-path table to DRBD. See `docs/06-mesh-network.md` for the
+full design. Summary of the address spaces involved:
 
 ```
-  br0 (bridge, primary LAN)
-     - 192.168.x.y / operator LAN
-     - carries: SSH, dashboard HTTP/WS, metrics scrape, mgmt API, cockpit,
-       VNC sessions (proxied via mgmt /vnc/…), LAN DHCP from router
-     - in the testbed: bridged through KVM to the KPN router's DHCP
-     - VMs inherit br0 via their libvirt <interface type='bridge'/>
+  Cluster identity (loopback /32, one per node)
+     - 100.X.Y.<node_index>/32 on lo
+     - X.Y derived deterministically from sha256(cluster_uuid),
+       carved from RFC 6598 Shared Address Space (100.64.0.0/10).
+       Operator LANs can't be in this range — IANA-reserved for
+       ISP-to-CPE only.
+     - Used as the destination address by every cluster-internal
+       protocol (DRBD via path-block loopback fallback, libvirt
+       migrate-uri, NFS, SSH-from-scripts, dashboard inter-node).
+     - Never leaves the cluster; not routed past the mesh.
 
-  eth1 (or any secondary NIC)
-     - 10.99.0.0/24 / DRBD ring
-     - carries: DRBD replication (port 7000+minor), QEMU live-migrate
-       traffic (migrateuri = tcp://<drbd_ip>)
-     - physical lab: direct 2.5G ethernet cross-connect between two nodes,
-       with a third cable for the 3-node ring
-     - testbed: libvirt isolated network (no DHCP, static IPs from cloud-init)
-     - ideal topology: dedicated VLAN or direct cable, no switch uplink
+  Per-NIC link-local (one per up mesh NIC)
+     - 169.254.X.Y/16, assigned by NetworkManager via
+       bedrock-mesh-<nic> profiles (ipv4.method=link-local).
+     - RFC 3927 ARP-probe + retry within each L2 segment. Cross-
+       segment collisions handled by bedrock-net via ARP defense
+       (see docs/06-mesh-network.md §cross-segment LL collision).
+     - DRBD's per-link path blocks list these addresses so DRBD
+       can do its own path-level failure detection.
+
+  Operator LAN (br0)
+     - Real LAN IP from operator's DHCP, untouched by bedrock-net.
+     - Carries dashboard HTTP/WS, SSH, Cockpit, VM bridges, all
+       operator-facing traffic.
+
+  Optional secondary planes (bedrock-drbd, bedrock-mesh-*)
+     - Direct cables or isolated bridges; treated identically by
+       bedrock-net (one of many path candidates per peer pair).
 ```
 
-## Why two networks
+## Why this works
 
-- **Bandwidth separation**: a 10 GB VM migrate would saturate a 1 G mgmt
-  LAN. DRBD writes from a busy database would do the same. The ring
-  absorbs the heavy traffic; the LAN stays responsive.
-- **Latency**: DRBD protocol C waits for peer ACK. 0.1 ms more latency
-  on writes is perceptible; dedicated link keeps it deterministic.
-- **Failure isolation**: a mgmt-LAN switch failure doesn't stop DRBD
-  replication — data plane survives a partial network outage. Combined
-  with the witness on a third domain, this lets the cluster keep
-  serving even with degraded networking.
+- **Bandwidth**: a 10 GB VM migrate picks the fastest direct link
+  (USB4 / 10G / 2.5G) without any operator config; DRBD pushes
+  replication across every direct link in parallel via its own
+  multi-path.
+- **Latency**: per-peer routes via fastest link, kernel auto-
+  failover on link-down at metric 10..14, panic-neighbour route
+  at metric 999 as catch-all.
+- **Failure isolation**: any single cable or NIC can die; routing
+  reconverges in seconds via metric-ordered host routes + the
+  bedrock-net heartbeat-driven route delete on black-hole
+  detection. Cluster keeps serving as long as any one path between
+  any two peers remains (possibly via transit through a third node).
 
 ## Firewall policy
 
@@ -90,14 +111,13 @@ Bedrock target environment), the allowlist would be:
 
   br0-<nic>                   bridge-slave connection for the physical uplink
 
-  bedrock-drbd                ethernet connection on eth1
-                              ipv4.method = manual  addresses=10.99.0.X/24
-                              (written by cloud-init in the testbed, by the
-                              operator on physical hw)
-
-  "Wired connection 1"        auto-created by NM on first boot before we could
-                              inject bedrock-drbd → deleted in bootstrap
-                              (cloud-init runcmd: `nmcli con delete ...`)
+  bedrock-mesh-<nic>          ethernet connection on every non-bridge-slave NIC
+                              ipv4.method = link-local
+                              ipv6.method = ignore
+                              connection.autoconnect = yes
+                              (created on-demand by bedrock-net.service when
+                              it first sees the NIC; NM does the RFC 3927
+                              ARP probe + claim)
 ```
 
 ## Open issues / follow-ups

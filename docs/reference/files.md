@@ -8,8 +8,12 @@ Grouped by who owns the file and what changes it.
 | Path | Owner | Shape | Written by | Read by |
 |---|---|---|---|---|
 | `/etc/bedrock/state.json` | all | JSON | `bedrock bootstrap` (init hw section), `bedrock init`/`join` (cluster_*) | `bedrock status`, `bedrock vm *`, `installer/lib/*` |
-| `/etc/bedrock/cluster.json` | mgmt node | JSON | `save_cluster()` in mgmt/app.py (on register) | mgmt dashboard, `bedrock vm create` peer selection |
+| `/etc/bedrock/cluster.json` | all | JSON | mgmt master via `save_cluster()` + orchestrator's view_builder fold; replicated to followers via the bedrock-rust log | mgmt dashboard, `bedrock vm create` peer selection, `bedrock-net` for cluster prefix |
+| `/etc/bedrock/cluster.key` | all | 32-byte binary | mgmt master at `bedrock init` (`daemon_setup.write_cluster_key`); replicated to joiners via register response | bedrock-rust (witness AEAD auth), bedrock-net (signed multicast probe HMAC) |
+| `/etc/bedrock/daemon.toml` | all | TOML | orchestrator subscriber's `daemon_setup.render_from_snapshot` on every relevant log entry | bedrock-rust on startup + after each `systemctl restart` triggered by toml hash change |
 | `/etc/bedrock/installer.env` | all | `KEY=val` | `install.sh` | `bedrock` CLI `get_repo()` |
+| `/etc/systemd/system/bedrock-net.service` | all | systemd unit | `install.sh` | systemd at boot; starts `/usr/local/bin/bedrock-net` |
+| `/etc/NetworkManager/system-connections/bedrock-mesh-<nic>.nmconnection` | all | NM keyfile | `nmcli con add` invoked by bedrock-net's `ensure_link_local` | NetworkManager — drives RFC 3927 link-local on the mesh NIC |
 
 `state.json` shape:
 
@@ -27,7 +31,8 @@ Grouped by who owns the file and what changes it.
   "witness_host": "self" | "<external-host>",
   "mgmt_ip": "192.168.2.152",
   "mgmt_url": "http://192.168.2.152:8080",
-  "drbd_ip": "10.99.0.10"
+  "drbd_ip": "",                            // legacy; mesh layer ignores
+  "loopback_ip": "100.X.Y.1"                // /32 on lo, cluster identity
 }
 ```
 
@@ -38,13 +43,25 @@ Grouped by who owns the file and what changes it.
   "cluster_name": "bedrock-e2e",
   "cluster_uuid": "abcd-...",
   "nodes": {
-    "bedrock-sim-1.bedrock.local": {
-      "host": "192.168.2.152",
-      "drbd_ip": "10.99.0.10",
-      "tb_ip":   "10.99.0.10",
-      "eno_ip":  "10.99.0.10",
-      "role":    "mgmt+compute",
-      "cockpit": "https://192.168.2.152:9090"
+    "bedrock-sim-1": {
+      "host":        "192.168.2.152",
+      "drbd_ip":     "",                    // legacy
+      "loopback_ip": "100.X.Y.1",           // /32 cluster identity
+      "role":        "mgmt+compute",
+      "cockpit":     "https://192.168.2.152:9090",
+      "pubkey":      "ssh-ed25519 ..."
+    },
+    ...
+  },
+  "paths": {
+    // canonical-keyed bedrock-net path table
+    "bedrock-sim-1|enp3s0|bedrock-sim-2|enp3s0": {
+      "node_a": "bedrock-sim-1", "nic_a": "enp3s0",
+      "link_addr_a": "169.254.10.20",
+      "node_b": "bedrock-sim-2", "nic_b": "enp3s0",
+      "link_addr_b": "169.254.30.40",
+      "speed_mbps": 0, "rtt_us": 0,
+      "observed_at": 1778409620.17, "up_since": 1778409620.17
     },
     ...
   }

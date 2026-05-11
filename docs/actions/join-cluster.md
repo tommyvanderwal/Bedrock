@@ -39,11 +39,15 @@ bedrock join --witness <mgmt-host> [--yes]
          │
   T+1s   agent_install.install(witness, cluster_info, repo)
          │
-         │  1. pick mgmt_ip (br0 IP) and drbd_ip (10.99.0.X) from hardware
+         │  1. pick mgmt_ip (br0 IP) from hardware; drbd_ip kept
+         │     empty in mesh mode (path discovery handles routing)
          │
          │  2. state.save({ cluster_name, cluster_uuid, role=compute,
          │                 node_id, node_name, witness_host, mgmt_url,
-         │                 mgmt_ip, drbd_ip })
+         │                 mgmt_ip, drbd_ip,
+         │                 loopback_ip <- result["loopback_ip"] })
+         │     (mgmt master allocated the /32 from this cluster's
+         │      /24 in 100.64.0.0/10 — see cluster_addr.py)
          │
          │  3. exporters.install(repo)  ────────────────────┐
          │       curl <repo>/binaries/node_exporter          │
@@ -73,13 +77,20 @@ bedrock join --witness <mgmt-host> [--yes]
 ```python
 # mgmt/app.py:register_node
 cluster = load_cluster()
+
+# Allocate next free /32 from this cluster's /24 (cluster_addr).
+# Reads used loopbacks from the log directly to avoid a race with
+# orchestrator's cluster.json fold.
+next_loopback = _allocate_next_loopback(cluster["cluster_uuid"])
+
 cluster["nodes"][req.name] = {
-    "host": req.host,                    # mgmt LAN IP (for SSH, cockpit)
-    "drbd_ip": req.drbd_ip or "",        # 10.99.0.X (for DRBD, migrate URI)
-    "tb_ip":   req.drbd_ip or "",        # testbed migration URI = drbd_ip
-    "eno_ip":  req.drbd_ip or "",        # physical-lab direct-eth fallback
-    "role":    req.role,
-    "cockpit": f"https://{req.host}:9090",
+    "host":        req.host,             # mgmt LAN IP (for SSH, cockpit)
+    "drbd_ip":     req.drbd_ip or "",    # legacy field; mesh layer ignores
+    "loopback_ip": next_loopback,        # 100.X.Y.<N> cluster identity
+    "tb_ip":       req.drbd_ip or "",    # testbed legacy
+    "eno_ip":      req.drbd_ip or "",    # legacy
+    "role":        req.role,
+    "cockpit":     f"https://{req.host}:9090",
 }
 save_cluster(cluster)                    # atomic write + write_scrape_config()
 push_log(f"Node {req.name} ({req.host}) registered with cluster",

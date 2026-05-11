@@ -72,6 +72,7 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | VictoriaLogs | 9428 (syslog 5140) | [`components/metrics.md`](components/metrics.md) |
 | node_exporter + vm_exporter | 9100 / 9177 | [`components/exporters.md`](components/exporters.md) |
 | DRBD | kernel + port 7000+minor | [`components/drbd.md`](components/drbd.md) |
+| bedrock-net (mesh discovery + routing) | UDP 7732 | [`06-mesh-network.md`](06-mesh-network.md) |
 | Cockpit | 9090 | —  (upstream docs) |
 
 ---
@@ -91,6 +92,12 @@ the internals in more detail:
   auto-recovery on cold boot.
 - [`05-drbd-internals.md`](05-drbd-internals.md) — activity log, bitmap,
   and how DRBD stays fast + crash-safe.
+- [`06-mesh-network.md`](06-mesh-network.md) — bedrock-net daemon,
+  per-NIC link-local addressing, kernel routing, DRBD multi-path
+  integration, cross-segment collision handling.
+- [`mesh-network-v1-uncertainties.md`](mesh-network-v1-uncertainties.md) —
+  honest list of what's tested, what isn't, and what's known-to-be-fragile
+  in the mesh layer.
 
 ## Conventions used in these docs
 

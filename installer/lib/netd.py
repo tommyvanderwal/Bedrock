@@ -1,9 +1,13 @@
 """Bedrock mesh-network daemon (`bedrock-net.service`).
 
+See `netd.md` (next to this file) for the implementation reference
+(function inventory, state shapes, kernel state touched, invariants).
+See `docs/06-mesh-network.md` for the high-level design rationale
+and operational verification.
+
 Single Python daemon that runs on every node and owns the layer
 between L2-cable-up and "DRBD/libvirt/NFS can talk to a peer's
-loopback IP." The architecture rationale lives in BEDROCK.md
-"network architecture" but the short version:
+loopback IP." The short version:
 
   * Every node has ONE cluster identity = a /32 loopback IP recorded
     in cluster.json (via NODE_LOOPBACK log entry, set at init/join).

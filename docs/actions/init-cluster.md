@@ -58,10 +58,20 @@ bedrock init [--name CLUSTER_NAME] [--witness HOST]
          │       cluster_name, cluster_uuid (random uuid4), │
          │       role=mgmt+compute, node_id=0, mgmt_ip,     │
          │       mgmt_url=http://<ip>:8080, witness_host=self│
+         │       loopback_ip=100.<X>.<Y>.1                  │
+         │       (derived from sha256(cluster_uuid) per     │
+         │        cluster_addr.node_loopback_ip;            │
+         │        RFC 6598 Shared Address Space)            │
          │                                                   │
          │  8. write /etc/bedrock/cluster.json:              │
          │     { cluster_name, cluster_uuid,                 │
-         │       nodes: { <hostname>: { host, drbd_ip, ... }}}│
+         │       nodes: { <hostname>: { host, drbd_ip,       │
+         │                              loopback_ip, ...}}}  │
+         │                                                   │
+         │  8a. systemctl enable --now bedrock-net.service   │
+         │      (mesh discovery + per-NIC link-local via NM, │
+         │      per-peer kernel routes, panic-neighbour      │
+         │      catch-all; see docs/06-mesh-network.md)      │
          │                                                   │
   T+~30s print "Dashboard: http://<ip>:8080"
          │

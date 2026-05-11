@@ -1,43 +1,57 @@
 # Bedrock DRBD Replication
 
-## Network Topology
+> **As of the mesh-network rewrite**: DRBD's `path` blocks are
+> generated from the bedrock-net path table — one `path` per direct
+> NIC pair the cluster observed, ordered fastest-first, plus a
+> loopback fallback as the last resort. The old "dual-path = direct
+> cable + switch" model is now N-path where N matches the actual
+> cabling. See `docs/06-mesh-network.md` for the layer that owns
+> path discovery and route emission.
+
+## Network topology (general case)
 
 ```
-                          MikroTik CRS310
-                        192.168.2.253 (mgmt)
-                     ┌──────────┴──────────┐
-                     │   8x 2.5Gbit ports   │
-                     │   br0 / VLAN 1       │
-                     └───┬──────────────┬───┘
-                         │              │
-                    enp3s0 (br0)   enp3s0 (br0)
-                   192.168.2.141  192.168.2.142
-                 ┌───────┴───┐  ┌───┴───────┐
-                 │   NODE 1  │  │   NODE 2   │
-                 │           │  │            │
-                 │  eno1 ────┼──┼──── eno1   │  ◄── Direct 2.5Gbit cable
-                 │ 10.99.0.1 │  │ 10.99.0.2  │      (no switch in path)
-                 └───────────┘  └────────────┘
+                  cluster identity layer
+                  100.<X>.<Y>.0/24  (RFC 6598)
+                   │
+                   │  per-node /32 on lo
+                   ▼
+           ┌──────────────┐         ┌──────────────┐
+           │   node 1     │         │   node 2     │
+           │ 100.<X>.<Y>.1│         │ 100.<X>.<Y>.2│
+           ├──────────────┤         ├──────────────┤
+           │ br0 (LAN)    │ ─────── │ br0 (LAN)    │
+           │              │ switch  │              │
+           │ enp2s0 (mesh)│ ─────── │ enp2s0       │
+           │ enp3s0 (mesh)│ ─────── │ enp3s0       │  direct cable
+           │ usb4 (mesh)  │ ─────── │ usb4         │  direct cable
+           └──────────────┘         └──────────────┘
 
-     Management / VM traffic: via MikroTik switch (enp3s0 → br0)
-     DRBD replication:        DUAL PATH (see below)
-     SSH between nodes:       works on BOTH paths
+  Mgmt traffic + VM bridge: br0 (operator LAN)
+  Cluster identity:         /32 on lo, 100.X.Y.<node>
+  DRBD replication:         every direct NIC pair, plus loopback fallback
+  Routes:                   bedrock-net installs metric-ordered host routes;
+                            DRBD multi-paths over per-NIC link-local
 ```
 
-## DRBD Dual-Path Replication
+## DRBD multi-path replication
 
-DRBD is configured with **two independent replication paths** per resource.
-If one path fails, replication continues over the other. No VM freeze.
+DRBD is configured with **one `path` block per directly-connected NIC
+pair** the bedrock-net mesh layer has observed. Failover between
+paths is automatic — DRBD detects path-level TCP failure
+independent of kernel routing.
 
 ```
-  Resource        Path 1 (direct cable)    Path 2 (via switch)
-  ──────────────────────────────────────────────────────────────
-  vm-test-disk0   10.99.0.1 ↔ 10.99.0.2   192.168.2.141 ↔ .142
-                  port 7789                port 7789
-  vm-win-disk0    10.99.0.1 ↔ 10.99.0.2   192.168.2.141 ↔ .142
-                  port 7790                port 7790
+  Resource    Path 1 (LAN)       Path 2 (cable A)     Path 3 (cable B)   Path 4 (loopback fallback)
+  ─────────────────────────────────────────────────────────────────────────────────────────────────
+  tier-bulk   192.168.2.1 ↔ .2   169.254.A.B ↔ .C.D   169.254.E.F ↔ .G.H 100.X.Y.1 ↔ 100.X.Y.2
 
-  ┌──────────┐         Path 1: direct cable          ┌──────────┐
+  ↑ Real per-NIC addresses populated automatically from the bedrock-net
+    path table; each path block carries the actual addresses for that
+    specific NIC pair. DRBD picks fastest-first by metric, falls over
+    to the next on path-level TCP failure.
+
+  ┌──────────┐         Path 2: direct cable          ┌──────────┐
   │  NODE 1  │═══════ 10.99.0.1 ←──────→ 10.99.0.2 ═══│  NODE 2  │
   │          │                                        │          │
   │          │         Path 2: via MikroTik switch    │          │

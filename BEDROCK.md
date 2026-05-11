@@ -24,7 +24,7 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - **Base OS:** AlmaLinux 10.1. (Earlier drafts targeted 9 because DRBD-kmod against the 10.0 kernel had open issues; ELRepo's `kmod-drbd9x-9.3.x` against el10_1 resolves that.)
 - **Hypervisor:** KVM/QEMU/libvirt (standard AlmaLinux packages)
 - **Storage:** **One disk per node, one VG, one thin pool.** Everything dynamic — host root LV, optional swap LV, storage tiers, every VM disk — lives as a thin LV in that single pool. Boot needs ~1.5 GB outside (EFI + /boot); the rest is flexible and freely re-allocatable. TRIM/discard end-to-end so freed blocks return to the pool. DRBD per VM disk for pet/ViPet replication, on top of those thin LVs.
-- **Networking:** br0 bridge on management NIC for VM traffic. Dedicated private subnet on direct cable for DRBD replication.
+- **Networking:** br0 bridge on management NIC for VM traffic. Mesh-aware overlay (`bedrock-net` daemon, on every node) for cluster-internal traffic — every NIC is a path candidate, the kernel routes per-peer through the best available physical link, DRBD multi-paths over the real per-NIC addresses. See `docs/06-mesh-network.md`. Cluster identity lives in RFC 6598 Shared Address Space (`100.64.0.0/10`, derived `/24` per cluster from `cluster_uuid`); per-NIC link addresses come from RFC 3927 IPv4 link-local assigned by NetworkManager. Operator plugs any cable into any port and the system figures out the rest.
 - **Orchestrator:** Python based. Most code should be python based. Only realtime critical items should potentially be rust components. e.q. a custom docker DRBD witness on Mikrotik, would probably be rust.
 
 ## Why AlmaLinux (not Debian, not Ubuntu)

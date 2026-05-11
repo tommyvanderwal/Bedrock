@@ -119,25 +119,47 @@ resource vm-webapp1-disk0 {
     protocol C;
     net { allow-two-primaries no; after-sb-0pri discard-zero-changes;
           after-sb-1pri discard-secondary; after-sb-2pri disconnect; }
-    on bedrock-sim-1.bedrock.local {
+    on bedrock-sim-1 {
         node-id 0;
         device /dev/drbd1000;
-        disk /dev/almalinux/vm-webapp1-disk0;
-        address 10.99.0.10:8000;
-        meta-disk /dev/almalinux/vm-webapp1-disk0-meta;
+        disk /dev/bedrock/vm-webapp1-disk0;
+        meta-disk /dev/bedrock/vm-webapp1-disk0-meta;
+        address 100.X.Y.1:8000;       # cluster identity (lo /32)
     }
-    on bedrock-sim-2.bedrock.local { node-id 1; ... 10.99.0.11:8000; ... }
-    on bedrock-sim-3.bedrock.local { node-id 2; ... 10.99.0.12:8000; ... }
-    connection-mesh {
-        hosts bedrock-sim-1.bedrock.local
-              bedrock-sim-2.bedrock.local
-              bedrock-sim-3.bedrock.local;
+    on bedrock-sim-2 { node-id 1; ...; address 100.X.Y.2:8000; }
+    on bedrock-sim-3 { node-id 2; ...; address 100.X.Y.3:8000; }
+
+    # One connection per peer pair, multi-path over the mesh:
+    connection {
+        path {
+            # LAN bridge (br0 ↔ br0)
+            host bedrock-sim-1 address 192.168.2.1:8000;
+            host bedrock-sim-2 address 192.168.2.2:8000;
+        }
+        path {
+            # Direct mesh cable (e.g. enp2s0 ↔ enp2s0)
+            host bedrock-sim-1 address 169.254.10.20:8000;
+            host bedrock-sim-2 address 169.254.30.40:8000;
+        }
+        path {
+            # Loopback fallback — kernel routes via best NIC
+            host bedrock-sim-1 address 100.X.Y.1:8000;
+            host bedrock-sim-2 address 100.X.Y.2:8000;
+        }
     }
+    connection { ...  # same for sim-1 ↔ sim-3
+    connection { ...  # same for sim-2 ↔ sim-3
 }
 ```
 
-Written by `_gen_drbd_res()` in mgmt/app.py and landed on every node
-via `_write_drbd_res()` (base64-over-SSH, idempotent).
+Written by `tier_storage.render_drbd_res_mesh()`, regenerated
+automatically on every `LINK_*` log entry via the mgmt orchestrator's
+subscriber. `drbdadm adjust tier-<resource>` after each regen —
+in-flight replication survives.
+
+The per-NIC addresses come from the bedrock-net path table; see
+[`../06-mesh-network.md`](../06-mesh-network.md) for how they're
+discovered and kept fresh.
 
 ## Lifecycle under Bedrock
 

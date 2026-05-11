@@ -998,3 +998,130 @@ swap is one line and protects every existing and future SSH'd cmd.
 - bash(1) "Double Quotes": `$`, ``\``, `"`, `\` are special inside
   double quotes; `\$N` would have escaped, but better not to lay
   the trap.
+
+
+## L32 — Cluster identity belongs in RFC 6598 (`100.64.0.0/10`), not RFC 1918
+
+**Date**: 2026-05-11
+**Files**: `installer/lib/cluster_addr.py`, `installer/lib/mgmt_install.py`,
+`installer/lib/netd.py`, `mgmt/app.py`
+
+We originally carved cluster loopback `/32` identities from
+`10.99.0.0/24`. That's RFC 1918 private space, which means an
+operator using `10.99` internally (Hetzner default networks, AWS
+VPC defaults, plenty of homelabs) silently collides with us. Our
+"throwaway" `/32`s end up on real LAN hosts; routes fight each
+other.
+
+Fix: derive the cluster's `/24` from `sha256(cluster_uuid)` inside
+RFC 6598 Shared Address Space (`100.64.0.0/10`). IANA reserved
+that block for the ISP-to-CPE link of carrier-grade NAT, with an
+explicit rule that operator LANs SHOULD NOT use it. 16,384 distinct
+`/24`s available; two Bedrock clusters in the same operator network
+collide with probability ≈ 0.006%. Cluster-internal traffic never
+leaves the cluster, so we don't care that ISPs use this space
+upstream — the only edge case is a node plugged directly into a
+CGNAT-ed ISP link, which Bedrock isn't designed for.
+
+The takeaway: when picking a private address block for an isolated
+overlay, pick the IANA range whose *intent* matches your use case
+(non-public, can't conflict with LANs). RFC 1918 is the wrong
+default for cluster overlays specifically because operators have
+already claimed every popular /16 inside it.
+
+
+## L33 — IPv4 link-local across multiple NICs needs `/32` host routes
+
+**Date**: 2026-05-10
+**Files**: `installer/lib/netd.py`
+
+RFC 3927 / APIPA assigns each NIC its own `169.254.X.Y/16`, and the
+kernel auto-installs `169.254.0.0/16 dev <nic> scope link` per NIC.
+With multiple mesh NICs that all have link-local addresses, the
+auto-installed `/16`s are ambiguous — the kernel picks the
+lowest-metric one when routing to `169.254.151.72`, which may be
+the wrong physical NIC for that destination. ARP fails silently on
+the wrong wire, the peer is "unreachable," the path appears dead.
+
+Linux has no equivalent of IPv6's `%iface` zone identifier for IPv4
+link-local. RFC 3927 explicitly notes IPv4 LL "is not designed for
+use across multiple interfaces simultaneously" and recommends a
+single LL interface per host.
+
+Fix: bedrock-net installs a `/32` host route per observed peer
+link-address, pinned to the NIC that received its probe — e.g.
+`169.254.151.72/32 dev enp2s0 scope link`. Longest-prefix-match
+beats the auto `/16`, the kernel uses the right NIC, ARP succeeds.
+
+The takeaway: when using IPv4 link-local on a multi-NIC host, you
+must explicitly install `/32` host routes per peer. The kernel's
+auto-routing isn't sufficient.
+
+
+## L34 — RFC 3927's ARP probe doesn't cross L2 segments — collisions need an out-of-band mechanism
+
+**Date**: 2026-05-11
+**Files**: `installer/lib/netd.py`
+
+Two peers on different isolated L2 segments can independently
+negotiate the same `169.254.X.Y` because ARP probes don't traverse
+bridges. Within-segment, NetworkManager catches conflicts cleanly
+(probe, see reply, pick another). Cross-segment is invisible to
+RFC 3927.
+
+Bedrock-net detects the collision because both peers' probes reach
+the same discoverers (any node with NICs on both segments). The
+local `/32` route install conflicts: `EEXIST` with a different
+`dev`.
+
+Fix: the discoverer fires a 3× gratuitous ARP announcement on the
+loser's segment from its own MAC, claiming the colliding address.
+RFC 3927 §2.5 defense kicks in on the loser — sees a different
+MAC asserting its IP, defends once, sees the announcement persist
+on retry, renumbers via fresh ARP probe. The discoverer's own
+MAC is fine (two IPs on one MAC is kernel-legal; APIPA only checks
+MAC inequality).
+
+Two safety guards:
+1. `(peer_node, peer_nic)` discriminator: if the same peer interface
+   shows up via multiple of our NICs, it's an L2 *merge* (operator
+   bridged two segments), not a collision. Firing the countermeasure
+   would chase a legitimate peer off its address. Skip.
+2. 30 s per-`(addr, my_nic)` cooldown to prevent re-firing every
+   sweep while the loser is mid-renumber. Multiple discoverers in
+   parallel each maintain their own cooldown — by design, since
+   RFC 3927 defense is idempotent against multiple defends.
+
+The takeaway: extending APIPA's safety properties beyond a single
+L2 segment requires a higher-layer protocol with both the *peer
+identity* and the *link address* in one signed envelope. Standard
+mDNS / LLDP / RFC 3927 don't carry that triple; bedrock-net's
+signed probe payload does, which is what makes the collision
+detection forge-proof.
+
+
+## L35 — Single-writer means followers can't write LINK_* entries
+
+**Date**: 2026-05-09
+**Files**: `installer/lib/netd.py`
+
+Originally every node's bedrock-net daemon called
+`rust_ipc.Daemon().append()` to write its observed LINK_UP entries
+to the local log. Followers writing to their own log diverges the
+hash chain from master's — master's subsequent entries can't
+replicate forward because their hash chain assumed an empty follower
+log. Result: when a new node joins, follower-sim-2's log can't
+accept master's entries 25+ because its own writes have already
+occupied those indices.
+
+Fix: only the mgmt master calls `append()`. Followers keep their
+in-memory neighbour table for routing decisions but don't write
+log entries. The path table in cluster.json is therefore
+master-centric — inter-peer paths (peers that don't include master)
+aren't visible in the log. That's a known limit; v1.x adds a
+follower-POSTs-to-master API so master can append on their behalf.
+
+The takeaway: any process that writes to bedrock-rust's log MUST
+verify it's running on the mgmt master first. Even daemons that
+seem "local" (like a per-node mesh discovery daemon) violate
+single-writer if they all append independently.
