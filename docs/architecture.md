@@ -37,22 +37,36 @@ A 3-node cluster typically looks like this:
     │ same as node2                      ├──────── br0 ─────────────┘
     └────────────────────────────────────┘
                           │
-                          │   ═══ DRBD replication ═══
-                          │   10.99.0.0/24 (direct-cable / VLAN)
+                          │   ═══ mesh underlay (bedrock-net) ═══
+                          │   per-cluster /24 in 100.64.0.0/10 +
+                          │   per-NIC 169.254.x.y link-local
                           │
                 ┌─────────┴──────────┐
          node1 ═╪════════════════════╪═ node2
-         10.99.0.10                  10.99.0.11
+         100.X.Y.1                    100.X.Y.2
                           ╪
                        node3
-                      10.99.0.12
+                      100.X.Y.3
 ```
 
-Two networks, one bridge. The **management LAN** (br0, 192.168.2.x) carries
-everything the operator and the dashboard use: SSH, HTTP, metrics, logs, DNS,
-DHCP from the LAN router. The **DRBD ring** (10.99.0.x) is isolated and only
-carries block-replication traffic between nodes — in a testbed it's a libvirt
-isolated network; in the physical lab it's direct-cable or a dedicated VLAN.
+**Cluster identity** — each node has one stable `/32` on `lo` derived
+from `cluster_uuid` (per-cluster `/24` carved deterministically from
+RFC 6598 Shared Address Space, `100.64.0.0/10`). All cluster-internal
+traffic targets that `/32`; the kernel routes it through whichever
+physical NIC is best per the bedrock-net path table.
+
+**Per-NIC reachability** — every directly-attached interface gets a
+`169.254.x.y` link-local via NetworkManager (RFC 3927). DRBD's
+multi-path config lists each direct-link address pair as a separate
+`path` block; a loopback fallback path catches everything if every
+direct link fails. The mgmt LAN (br0, 192.168.2.x) keeps its DHCP
+address and carries operator-facing traffic — dashboard HTTP, SSH,
+metrics, VM bridges — bedrock-net just observes it as one of many
+path candidates per peer pair.
+
+See [`06-mesh-network.md`](06-mesh-network.md) for the full mesh-layer
+design, RFC choices, cross-segment collision handling, and
+verification commands.
 
 ## Workload types
 
@@ -181,8 +195,12 @@ referenced as an external host in `cluster.json`.
 
 ```
 /etc/bedrock/
-    state.json            per-node identity, mgmt_url, hardware inventory
-    cluster.json          cluster topology, all node hosts + drbd_ips
+    state.json            per-node identity, mgmt_url, loopback_ip, hardware
+    cluster.json          cluster topology — nodes (with loopback_ip),
+                          witnesses, tiers, paths (mesh path table)
+    cluster.key           32-byte HMAC key (bedrock-net probes + Echo witness)
+    daemon.toml           bedrock-rust config; regenerated on every snapshot
+                          change by mgmt/orchestrator's subscriber
     installer.env         BEDROCK_REPO=... (used by bedrock CLI subcommands)
 
 /opt/bedrock/

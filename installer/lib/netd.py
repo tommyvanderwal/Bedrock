@@ -11,38 +11,71 @@ loopback IP." The short version:
 
   * Every node has ONE cluster identity = a /32 loopback IP recorded
     in cluster.json (via NODE_LOOPBACK log entry, set at init/join).
-    Per-NIC IPs are throwaway and never logged.
-  * On every up interface, this daemon emits a signed UDP multicast
-    probe every 1 s. Recipients verify the cluster_key MAC, learn
-    "node X's loopback Y is reachable on this link via address Z."
-  * In-memory gossip is realtime; only durable transitions (link up
-    past 5 s, link down past 30 s) get appended to the log as
-    LINK_UP / LINK_DOWN.
-  * Routing is computed locally per-node from the replicated path
-    table (Dijkstra on the graph). Backup routes installed at
-    monotonic metrics so the kernel fails over for free on
-    link-down. Black-hole gateway detection comes from this daemon's
-    own probe-loss → it `ip route del` the dead route, the
-    next-metric one auto-promotes.
-  * A panic-neighbour catch-all `<cluster /24> via <freshest peer>
+    Per-NIC IPs ARE logged (as link_addr_a/b in LINK_UP/LINK_QUALITY)
+    so DRBD's multi-path config can list them in path blocks.
+  * On every up non-blocklisted interface, this daemon emits a signed
+    UDP multicast probe every 1 s. Recipients verify the cluster_key
+    HMAC, learn "node X's loopback Y is reachable on this link via
+    address Z." The interface blocklist filters lo / virbr / docker /
+    br-* / veth / tap / tun / wg / kube / cali / cni prefixes and
+    any interface that's enslaved to a bridge (bridge ports get no
+    /32 because the bridge itself is the routable endpoint).
+  * In-memory gossip is realtime; only durable transitions get
+    appended to the bedrock-rust log: LINK_UP after 5 s continuous,
+    LINK_DOWN after 30 s silent, LINK_QUALITY is rate-limited first
+    (max once per QUALITY_REFRESH_S = 60 s) AND change-sensitive
+    second (≥25% speed bucket change). Order matters: we never
+    emit a quality event sooner than the gate, even on a big change.
+  * Single-writer rule: only the mgmt master appends LINK_* entries
+    to the log. Followers return success from emit_link_event()
+    without appending so their hysteresis state still advances (and
+    they don't retry forever) — but the log itself stays
+    single-writer. Without this, follower writes diverge the hash
+    chain from master's and break replication of subsequent
+    membership entries.
+  * Routing: each tick rebuilds the desired routes from the
+    in-memory neighbour table (no Dijkstra in v1 — we do direct
+    routing per peer, one /32 per direct link in metric order plus
+    a panic /24 catch-all; transit routing through other nodes is a
+    v1.x add). Backup routes installed at monotonic metrics so the
+    kernel fails over for free on link-down. Black-hole gateway
+    detection comes from this daemon's own probe-loss → it
+    `ip route del` the dead route, the next-metric one auto-promotes.
+  * Panic-neighbour catch-all `<cluster /24> via <freshest peer>
     metric 999` is always installed when at least one neighbour is
     reachable. Cluster /24 is derived from cluster_uuid (RFC 6598
     100.64.0.0/10). Loops are bounded by IP TTL; TCP backoff and
     UDP's low volume keep the worst case from being noisy.
 
 Concretely this file holds:
-  * `NetDaemon` — the run-loop. Started by /usr/local/bin/bedrock-net
-    via the bedrock-net.service systemd unit.
+  * `Daemon` dataclass — the run-loop state. Started by
+    /usr/local/bin/bedrock-net via the bedrock-net.service systemd
+    unit.
   * Probe codec (msgpack + HMAC-SHA256 over cluster_key).
-  * Interface watcher (parses `ip monitor link`).
-  * Hysteresis logic.
-  * Route emitter (`ip route` shell-outs; one place that touches the
-    cluster prefixes, so we never fight ourselves).
+  * Interface set maintenance — every tick walks /sys/class/net to
+    find up non-blocklisted NICs; no kernel-event subscription. NICs
+    coming up/down are detected within one tick (~250 ms).
+  * Link-local IP assignment via NetworkManager (preferred — creates
+    a per-NIC `bedrock-mesh-<nic>` profile with ipv4.method=link-
+    local so NM does the RFC 3927 ARP probe + claim) with a kernel-
+    only fallback (`ip addr add` of a MAC-derived 169.254.x.y) when
+    nmcli isn't available.
+  * Hysteresis logic (sweep_hysteresis).
+  * Cross-segment LL collision detection + RFC 3927 ARP defense
+    countermeasure (_detect_and_handle_ll_collision +
+    arp_force_renumber).
+  * Route emitter (`ip route` shell-outs via emit_routes() /
+    compute_routes(); one place that touches the cluster prefixes,
+    so we never fight ourselves).
 
-Style: pure stdlib + msgpack. No external deps beyond what packages.py
-already installs cluster-wide. The daemon is single-threaded with
-soft real-time loops (~250 ms tick); receive sockets run in a thread
-pool so a blocked NIC doesn't stall the rest.
+DRBD config regen on path-table change lives in
+`installer/lib/tier_storage.py::regen_drbd_configs_from_snapshot`,
+called by mgmt/orchestrator.py's subscriber. Not in this file.
+
+Style: pure stdlib + msgpack. No external deps beyond what
+packages.py installs cluster-wide. The daemon is single-threaded
+with a ~250 ms main-loop tick; receive happens inline via recvmsg
+(non-blocking, drained until empty each tick).
 """
 
 from __future__ import annotations

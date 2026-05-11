@@ -35,11 +35,27 @@ the cluster's UUID and a node index:
     topology — protocols bind to this, not to a physical NIC's IP.
 
 **Reachability** — every directly-attached NIC gets an IPv4
-link-local address (`169.254.0.0/16`, RFC 3927), assigned by
-NetworkManager via a per-NIC `bedrock-mesh-<nic>` profile with
-`ipv4.method=link-local`. NM does the ARP probe + retry on
-collision per the standard. The DHCP-assigned LAN address on the
-mgmt bridge (`br0`) is left alone; bedrock-net just picks it up.
+link-local address (`169.254.0.0/16`, RFC 3927).
+NetworkManager is the preferred assignment path: bedrock-net
+creates a per-NIC `bedrock-mesh-<nic>` profile with
+`ipv4.method=link-local`, and NM does the ARP probe + retry on
+collision per the standard.
+
+When `nmcli` isn't on PATH (operator using systemd-networkd or a
+bare-kernel setup), bedrock-net falls back to assigning a
+deterministic `169.254.X.Y` derived from the NIC MAC via plain
+`ip addr add` — no ARP probe, just enough to let the mesh layer
+send/receive. Within-segment collisions in that fallback path are
+caught the same way as cross-segment ones (by the cluster-protocol
+collision logic below), so safety is preserved.
+
+The DHCP-assigned LAN address on the mgmt bridge (`br0`) is left
+alone; bedrock-net just picks it up. Interfaces matching the prefix
+blocklist (`lo`, `virbr*`, `docker*`, `br-*`, `veth*`, `tap*`,
+`tun*`, `wg*`, `kube*`, `cali*`, `cni*`) and bridge slaves
+(interfaces with `/sys/class/net/<nic>/master` set) are skipped
+entirely — operator-managed networks, container plumbing, and
+bridge ports are not mesh path candidates.
 
 ## What flows on the wire
 
@@ -64,8 +80,14 @@ get appended to the bedrock-rust log:
 
   * `LINK_UP` after a path has been continuously reachable for ≥5 s.
   * `LINK_DOWN` after a path has been silent for ≥30 s.
-  * `LINK_QUALITY` at most once per minute per pair when stable,
-    immediate on >25 % change.
+  * `LINK_QUALITY` is **rate-limited first, change-sensitive second**:
+    the sweep checks `(now − last_quality_log) ≥ QUALITY_REFRESH_S`
+    (60 s default) before considering whether the speed bucket
+    changed by ≥25 %. So a quality event is never emitted sooner
+    than the rate limit, even on a big sudden change. The trade is
+    log volume — at scale we'd rather miss a fast transient than
+    flood the cluster log; large persistent changes get captured on
+    the next sweep after the gate elapses.
 
 The log carries `(node_a, nic_a, link_addr_a, node_b, nic_b,
 link_addr_b, speed_mbps, rtt_us, observed_at)`. Fold canonicalises
@@ -77,6 +99,17 @@ Followers keep their full in-memory neighbour table for routing
 decisions but don't write to the log — otherwise their writes
 diverge the hash chain and break master's replication of
 subsequent membership entries.
+
+Implementation nuance: on a follower, `emit_link_event()` returns
+`True` (success) without actually appending. This is deliberate —
+the caller in `sweep_hysteresis` flips `logged_up = True` on
+success, which advances the local state machine past the
+up-hysteresis edge. Without that, every sweep on a follower would
+re-attempt the (impossible) append forever. The fact that the log
+itself doesn't gain the entry is fine because master is observing
+the same physical paths and writing them on master's side; followers
+just need to know "I've crossed this threshold locally" so their
+own routes get installed.
 
 ## Kernel routing
 
@@ -104,9 +137,12 @@ route` calls, diffs against current state, applies the delta:
 
 ## DRBD multi-path
 
-When `regen_drbd_configs_from_snapshot()` fires on a path-table
-change (subscribed via mgmt orchestrator), every tier currently in
-DRBD mode regenerates its resource file:
+The function `regen_drbd_configs_from_snapshot()` lives in
+`installer/lib/tier_storage.py` (not in `netd.py`). The mgmt
+orchestrator's subscriber calls it after every relevant log fold
+— see `mgmt/orchestrator.py::_apply_entry`. When the path table
+changes, every tier currently in DRBD mode regenerates its
+resource file:
 
   * One `connection` per peer pair.
   * One `path { host A address <addr_a>:port; host B address <addr_b>:port; }`

@@ -165,8 +165,14 @@ nohup ./serve.py &        # serve installer over :8000
 ./test_e2e.sh             # full multi-scenario validation
 ```
 
-The testbed mirrors the v1 LAN layout: each sim is on `192.168.2.20{1,2,3,4}`
-with a private DRBD ring on `10.99.0.x`.
+The testbed mirrors the v1 layout: each sim plugs into the LAN bridge
+(DHCP-assigned `192.168.2.x`) plus three isolated mesh bridges
+(`bedrock-mesh-{1,2,3}`). bedrock-net discovers per-NIC link-local
+addresses via NetworkManager, builds the cluster path table, and
+installs metric-ordered host routes for the per-cluster `/24` it
+derives from `cluster_uuid` inside RFC 6598 (`100.64.0.0/10`). See
+[`docs/06-mesh-network.md`](docs/06-mesh-network.md) for the full
+mesh design.
 
 ## License
 

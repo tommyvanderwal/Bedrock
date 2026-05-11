@@ -199,7 +199,28 @@ prevent this, but I haven't constructed a test for it.
 - Async return paths (rp_filter=2 is set but no test verified it does
   what we expect under real asymmetry)
 
-## 13. The big "design choice I'd revisit"
+## 13. bedrock-rust peer dialing — RESOLVED 2026-05-11
+
+The external code review (2026-05-11) flagged this:
+`installer/lib/daemon_setup.py::render_from_snapshot` and
+`mgmt/app.py::register_node` both built bedrock-rust peer addresses
+from `n.get("drbd_ip") or n.get("host", "")`, which meant cluster-
+protocol log replication rode the mgmt LAN regardless of what the
+mesh layer had discovered. DRBD storage replication got the full
+mesh benefit; the cluster-protocol log didn't.
+
+**Fix landed**: both functions now use the preference chain
+`loopback_ip → drbd_ip → host`. bedrock-rust dials each peer at
+its `/32` cluster identity; the kernel route to that identity picks
+the best physical NIC via bedrock-net's metric-ordered routing.
+Multi-path failover is now uniform across DRBD and bedrock-rust.
+
+The legacy fallbacks (drbd_ip / host) stay in the preference chain
+so clusters that pre-date the mesh layer keep working, and N=1
+clusters whose master genuinely has no loopback yet (mid-init race)
+still get a dialable address.
+
+## 14. The big "design choice I'd revisit"
 
 The bedrock-net daemon is a separate Python process. Reasonable for v1
 because it isolates the netlink/multicast stuff from bedrock-rust's

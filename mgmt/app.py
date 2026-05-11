@@ -732,16 +732,22 @@ def register_node(req: NodeRegister):
     except Exception:
         pass
     # Address the joiner's bedrock-rust should dial to start log
-    # replication. Prefer drbd_ip (the dedicated peer-link at N≥2 —
-    # separate cable, redundant) but fall back to host (mgmt LAN) when
-    # drbd_ip is empty. drbd_ip is always empty in N=1 (no DRBD ring),
-    # so without this fallback the joiner gets `peer=[":8200"]` and
-    # never replicates the log. Field name is kept as `master_drbd_ip`
-    # for wire-format compatibility with older joiners.
+    # replication. Preference order:
+    #   1. loopback_ip — the mesh cluster identity. Kernel route to
+    #      the /32 picks the best NIC; bedrock-rust gets multi-path
+    #      failover for free.
+    #   2. drbd_ip — legacy dedicated peer-link.
+    #   3. host — mgmt LAN, always-true fallback.
+    # Field name kept as `master_drbd_ip` for wire-format
+    # compatibility with older joiners. The render path
+    # (daemon_setup.render_from_snapshot) applies the same
+    # preference order once the snapshot folds in.
     master_drbd_ip = ""
     for n_name, n in cluster.get("nodes", {}).items():
         if "mgmt" in n.get("role", ""):
-            master_drbd_ip = n.get("drbd_ip") or n.get("host", "")
+            master_drbd_ip = (n.get("loopback_ip")
+                              or n.get("drbd_ip")
+                              or n.get("host", ""))
             if master_drbd_ip:
                 break
 
