@@ -18,6 +18,10 @@ This documentation exists so any engineer picking up the project can answer:
 
 - [`architecture.md`](architecture.md) — the whole stack on one page, with a
   component map, port list, and data-flow diagram. Read this first.
+- [`network-walkthrough.md`](network-walkthrough.md) — a friendly,
+  ASCII-art-heavy tour of how the cluster's networking actually works
+  (every step, every decision). Aimed at non-network engineers; use as
+  the gentle introduction before diving into `06-mesh-network.md`.
 
 ## Actions (what engineers trigger)
 
