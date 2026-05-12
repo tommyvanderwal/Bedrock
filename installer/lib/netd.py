@@ -394,7 +394,11 @@ class Neighbour:
     first_seen: float
     last_seen: float
     speed_mbps: int = 0
+    # Smoothed RTT from ICMP latency measurement (protocol 2). Zero
+    # means "no sample yet"; first non-outlier sample seeds the EWMA.
     rtt_us: int = 0
+    rtt_var_us: int = 0
+    rtt_outlier_streak: int = 0
     # Logged: True once we've emitted a LINK_UP that hasn't been
     # superseded by a LINK_DOWN yet.
     logged_up: bool = False
@@ -426,6 +430,10 @@ class Daemon:
     # still mid-NM-renumber. Multiple discoverers in parallel are
     # still fine — each maintains its own cooldown.
     last_arp_renumber: dict = field(default_factory=dict)
+    # ICMP latency-probing state (protocol 2): one pinger per local
+    # NIC. The pinger owns a non-blocking unprivileged ICMP socket
+    # bound to that NIC's link-local address.
+    icmp_pingers: dict = field(default_factory=dict)
     # Stop flag for clean shutdown.
     stopped: bool = False
 
@@ -603,14 +611,23 @@ def run_daemon():
 
     last_probe = 0.0
     last_route_emit = 0.0
+    last_icmp = 0.0
 
     while not d.stopped:
         try:
             tick(d, last_probe, last_route_emit)
             now = time.time()
+            now_mono_ns = time.monotonic_ns()
             if now - last_probe >= PROBE_INTERVAL:
                 send_probes(d, now)
                 last_probe = now
+            # Protocol 2: ICMP latency. Drain replies every tick (cheap
+            # — non-blocking recv); send a fresh round every
+            # ICMP_INTERVAL_S.
+            icmp_drain_replies(d, now_mono_ns)
+            if now - last_icmp >= ICMP_INTERVAL_S:
+                icmp_send_round(d, now_mono_ns)
+                last_icmp = now
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
                 last_route_emit = now
@@ -992,6 +1009,235 @@ def sweep_hysteresis(d: Daemon) -> None:
         d.neighbours.pop(key, None)
 
 
+# ── ICMP latency measurement (protocol 2 of three) ──────────────────
+#
+# Per the docs/06-mesh-network.md "three protocols, one job each"
+# architecture: discovery rides multicast (above), latency rides
+# ICMP echo with kernel timestamps (here), advertisement rides
+# unicast (below). Each is independently observable + fails closed.
+#
+# Why unprivileged ICMP and not a custom UDP echo: kernel hot-path,
+# 40 years of testing, externally validatable via tcpdump/mtr, no
+# userspace echoer needed on the peer (peer's kernel responds).
+#
+# Why our own ICMP socket and not the `ping` shell utility:
+# per-NIC source binding + sub-ms timing matter; subprocess startup
+# alone adds milliseconds of jitter, swamping the signal we're
+# trying to measure on sub-ms LANs.
+
+ICMP_INTERVAL_S = 2.0
+ICMP_TIMEOUT_S  = 0.5
+RTT_OUTLIER_ABS_US = 100_000   # 100 ms absolute on a sub-ms LAN = noise
+
+# TCP RFC 6298 EWMA constants
+RTT_ALPHA = 0.125    # smoothed RTT mixing weight
+RTT_BETA  = 0.25     # variance mixing weight
+
+
+def icmp_checksum(data: bytes) -> int:
+    """Standard internet checksum over a bytestring; pads odd length."""
+    if len(data) & 1:
+        data = data + b"\x00"
+    s = 0
+    for i in range(0, len(data), 2):
+        s += (data[i] << 8) | data[i + 1]
+    s = (s & 0xFFFF) + (s >> 16)
+    s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def build_icmp_echo(identifier: int, seq: int, payload: bytes = b"bedrock") -> bytes:
+    """ICMP echo request packet (type 8, code 0). Kernel will fill in
+    the IP header for us via SOCK_DGRAM/IPPROTO_ICMP."""
+    icmp_type, code = 8, 0
+    header_without_csum = struct.pack("!BBHHH", icmp_type, code, 0,
+                                       identifier & 0xFFFF, seq & 0xFFFF)
+    pkt_for_csum = header_without_csum + payload
+    csum = icmp_checksum(pkt_for_csum)
+    header = struct.pack("!BBHHH", icmp_type, code, csum,
+                          identifier & 0xFFFF, seq & 0xFFFF)
+    return header + payload
+
+
+def parse_icmp_reply_seq(buf: bytes) -> int | None:
+    """Pull the (identifier, seq) out of an ICMP echo reply that the
+    kernel handed us. The Linux unprivileged ICMP socket strips the
+    IP header for us — the first byte is the ICMP type. Returns the
+    sequence number if this is a valid echo reply, or None.
+
+    Even after Linux's NAT remap of the identifier on
+    SOCK_DGRAM/IPPROTO_ICMP, the sequence number is preserved
+    verbatim, so we use it as the pending-request key."""
+    if len(buf) < 8:
+        return None
+    icmp_type = buf[0]
+    if icmp_type != 0:    # 0 == echo reply
+        return None
+    _ident, seq = struct.unpack("!HH", buf[4:8])
+    return seq
+
+
+@dataclass
+class IcmpPinger:
+    """One per (peer_node, peer_nic, my_nic): owns a non-blocking ICMP
+    socket bound to my_link_addr, with a per-instance sequence counter
+    and a tiny outstanding-probe map keyed by sequence number.
+
+    Sockets are pooled per `my_nic` (one per local NIC), not per peer,
+    because the kernel routes based on the destination /32 we
+    installed via emit_routes. Many peers can share the same source
+    socket. The pending map is per-(seq, peer) so reply
+    dis-ambiguation works without collision."""
+    sock: socket.socket
+    seq:  int = 1
+    pending: dict = field(default_factory=dict)
+        # seq -> (peer_link_addr, send_ts_monotonic_ns)
+
+
+def _ensure_icmp_socket(d: Daemon, my_nic: str) -> socket.socket | None:
+    """One unprivileged ICMP socket per local NIC. Bound to that NIC's
+    link-local address so the kernel uses it as the source. Returns
+    None if the kernel doesn't allow unprivileged ICMP (no entry in
+    /proc/sys/net/ipv4/ping_group_range covering our gid)."""
+    p = d.icmp_pingers.get(my_nic)
+    if p is not None:
+        return p.sock
+    src_addr = d.nic_addrs.get(my_nic, "")
+    if not src_addr:
+        return None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                           socket.IPPROTO_ICMP)
+        s.bind((src_addr, 0))
+        s.setblocking(False)
+    except OSError as e:
+        sys.stderr.write(
+            f"bedrock-net: icmp socket on {my_nic} ({src_addr}) failed: "
+            f"{e}. Ensure /proc/sys/net/ipv4/ping_group_range covers "
+            f"the daemon's gid; latency measurement disabled on this "
+            f"NIC until next try.\n"
+        )
+        return None
+    d.icmp_pingers[my_nic] = IcmpPinger(sock=s)
+    return s
+
+
+def icmp_send_round(d: Daemon, now_mono_ns: int) -> None:
+    """Send one ICMP echo request to every logged-up neighbour through
+    its specific NIC. Non-blocking; receive happens in the drain.
+    Called every ICMP_INTERVAL_S from the main loop."""
+    for key, n in list(d.neighbours.items()):
+        if not n.logged_up or not n.peer_link_addr:
+            continue
+        sock = _ensure_icmp_socket(d, n.my_nic)
+        if sock is None:
+            continue
+        pinger = d.icmp_pingers[n.my_nic]
+        seq = pinger.seq
+        pinger.seq = (pinger.seq + 1) & 0xFFFF
+        pkt = build_icmp_echo(identifier=os.getpid() & 0xFFFF, seq=seq)
+        try:
+            sock.sendto(pkt, (n.peer_link_addr, 0))
+        except OSError:
+            continue
+        # Stash send time + dest so we can compute RTT on reply.
+        pinger.pending[seq] = (n.peer_link_addr, now_mono_ns,
+                                key)  # key for the neighbour update
+
+
+def icmp_drain_replies(d: Daemon, now_mono_ns: int) -> None:
+    """Drain every ICMP socket's receive queue, match replies to
+    pending sends by sequence, update Neighbour's smoothed RTT."""
+    for my_nic, pinger in list(d.icmp_pingers.items()):
+        while True:
+            try:
+                data, addr = pinger.sock.recvfrom(2048)
+            except (BlockingIOError, socket.timeout):
+                break
+            except OSError:
+                break
+            seq = parse_icmp_reply_seq(data)
+            if seq is None:
+                continue
+            pend = pinger.pending.pop(seq, None)
+            if pend is None:
+                continue   # late reply, already timed out
+            peer_link_addr_expected, send_ts, neigh_key = pend
+            if addr[0] != peer_link_addr_expected:
+                continue   # reply from someone else with same seq, ignore
+            sample_us = (now_mono_ns - send_ts) / 1000.0
+            _update_neighbour_rtt(d, neigh_key, sample_us)
+
+        # Expire pending sends past timeout, so the map doesn't grow.
+        cutoff_ns = now_mono_ns - int(ICMP_TIMEOUT_S * 1_000_000_000)
+        for seq in [s for s, p in pinger.pending.items()
+                     if p[1] < cutoff_ns]:
+            pinger.pending.pop(seq, None)
+
+
+def _update_neighbour_rtt(d: Daemon, neigh_key: tuple,
+                           sample_us: float) -> None:
+    """TCP RFC 6298 EWMA on the per-neighbour RTT, with outlier
+    rejection BEFORE smoothing so a transient 230 ms hiccup on a
+    100 µs link doesn't poison the smoothed value or kick off route
+    reshuffling. See docs/06-mesh-network.md §protocol 2."""
+    n = d.neighbours.get(neigh_key)
+    if n is None:
+        return
+    srtt = float(n.rtt_us)
+    rttvar = float(n.rtt_var_us)
+
+    if srtt <= 0:
+        # First sample — accept as-is, seed rttvar with sample/2.
+        n.rtt_us = int(sample_us)
+        n.rtt_var_us = int(sample_us / 2)
+        n.rtt_outlier_streak = 0
+        return
+
+    is_outlier = False
+    if sample_us > srtt + 4 * rttvar:
+        is_outlier = True
+    elif srtt > 100 and sample_us > 10 * srtt:
+        is_outlier = True
+    elif srtt < 5_000 and sample_us > RTT_OUTLIER_ABS_US:
+        is_outlier = True
+
+    if is_outlier and n.rtt_outlier_streak < 3:
+        # Single transient hiccup; reject the sample but track for
+        # genuine degradation that produces 3 consecutive outliers
+        # in a row.
+        n.rtt_outlier_streak += 1
+        return
+
+    # Either not an outlier, or 3+ consecutive outliers (real degrade).
+    n.rtt_var_us = int((1 - RTT_BETA) * rttvar
+                       + RTT_BETA * abs(sample_us - srtt))
+    n.rtt_us     = int((1 - RTT_ALPHA) * srtt + RTT_ALPHA * sample_us)
+    n.rtt_outlier_streak = 0
+
+
+# ── Local metric (per-receiver, format-decoupled) ────────────────────
+
+def local_metric(bw_mbps: int, latency_us: int,
+                 loss_rate: float = 0.0, age_s: float = 1e9) -> int:
+    """EIGRP-style composite metric, weights tuned for modern speeds.
+
+    bandwidth term: 1_000_000 / Mbps      → 12 at 80G, 100 at 10G,
+                                             400 at 2.5G, 1000 at 1G
+    latency term:   us / 100              → 1 per 100 µs of RTT
+    flap penalty:   +50 if up_since < 60 s (additive, predictable —
+                                             not a multiplier)
+    loss penalty:   +500 × min(1, loss×20) → graded, not binary
+
+    See docs/06-mesh-network.md §protocol 3.
+    """
+    bw_cost  = 1_000_000 / max(int(bw_mbps), 1)
+    lat_cost = max(int(latency_us), 0) / 100
+    flap     = 50 if age_s < 60 else 0
+    loss     = 500 * min(1.0, max(0.0, loss_rate) * 20)
+    return int(bw_cost + lat_cost + flap + loss)
+
+
 def i_am_mgmt_master(d: Daemon) -> bool:
     """True if this node currently holds the mgmt-master role per
     state.json (single-writer source of truth). Followers' bedrock-net
@@ -1160,18 +1406,33 @@ def compute_routes(d: Daemon) -> list[str]:
             continue
         _detect_and_handle_ll_collision(routes, seen_link_addrs, n, d)
 
-    # 2. Stable sort across nodes for determinism, then loopback /32s.
+    # 2. Per-peer loopback /32s, sorted by the EIGRP-style local metric.
+    #    See docs/06-mesh-network.md §protocol 3 for the formula.
+    #    Stable tiebreak on my_nic ensures every node computes the
+    #    same order given the same observables.
+    now_s = time.time()
+    def _path_cost(n: Neighbour) -> tuple[int, int, str]:
+        # Read measured bandwidth from /sys/class/net; falls back to 0
+        # which the metric treats as worst-case.
+        bw = bucket_speed(nic_speed_mbps(n.my_nic))
+        if not bw:
+            bw = max(int(n.speed_mbps), 1)
+        age_s = now_s - (n.first_seen or now_s)
+        cost = local_metric(bw_mbps=bw,
+                             latency_us=int(n.rtt_us),
+                             loss_rate=0.0,           # TODO: track loss
+                             age_s=age_s)
+        # Tiebreak on RTT then nic name for determinism.
+        return (cost, int(n.rtt_us), n.my_nic)
+
     for peer, lst in by_peer.items():
-        lst.sort(key=lambda x: (
-            -x.speed_mbps if x.speed_mbps else 0,
-            x.rtt_us,
-            x.my_nic,
-        ))
+        lst.sort(key=_path_cost)
         for i, n in enumerate(lst):
             if not n.peer_link_addr:
                 continue
             metric = METRIC_DIRECT_BASE + i
-            spec = f"{n.peer_loopback}/32 via {n.peer_link_addr} dev {n.my_nic} metric {metric}"
+            spec = (f"{n.peer_loopback}/32 via {n.peer_link_addr} "
+                    f"dev {n.my_nic} metric {metric}")
             routes.append(spec)
 
     # Panic-neighbour catch-all: the freshest neighbour overall acts
