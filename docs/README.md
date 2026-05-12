@@ -72,7 +72,7 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | VictoriaLogs | 9428 (syslog 5140) | [`components/metrics.md`](components/metrics.md) |
 | node_exporter + vm_exporter | 9100 / 9177 | [`components/exporters.md`](components/exporters.md) |
 | DRBD | kernel + port 7000+minor | [`components/drbd.md`](components/drbd.md) |
-| bedrock-net (mesh discovery + routing) | UDP 7732 | [`06-mesh-network.md`](06-mesh-network.md) |
+| bedrock-net (mesh discovery + routing) | UDP 7732 (discovery) + ICMP echo (latency) + UDP 7733 (advertisement) | [`06-mesh-network.md`](06-mesh-network.md) |
 | Cockpit | 9090 | —  (upstream docs) |
 
 ---

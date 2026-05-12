@@ -11,7 +11,9 @@ All ports Bedrock listens on, speaks to, or crosses between nodes.
 | 9100 | TCP | node_exporter | all IPs | Prometheus metrics, scraped by mgmt |
 | 9177 | TCP | vm_exporter | all IPs | Bedrock-specific libvirt + DRBD metrics |
 | 7000-7999 | TCP | DRBD replication | per-NIC mesh paths | Port = `7000 + minor`; multi-path via mesh layer — DRBD opens one path per direct `(nic_a, nic_b)` pair the bedrock-net path table observed, plus a loopback fallback as last resort. See `docs/06-mesh-network.md`. |
-| 7732 | UDP | bedrock-net probe (multicast) | all mesh NICs | Signed multicast on `239.7.7.7`, TTL=1, every 1 s per up NIC. HMAC-SHA256-signed by cluster_key. |
+| 7732 | UDP | bedrock-net probe (multicast) | all mesh NICs | **Protocol 1.** Signed multicast on `239.7.7.7`, TTL=1, every 1 s per up NIC. HMAC-SHA256-signed by cluster_key. Discovery only — carries no RTT data or routes. |
+| ICMP | echo | bedrock-net latency | per-NIC link-local | **Protocol 2.** Unprivileged kernel ICMP (`SOCK_DGRAM/IPPROTO_ICMP`) every 2 s per `(peer, my_nic)`; kernel timestamps drive the EWMA. Needs `/proc/sys/net/ipv4/ping_group_range` to cover the daemon's gid. |
+| 7733 | UDP | bedrock-net advertisement (unicast) | peer loopback `/32` | **Protocol 3.** Signed UDP unicast every 2 s per peer (NOT per link — kernel picks the NIC). Path-vector payload with `via_chain` for loop prevention. HMAC-SHA256-signed by cluster_key. |
 | 8200 | TCP | bedrock-rust peer link | per-NIC mesh paths | Cluster-protocol log replication. Each follower dials the master here. |
 | 5900-5999 | TCP | QEMU VNC | all IPs | One per running VM (display :0 → 5900, :1 → 5901, ...) |
 | 49152-49215 | TCP | QEMU live-migrate | per-NIC mesh paths via peer's `loopback_ip` | libvirt's default migration port range; the kernel route to the peer's `/32` picks the best NIC. |

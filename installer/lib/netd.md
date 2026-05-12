@@ -23,9 +23,14 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
   2. `ensure_loopback_ip(loopback_ip)` adds the cluster identity
      /32 to `lo`. Idempotent.
   3. `open_recv_socket()` binds the AF_INET/SOCK_DGRAM socket to
-     port 7732 with IP_PKTINFO.
-  4. Main loop (`tick()` every ~250 ms + probe send every 1 s +
-     route emit every 1 s).
+     port 7732 with IP_PKTINFO (protocol 1 — discovery multicast).
+  4. `open_adv_recv_socket()` + `open_adv_send_socket()` bind UDP
+     port 7733 (protocol 3 — unicast routing advertisement).
+  5. Per-NIC unprivileged ICMP sockets are lazy-created on first
+     send (protocol 2 — latency measurement).
+  6. Main loop (`tick()` every ~250 ms + probe send every 1 s +
+     ICMP round every 2 s + adv round every 2 s + route emit
+     every 1 s + status log every 30 s).
 
 ## State shapes
 
@@ -38,9 +43,15 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
     neighbours:         dict[(peer_node, peer_nic, my_nic) -> Neighbour]
     nic_addrs:          dict[nic_name -> ipv4_address]
     probe_send_socks:   dict[nic_name -> socket]
-    recv_sock:          socket            # single, IP_PKTINFO
+    recv_sock:          socket            # single, IP_PKTINFO (protocol 1)
     last_routes_signature: str            # diff cache for ip-route writes
     last_arp_renumber:  dict[(addr, my_nic) -> last-fire ts]
+    icmp_pingers:       dict[my_nic -> IcmpPinger]   # protocol 2
+    adv_send_sock:      socket            # protocol 3 outgoing
+    adv_recv_sock:      socket            # protocol 3 incoming, 0.0.0.0:7733
+    adv_seq:            int               # monotonic
+    adv_table:          dict[advertiser -> {seq, ts_local, sender_addr, paths}]
+    best_transit_paths: dict[dest -> {metric, advertiser, neighbour, bw, lat, via_chain}]
     stopped:            bool
 
 @dataclass class Neighbour:
@@ -52,7 +63,9 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
     first_seen:         float
     last_seen:          float
     speed_mbps:         int
-    rtt_us:             int
+    rtt_us:             int               # EWMA-smoothed from protocol 2
+    rtt_var_us:         int               # TCP RFC 6298 variance
+    rtt_outlier_streak: int               # consecutive rejections; 3 ⇒ accept
     logged_up:          bool              # crossed up-hysteresis threshold
     last_quality_log:   float
 ```
@@ -86,6 +99,15 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
 | `ensure_link_local(nic)` | Idempotent: create/keep NM `bedrock-mesh-<nic>` profile, return assigned IP. |
 | `i_am_mgmt_master(d)` | True if `state.json` role contains `"mgmt"`. Gates log writes. |
 | `current_cluster_routes(uuid)` | Read existing `ip route` entries that we own (cluster `/24` + our `169.254.x.y` `/32`s). |
+| `icmp_send_round(d, now_ns)` | Protocol 2: send ICMP echo to every logged-up neighbour through its specific `my_nic`. |
+| `icmp_drain_replies(d, now_ns)` | Non-blocking recv on every per-NIC ICMP socket; match by seq; update Neighbour RTT via `_update_neighbour_rtt`. |
+| `_update_neighbour_rtt(d, key, sample_us)` | TCP RFC 6298 EWMA with 3-rule outlier rejection (statistical / 10× multiplicative / 100 ms absolute). |
+| `local_metric(bw_mbps, latency_us, loss, age)` | EIGRP-style composite metric; receiver-side, format-decoupled. |
+| `adv_send_round(d, now_ts)` | Protocol 3: send one signed unicast advertisement per peer (kernel picks NIC). |
+| `adv_drain(d, now_ts)` | Drain incoming advertisements non-blocking; call `process_advertisement` on each. |
+| `process_advertisement(d, body, addr, ts)` | Validate (advertiser must be direct neighbour; seq must advance); store in `adv_table`. |
+| `recompute_best_transit_paths(d, ts)` | Path-vector selection per destination: drop loops, compose `bw=min`/`lat=sum`, rank by `local_metric`. |
+| `build_advertisement_paths(d)` | Compose paths[] for outgoing advertisement: direct neighbours + selected transit destinations. |
 
 ## Invariants
 
@@ -105,6 +127,18 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
 5. **Collision cooldown**: per `(addr, my_nic)`, 30 s minimum
    between successive `arp_force_renumber` calls from this node.
    Multiple discoverers in parallel each maintain their own cooldown.
+6. **One advertisement per peer per cycle** (protocol 3). The
+   kernel picks the egress NIC from the cluster `/32` route — we
+   deliberately do NOT send one per `(my_nic, peer)`. If a peer is
+   reachable on 5 NICs, that's still 1 unicast every 2 s, not 5.
+7. **Advertiser must be a direct neighbour**. Transit-borne
+   advertisements (e.g. C receiving A's adv via B) are dropped.
+   This is what makes the path-vector loop-free regardless of
+   topology depth.
+8. **Outlier rejection before EWMA update** (protocol 2). A 230 ms
+   transient on a 100 µs link is rejected, srtt stays put, no
+   operator-visible event, no route reshuffle. After 3 consecutive
+   outliers the filter relents — that's a genuine degradation.
 
 ## Failure modes + recovery
 

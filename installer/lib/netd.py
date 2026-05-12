@@ -33,14 +33,15 @@ loopback IP." The short version:
     single-writer. Without this, follower writes diverge the hash
     chain from master's and break replication of subsequent
     membership entries.
-  * Routing: each tick rebuilds the desired routes from the
-    in-memory neighbour table (no Dijkstra in v1 — we do direct
-    routing per peer, one /32 per direct link in metric order plus
-    a panic /24 catch-all; transit routing through other nodes is a
-    v1.x add). Backup routes installed at monotonic metrics so the
-    kernel fails over for free on link-down. Black-hole gateway
-    detection comes from this daemon's own probe-loss → it
-    `ip route del` the dead route, the next-metric one auto-promotes.
+  * Routing: each tick rebuilds the desired routes from in-memory
+    state: direct paths (per-peer-link host routes + per-peer
+    loopback /32s in metric order) PLUS transit /32s computed from
+    protocol-3 routing advertisements (path-vector, BGP-shaped, with
+    via_chain loop detection). Backup routes installed at monotonic
+    metrics so the kernel fails over for free on link-down. Panic
+    catch-all `<cluster /24> via <freshest peer> metric 999` covers
+    the gap between a peer's withdrawal and the next adv-table
+    recompute. Loops bounded by IP TTL.
   * Panic-neighbour catch-all `<cluster /24> via <freshest peer>
     metric 999` is always installed when at least one neighbour is
     reachable. Cluster /24 is derived from cluster_uuid (RFC 6598
@@ -195,6 +196,54 @@ def decode_probe(buf: bytes, *, key: bytes) -> Optional[dict]:
                   "link_addr", "ts"):
             if k not in body:
                 return None
+        return body
+    except Exception:
+        return None
+
+
+def encode_advertisement(*, cluster_uuid: str, advertiser: str, seq: int,
+                          ts: float, paths: list, key: bytes) -> bytes:
+    """Sign-then-pack a routing advertisement (protocol 3). Same wrap
+    layout as the discovery probe so receivers reuse the verification
+    flow: msgpack({v, body, sig}), body is itself msgpack-packed so
+    the HMAC input is bit-identical across implementations."""
+    body = msgpack.packb({
+        "cluster_uuid": cluster_uuid,
+        "advertiser":   advertiser,
+        "seq":          int(seq) & 0xFFFFFFFF,
+        "ts":           float(ts),
+        "paths":        paths,
+    }, use_bin_type=True)
+    sig = hmac.new(key, body, hashlib.sha256).digest()
+    return msgpack.packb({"v": ADV_VERSION, "body": body, "sig": sig},
+                          use_bin_type=True)
+
+
+def decode_advertisement(buf: bytes, *, key: bytes) -> Optional[dict]:
+    """Verify an advertisement and return the body dict, or None on
+    any signature / schema failure. Silent on failure for the same
+    reason decode_probe is — random UDP arrives on port 7733 too."""
+    try:
+        wrap = msgpack.unpackb(buf, raw=False)
+        if not isinstance(wrap, dict):
+            return None
+        if wrap.get("v") != ADV_VERSION:
+            return None
+        body_bytes = wrap.get("body")
+        sig = wrap.get("sig")
+        if not body_bytes or not sig:
+            return None
+        expected = hmac.new(key, body_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        body = msgpack.unpackb(body_bytes, raw=False)
+        if not isinstance(body, dict):
+            return None
+        for k in ("cluster_uuid", "advertiser", "seq", "ts", "paths"):
+            if k not in body:
+                return None
+        if not isinstance(body["paths"], list):
+            return None
         return body
     except Exception:
         return None
@@ -434,6 +483,23 @@ class Daemon:
     # NIC. The pinger owns a non-blocking unprivileged ICMP socket
     # bound to that NIC's link-local address.
     icmp_pingers: dict = field(default_factory=dict)
+    # Routing-advertisement state (protocol 3).
+    # adv_send_sock — one UDP socket for all outgoing unicasts;
+    #   the kernel picks the physical NIC via the /32 route to peer's
+    #   loopback that emit_routes() installs. One advertisement per
+    #   peer per cycle, regardless of how many physical NICs connect us
+    #   (the architectural fix the previous per-link design botched).
+    # adv_recv_sock — one UDP socket bound to 0.0.0.0:ADV_PORT.
+    # adv_seq — monotonic counter; receivers dedup by (advertiser, seq).
+    # adv_table — last advertisement per advertiser; entries past
+    #   ADV_STALE_S are considered withdrawn.
+    # best_transit_paths — recomputed each tick from adv_table:
+    #   dest_node -> {metric, advertiser, neighbour, bw, lat, via_chain}.
+    adv_send_sock: Optional[socket.socket] = None
+    adv_recv_sock: Optional[socket.socket] = None
+    adv_seq: int = 0
+    adv_table: dict = field(default_factory=dict)
+    best_transit_paths: dict = field(default_factory=dict)
     # Stop flag for clean shutdown.
     stopped: bool = False
 
@@ -477,6 +543,36 @@ def open_recv_socket() -> socket.socket:
     IP_PKTINFO = 8  # not exposed in py stdlib
     s.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
     s.bind(("", PROBE_PORT))
+    return s
+
+
+def open_adv_recv_socket() -> socket.socket:
+    """Single non-blocking UDP socket bound to 0.0.0.0:ADV_PORT for
+    incoming routing advertisements (protocol 3). Unlike the discovery
+    socket, this one is plain unicast — the kernel delivers per the
+    /32 routes emit_routes installs, and the source IP tells us which
+    advertiser sent it. No IP_PKTINFO needed: an advertisement's
+    contents identify the advertiser, not its arrival NIC."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+        pass
+    s.bind(("", ADV_PORT))
+    s.setblocking(False)
+    return s
+
+
+def open_adv_send_socket() -> socket.socket:
+    """Single non-blocking UDP socket for outgoing advertisements.
+    No bind to a specific NIC — we deliberately want the kernel to
+    pick the physical interface via the cluster /32 route to the
+    peer's loopback. One advertisement per peer regardless of how
+    many physical links exist (the "one per peer not per link"
+    design invariant from docs/06-mesh-network.md)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
     return s
 
 
@@ -604,6 +700,8 @@ def run_daemon():
 
     d.recv_sock = open_recv_socket()
     d.recv_sock.settimeout(0.05)
+    d.adv_recv_sock = open_adv_recv_socket()
+    d.adv_send_sock = open_adv_send_socket()
 
     print(f"bedrock-net: cluster_uuid={cluster_uuid} node={my_node} "
           f"loopback={my_loopback or '<not yet assigned>'}",
@@ -612,6 +710,8 @@ def run_daemon():
     last_probe = 0.0
     last_route_emit = 0.0
     last_icmp = 0.0
+    last_adv = 0.0
+    last_status = 0.0
 
     while not d.stopped:
         try:
@@ -628,9 +728,34 @@ def run_daemon():
             if now - last_icmp >= ICMP_INTERVAL_S:
                 icmp_send_round(d, now_mono_ns)
                 last_icmp = now
+            # Protocol 3: routing advertisement. Drain every tick;
+            # recompute best transit paths when adv_table changed OR
+            # on a regular cadence to expire stale entries. Send a
+            # fresh round every ADV_INTERVAL_S.
+            changed = adv_drain(d, now)
+            if changed or (now - last_adv) >= ADV_INTERVAL_S:
+                recompute_best_transit_paths(d, now)
+            if now - last_adv >= ADV_INTERVAL_S:
+                adv_send_round(d, now)
+                last_adv = now
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
                 last_route_emit = now
+            if now - last_status >= 30.0:
+                logged = sum(1 for n in d.neighbours.values() if n.logged_up)
+                advs = [
+                    f"{adv_name}({len(adv['paths'])}p)"
+                    for adv_name, adv in d.adv_table.items()
+                    if now - float(adv.get("ts_local", 0)) <= ADV_STALE_S
+                ]
+                transit = list(d.best_transit_paths.keys())
+                print(
+                    f"bedrock-net: status neighbours={len(d.neighbours)} "
+                    f"(logged_up={logged}); advertisers=[{','.join(advs) or '-'}]; "
+                    f"transit_dests=[{','.join(transit) or '-'}]",
+                    file=sys.stderr, flush=True,
+                )
+                last_status = now
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -1033,6 +1158,12 @@ RTT_OUTLIER_ABS_US = 100_000   # 100 ms absolute on a sub-ms LAN = noise
 RTT_ALPHA = 0.125    # smoothed RTT mixing weight
 RTT_BETA  = 0.25     # variance mixing weight
 
+# Protocol 3: unicast routing advertisement.
+ADV_PORT       = 7733          # 'BR' adjacent; complements PROBE_PORT=7732
+ADV_INTERVAL_S = 2.0           # one advertisement per peer per cycle
+ADV_STALE_S    = 6.0           # 3× cadence; entries older than this are stale
+ADV_VERSION    = 1
+
 
 def icmp_checksum(data: bytes) -> int:
     """Standard internet checksum over a bytestring; pads odd length."""
@@ -1216,6 +1347,271 @@ def _update_neighbour_rtt(d: Daemon, neigh_key: tuple,
     n.rtt_outlier_streak = 0
 
 
+# ── Routing advertisement (protocol 3 of three) ──────────────────────
+#
+# Path-vector advertisement, BGP-shaped: every 2 s each node sends ONE
+# signed UDP unicast per peer (regardless of how many physical NICs
+# connect us) listing the destinations it currently believes it can
+# reach. Each path carries its full via_chain (loop prevention),
+# bottleneck bandwidth (min over the path), and cumulative latency
+# (sum over the path). Receivers compose `bw = min(adv_bw, my_bw_to_adv)`
+# and `lat = adv_lat + my_rtt_to_adv`, rank candidates per destination
+# by local_metric, and install the lowest-metric next-hop as a /32.
+#
+# Invariants enforced here:
+#   * one advertisement per peer per cycle, kernel picks the NIC
+#   * advertiser MUST be a direct logged-up neighbour of the receiver
+#     (transit-borne advertisements are dropped — would invite spoof)
+#   * via_chain[0] MUST == advertiser
+#   * receiver's own node name in via_chain ⇒ drop (loop)
+#   * stale advertisements (> ADV_STALE_S) are withdrawn implicitly
+#     by recompute_best_transit_paths skipping them
+
+
+def _direct_neighbour_by_node(d: Daemon) -> dict:
+    """For each peer_node we have at least one logged_up neighbour
+    entry for, return the BEST (lowest local_metric) Neighbour record.
+    Used both for sending advertisements (we send to peer_loopback,
+    kernel picks NIC) and for composing transit metrics (rtt_us +
+    bw_to_advertiser).
+    """
+    best: dict[str, Neighbour] = {}
+    best_metric: dict[str, int] = {}
+    for n in d.neighbours.values():
+        if not n.logged_up or not n.peer_loopback:
+            continue
+        bw = bucket_speed(nic_speed_mbps(n.my_nic)) or max(int(n.speed_mbps), 1)
+        lat = int(n.rtt_us)
+        m = local_metric(bw_mbps=bw, latency_us=lat)
+        prev = best_metric.get(n.peer_node)
+        if prev is None or m < prev:
+            best[n.peer_node] = n
+            best_metric[n.peer_node] = m
+    return best
+
+
+def _cluster_node_loopbacks(my_node: str) -> dict:
+    """Read cluster.json's nodes -> loopback_ip mapping (best-effort).
+    Used to know who to address advertisements to. Mesh routing
+    decisions themselves never depend on this — the cluster log is
+    membership-of-record, not routing-of-record, per the design
+    invariants. Returns {} on any error."""
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for nm, n in (cluster.get("nodes") or {}).items():
+        if nm == my_node:
+            continue
+        lo = (n or {}).get("loopback_ip") or ""
+        if lo:
+            out[nm] = lo
+    return out
+
+
+def build_advertisement_paths(d: Daemon) -> list:
+    """Construct the paths[] list for an outgoing advertisement.
+    Includes:
+      * one entry per direct logged-up peer (via_chain=[me, peer])
+      * one entry per transit destination we've selected as best
+        (via_chain=[me, ...adv.via_chain]), so neighbours can
+        propagate our learned paths through to further peers
+    A destination reachable both directly and through transit is
+    advertised only as direct — direct beats transit by definition."""
+    paths: list[dict] = []
+    direct = _direct_neighbour_by_node(d)
+
+    for peer, n in direct.items():
+        bw  = bucket_speed(nic_speed_mbps(n.my_nic)) or max(int(n.speed_mbps), 1)
+        lat = int(n.rtt_us)
+        paths.append({
+            "dest":                 peer,
+            "via_chain":            [d.my_node, peer],
+            "bottleneck_bw_mbps":   int(bw),
+            "cumulative_latency_us": int(lat),
+        })
+
+    for dest, sel in d.best_transit_paths.items():
+        if dest == d.my_node:
+            continue
+        if dest in direct:
+            continue
+        paths.append({
+            "dest":                 dest,
+            "via_chain":            [d.my_node] + list(sel["via_chain"]),
+            "bottleneck_bw_mbps":   int(sel["bw"]),
+            "cumulative_latency_us": int(sel["lat"]),
+        })
+    return paths
+
+
+def adv_send_round(d: Daemon, now_ts: float) -> None:
+    """Send one signed unicast advertisement to every known cluster
+    peer per cycle. `Known peers` is the union of:
+      * direct neighbours (we already have their peer_loopback)
+      * cluster.json nodes map (covers peers we know exist but
+        haven't observed a direct probe from yet — kernel routes
+        transit /32 if installed, otherwise the send silently fails
+        and the next cycle retries)
+    Kernel selects the egress NIC from the routing table — exactly
+    once per peer regardless of NIC fan-out.
+    """
+    if d.adv_send_sock is None:
+        return
+    d.adv_seq = (d.adv_seq + 1) & 0xFFFFFFFF
+    paths = build_advertisement_paths(d)
+    buf = encode_advertisement(
+        cluster_uuid=d.cluster_uuid,
+        advertiser=d.my_node,
+        seq=d.adv_seq,
+        ts=now_ts,
+        paths=paths,
+        key=d.cluster_key,
+    )
+
+    targets: dict[str, str] = {}
+    for n in d.neighbours.values():
+        if n.peer_loopback and n.peer_node != d.my_node:
+            targets[n.peer_node] = n.peer_loopback
+    for nm, lo in _cluster_node_loopbacks(d.my_node).items():
+        targets.setdefault(nm, lo)
+
+    for peer_node, peer_lo in targets.items():
+        try:
+            d.adv_send_sock.sendto(buf, (peer_lo, ADV_PORT))
+        except OSError:
+            # No route yet (transit /32 not installed, or peer down).
+            # Silent — next cycle retries; nothing else to do.
+            pass
+
+
+def adv_drain(d: Daemon, now_ts: float) -> bool:
+    """Drain incoming advertisements. Returns True if anything new
+    arrived (so the caller knows to recompute_best_transit_paths)."""
+    if d.adv_recv_sock is None:
+        return False
+    changed = False
+    while True:
+        try:
+            buf, src = d.adv_recv_sock.recvfrom(65536)
+        except (BlockingIOError, socket.timeout):
+            break
+        except OSError:
+            break
+        body = decode_advertisement(buf, key=d.cluster_key)
+        if not body:
+            continue
+        if body.get("cluster_uuid") != d.cluster_uuid:
+            continue
+        if body.get("advertiser") == d.my_node:
+            continue   # echoed our own — ignore
+        if process_advertisement(d, body, src[0], now_ts):
+            changed = True
+    return changed
+
+
+def process_advertisement(d: Daemon, body: dict, sender_addr: str,
+                           now_ts: float) -> bool:
+    """Validate + store one advertisement. Returns True if adv_table
+    changed.
+
+    Validation:
+      * advertiser MUST appear in our direct neighbour table. A
+        transit-borne advertisement (e.g. C receiving A's adv via B)
+        is ignored — only direct neighbours' advertisements drive
+        our routing. This is the architectural rule that makes the
+        protocol loop-free by induction, no matter how chained the
+        topology gets.
+      * seq MUST be greater than last seq (wrap-aware). Replays drop.
+    """
+    advertiser = body["advertiser"]
+    seq = int(body["seq"])
+    direct = _direct_neighbour_by_node(d)
+    if advertiser not in direct:
+        return False
+
+    prev = d.adv_table.get(advertiser)
+    if prev is not None:
+        prev_seq = int(prev.get("seq", 0))
+        delta = (seq - prev_seq) & 0xFFFFFFFF
+        if delta == 0 or delta > 0x80000000:
+            return False   # replay or older
+
+    d.adv_table[advertiser] = {
+        "seq":         seq,
+        "ts_local":    now_ts,
+        "sender_addr": sender_addr,
+        "paths":       body["paths"],
+    }
+    return True
+
+
+def recompute_best_transit_paths(d: Daemon, now_ts: float) -> None:
+    """For every destination we have advertisement candidates for, pick
+    the lowest-local-metric path through one of our direct neighbours.
+
+    Path-vector semantics:
+      * advertiser must be a direct neighbour (filter applied upstream
+        in process_advertisement, re-verified here in case the
+        neighbour just dropped out)
+      * each path's via_chain[0] must == advertiser
+      * each path's via_chain must not contain my_node
+      * composed metric: bw=min(adv_bw, my_bw_to_adv);
+                          lat=adv_lat + my_rtt_to_adv
+      * stale advertisements (> ADV_STALE_S) are silently skipped —
+        their dest will fall out of best_transit_paths next tick, and
+        emit_routes will withdraw the /32 on the same tick
+    """
+    direct = _direct_neighbour_by_node(d)
+    best: dict[str, dict] = {}
+
+    for advertiser, adv in d.adv_table.items():
+        if now_ts - float(adv.get("ts_local", 0)) > ADV_STALE_S:
+            continue
+        nb = direct.get(advertiser)
+        if nb is None:
+            continue
+        bw_to_adv  = bucket_speed(nic_speed_mbps(nb.my_nic)) or max(int(nb.speed_mbps), 1)
+        lat_to_adv = int(nb.rtt_us)
+
+        for p in adv.get("paths", []):
+            try:
+                dest      = p["dest"]
+                via_chain = list(p["via_chain"])
+                p_bw      = int(p["bottleneck_bw_mbps"])
+                p_lat     = int(p["cumulative_latency_us"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not via_chain or via_chain[0] != advertiser:
+                continue
+            if d.my_node in via_chain:
+                continue
+            if dest == d.my_node:
+                continue
+
+            bw  = min(p_bw, bw_to_adv) if p_bw > 0 else bw_to_adv
+            lat = p_lat + lat_to_adv
+            m   = local_metric(bw_mbps=bw, latency_us=lat)
+
+            cur = best.get(dest)
+            if (cur is None
+                    or m < cur["metric"]
+                    or (m == cur["metric"] and lat < cur["lat"])
+                    or (m == cur["metric"] and lat == cur["lat"]
+                        and advertiser < cur["advertiser"])):
+                best[dest] = {
+                    "metric":     m,
+                    "advertiser": advertiser,
+                    "neighbour":  nb,
+                    "bw":         bw,
+                    "lat":        lat,
+                    "via_chain":  via_chain,
+                }
+
+    d.best_transit_paths = best
+
+
 # ── Local metric (per-receiver, format-decoupled) ────────────────────
 
 def local_metric(bw_mbps: int, latency_us: int,
@@ -1328,13 +1724,11 @@ def emit_routes(d: Daemon) -> None:
         primary metric.
       * Add backup routes (other direct paths to the same peer) at
         increasing metrics so the kernel auto-fails-over on link-down.
+      * For each non-direct destination in best_transit_paths (fed
+        by protocol 3 advertisements from direct neighbours), install
+        a single /32 via the chosen next-hop at METRIC_TRANSIT_BASE.
       * Add a panic route for the cluster /24 via the freshest
         neighbour at metric 999.
-
-    Transit hops (paths through other nodes) are fed in from the
-    cluster.json paths section — see compute_routes() for the
-    Dijkstra. v1 keeps it simple: we only install transit if we have
-    the cluster snapshot; if not, only direct paths.
     """
     desired = compute_routes(d)
     sig = "\n".join(sorted(desired))
@@ -1434,6 +1828,31 @@ def compute_routes(d: Daemon) -> list[str]:
             spec = (f"{n.peer_loopback}/32 via {n.peer_link_addr} "
                     f"dev {n.my_nic} metric {metric}")
             routes.append(spec)
+
+    # 3. Transit /32s (protocol 3, path-vector). For each cluster peer
+    #    that's NOT directly reachable but whose path we've learned
+    #    from a direct neighbour's advertisement, install a single
+    #    /32 via that neighbour at METRIC_TRANSIT_BASE. Direct beats
+    #    transit by definition (METRIC_DIRECT_BASE < METRIC_TRANSIT_BASE,
+    #    and longest-prefix-match is identical at /32 so kernel sorts
+    #    by metric). The destination loopback IP comes from cluster.json
+    #    — membership-of-record, never used for routing decisions
+    #    themselves.
+    dest_loopbacks = _cluster_node_loopbacks(d.my_node)
+    transit_items = sorted(d.best_transit_paths.items(),
+                            key=lambda kv: (kv[1]["metric"], kv[0]))
+    for i, (dest, sel) in enumerate(transit_items):
+        if dest in by_peer:
+            continue   # direct already covers it
+        dest_lo = dest_loopbacks.get(dest, "")
+        if not dest_lo:
+            continue   # cluster.json hasn't caught up yet; retry next tick
+        nb = sel["neighbour"]
+        if not nb.peer_link_addr:
+            continue
+        spec = (f"{dest_lo}/32 via {nb.peer_link_addr} "
+                f"dev {nb.my_nic} metric {METRIC_TRANSIT_BASE + i}")
+        routes.append(spec)
 
     # Panic-neighbour catch-all: the freshest neighbour overall acts
     # as default gateway for the whole cluster /24. If the peer has a
