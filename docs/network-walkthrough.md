@@ -38,9 +38,7 @@ cables** between every pair of nodes:
                   ║            ║            ║            ║
                   ╠════════════╬════════════╬════════════╣   mesh-plane 2 (10 G)
                   ║            ║            ║            ║
-                  ╠════════════╬════════════╬════════════╣   mesh-plane 3 (10 G)
-                  ║            ║            ║            ║
-                  ╚════════════╩════════════╩════════════╝   mesh-plane 4 (10 G)
+                  ╚════════════╩════════════╩════════════╝   mesh-plane 3 (10 G)
 ```
 
 Every node has:
@@ -49,13 +47,21 @@ Every node has:
     home router). This is where DHCP gives it a normal address
     like `192.168.2.62`. SSH, the web dashboard, NFS for ISOs,
     and node bootstrap all use this wire.
-  * `enp2s0`, `enp3s0`, … — the **mesh** wires. Each one goes to
-    a separate switch (a "plane") so that one switch failure
-    cannot cut the cluster apart.
+  * `enp2s0`, `enp3s0`, `enp4s0` — the **mesh** wires. Each one
+    goes to a separate switch (a "plane") so that one switch
+    failure cannot cut the cluster apart.
 
-So a 4-node cluster typically has **5 cables per node** (1 LAN +
-4 mesh planes). Between every pair of nodes there are now
-**5 distinct paths**. Lose one, the other four keep working.
+So a 4-node cluster typically has **4 cables per node** (1 LAN +
+3 mesh planes — you don't need a cable to yourself, and one
+plane per pair-redundancy-level is enough). Between every pair
+of nodes there are **4 distinct paths**. Lose one, the other
+three keep working.
+
+> The bedrock testbed actually runs 4 mesh planes (an extra one
+> for stress-testing the multi-NIC code), which is why testbed
+> verification output you'll see further down shows five paths
+> per peer rather than four. The shape of the design is identical
+> either way — just add or remove a plane.
 
 That's the goal. The rest of this doc is about how a piece of
 software called **bedrock-net** turns all that physical
@@ -98,7 +104,6 @@ every node both.
    │   │       enp2s0: 169.254.151.72/16  (mesh-1)    │   │
    │   │       enp3s0: 169.254.49.209/16  (mesh-2)    │   │
    │   │       enp4s0: 169.254.11.214/16  (mesh-3)    │   │
-   │   │       enp5s0: 169.254.248.218/16 (mesh-4)    │   │
    │   │                                              │   │
    │   │  One IP per cable. These can change when a   │   │
    │   │  cable moves between switches.               │   │
@@ -147,9 +152,10 @@ choice of cable, because:
 
   * The cluster identity addresses are `/32` — single-host —
     routes.
-  * Each `/32` is installed with **5 entries**, one per cable to
-    that node, ordered by quality. (The exact ordering rule is in
-    section 4.)
+  * Each `/32` is installed with **one entry per cable to that
+    node** (so four in our example: one for the LAN and one for
+    each mesh plane), ordered by quality. (The exact ordering
+    rule is in section 4.)
   * If the best cable goes dead, the kernel falls over to the
     next-best entry. Instantly. No application restart, no
     reconnect logic.
@@ -324,11 +330,12 @@ has:
 
 This is sent **once per peer, no matter how many cables connect
 us to that peer.** That's the architectural rule that keeps
-this protocol small: if A is connected to B by 5 cables, A sends
-**one** advertisement, and the kernel routing table picks the
-best cable to send it on. (If the best cable dies between sends,
-the kernel auto-fails-over and the next advertisement goes via
-the next-best cable. No retry logic, no application awareness.)
+this protocol small: if A is connected to B by four cables, A
+still sends just **one** advertisement, and the kernel routing
+table picks the best cable to send it on. (If the best cable
+dies between sends, the kernel auto-fails-over and the next
+advertisement goes via the next-best cable. No retry logic, no
+application awareness.)
 
 #### The `via_chain` and why it stops loops
 
@@ -452,8 +459,8 @@ on, in time order.
               │   ├─  Opens UDP socket on port 7732   (discovery in/out)
               │   └─  Opens UDP socket on port 7733   (advertisement in/out)
               │
-   t ≈ 1 s   ─┼─  Daemon walks /sys/class/net, sees enp2s0, enp3s0, enp4s0,
-              │   enp5s0, plus br0 (the LAN bridge).
+   t ≈ 1 s   ─┼─  Daemon walks /sys/class/net, sees the mesh NICs
+              │   (enp2s0, enp3s0, enp4s0) plus br0 (the LAN bridge).
               │
               │   For each mesh cable: tells NetworkManager
               │       "give this NIC a link-local IP".
@@ -485,7 +492,8 @@ on, in time order.
               │       • /32 route to the peer's loopback IP via that link,
               │         at metric 10 (the best of N direct paths)
               │       • /32 routes for other direct cables to the same peer
-              │         at metrics 11, 12, 13, 14 (backups)
+              │         at metrics 11, 12, 13 (backups; one per remaining
+              │         cable — three in a 4-cable-per-node cluster)
               │       • a panic catch-all route for the cluster /24 at
               │         metric 999, via the freshest neighbour overall
               │
@@ -587,10 +595,11 @@ direct) is already known via B's own advertisements.
   * **t≤30 s**: A's daemon stops seeing discovery probes from B
     on that cable. Hysteresis countdown.
   * Meanwhile, A's *other* cables to B (if any) still work — the
-    kernel route table for B has 4 backup entries at higher
-    metrics. The kernel auto-fails-over to the next-best. **Sub-
-    second.** The application (libvirt, DRBD, dashboard) sees
-    no error; the TCP connection keeps going.
+    kernel route table for B has additional backup entries at
+    higher metrics (three more in a 4-cable cluster). The kernel
+    auto-fails-over to the next-best. **Sub-second.** The
+    application (libvirt, DRBD, dashboard) sees no error; the
+    TCP connection keeps going.
   * **t=30 s**: LINK_DOWN hysteresis fires for that specific
     cable. The /32 route for that cable is removed. The route to
     B's loopback via that cable is also removed. Other cables to
@@ -612,8 +621,9 @@ Say B is power-cycled. From A's point of view:
 
   * t=0: B is gone.
   * t≤30 s: probes stop on every cable. Same hysteresis as before.
-  * t=30 s: all 5 LINK_DOWN events for B fire. The /32 routes to
-    B's loopback disappear.
+  * t=30 s: one LINK_DOWN event fires per cable to B (so four
+    in our 4-cable example). The /32 routes to B's loopback all
+    disappear.
   * Meanwhile, B's advertisements stop arriving. After 6 s the
     `adv_table[B]` entry is considered stale and falls out of
     `best_transit_paths`. So nothing tries to route via B for
@@ -893,8 +903,9 @@ If after 30 seconds you still see `neighbours=0`:
    │   ┌────────────────────────────────────────────────────────────┐  │
    │   │   emit_routes(): write Linux kernel routing table          │  │
    │   │                                                            │  │
-   │   │   • /32 for every peer's loopback, 5 entries (one per      │  │
-   │   │     direct cable), metrics 10..14 — kernel auto-fails-over │  │
+   │   │   • /32 for every peer's loopback, one entry per direct    │  │
+   │   │     cable (e.g. metrics 10..13 in a 4-cable cluster)       │  │
+   │   │     — kernel auto-fails-over                               │  │
    │   │                                                            │  │
    │   │   • /32 for transit destinations, metric 100               │  │
    │   │                                                            │  │
