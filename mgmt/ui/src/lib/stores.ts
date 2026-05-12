@@ -82,9 +82,37 @@ export interface WitnessInfo {
 	error?: string;
 }
 
+export interface TopologyConnection {
+	node: string;
+	my_nic: string;
+	protocol: string;     // lldp | cdp | mndp
+	port_id: string;
+	port_descr: string;
+	first_seen: number;
+	last_seen: number;
+}
+export interface TopologySwitch {
+	device_key: string;   // lowercase MAC, the cross-protocol merge key
+	system_name: string;
+	mgmt_ip: string;
+	platform: string;
+	aliases: string[];    // distinct chassis_id values seen for this MAC
+	protocols: string[];  // ['lldp', 'cdp', 'mndp']
+	connections: TopologyConnection[];
+}
+export interface TopologyInfo {
+	switches: Record<string, TopologySwitch>;
+	node_count: number;
+	switch_count: number;
+	computed_at: number;
+}
+
 export const nodes = writable<Record<string, NodeInfo>>({});
 export const vms = writable<Record<string, VMInfo>>({});
 export const witness = writable<WitnessInfo>({ nodes: {} });
+export const topology = writable<TopologyInfo>({
+	switches: {}, node_count: 0, switch_count: 0, computed_at: 0,
+});
 export const events = writable<any[]>([]);
 export const connected = writable(false);
 export const lastUpdate = writable<string>('');

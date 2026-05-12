@@ -450,37 +450,46 @@ PHYSICAL_TOPOLOGY_CACHE = Path("/run/bedrock/physical_topology.json")
 
 
 def build_physical_topology(nodes_data: dict) -> dict:
-    """Group per-node switch observations by chassis_id so the
-    dashboard can render 'these N NICs are all plugged into the same
-    switch'.
+    """Group per-node switch observations by the device's MAC (the
+    `device_key` field bedrock-net's l2disc parser computes).
 
-    Input: nodes_data[node_name]["switches"] is the per-NIC dict the
-    node's bedrock-net daemon writes to /run/bedrock/switch_neighbors.json:
-        { "<my_nic>": { "<protocol>": {chassis_id, system_name,
+    Why MAC, not chassis_id: different protocols report the same
+    physical device with different identifiers. CDP says the
+    device name ('office-sw-01'); MNDP says the device MAC
+    ('d4:01:c3:0e:7b:36'); LLDP says either depending on the
+    switch's chassis-ID subtype. The MAC is the only identifier
+    every real switch carries and the only one guaranteed unique.
+    l2disc.decode_*() does the chassis-id-or-frame-src-MAC pick
+    so we always have a usable device_key here.
+
+    Input: nodes_data[node_name]['switches'] is the per-NIC dict
+    that bedrock-net writes to /run/bedrock/switch_neighbors.json:
+        { '<my_nic>': { '<protocol>': {device_key, chassis_id,
+                                        src_mac, system_name,
                                         port_id, mgmt_ip, ...} } }
 
-    Output: a derived view-only structure — NEVER folded into the
+    Output: derived view-only structure, NEVER folded into the
     cluster log / cluster.json. Shape:
 
         {
-          "switches": {
-            "<chassis_id>": {
-              "chassis_id":  "<id>",
-              "system_name": "<best-known name>",
-              "mgmt_ip":     "<best-known ip>",
-              "platform":    "<best-known platform>",
-              "protocols":   ["lldp", "cdp", "mndp"],
-              "connections": [
-                {"node": "bedrock-X", "my_nic": "br0",
-                 "port_id": "Gi1/0/3", "protocol": "lldp",
-                 "first_seen": …, "last_seen": …},
-                …
+          'switches': {
+            '<device_key>': {                # lowercase MAC
+              'device_key': '<lowercase mac>',
+              'system_name': '<best known>',
+              'mgmt_ip':    '<best known>',
+              'platform':   '<best known>',
+              'aliases':    ['MikroTik', 'd4:01:c3:0e:7b:36'],
+              'protocols':  ['cdp', 'mndp'],
+              'connections': [
+                {'node': 'bedrock-X', 'my_nic': 'br0',
+                 'port_id': 'Gi1/0/3', 'protocol': 'lldp',
+                 'first_seen': ..., 'last_seen': ...}, ...
               ]
             }
           },
-          "node_count":   3,    # nodes that reported any data
-          "switch_count": 2,    # distinct chassis_ids observed
-          "computed_at":  1731320000.123,
+          'node_count':   3,
+          'switch_count': 2,    # distinct devices (by MAC)
+          'computed_at':  <epoch>,
         }
     """
     grouped: dict = {}
@@ -496,25 +505,39 @@ def build_physical_topology(nodes_data: dict) -> dict:
             for protocol, entry in by_proto.items():
                 if not isinstance(entry, dict):
                     continue
-                chassis_id = entry.get("chassis_id") or ""
-                if not chassis_id:
+                # Prefer device_key (MAC-canonicalised by l2disc).
+                # Older state files predating the upgrade may not
+                # have it; fall back to chassis_id so the merge still
+                # surfaces something instead of dropping the entry.
+                device_key = (entry.get("device_key")
+                               or entry.get("chassis_id") or "")
+                if not device_key:
                     continue
-                bucket = grouped.setdefault(chassis_id, {
-                    "chassis_id":  chassis_id,
+                device_key = str(device_key).lower()
+                bucket = grouped.setdefault(device_key, {
+                    "device_key": device_key,
                     "system_name": "",
                     "mgmt_ip":     "",
                     "platform":    "",
+                    "aliases":     set(),
                     "protocols":   set(),
                     "connections": [],
                 })
                 # Pick the most-informative system_name / mgmt_ip /
-                # platform across all observations.
+                # platform across all observations (first non-empty
+                # wins; tied values keep the first-seen).
                 for src, key in (("system_name", "system_name"),
                                   ("mgmt_ip",     "mgmt_ip"),
                                   ("platform",    "platform")):
                     v = entry.get(src)
                     if v and not bucket[key]:
                         bucket[key] = v
+                # Aliases — every distinct chassis_id we've ever seen
+                # for this MAC. Useful so the dashboard can show
+                # 'MikroTik / d4:01:c3:0e:7b:36' as the device label.
+                ci = entry.get("chassis_id")
+                if ci:
+                    bucket["aliases"].add(str(ci))
                 bucket["protocols"].add(protocol)
                 bucket["connections"].append({
                     "node":       node_name,
@@ -528,6 +551,7 @@ def build_physical_topology(nodes_data: dict) -> dict:
 
     # Sets aren't JSON-serialisable; finalize.
     for bucket in grouped.values():
+        bucket["aliases"]   = sorted(bucket["aliases"])
         bucket["protocols"] = sorted(bucket["protocols"])
         bucket["connections"].sort(
             key=lambda c: (c["node"], c["my_nic"], c["protocol"]))

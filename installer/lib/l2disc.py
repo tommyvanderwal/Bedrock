@@ -89,6 +89,41 @@ def _utf8(b: bytes) -> str:
     return b.decode("utf-8", errors="replace").rstrip("\x00").strip()
 
 
+_HEX = set("0123456789abcdefABCDEF")
+def _is_mac(s: str) -> bool:
+    """True if `s` is a colon-separated 6-byte MAC string."""
+    if not isinstance(s, str):
+        return False
+    parts = s.split(":")
+    if len(parts) != 6:
+        return False
+    return all(len(p) == 2 and all(c in _HEX for c in p) for p in parts)
+
+
+def _pick_device_key(chassis_id: str, src_mac: str) -> str:
+    """Best identifier for cross-protocol merging.
+
+    A switch is one physical device; ideally we want one rollup entry
+    per device regardless of which protocol it advertises with. The
+    only identifier guaranteed to exist on a real switch is its MAC
+    address. Some protocols put a MAC directly in chassis_id (LLDP
+    subtype 4, MNDP MAC TLV); others put a string device name (CDP).
+    Where we can read the L2 source MAC from the frame we use that
+    as the fallback — every real switch transmits frames from a real
+    MAC even when its advertised chassis_id is a string.
+
+    Returns the lowercase MAC form so case mismatches don't fragment
+    the rollup."""
+    if _is_mac(chassis_id):
+        return chassis_id.lower()
+    if _is_mac(src_mac):
+        return src_mac.lower()
+    # Last resort: use whatever string we got. Two different protocols
+    # advertising different string chassis_ids will not merge here, but
+    # at least each protocol's view stays consistent across nodes.
+    return chassis_id or src_mac or ""
+
+
 def _fmt_lldp_chassis(subtype: int, data: bytes) -> str:
     # subtype 4 = MAC address (most common). 5 = network address.
     # 1, 2, 3, 6, 7 = string-ish identifiers.
@@ -141,7 +176,8 @@ def decode_lldp(frame: bytes) -> Optional[dict]:
     if ethertype != LLDP_ETHERTYPE:
         return None
 
-    out: dict = {"protocol": "lldp"}
+    src_mac = _mac(frame[6:12])
+    out: dict = {"protocol": "lldp", "src_mac": src_mac}
     offset = 14
     while offset + 2 <= len(frame):
         header = struct.unpack_from("!H", frame, offset)[0]
@@ -173,6 +209,7 @@ def decode_lldp(frame: bytes) -> Optional[dict]:
 
     if "chassis_id" not in out:
         return None
+    out["device_key"] = _pick_device_key(out["chassis_id"], src_mac)
     return out
 
 
@@ -208,6 +245,7 @@ def decode_cdp(frame: bytes) -> Optional[dict]:
         return None
     if frame[20:22] != b"\x20\x00":
         return None
+    src_mac = _mac(frame[6:12])
     cdp_offset = 22
     if cdp_offset + 4 > len(frame):
         return None
@@ -215,7 +253,7 @@ def decode_cdp(frame: bytes) -> Optional[dict]:
     ttl = frame[cdp_offset + 1]
     cdp_offset += 4
 
-    out: dict = {"protocol": "cdp", "ttl_s": int(ttl)}
+    out: dict = {"protocol": "cdp", "src_mac": src_mac, "ttl_s": int(ttl)}
     while cdp_offset + 4 <= len(frame):
         ttype, tlen = struct.unpack_from("!HH", frame, cdp_offset)
         if tlen < 4 or cdp_offset + tlen > len(frame):
@@ -254,6 +292,9 @@ def decode_cdp(frame: bytes) -> Optional[dict]:
 
     if "chassis_id" not in out:
         return None
+    # CDP's chassis_id is the device name (text). The frame's L2 source
+    # MAC is the closest thing to a chassis identifier we get on the wire.
+    out["device_key"] = _pick_device_key(out["chassis_id"], src_mac)
     return out
 
 
@@ -292,6 +333,7 @@ def decode_mndp(payload: bytes) -> Optional[dict]:
         offset += tlen
         if ttype == _MNDP_MAC and len(value) == 6:
             out["chassis_id"] = _mac(value)
+            out["src_mac"]    = _mac(value)   # UDP, no L2 access — best guess
         elif ttype == _MNDP_IDENTITY:
             out["system_name"] = _utf8(value)
         elif ttype == _MNDP_VERSION:
@@ -305,6 +347,8 @@ def decode_mndp(payload: bytes) -> Optional[dict]:
 
     if "chassis_id" not in out:
         return None
+    out["device_key"] = _pick_device_key(out["chassis_id"],
+                                          out.get("src_mac", ""))
     return out
 
 
@@ -354,6 +398,8 @@ if __name__ == "__main__":
     decoded = decode_lldp(eth + payload)
     assert decoded == {
         "protocol":    "lldp",
+        "src_mac":     "00:1f:2e:aa:bb:cc",
+        "device_key":  "00:1f:2e:aa:bb:cc",
         "chassis_id":  "00:1f:2e:aa:bb:cc",
         "port_id":     "Gi1/0/3",
         "ttl_s":       120,
@@ -384,6 +430,8 @@ if __name__ == "__main__":
     decoded = decode_cdp(cdp_eth)
     assert decoded == {
         "protocol":     "cdp",
+        "src_mac":      "00:1f:2e:aa:bb:cc",
+        "device_key":   "00:1f:2e:aa:bb:cc",
         "ttl_s":        120,
         "chassis_id":   "office-cisco-1",
         "system_name":  "office-cisco-1",
@@ -404,11 +452,20 @@ if __name__ == "__main__":
     decoded = decode_mndp(mndp)
     assert decoded == {
         "protocol":     "mndp",
+        "src_mac":      "00:1f:2e:aa:bb:cc",
+        "device_key":   "00:1f:2e:aa:bb:cc",
         "chassis_id":   "00:1f:2e:aa:bb:cc",
         "system_name":  "router-1",
         "system_descr": "7.13.4",
         "platform":     "MikroTik",
         "port_id":      "ether2",
     }, f"unexpected MNDP decode: {decoded!r}"
+
+    # Cross-protocol merge: CDP and MNDP from the same device should
+    # produce the same device_key when the CDP frame's L2 source MAC
+    # matches the MNDP MAC TLV. This is what makes the dashboard
+    # rollup show one entry per physical device.
+    assert decode_cdp(cdp_eth)["device_key"] == decode_mndp(mndp)["device_key"], \
+        "CDP + MNDP from same MAC should produce identical device_key"
 
     print("l2disc: self-test OK (LLDP + CDP + MNDP parsers)")

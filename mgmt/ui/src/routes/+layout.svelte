@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { ws } from '$lib/ws';
-	import { nodes, vms, witness, connected, lastUpdate, events, tasks,
+	import { nodes, vms, witness, topology, connected, lastUpdate, events, tasks,
 		type TaskInfo } from '$lib/stores';
 	import { apiGet } from '$lib/api';
 
@@ -24,6 +24,7 @@
 			if (msg.nodes) nodes.set(msg.nodes);
 			if (msg.vms) vms.set(msg.vms);
 			if (msg.witness) witness.set(msg.witness);
+			if (msg.topology) topology.set(msg.topology);
 			lastUpdate.set(new Date().toLocaleTimeString());
 		});
 
@@ -106,6 +107,12 @@
 			</a>
 			<a class="tree-top" class:active={isActive('/backups')} href="/backups">
 				<span class="tree-icon">⎘</span> Backups
+			</a>
+			<a class="tree-top" class:active={isActive('/topology')} href="/topology">
+				<span class="tree-icon">⇆</span> Topology
+				{#if $topology.switch_count > 0}
+					<span class="count">{$topology.switch_count}</span>
+				{/if}
 			</a>
 			<a class="tree-top" class:active={isActive('/support')} href="/support">
 				<span class="tree-icon">⚑</span> Support
