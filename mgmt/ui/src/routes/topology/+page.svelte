@@ -64,13 +64,16 @@
 
 	// ─── Diagram layout ─────────────────────────────────────────────────
 	const SVG_W = 1200;
-	const SVG_H = 540;
-	const SWITCH_Y = 60;
+	const SVG_H = 620;
+	const SWITCH_Y = 40;
 	const SWITCH_W = 200;
 	const SWITCH_H = 80;
-	const NODE_Y  = 360;
 	const NODE_W  = 220;
 	const NODE_H  = 140;
+	const NODE_Y_FLAT = 420;          // Bottom row when no core selected
+	const STAR_CORE_X = SVG_W / 2;    // Centred core
+	const STAR_CORE_Y = SVG_H * 0.58;
+	const STAR_RADIUS = 230;
 
 	type Pos = { x: number; y: number };
 
@@ -85,18 +88,57 @@
 			margin + step * i - boxW / 2);
 	}
 
-	let nodeX = $derived(spread(clusterNodes.length, SVG_W, NODE_W));
-	let switchX = $derived(spread(switchList.length, SVG_W, SWITCH_W));
+	// Layout returns both maps and a flag indicating which mode we're in.
+	// In flat mode: switches top row, nodes bottom row. In star mode: the
+	// selected core sits at the canvas centre and peer nodes are spread
+	// in a wide arc *above and around* the core, switches still on top.
+	let layout = $derived.by(() => {
+		const switchPos = new Map<string, Pos>();
+		const swx = spread(switchList.length, SVG_W, SWITCH_W);
+		switchList.forEach((sw, i) => {
+			switchPos.set(sw.device_key, { x: swx[i], y: SWITCH_Y });
+		});
+
+		const nodePos = new Map<string, Pos>();
+		const isStar = !!coreNode && clusterNodes.includes(coreNode);
+
+		if (isStar) {
+			// Core dead-centred. Peers arranged on an arc *above and
+			// around* the core (between 200° and 340°, an upward fan) so
+			// cables flow downward into the core from naturally-placed
+			// peers and there's still room for switches at the top.
+			nodePos.set(coreNode!, {
+				x: STAR_CORE_X - NODE_W / 2,
+				y: STAR_CORE_Y - NODE_H / 2,
+			});
+			const peers = clusterNodes.filter(n => n !== coreNode);
+			const n = peers.length;
+			peers.forEach((peer, i) => {
+				// Angles measured clockwise from "east"; we want a fan
+				// pointing UP from the core (i.e. north-ish).
+				const startAng = -Math.PI * 0.85;   // ~ 207°
+				const endAng   = -Math.PI * 0.15;   // ~ -27° (=333°)
+				const t = n === 1 ? 0.5 : i / (n - 1);
+				const ang = startAng + t * (endAng - startAng);
+				nodePos.set(peer, {
+					x: STAR_CORE_X + STAR_RADIUS * Math.cos(ang) - NODE_W / 2,
+					y: STAR_CORE_Y + STAR_RADIUS * Math.sin(ang) - NODE_H / 2,
+				});
+			});
+		} else {
+			const nx = spread(clusterNodes.length, SVG_W, NODE_W);
+			clusterNodes.forEach((name, i) => {
+				nodePos.set(name, { x: nx[i], y: NODE_Y_FLAT });
+			});
+		}
+		return { nodePos, switchPos, isStar };
+	});
 
 	function nodePos(node: string): Pos | null {
-		const idx = clusterNodes.indexOf(node);
-		if (idx < 0) return null;
-		return { x: nodeX[idx], y: NODE_Y };
+		return layout.nodePos.get(node) ?? null;
 	}
 	function switchPos(deviceKey: string): Pos | null {
-		const idx = switchList.findIndex(s => s.device_key === deviceKey);
-		if (idx < 0) return null;
-		return { x: switchX[idx], y: SWITCH_Y };
+		return layout.switchPos.get(deviceKey) ?? null;
 	}
 
 	function nicAnchor(node: string, nic: string): Pos | null {
@@ -172,6 +214,37 @@
 	function toggleCore(name: string) {
 		coreNode = (coreNode === name) ? '' : name;
 	}
+
+	// Peer-pair summary: group all mesh links by the (a, b) pair so the
+	// detail table shows 'Node A ↔ Node B: 5 cables (LAN + 4 mesh planes)'.
+	type PairRow = {
+		a: string; b: string;
+		links: TopologyLink[];
+	};
+	let pairRows = $derived.by((): PairRow[] => {
+		const m = new Map<string, PairRow>();
+		for (const L of $topology.links) {
+			const key = `${L.node_a}|${L.node_b}`;
+			let r = m.get(key);
+			if (!r) {
+				r = { a: L.node_a, b: L.node_b, links: [] };
+				m.set(key, r);
+			}
+			r.links.push(L);
+		}
+		const out = Array.from(m.values());
+		// Stable sort by node-name pair.
+		out.sort((x, y) => (x.a + '|' + x.b).localeCompare(y.a + '|' + y.b));
+		// Sort cables within each pair: br0 first, then alphabetical.
+		for (const r of out) {
+			r.links.sort((p, q) => {
+				if (p.nic_a === 'br0' && q.nic_a !== 'br0') return -1;
+				if (q.nic_a === 'br0' && p.nic_a !== 'br0') return 1;
+				return (p.nic_a + p.nic_b).localeCompare(q.nic_a + q.nic_b);
+			});
+		}
+		return out;
+	});
 </script>
 
 <svelte:head><title>Topology — Bedrock</title></svelte:head>
@@ -198,6 +271,16 @@
 		Click any node to focus on its connections.
 	{/if}
 </p>
+
+<div class="legend">
+	<span class="legend-item"><svg width="36" height="12" viewBox="0 0 36 12"><line x1="2" y1="6" x2="34" y2="6" class="cable cable-mesh"/></svg> mesh cable (cluster node ↔ cluster node, discovery probe)</span>
+	<span class="legend-item"><svg width="36" height="12" viewBox="0 0 36 12"><line x1="2" y1="6" x2="34" y2="6" class="cable cable-switch"/></svg> switch cable (cluster node ↔ switch, LLDP / CDP / MNDP)</span>
+	{#if coreNode}
+		<button class="reset-btn" onclick={() => coreNode = ''}>Reset · show all</button>
+	{:else}
+		<span class="hint">Click a node box to centre it.</span>
+	{/if}
+</div>
 
 <div class="diagram-wrap">
 	<svg viewBox="0 0 {SVG_W} {SVG_H}" xmlns="http://www.w3.org/2000/svg"
@@ -291,6 +374,54 @@ heard via {sw.protocols.join(', ')}</title>
 	</div>
 {/if}
 
+<!-- Detail panel: mesh cables between cluster nodes, grouped per pair.
+     This is the table version of what the SVG draws in green. -->
+{#if pairRows.length > 0}
+	<h2 class="section">Cluster cables (node ↔ node) — detail</h2>
+	<div class="cards">
+		{#each pairRows as pair (pair.a + '|' + pair.b)}
+			{@const dim = !!coreNode && pair.a !== coreNode && pair.b !== coreNode}
+			<div class="card" class:dim>
+				<div class="card-head">
+					<div class="title">
+						<span class="icon">↔</span>
+						<span class="name">{shortName(pair.a)} ↔ {shortName(pair.b)}</span>
+						<span class="tag pair-tag">{pair.links.length} cable{pair.links.length === 1 ? '' : 's'}</span>
+					</div>
+				</div>
+				<table class="conns">
+					<thead>
+						<tr>
+							<th>{shortName(pair.a)} NIC</th>
+							<th>↔</th>
+							<th>{shortName(pair.b)} NIC</th>
+							<th>Speed</th>
+							<th>RTT</th>
+							<th>Blips</th>
+							<th>Last seen</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each pair.links as L (L.nic_a + L.nic_b)}
+							<tr>
+								<td><code>{L.nic_a}</code></td>
+								<td class="muted">↔</td>
+								<td><code>{L.nic_b}</code></td>
+								<td>{fmtSpeed(L.speed_mbps)}</td>
+								<td>{L.rtt_us ? `${L.rtt_us} µs` : ''}</td>
+								<td class:warn={L.blip_total > 0}>
+									{L.blip_total > 0 ? L.blip_total : '0'}
+								</td>
+								<td class="muted">{fmtAge(L.last_seen)}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/each}
+	</div>
+{/if}
+
 <!-- Detail panel: per-switch breakdown — keeps the previous card-list
      view for operators who want the text version. -->
 {#if switchList.length > 0}
@@ -357,6 +488,26 @@ heard via {sw.protocols.join(', ')}</title>
 		color: #8b949e; font-size: 13px; line-height: 1.55;
 		max-width: 880px; margin: 8px 0 16px;
 	}
+
+	.legend {
+		display: flex;
+		gap: 24px;
+		align-items: center;
+		font-size: 12px;
+		color: #8b949e;
+		margin: 8px 0 6px;
+		flex-wrap: wrap;
+	}
+	.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+	.legend svg { vertical-align: middle; }
+	.hint { font-style: italic; color: #6e7681; margin-left: auto; }
+	.reset-btn {
+		margin-left: auto;
+		background: #d29922; color: #000; border: none;
+		border-radius: 4px; padding: 3px 10px; cursor: pointer;
+		font-size: 12px; font-weight: 600;
+	}
+	.reset-btn:hover { background: #f0b942; }
 
 	.diagram-wrap {
 		background: #0d1117;
@@ -454,6 +605,9 @@ heard via {sw.protocols.join(', ')}</title>
 		padding: 2px 8px; border-radius: 10px; font-weight: 600;
 	}
 	.shared-tag { background: #1f6feb33; color: #79c0ff; }
+	.pair-tag   { background: #3fb95033; color: #56d364; }
+	.card.dim   { opacity: 0.45; }
+	.warn       { color: #d29922; font-weight: 600; }
 
 	.ids {
 		display: flex; gap: 12px; font-size: 12px;
