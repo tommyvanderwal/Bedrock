@@ -27,7 +27,7 @@ Only the node running `bedrock-mgmt.service` (init'd node, or a future HA mgmt):
 
 | Port | Protocol | Service | Bound | Notes |
 |---|---|---|---|---|
-| 8080 | TCP | FastAPI mgmt dashboard | all IPs | HTTP + `/ws` WebSocket + `/vnc/{vm}` VNC proxy |
+| 8080 | TCP | FastAPI mgmt dashboard | all IPs | HTTP + `/ws` WebSocket + `/vnc/{vm}` VNC proxy. `/api/topology` returns the physical-topology rollup (per-node `switch_neighbors.json` grouped by chassis ID; cached at `/run/bedrock/physical_topology.json`). |
 | 8428 | TCP | VictoriaMetrics | all IPs | `/api/v1/query`, `/api/v1/query_range`, `/-/reload` |
 | 9428 | TCP | VictoriaLogs HTTP | all IPs | `/insert/jsonline` (push_log writes), `/select/logsql/query` (reads) |
 | 5140 | TCP | VictoriaLogs syslog | all IPs | RFC 5424 syslog from cluster nodes (follow-up: auto-config per node) |

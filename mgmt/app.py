@@ -140,7 +140,8 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "echo '---KERNEL---'; uname -r; "
             "echo '---THINPOOL---'; lvs --noheadings --units b --nosuffix "
             "--separator '|' -o vg_name,lv_name,lv_size,data_percent,metadata_percent "
-            "--select 'lv_attr=~\"^t\"' 2>/dev/null"
+            "--select 'lv_attr=~\"^t\"' 2>/dev/null; "
+            "echo '---SWITCHES---'; cat /run/bedrock/switch_neighbors.json 2>/dev/null || echo '{}'"
         ))
         sections = {}
         current = None
@@ -170,6 +171,19 @@ def get_node_info(name: str, cfg: dict) -> dict:
                     })
                 except ValueError: pass
 
+        # Switch neighbours seen by bedrock-net (LLDP / CDP / MNDP). The
+        # raw payload is the contents of /run/bedrock/switch_neighbors.json
+        # on the node — a per-NIC dict keyed by protocol. We parse it
+        # eagerly so the rollup logic doesn't have to re-parse on every
+        # 3 s push.
+        try:
+            switches_raw = "\n".join(sections.get("SWITCHES", [])).strip()
+            switches = json.loads(switches_raw) if switches_raw else {}
+            if not isinstance(switches, dict):
+                switches = {}
+        except (ValueError, TypeError):
+            switches = {}
+
         return {
             "name": name, "host": host, "online": True,
             "kernel": sections.get("KERNEL", [""])[0],
@@ -180,6 +194,7 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "all_vms": all_vms, "running_vms": running_vms,
             "drbd_raw": "\n".join(sections.get("DRBD", [])),
             "thinpools": thinpools,
+            "switches": switches,
             "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
         }
     except Exception as e:
@@ -187,6 +202,7 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "name": name, "host": host, "online": False, "error": str(e),
             "all_vms": [], "running_vms": [], "drbd_raw": "",
             "thinpools": [],
+            "switches": {},
             "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
             "kernel": "", "uptime_since": "", "load": "0",
             "mem_total_mb": 0, "mem_used_mb": 0,
@@ -422,7 +438,120 @@ def build_cluster_state() -> dict:
                 "created_at": data.get("created_at"),
             })
 
-    return {"nodes": nodes_data, "vms": vms_data, "witness": get_witness_status()}
+    topology = build_physical_topology(nodes_data)
+    return {"nodes": nodes_data, "vms": vms_data,
+            "witness": get_witness_status(),
+            "topology": topology}
+
+
+# ── Physical topology rollup ────────────────────────────────────────────────
+
+PHYSICAL_TOPOLOGY_CACHE = Path("/run/bedrock/physical_topology.json")
+
+
+def build_physical_topology(nodes_data: dict) -> dict:
+    """Group per-node switch observations by chassis_id so the
+    dashboard can render 'these N NICs are all plugged into the same
+    switch'.
+
+    Input: nodes_data[node_name]["switches"] is the per-NIC dict the
+    node's bedrock-net daemon writes to /run/bedrock/switch_neighbors.json:
+        { "<my_nic>": { "<protocol>": {chassis_id, system_name,
+                                        port_id, mgmt_ip, ...} } }
+
+    Output: a derived view-only structure — NEVER folded into the
+    cluster log / cluster.json. Shape:
+
+        {
+          "switches": {
+            "<chassis_id>": {
+              "chassis_id":  "<id>",
+              "system_name": "<best-known name>",
+              "mgmt_ip":     "<best-known ip>",
+              "platform":    "<best-known platform>",
+              "protocols":   ["lldp", "cdp", "mndp"],
+              "connections": [
+                {"node": "bedrock-X", "my_nic": "br0",
+                 "port_id": "Gi1/0/3", "protocol": "lldp",
+                 "first_seen": …, "last_seen": …},
+                …
+              ]
+            }
+          },
+          "node_count":   3,    # nodes that reported any data
+          "switch_count": 2,    # distinct chassis_ids observed
+          "computed_at":  1731320000.123,
+        }
+    """
+    grouped: dict = {}
+    node_count = 0
+    for node_name, info in (nodes_data or {}).items():
+        switches = (info or {}).get("switches") or {}
+        if not switches:
+            continue
+        node_count += 1
+        for my_nic, by_proto in switches.items():
+            if not isinstance(by_proto, dict):
+                continue
+            for protocol, entry in by_proto.items():
+                if not isinstance(entry, dict):
+                    continue
+                chassis_id = entry.get("chassis_id") or ""
+                if not chassis_id:
+                    continue
+                bucket = grouped.setdefault(chassis_id, {
+                    "chassis_id":  chassis_id,
+                    "system_name": "",
+                    "mgmt_ip":     "",
+                    "platform":    "",
+                    "protocols":   set(),
+                    "connections": [],
+                })
+                # Pick the most-informative system_name / mgmt_ip /
+                # platform across all observations.
+                for src, key in (("system_name", "system_name"),
+                                  ("mgmt_ip",     "mgmt_ip"),
+                                  ("platform",    "platform")):
+                    v = entry.get(src)
+                    if v and not bucket[key]:
+                        bucket[key] = v
+                bucket["protocols"].add(protocol)
+                bucket["connections"].append({
+                    "node":       node_name,
+                    "my_nic":     my_nic,
+                    "protocol":   protocol,
+                    "port_id":    entry.get("port_id", ""),
+                    "port_descr": entry.get("port_descr", ""),
+                    "first_seen": entry.get("first_seen"),
+                    "last_seen":  entry.get("last_seen"),
+                })
+
+    # Sets aren't JSON-serialisable; finalize.
+    for bucket in grouped.values():
+        bucket["protocols"] = sorted(bucket["protocols"])
+        bucket["connections"].sort(
+            key=lambda c: (c["node"], c["my_nic"], c["protocol"]))
+
+    rollup = {
+        "switches":     grouped,
+        "node_count":   node_count,
+        "switch_count": len(grouped),
+        "computed_at":  time.time(),
+    }
+
+    # Best-effort cache to disk so post-mortem inspection without the
+    # mgmt service running is possible. Not authoritative — the live
+    # view is always the in-memory _last_state.
+    try:
+        PHYSICAL_TOPOLOGY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PHYSICAL_TOPOLOGY_CACHE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rollup, indent=2, sort_keys=True))
+        tmp.replace(PHYSICAL_TOPOLOGY_CACHE)
+    except OSError as e:
+        log.debug("physical_topology cache write failed: %s", e)
+
+    return rollup
+
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
 
@@ -495,10 +624,13 @@ async def startup():
                       "kernel": "", "uptime_since": "", "load": "",
                       "mem_total_mb": 0, "mem_used_mb": 0,
                       "all_vms": [], "running_vms": [], "drbd_raw": "",
+                      "switches": {},
                       "cockpit_url": c.get("cockpit", f"https://{c.get('host', '')}:9090")}
                   for n, c in cfg.get("nodes", {}).items()},
         "vms": {},
         "witness": {"nodes": {}},
+        "topology": {"switches": {}, "node_count": 0, "switch_count": 0,
+                     "computed_at": 0.0},
     }
     task_registry().wire(_main_loop, hub.broadcast)
     asyncio.create_task(state_push_loop())
@@ -516,6 +648,18 @@ async def startup():
 def api_cluster():
     # Serve cached state. Fresh data lands every 3s via the push loop.
     return _last_state
+
+
+@app.get("/api/topology")
+def api_topology():
+    """Physical topology rollup — switches and routers each cluster
+    NIC sees, grouped by chassis_id. Computed every 3 s by the state
+    push loop from each node's /run/bedrock/switch_neighbors.json.
+    Not consensus state — never in cluster.json — purely a derived
+    view for the dashboard."""
+    return _last_state.get("topology", {"switches": {}, "node_count": 0,
+                                          "switch_count": 0,
+                                          "computed_at": 0.0})
 
 
 @app.get("/api/tasks")

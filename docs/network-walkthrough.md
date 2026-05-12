@@ -846,10 +846,14 @@ flagging.
 }
 ```
 
-The mgmt master scrapes this file from every node and assembles
-a cluster-wide rollup **in memory** (or as a derived
-`/run/bedrock/physical_topology.json` cache on the mgmt node —
-whichever is more convenient for the dashboard endpoint to read).
+The mgmt master scrapes this file from every node every 3 s (via
+the same SSH fan-out that already gathers DRBD / virsh / load
+state for the dashboard), assembles a cluster-wide rollup **in
+memory**, and ALSO caches it to `/run/bedrock/physical_topology.json`
+on the mgmt node so a post-mortem inspection without the mgmt
+service running is still possible. The live data is reachable
+via `GET /api/topology`.
+
 **It is never folded into `cluster.json`.** That file is reserved
 for materialised cluster-log state — things the cluster has
 reached consensus on (membership, master role, loopback
