@@ -169,10 +169,10 @@ outlier IS information:
                srtt_us=120 rule=absolute streak=1 total=7
   ```
 
-  The syslog → VictoriaLogs pipeline ingests this for free.
-  `_msg:BLIP peer:bedrock-X | stats by (my_nic) count()` in
-  LogsQL gives an operator the per-link blip rate over any
-  window.
+  Each node's VLagent forwards the line to both redundant
+  VictoriaLogs backends. `_msg:BLIP peer:bedrock-X | stats by
+  (my_nic) count()` in LogsQL gives an operator the per-link
+  blip rate over any window.
 
 Optional: expose smoothed values as Prometheus gauges (e.g.
 `bedrock_path_rtt_us{peer, nic}`, `bedrock_path_blip_total{peer,

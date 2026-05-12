@@ -98,6 +98,15 @@ from typing import Optional
 
 import msgpack
 
+try:
+    from . import l2disc
+except ImportError:
+    # When this file is run directly (not as a package member) by the
+    # bedrock-net systemd unit, fall back to the explicit sys.path
+    # entry that PYTHONPATH puts in place.
+    sys.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import l2disc  # type: ignore
+
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -513,6 +522,16 @@ class Daemon:
     adv_seq: int = 0
     adv_table: dict = field(default_factory=dict)
     best_transit_paths: dict = field(default_factory=dict)
+    # L2 switch/router neighbour discovery (LLDP, CDP, MNDP). Per-NIC
+    # raw sockets are opened on NIC bringup and closed on teardown.
+    # switch_neighbors is keyed by (my_nic, protocol) → dict, where
+    # the dict carries {chassis_id, system_name, port_id, ...,
+    # first_seen, last_seen, last_logged_at}. mndp_sock is single,
+    # shared across all NICs (broadcast UDP socket with IP_PKTINFO).
+    lldp_socks: dict = field(default_factory=dict)
+    cdp_socks: dict  = field(default_factory=dict)
+    mndp_sock: Optional[socket.socket] = None
+    switch_neighbors: dict = field(default_factory=dict)
     # Stop flag for clean shutdown.
     stopped: bool = False
 
@@ -715,6 +734,14 @@ def run_daemon():
     d.recv_sock.settimeout(0.05)
     d.adv_recv_sock = open_adv_recv_socket()
     d.adv_send_sock = open_adv_send_socket()
+    try:
+        d.mndp_sock = l2disc.open_mndp_socket()
+    except OSError as e:
+        sys.stderr.write(
+            f"bedrock-net: mndp socket open failed: {e}; "
+            f"MikroTik neighbour discovery disabled.\n"
+        )
+        d.mndp_sock = None
 
     print(f"bedrock-net: cluster_uuid={cluster_uuid} node={my_node} "
           f"loopback={my_loopback or '<not yet assigned>'}",
@@ -725,6 +752,7 @@ def run_daemon():
     last_icmp = 0.0
     last_adv = 0.0
     last_status = 0.0
+    last_switch_state = 0.0
 
     while not d.stopped:
         try:
@@ -751,6 +779,11 @@ def run_daemon():
             if now - last_adv >= ADV_INTERVAL_S:
                 adv_send_round(d, now)
                 last_adv = now
+            # L2 neighbour discovery — passive, drain every tick.
+            l2disc_drain(d, now)
+            if now - last_switch_state >= SWITCH_STATE_INTERVAL_S:
+                write_switch_state_file(d)
+                last_switch_state = now
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
                 last_route_emit = now
@@ -778,11 +811,22 @@ def run_daemon():
                     )
                 else:
                     blip_str = "blips_total=0"
+                # Switch / router neighbours by NIC.
+                sw_parts: list[str] = []
+                for (nic, proto), entry in sorted(d.switch_neighbors.items()):
+                    name = entry.get("system_name") or entry.get("chassis_id", "")
+                    port = entry.get("port_id", "")
+                    short = f"{proto}:{nic}->{name}"
+                    if port:
+                        short += f"/{port}"
+                    sw_parts.append(short)
+                sw_str = (f"switches={len(sw_parts)}"
+                          + (f"({','.join(sw_parts)})" if sw_parts else ""))
                 print(
                     f"bedrock-net: status neighbours={len(d.neighbours)} "
                     f"(logged_up={logged}); advertisers=[{','.join(advs) or '-'}]; "
                     f"transit_dests=[{','.join(transit) or '-'}]; "
-                    f"{blip_str}",
+                    f"{blip_str}; {sw_str}",
                     file=sys.stderr, flush=True,
                 )
                 last_status = now
@@ -837,6 +881,25 @@ def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
                 d.nic_addrs[nic] = addr
                 join_group_on(d.recv_sock, nic)
                 d.probe_send_socks[nic] = open_send_socket(nic)
+                # L2 neighbour discovery — receive-only LLDP + CDP per
+                # NIC. Failures are non-fatal: a NIC without permission
+                # to AF_PACKET still does discovery + ICMP + routing.
+                try:
+                    d.lldp_socks[nic] = l2disc.open_lldp_socket(nic)
+                except OSError as e:
+                    sys.stderr.write(
+                        f"bedrock-net: lldp socket on {nic} failed: "
+                        f"{e}; switch identity won't be observed on "
+                        f"this NIC.\n"
+                    )
+                try:
+                    d.cdp_socks[nic] = l2disc.open_cdp_socket(nic)
+                except OSError as e:
+                    sys.stderr.write(
+                        f"bedrock-net: cdp socket on {nic} failed: "
+                        f"{e}; Cisco/Aruba/HP switch identity won't "
+                        f"be observed on this NIC.\n"
+                    )
                 print(f"bedrock-net: nic up {nic} addr={addr}",
                       file=sys.stderr, flush=True)
     # NICs that went away
@@ -848,6 +911,15 @@ def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
                 d.probe_send_socks.pop(nic).close()
             except Exception:
                 pass
+            for sock_map in (d.lldp_socks, d.cdp_socks):
+                s = sock_map.pop(nic, None)
+                if s is not None:
+                    try: s.close()
+                    except Exception: pass
+            # Drop any switch_neighbors entries for this NIC.
+            for k in list(d.switch_neighbors.keys()):
+                if k[0] == nic:
+                    d.switch_neighbors.pop(k, None)
             d.nic_addrs.pop(nic, None)
             # Mark all neighbours via this nic as stale; they'll be
             # cleaned on the next hysteresis sweep.
@@ -1352,10 +1424,10 @@ def _update_neighbour_rtt(d: Daemon, neigh_key: tuple,
     earliest warning an operator gets that a cable, a switch port,
     or a kernel buffer is starting to misbehave. Per-neighbour
     totals appear on the daemon's 30 s status line; each blip also
-    prints a structured journal line that the syslog →
-    VictoriaLogs pipeline ingests automatically, rate-limited to
-    one emit per (peer, my_nic) per 5 min so a flapping path can't
-    flood the log server. Operators query
+    prints a structured journal line that each node's VLagent
+    forwards to both redundant VictoriaLogs backends, rate-limited
+    to one emit per (peer, my_nic) per 5 min so a flapping path
+    can't flood the log server. Operators query
 
         _msg:BLIP peer:bedrock-X | stats by (my_nic) count()
 
@@ -1674,6 +1746,169 @@ def recompute_best_transit_paths(d: Daemon, now_ts: float) -> None:
                 }
 
     d.best_transit_paths = best
+
+
+# ── L2 neighbour discovery (LLDP + CDP + MNDP) ───────────────────────
+#
+# Sidecar feature, not part of the routing protocols 1/2/3. Purely
+# observational: each tick we drain whatever LLDP / CDP / MNDP frames
+# the kernel queued for us, decode them (l2disc.decode_*), and update
+# Daemon.switch_neighbors. First-seen and switch-swap events emit a
+# structured 'NIC_SWITCH' journal line that the per-node VLagent
+# forwards to the cluster's two redundant VictoriaLogs backends.
+#
+# The live per-node view is also written to
+# /run/bedrock/switch_neighbors.json so the mgmt master can scrape
+# it cheaply and the dashboard can render "node X enp3s0 → switch S
+# port 5" without any cluster log involvement (single-writer rule
+# stays clean: this is per-node local reality, not consensus state).
+
+SWITCH_REFRESH_S = 24 * 3600        # re-emit NIC_SWITCH at least daily
+SWITCH_DRAIN_MAX = 100              # frames per socket per tick
+SWITCH_STATE_FILE = Path("/run/bedrock/switch_neighbors.json")
+SWITCH_STATE_INTERVAL_S = 5.0
+
+
+def l2disc_drain(d: Daemon, now_ts: float) -> bool:
+    """Drain LLDP + CDP per-NIC sockets and the shared MNDP socket.
+    Returns True if any (my_nic, protocol) entry was inserted or
+    swapped to a new chassis_id."""
+    changed = False
+    for nic, sock in list(d.lldp_socks.items()):
+        for _ in range(SWITCH_DRAIN_MAX):
+            try:
+                buf = sock.recv(2048)
+            except (BlockingIOError, socket.timeout):
+                break
+            except OSError:
+                break
+            info = l2disc.decode_lldp(buf)
+            if info and _record_switch(d, nic, info, now_ts):
+                changed = True
+    for nic, sock in list(d.cdp_socks.items()):
+        for _ in range(SWITCH_DRAIN_MAX):
+            try:
+                buf = sock.recv(2048)
+            except (BlockingIOError, socket.timeout):
+                break
+            except OSError:
+                break
+            info = l2disc.decode_cdp(buf)
+            if info and _record_switch(d, nic, info, now_ts):
+                changed = True
+    if d.mndp_sock is not None:
+        for _ in range(SWITCH_DRAIN_MAX):
+            data, src_addr, ifindex = recv_with_ifindex(d.mndp_sock)
+            if data is None:
+                break
+            nic = ifname_for_index(ifindex) if ifindex else ""
+            if not nic:
+                continue
+            info = l2disc.decode_mndp(data)
+            if not info:
+                continue
+            if src_addr and "mgmt_ip" not in info:
+                info["mgmt_ip"] = src_addr
+            if _record_switch(d, nic, info, now_ts):
+                changed = True
+    return changed
+
+
+def _record_switch(d: Daemon, nic: str, info: dict, now_ts: float) -> bool:
+    """Insert/update the entry for (nic, protocol). Emit a journal
+    line if this is a first-observation, a chassis_id swap (cable
+    moved / switch replaced), or if 24 h has elapsed since the last
+    emit for this (nic, protocol)."""
+    protocol = info.get("protocol", "")
+    chassis_id = info.get("chassis_id", "")
+    if not chassis_id or not protocol:
+        return False
+    key = (nic, protocol)
+    prev = d.switch_neighbors.get(key)
+    is_new  = prev is None
+    is_swap = (prev is not None
+               and prev.get("chassis_id") != chassis_id)
+    is_refresh = (prev is not None and not is_swap
+                  and now_ts - prev.get("last_logged_at", 0)
+                       >= SWITCH_REFRESH_S)
+
+    entry = dict(info)
+    if prev and not is_swap:
+        entry["first_seen"] = prev.get("first_seen", now_ts)
+    else:
+        entry["first_seen"] = now_ts
+    entry["last_seen"] = now_ts
+    if is_new or is_swap or is_refresh:
+        entry["last_logged_at"] = now_ts
+        _emit_nic_switch_log(
+            nic, entry,
+            reason=("new" if is_new
+                    else "swap" if is_swap
+                    else "refresh"),
+        )
+    else:
+        entry["last_logged_at"] = prev.get("last_logged_at", 0)
+    d.switch_neighbors[key] = entry
+    return is_new or is_swap
+
+
+def _emit_nic_switch_log(nic: str, entry: dict, *, reason: str) -> None:
+    """Structured key=value journal line. VLagent forwards it to
+    both VictoriaLogs backends; LogsQL operators query e.g.
+
+        _msg:NIC_SWITCH chassis:"00:1f:2e:aa:bb:cc"
+            | stats by (my_nic, port) count()
+    """
+    fields = [
+        f"my_nic={nic}",
+        f"protocol={entry.get('protocol', '')}",
+        f"chassis={entry.get('chassis_id', '')}",
+    ]
+    for src, label in (("system_name", "system"),
+                        ("port_id",     "port"),
+                        ("port_descr",  "port_descr"),
+                        ("mgmt_ip",     "mgmt"),
+                        ("platform",    "platform"),
+                        ("ttl_s",       "ttl_s")):
+        v = entry.get(src)
+        if v not in (None, ""):
+            # Wrap values containing spaces in quotes for clean LogsQL.
+            sval = str(v)
+            if " " in sval:
+                sval = '"' + sval.replace('"', '\\"') + '"'
+            fields.append(f"{label}={sval}")
+    fields.append(f"reason={reason}")
+    sys.stderr.write("bedrock-net: NIC_SWITCH " + " ".join(fields) + "\n")
+    sys.stderr.flush()
+
+
+def write_switch_state_file(d: Daemon) -> None:
+    """Atomic write of the current per-NIC switch view to
+    /run/bedrock/switch_neighbors.json. The mgmt master scrapes this
+    from every node to assemble the cluster-wide physical_topology
+    section of cluster.json.
+
+    Shape:
+      { "enp2s0": { "lldp": {chassis_id, system_name, port_id, …},
+                     "cdp":  {…} },
+        "enp3s0": { "mndp": {…} },
+        … }
+    """
+    grouped: dict = {}
+    for (nic, protocol), entry in d.switch_neighbors.items():
+        # Strip our internal bookkeeping field; everything else is
+        # the protocol payload + first_seen/last_seen.
+        view = {k: v for k, v in entry.items() if k != "last_logged_at"}
+        grouped.setdefault(nic, {})[protocol] = view
+    try:
+        SWITCH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SWITCH_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(grouped, indent=2, sort_keys=True))
+        tmp.replace(SWITCH_STATE_FILE)
+    except OSError as e:
+        sys.stderr.write(
+            f"bedrock-net: switch state file write failed: {e}\n"
+        )
 
 
 # ── Local metric (per-receiver, format-decoupled) ────────────────────

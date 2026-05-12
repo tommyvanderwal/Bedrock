@@ -331,7 +331,8 @@ bedrock-net: BLIP peer=bedrock-X my_nic=enp3s0 sample_us=230000
              srtt_us=120 rule=absolute streak=1 total=7
 ```
 
-…which the syslog → VictoriaLogs pipeline picks up automatically.
+…which the per-node VLagent forwards to both redundant
+VictoriaLogs backends.
 Operators query
 
 ```
@@ -774,7 +775,142 @@ other being broken.
 
 ---
 
-## 9. What an operator actually sees
+## 9. Switch / router identity — the side-quest
+
+The three protocols above tell us everything about Bedrock-on-
+Bedrock: which nodes exist, how fast each path is, how to route
+around failures. They tell us **nothing** about what the wires
+are connected TO on the other end. Is `enp3s0` plugged into
+office-switch port 7, or office-switch port 23, or a totally
+different switch?
+
+That's a question every operator eventually wants to answer.
+Bedrock listens to three commonly-spoken switch-discovery
+protocols so it can answer it without having to walk to the
+switch console:
+
+```
+   ┌────────────────────┬───────────────────┬──────────────────┐
+   │ LLDP               │ CDP               │ MNDP             │
+   │ vendor-neutral     │ Cisco's,          │ MikroTik's       │
+   │ IEEE standard      │ widely copied     │                  │
+   │                    │                   │                  │
+   │ EtherType 0x88CC,  │ 802.3 SNAP frame, │ UDP broadcast    │
+   │ multicast to       │ multicast to      │ on port 5678     │
+   │ 01:80:c2:00:00:0e  │ 01:00:0c:cc:cc:cc │                  │
+   │                    │                   │                  │
+   │ every ~30 s        │ every ~60 s       │ every ~30 s      │
+   └────────────────────┴───────────────────┴──────────────────┘
+```
+
+All three carry roughly the same information: who I am (chassis
+ID, system name), which port of mine you're plugged into (port
+ID, port description), and how to reach me at my management IP.
+Bedrock parses all three into a single shape so the rest of the
+system doesn't care which protocol the switch happens to speak.
+
+**Receive-only.** Bedrock never sends LLDP / CDP / MNDP frames
+back. We just listen. That keeps this layer purely diagnostic:
+swap a switch, move a cable, the parser notices within one TTL
+cycle (≤ 2 minutes).
+
+**Per-NIC table.** Each NIC keeps a tiny dict of
+`{protocol → switch info}`. Two protocols from the same switch
+(e.g. Aruba sends both LLDP and CDP) produce two entries — they
+agree on the chassis ID so the dashboard groups them. A NIC
+seeing two *different* chassis IDs is a misconfiguration worth
+flagging.
+
+**Live state file.** Every ~5 seconds the daemon rewrites
+`/run/bedrock/switch_neighbors.json`:
+
+```json
+{
+  "br0": {
+    "cdp": {
+      "chassis_id":   "office-sw-01",
+      "system_name":  "office-sw-01",
+      "port_id":      "vlan1",
+      "mgmt_ip":      "192.168.2.253",
+      "platform":     "MikroTik",
+      "ttl_s":        121
+    },
+    "mndp": {
+      "chassis_id":   "d4:01:c3:0e:7b:36",
+      "system_name":  "office-sw-01",
+      "port_id":      "vlan1",
+      "system_descr": "RouterOS 7.20.6",
+      "platform":     "MikroTik"
+    }
+  }
+}
+```
+
+The mgmt master scrapes this from every node and assembles a
+cluster-wide `physical_topology` section in `cluster.json`,
+grouping by `chassis_id`. That's how a rollup like
+
+> *Both `node A enp2s0` and `node B enp2s0` are plugged into
+>  `office-sw-01`, ports `7` and `23` respectively.*
+
+falls out automatically — group by chassis, list `(node, nic,
+port_id)` tuples per group.
+
+**First-seen logging.** When a NIC first sees a switch (or when
+the chassis ID under it changes — cable moved, switch replaced),
+the daemon emits a structured `NIC_SWITCH` line to the journal:
+
+```
+bedrock-net: NIC_SWITCH my_nic=br0 protocol=cdp chassis=MikroTik
+             system=MikroTik port=vlan1 mgmt=192.168.2.253
+             platform=MikroTik ttl_s=121 reason=new
+```
+
+The per-node VLagent forwards that line to **both** redundant
+VictoriaLogs backends (every Bedrock cluster runs two for
+durability). Operators query in LogsQL:
+
+```
+_msg:NIC_SWITCH chassis:"office-sw-01" | stats by (my_nic, port) count()
+```
+
+…to see, across the whole cluster's history, which NICs have
+ever been connected where. A node that's currently dead still
+shows up — its last `NIC_SWITCH` emit is on file at both backends.
+
+To keep the log server tidy, lines are rate-limited: a given
+`(NIC, chassis_id)` pair re-emits only on **first observation**,
+on **chassis change** (cable moved or switch swapped), or as a
+**24-hour refresh**. Continuous steady-state operation produces
+one journal line per NIC per day — exactly the heartbeat
+operators want.
+
+**Big picture:**
+
+```
+   ┌─────────┐                                           ┌─────────┐
+   │ switch  │  ─ LLDP frame every 30 s ──────────────▶  │ node X  │
+   │ (any)   │  ─ CDP frame every 60 s ───────────────▶  │ enp3s0  │
+   └─────────┘                                           └────┬────┘
+                                                              │
+                                                              ▼
+                                        ┌──────────────────────────────────┐
+                                        │ bedrock-net daemon               │
+                                        │  • parse, dedup by chassis_id    │
+                                        │  • update switch_neighbors map   │
+                                        │  • emit NIC_SWITCH on first-seen │
+                                        │    or 24h refresh                │
+                                        │  • write state file every 5 s    │
+                                        └────────────┬─────────────────────┘
+                                                     │
+                            ┌────────────────────────┴───────────────────┐
+                            ▼                                            ▼
+              /run/bedrock/switch_neighbors.json            VLagent → 2× VictoriaLogs
+              (live view, scraped by mgmt master           (durable history; queries
+              for cluster.json physical_topology)           via LogsQL)
+```
+
+## 10. What an operator actually sees
 
 This section is "I have a terminal, what should I look at?" —
 in roughly the order you'd run things to verify everything is
@@ -908,7 +1044,7 @@ If after 30 seconds you still see `neighbours=0`:
 
 ---
 
-## 10. The big picture in one image
+## 11. The big picture in one image
 
 ```
    ┌───────────────────────────────────────────────────────────────────┐
@@ -975,7 +1111,7 @@ layer doesn't know or care about any of it.
 
 ---
 
-## 11. Where to dig deeper
+## 12. Where to dig deeper
 
 | You want to know | Look at |
 |---|---|

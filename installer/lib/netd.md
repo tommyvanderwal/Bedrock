@@ -52,6 +52,13 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
     adv_seq:            int               # monotonic
     adv_table:          dict[advertiser -> {seq, ts_local, sender_addr, paths}]
     best_transit_paths: dict[dest -> {metric, advertiser, neighbour, bw, lat, via_chain}]
+    # L2 neighbour discovery sidecar (LLDP / CDP / MNDP)
+    lldp_socks:         dict[my_nic -> socket]   # per-NIC AF_PACKET
+    cdp_socks:          dict[my_nic -> socket]   # per-NIC AF_PACKET (ETH_P_802_2)
+    mndp_sock:          socket                   # single, UDP 5678
+    switch_neighbors:   dict[(my_nic, protocol) -> {chassis_id, system_name,
+                              port_id, port_descr, mgmt_ip, platform, ttl_s,
+                              first_seen, last_seen, last_logged_at}]
     stopped:            bool
 
 @dataclass class Neighbour:
@@ -115,6 +122,11 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
 | `process_advertisement(d, body, addr, ts)` | Validate (advertiser must be direct neighbour; seq must advance); store in `adv_table`. |
 | `recompute_best_transit_paths(d, ts)` | Path-vector selection per destination: drop loops, compose `bw=min`/`lat=sum`, rank by `local_metric`. |
 | `build_advertisement_paths(d)` | Compose paths[] for outgoing advertisement: direct neighbours + selected transit destinations. |
+| `l2disc_drain(d, ts)` | Sidecar: pull LLDP / CDP / MNDP frames from the per-NIC + broadcast sockets, decode via `l2disc.decode_*`, hand off to `_record_switch`. |
+| `_record_switch(d, nic, info, ts)` | Insert/update Daemon.switch_neighbors entry; trigger journal emit on new / swap / 24 h refresh. |
+| `_emit_nic_switch_log(nic, entry, reason)` | Structured `NIC_SWITCH` journal line (forwarded by VLagent to both VictoriaLogs backends). |
+| `write_switch_state_file(d)` | Atomic write of `/run/bedrock/switch_neighbors.json` grouped by NIC then protocol; consumed by the mgmt master's scraper. |
+| `l2disc.decode_lldp(frame)` / `decode_cdp(frame)` / `decode_mndp(payload)` | Pure parsers (no daemon state). Return a normalised dict or None on failure. Unit-tested by `python3 -m installer.lib.l2disc`. |
 
 ## Invariants
 
@@ -146,6 +158,13 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
    transient on a 100 µs link is rejected, srtt stays put, no
    operator-visible event, no route reshuffle. After 3 consecutive
    outliers the filter relents — that's a genuine degradation.
+9. **L2 discovery is receive-only.** We never send LLDP / CDP /
+   MNDP frames. The sidecar exists to observe what's already
+   advertised by switches/routers on each NIC's wire. No cluster-
+   log involvement — switch identity is per-node local reality, not
+   consensus state. `/run/bedrock/switch_neighbors.json` is the
+   live source of truth; mgmt scrapes it into `cluster.json`'s
+   `physical_topology` section for cluster-wide rollups.
 
 ## Failure modes + recovery
 
