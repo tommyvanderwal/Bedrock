@@ -100,10 +100,25 @@ export interface TopologySwitch {
 	protocols: string[];  // ['lldp', 'cdp', 'mndp']
 	connections: TopologyConnection[];
 }
+export interface TopologyLink {
+	node_a: string;
+	nic_a: string;
+	addr_a: string;
+	node_b: string;
+	nic_b: string;
+	addr_b: string;
+	speed_mbps: number;
+	rtt_us: number;
+	blip_total: number;
+	first_seen?: number;
+	last_seen?: number;
+}
 export interface TopologyInfo {
 	switches: Record<string, TopologySwitch>;
+	links: TopologyLink[];
 	node_count: number;
 	switch_count: number;
+	link_count: number;
 	computed_at: number;
 }
 
@@ -111,7 +126,8 @@ export const nodes = writable<Record<string, NodeInfo>>({});
 export const vms = writable<Record<string, VMInfo>>({});
 export const witness = writable<WitnessInfo>({ nodes: {} });
 export const topology = writable<TopologyInfo>({
-	switches: {}, node_count: 0, switch_count: 0, computed_at: 0,
+	switches: {}, links: [],
+	node_count: 0, switch_count: 0, link_count: 0, computed_at: 0,
 });
 export const events = writable<any[]>([]);
 export const connected = writable(false);

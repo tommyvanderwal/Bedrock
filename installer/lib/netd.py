@@ -783,6 +783,7 @@ def run_daemon():
             l2disc_drain(d, now)
             if now - last_switch_state >= SWITCH_STATE_INTERVAL_S:
                 write_switch_state_file(d)
+                write_mesh_state_file(d)
                 last_switch_state = now
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
@@ -1768,6 +1769,12 @@ SWITCH_DRAIN_MAX = 100              # frames per socket per tick
 SWITCH_STATE_FILE = Path("/run/bedrock/switch_neighbors.json")
 SWITCH_STATE_INTERVAL_S = 5.0
 
+# Same per-node-local-state-file pattern, but for protocol-1
+# (signed multicast discovery) observations — every directly-cabled
+# peer this node sees on every NIC. The dashboard scrapes this from
+# each node to build the cluster-side of the topology diagram.
+MESH_STATE_FILE = Path("/run/bedrock/mesh_neighbors.json")
+
 
 def l2disc_drain(d: Daemon, now_ts: float) -> bool:
     """Drain LLDP + CDP per-NIC sockets and the shared MNDP socket.
@@ -1906,11 +1913,82 @@ def write_switch_state_file(d: Daemon) -> None:
     try:
         SWITCH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = SWITCH_STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(grouped, indent=2, sort_keys=True))
+        tmp.write_text(json.dumps(grouped, indent=2, sort_keys=True) + "\n")
         tmp.replace(SWITCH_STATE_FILE)
     except OSError as e:
         sys.stderr.write(
             f"bedrock-net: switch state file write failed: {e}\n"
+        )
+
+
+def write_mesh_state_file(d: Daemon) -> None:
+    """Atomic write of the current per-NIC view of directly-cabled
+    cluster peers (protocol-1 observations) to
+    /run/bedrock/mesh_neighbors.json. Per-node local file — same
+    lifecycle / non-replicated / not-folded-into-cluster.json story
+    as switch_neighbors.json. mgmt master scrapes this so the
+    dashboard topology view shows node-to-node cables as well as
+    node-to-switch.
+
+    Shape:
+      { 'me': 'bedrock-X',
+        'nics': {
+          'enp2s0': {
+            'addr': '169.254.165.122',
+            'speed_mbps': 10000,
+            'neighbours': [
+              {'peer_node': 'bedrock-Y', 'peer_nic': 'enp2s0',
+               'peer_link_addr': '169.254.49.209',
+               'peer_loopback': '100.104.109.2',
+               'rtt_us': 145, 'rtt_var_us': 22,
+               'first_seen': ..., 'last_seen': ...,
+               'logged_up': true, 'blip_total': 0},
+              ...
+            ]
+          }, ...
+        }
+      }
+    """
+    nics_view: dict = {}
+    for nic, addr in d.nic_addrs.items():
+        nics_view[nic] = {
+            "addr": addr,
+            "speed_mbps": bucket_speed(nic_speed_mbps(nic)),
+            "neighbours": [],
+        }
+    for n in d.neighbours.values():
+        if n.my_nic not in nics_view:
+            nics_view[n.my_nic] = {
+                "addr": d.nic_addrs.get(n.my_nic, ""),
+                "speed_mbps": bucket_speed(nic_speed_mbps(n.my_nic)),
+                "neighbours": [],
+            }
+        nics_view[n.my_nic]["neighbours"].append({
+            "peer_node":      n.peer_node,
+            "peer_nic":       n.peer_nic,
+            "peer_link_addr": n.peer_link_addr,
+            "peer_loopback":  n.peer_loopback,
+            "rtt_us":         int(n.rtt_us),
+            "rtt_var_us":     int(n.rtt_var_us),
+            "blip_total":     int(n.rtt_blip_total),
+            "first_seen":     float(n.first_seen),
+            "last_seen":      float(n.last_seen),
+            "logged_up":      bool(n.logged_up),
+        })
+    # Sort neighbour lists for stable output.
+    for v in nics_view.values():
+        v["neighbours"].sort(
+            key=lambda r: (r["peer_node"], r["peer_nic"]))
+
+    out = {"me": d.my_node, "nics": nics_view}
+    try:
+        MESH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MESH_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out, indent=2, sort_keys=True))
+        tmp.replace(MESH_STATE_FILE)
+    except OSError as e:
+        sys.stderr.write(
+            f"bedrock-net: mesh state file write failed: {e}\n"
         )
 
 

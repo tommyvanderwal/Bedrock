@@ -141,7 +141,11 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "echo '---THINPOOL---'; lvs --noheadings --units b --nosuffix "
             "--separator '|' -o vg_name,lv_name,lv_size,data_percent,metadata_percent "
             "--select 'lv_attr=~\"^t\"' 2>/dev/null; "
-            "echo '---SWITCHES---'; cat /run/bedrock/switch_neighbors.json 2>/dev/null || echo '{}'"
+            # Trailing `echo` after each `cat` guarantees a newline
+            # between this section's content and the next ---MARKER---
+            # line, even if the JSON file on disk lacks a final newline.
+            "echo '---SWITCHES---'; cat /run/bedrock/switch_neighbors.json 2>/dev/null; echo; "
+            "echo '---MESH---'; cat /run/bedrock/mesh_neighbors.json 2>/dev/null; echo"
         ))
         sections = {}
         current = None
@@ -184,6 +188,18 @@ def get_node_info(name: str, cfg: dict) -> dict:
         except (ValueError, TypeError):
             switches = {}
 
+        # Mesh neighbours (node-to-node, protocol-1 discovery). Contents
+        # of /run/bedrock/mesh_neighbors.json — shape:
+        # {'me': <node_name>, 'nics': {<my_nic>: {'addr':…,
+        #  'speed_mbps':…, 'neighbours': [{peer_node,peer_nic,…}…]}}}
+        try:
+            mesh_raw = "\n".join(sections.get("MESH", [])).strip()
+            mesh = json.loads(mesh_raw) if mesh_raw else {}
+            if not isinstance(mesh, dict):
+                mesh = {}
+        except (ValueError, TypeError):
+            mesh = {}
+
         return {
             "name": name, "host": host, "online": True,
             "kernel": sections.get("KERNEL", [""])[0],
@@ -195,6 +211,7 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "drbd_raw": "\n".join(sections.get("DRBD", [])),
             "thinpools": thinpools,
             "switches": switches,
+            "mesh": mesh,
             "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
         }
     except Exception as e:
@@ -203,6 +220,7 @@ def get_node_info(name: str, cfg: dict) -> dict:
             "all_vms": [], "running_vms": [], "drbd_raw": "",
             "thinpools": [],
             "switches": {},
+            "mesh": {},
             "cockpit_url": cfg.get("cockpit", f"https://{host}:9090"),
             "kernel": "", "uptime_since": "", "load": "0",
             "mem_total_mb": 0, "mem_used_mb": 0,
@@ -556,10 +574,60 @@ def build_physical_topology(nodes_data: dict) -> dict:
         bucket["connections"].sort(
             key=lambda c: (c["node"], c["my_nic"], c["protocol"]))
 
+    # Node-to-node links from protocol-1 (multicast discovery)
+    # observations on each node's mesh_neighbors.json. Each link is
+    # canonicalised so (A,B) and (B,A) collapse to one entry; we
+    # prefer the entry from the lexicographically-smaller node's
+    # view so each link's bandwidth/latency values are stable across
+    # rebuilds even if the two sides disagree slightly.
+    links: list[dict] = []
+    seen_link_keys: set[tuple] = set()
+    for node_name, info in sorted((nodes_data or {}).items()):
+        mesh = (info or {}).get("mesh") or {}
+        nics = (mesh.get("nics") or {})
+        for my_nic, nic_view in nics.items():
+            speed = int(nic_view.get("speed_mbps") or 0)
+            for r in (nic_view.get("neighbours") or []):
+                if not r.get("logged_up"):
+                    continue
+                peer = r.get("peer_node", "")
+                if not peer or peer == node_name:
+                    continue
+                # Canonical order: smaller node name first. Stable.
+                if node_name < peer:
+                    a, a_nic, b, b_nic = (node_name, my_nic,
+                                          peer, r.get("peer_nic", ""))
+                    a_addr, b_addr = (nic_view.get("addr", ""),
+                                       r.get("peer_link_addr", ""))
+                else:
+                    a, a_nic, b, b_nic = (peer, r.get("peer_nic", ""),
+                                          node_name, my_nic)
+                    a_addr, b_addr = (r.get("peer_link_addr", ""),
+                                       nic_view.get("addr", ""))
+                key = (a, a_nic, b, b_nic)
+                if key in seen_link_keys:
+                    continue
+                seen_link_keys.add(key)
+                links.append({
+                    "node_a":    a,
+                    "nic_a":     a_nic,
+                    "addr_a":    a_addr,
+                    "node_b":    b,
+                    "nic_b":     b_nic,
+                    "addr_b":    b_addr,
+                    "speed_mbps": speed,
+                    "rtt_us":     int(r.get("rtt_us") or 0),
+                    "blip_total": int(r.get("blip_total") or 0),
+                    "first_seen": r.get("first_seen"),
+                    "last_seen":  r.get("last_seen"),
+                })
+
     rollup = {
         "switches":     grouped,
+        "links":        links,
         "node_count":   node_count,
         "switch_count": len(grouped),
+        "link_count":   len(links),
         "computed_at":  time.time(),
     }
 
@@ -653,7 +721,8 @@ async def startup():
                   for n, c in cfg.get("nodes", {}).items()},
         "vms": {},
         "witness": {"nodes": {}},
-        "topology": {"switches": {}, "node_count": 0, "switch_count": 0,
+        "topology": {"switches": {}, "links": [], "node_count": 0,
+                     "switch_count": 0, "link_count": 0,
                      "computed_at": 0.0},
     }
     task_registry().wire(_main_loop, hub.broadcast)
@@ -681,8 +750,9 @@ def api_topology():
     push loop from each node's /run/bedrock/switch_neighbors.json.
     Not consensus state — never in cluster.json — purely a derived
     view for the dashboard."""
-    return _last_state.get("topology", {"switches": {}, "node_count": 0,
-                                          "switch_count": 0,
+    return _last_state.get("topology", {"switches": {}, "links": [],
+                                          "node_count": 0, "switch_count": 0,
+                                          "link_count": 0,
                                           "computed_at": 0.0})
 
 
