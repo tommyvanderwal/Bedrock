@@ -1884,9 +1884,12 @@ def _emit_nic_switch_log(nic: str, entry: dict, *, reason: str) -> None:
 
 def write_switch_state_file(d: Daemon) -> None:
     """Atomic write of the current per-NIC switch view to
-    /run/bedrock/switch_neighbors.json. The mgmt master scrapes this
-    from every node to assemble the cluster-wide physical_topology
-    section of cluster.json.
+    /run/bedrock/switch_neighbors.json. Per-node local file —
+    NOT replicated, NOT folded into cluster.json. The mgmt master
+    scrapes one of these per node to build an in-memory rollup
+    for the dashboard (or a /run/bedrock/physical_topology.json
+    cache on the master, if convenient). cluster.json stays
+    consensus-only.
 
     Shape:
       { "enp2s0": { "lldp": {chassis_id, system_name, port_id, …},

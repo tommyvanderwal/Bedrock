@@ -846,15 +846,26 @@ flagging.
 }
 ```
 
-The mgmt master scrapes this from every node and assembles a
-cluster-wide `physical_topology` section in `cluster.json`,
-grouping by `chassis_id`. That's how a rollup like
+The mgmt master scrapes this file from every node and assembles
+a cluster-wide rollup **in memory** (or as a derived
+`/run/bedrock/physical_topology.json` cache on the mgmt node —
+whichever is more convenient for the dashboard endpoint to read).
+**It is never folded into `cluster.json`.** That file is reserved
+for materialised cluster-log state — things the cluster has
+reached consensus on (membership, master role, loopback
+assignment). Switch identity is per-node local reality; it
+doesn't need cluster consensus, so it stays out.
+
+From this rollup a question like
 
 > *Both `node A enp2s0` and `node B enp2s0` are plugged into
 >  `office-sw-01`, ports `7` and `23` respectively.*
 
-falls out automatically — group by chassis, list `(node, nic,
-port_id)` tuples per group.
+falls out by grouping per-node entries on `chassis_id` and
+listing `(node, nic, port_id)` tuples per group. For dead-node
+history (e.g. "what was node X's enp2s0 connected to last
+Tuesday?") the dashboard queries VictoriaLogs LogsQL on the
+`NIC_SWITCH` event stream instead.
 
 **First-seen logging.** When a NIC first sees a switch (or when
 the chassis ID under it changes — cable moved, switch replaced),
@@ -906,8 +917,10 @@ operators want.
                             ┌────────────────────────┴───────────────────┐
                             ▼                                            ▼
               /run/bedrock/switch_neighbors.json            VLagent → 2× VictoriaLogs
-              (live view, scraped by mgmt master           (durable history; queries
-              for cluster.json physical_topology)           via LogsQL)
+              (per-node live view; mgmt master            (durable cluster-wide
+              scrapes + rolls up in-memory                  history; queries via
+              for the dashboard; never                       LogsQL — including for
+              folded into cluster.json)                      dead-node lookups)
 ```
 
 ## 10. What an operator actually sees

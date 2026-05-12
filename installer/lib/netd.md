@@ -162,9 +162,12 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
    MNDP frames. The sidecar exists to observe what's already
    advertised by switches/routers on each NIC's wire. No cluster-
    log involvement — switch identity is per-node local reality, not
-   consensus state. `/run/bedrock/switch_neighbors.json` is the
-   live source of truth; mgmt scrapes it into `cluster.json`'s
-   `physical_topology` section for cluster-wide rollups.
+   consensus state. The per-node file
+   `/run/bedrock/switch_neighbors.json` is the source of truth.
+   Cluster-wide rollups (e.g. "3 NICs on the same switch") are
+   computed on demand by the mgmt master from each node's local
+   file — **never folded into cluster.json**. VictoriaLogs holds
+   the durable cluster-wide history via the `NIC_SWITCH` lines.
 
 ## Failure modes + recovery
 
