@@ -66,6 +66,13 @@ runs `/usr/local/bin/bedrock-net`, a thin wrapper that
     rtt_us:             int               # EWMA-smoothed from protocol 2
     rtt_var_us:         int               # TCP RFC 6298 variance
     rtt_outlier_streak: int               # consecutive rejections; 3 ⇒ accept
+    # Blip telemetry — rejected samples are still counted, surfaced
+    # on the 30 s status line, and emitted as structured journal
+    # lines (rate-limited to one per neighbour per 5 min).
+    rtt_blip_total:        int
+    rtt_last_blip_us:      int
+    rtt_last_blip_at:      float
+    rtt_last_blip_log_at:  float
     logged_up:          bool              # crossed up-hysteresis threshold
     last_quality_log:   float
 ```

@@ -305,8 +305,53 @@ averaging:
 ```
 
 A 230 ms blip on a 100 µs LAN trips all three rules at once. The
-average stays at 100 µs. No event. No route change. No log
-spam.
+average stays at 100 µs. No route change. No measurement
+poisoning.
+
+But — and this matters on a cluster that should be perfect most
+of the time — the blip is **counted**. Each rejected sample
+bumps a per-(peer, cable) counter, and the daemon's 30-second
+status line reports the cluster-wide total and the most-recent
+offender:
+
+```
+status neighbours=15 (logged_up=15); advertisers=[…]; transit_dests=[…];
+       blips_total=105 last=314051us@18s_ago(bedrock-0acd31/enp5s0)
+```
+
+A clean cluster shows `blips_total=0` indefinitely. Anything
+else is a signal — usually small (a kernel pause, a momentary
+CPU contention), occasionally meaningful (a marginal switch
+port, a flapping NIC, a thermal-throttled CPU starting to fail).
+
+Each blip also prints a structured journal line:
+
+```
+bedrock-net: BLIP peer=bedrock-X my_nic=enp3s0 sample_us=230000
+             srtt_us=120 rule=absolute streak=1 total=7
+```
+
+…which the syslog → VictoriaLogs pipeline picks up automatically.
+Operators query
+
+```
+_msg:BLIP peer:bedrock-X | stats by (my_nic) count()
+```
+
+in LogsQL to see how often a specific link is misbehaving, or
+
+```
+_msg:BLIP | stats by (peer, my_nic) count()
+```
+
+for a cluster-wide ranking of trouble-spots.
+
+To keep the log server sane, BLIP lines are **rate-limited to
+one emit per (peer, cable) per 5 minutes**. Subsequent blips on
+the same path during that window still bump the counter (and the
+status line keeps reporting the rising total) — they just don't
+each get their own journal entry. A flapping path can't flood
+the log; a one-off blip still gets noticed.
 
 ### Job 3: Routing advertisement — "Best path?"
 

@@ -447,7 +447,20 @@ class Neighbour:
     # means "no sample yet"; first non-outlier sample seeds the EWMA.
     rtt_us: int = 0
     rtt_var_us: int = 0
+    # Consecutive-outliers gate before we let the filter relent and
+    # accept a new value (see _update_neighbour_rtt). Resets to 0 on
+    # the first non-outlier or on the 4th consecutive outlier.
     rtt_outlier_streak: int = 0
+    # Blip telemetry — every rejected sample (even ones we threw out
+    # of the EWMA) is still a signal that something on this path
+    # wasn't perfect. Cluster of blips on the same peer-link is the
+    # earliest warning an operator gets that a cable, a switch port,
+    # or a kernel buffer is starting to misbehave. Surfaced on the
+    # daemon's status line + rate-limited journal warning.
+    rtt_blip_total:  int   = 0   # cumulative since daemon start
+    rtt_last_blip_us: int  = 0   # most-recent rejected sample (µs)
+    rtt_last_blip_at: float = 0.0  # wallclock timestamp
+    rtt_last_blip_log_at: float = 0.0  # last journal emit (rate-limit)
     # Logged: True once we've emitted a LINK_UP that hasn't been
     # superseded by a LINK_DOWN yet.
     logged_up: bool = False
@@ -749,10 +762,27 @@ def run_daemon():
                     if now - float(adv.get("ts_local", 0)) <= ADV_STALE_S
                 ]
                 transit = list(d.best_transit_paths.keys())
+                # Latency blips — non-fatal but observable.
+                blips_total = sum(n.rtt_blip_total for n in d.neighbours.values())
+                recent_blip = max(
+                    (n for n in d.neighbours.values() if n.rtt_last_blip_at > 0),
+                    key=lambda n: n.rtt_last_blip_at,
+                    default=None,
+                )
+                if blips_total and recent_blip:
+                    age_s = max(0, int(now - recent_blip.rtt_last_blip_at))
+                    blip_str = (
+                        f"blips_total={blips_total} "
+                        f"last={recent_blip.rtt_last_blip_us}us@{age_s}s_ago"
+                        f"({recent_blip.peer_node}/{recent_blip.my_nic})"
+                    )
+                else:
+                    blip_str = "blips_total=0"
                 print(
                     f"bedrock-net: status neighbours={len(d.neighbours)} "
                     f"(logged_up={logged}); advertisers=[{','.join(advs) or '-'}]; "
-                    f"transit_dests=[{','.join(transit) or '-'}]",
+                    f"transit_dests=[{','.join(transit) or '-'}]; "
+                    f"{blip_str}",
                     file=sys.stderr, flush=True,
                 )
                 last_status = now
@@ -1306,12 +1336,31 @@ def icmp_drain_replies(d: Daemon, now_mono_ns: int) -> None:
             pinger.pending.pop(seq, None)
 
 
+BLIP_LOG_RATE_LIMIT_S = 300.0   # one journal line per (peer, my_nic) per 5 min
+
+
 def _update_neighbour_rtt(d: Daemon, neigh_key: tuple,
                            sample_us: float) -> None:
     """TCP RFC 6298 EWMA on the per-neighbour RTT, with outlier
     rejection BEFORE smoothing so a transient 230 ms hiccup on a
     100 µs link doesn't poison the smoothed value or kick off route
-    reshuffling. See docs/06-mesh-network.md §protocol 2."""
+    reshuffling.
+
+    Outliers ARE counted, even when they're thrown out of the EWMA
+    — they're a real signal that something on this path isn't
+    perfect. A cluster of blips on the same (peer, my_nic) is the
+    earliest warning an operator gets that a cable, a switch port,
+    or a kernel buffer is starting to misbehave. Per-neighbour
+    totals appear on the daemon's 30 s status line; each blip also
+    prints a structured journal line that the syslog →
+    VictoriaLogs pipeline ingests automatically, rate-limited to
+    one emit per (peer, my_nic) per 5 min so a flapping path can't
+    flood the log server. Operators query
+
+        _msg:BLIP peer:bedrock-X | stats by (my_nic) count()
+
+    in LogsQL to see how often a specific link is misbehaving.
+    See docs/06-mesh-network.md §protocol 2."""
     n = d.neighbours.get(neigh_key)
     if n is None:
         return
@@ -1325,19 +1374,34 @@ def _update_neighbour_rtt(d: Daemon, neigh_key: tuple,
         n.rtt_outlier_streak = 0
         return
 
-    is_outlier = False
+    outlier_rule = None
     if sample_us > srtt + 4 * rttvar:
-        is_outlier = True
+        outlier_rule = "variance"
     elif srtt > 100 and sample_us > 10 * srtt:
-        is_outlier = True
+        outlier_rule = "multiplicative"
     elif srtt < 5_000 and sample_us > RTT_OUTLIER_ABS_US:
-        is_outlier = True
+        outlier_rule = "absolute"
 
-    if is_outlier and n.rtt_outlier_streak < 3:
-        # Single transient hiccup; reject the sample but track for
-        # genuine degradation that produces 3 consecutive outliers
-        # in a row.
+    if outlier_rule is not None and n.rtt_outlier_streak < 3:
+        # Reject the sample, but record the blip. The streak gate
+        # ensures three consecutive outliers (~6 s) ⇒ genuine
+        # degradation, which the next iteration falls through to
+        # the EWMA update path below.
         n.rtt_outlier_streak += 1
+        n.rtt_blip_total += 1
+        n.rtt_last_blip_us = int(sample_us)
+        now = time.time()
+        n.rtt_last_blip_at = now
+        if now - n.rtt_last_blip_log_at >= BLIP_LOG_RATE_LIMIT_S:
+            sys.stderr.write(
+                f"bedrock-net: BLIP "
+                f"peer={n.peer_node} my_nic={n.my_nic} "
+                f"sample_us={int(sample_us)} srtt_us={int(srtt)} "
+                f"rule={outlier_rule} streak={n.rtt_outlier_streak} "
+                f"total={n.rtt_blip_total}\n"
+            )
+            sys.stderr.flush()
+            n.rtt_last_blip_log_at = now
         return
 
     # Either not an outlier, or 3+ consecutive outliers (real degrade).

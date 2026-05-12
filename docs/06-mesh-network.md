@@ -147,13 +147,37 @@ def is_outlier(sample, srtt, rttvar):
 ```
 
 A 230 ms hiccup on a 100 µs link hits all three rules — sample
-rejected, `srtt` stays at 100 µs, no operator-visible event, no
-route reshuffling. After 3 consecutive outliers (~6 s), the
-filter relents — the path has genuinely degraded.
+rejected, `srtt` stays at 100 µs, no route reshuffling. After
+3 consecutive outliers (~6 s), the filter relents — the path
+has genuinely degraded.
+
+**Blip telemetry** — even rejected samples are counted, because
+on a cluster that should be perfect most of the time a transient
+outlier IS information:
+
+- Per-`Neighbour` counter `rtt_blip_total` bumps on every
+  rejected sample (also captures `rtt_last_blip_us`,
+  `rtt_last_blip_at`).
+- The daemon's 30 s status line aggregates cluster-wide:
+  `blips_total=N last=<us>@<age>s_ago(peer/nic)`.
+- A structured journal entry is emitted on each blip — but
+  rate-limited to one per (peer, my_nic) per 5 minutes so a
+  flapping path can't flood the log server:
+
+  ```
+  bedrock-net: BLIP peer=bedrock-X my_nic=enp3s0 sample_us=230000
+               srtt_us=120 rule=absolute streak=1 total=7
+  ```
+
+  The syslog → VictoriaLogs pipeline ingests this for free.
+  `_msg:BLIP peer:bedrock-X | stats by (my_nic) count()` in
+  LogsQL gives an operator the per-link blip rate over any
+  window.
 
 Optional: expose smoothed values as Prometheus gauges (e.g.
-`bedrock_path_rtt_us{peer, nic}`) via `vm_exporter.py`. Operators
-get latency-over-time graphs per peer-link.
+`bedrock_path_rtt_us{peer, nic}`, `bedrock_path_blip_total{peer,
+nic}`) via `vm_exporter.py`. Operators get latency-over-time +
+blip-rate graphs per peer-link.
 
 ## Protocol 3 — Routing advertisement (unicast UDP)
 
