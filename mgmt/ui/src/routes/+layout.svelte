@@ -249,10 +249,6 @@
 		border-right: 1px solid #21262d;
 		display: flex;
 		flex-direction: column;
-		position: sticky;
-		top: 0;
-		max-height: 100vh;
-		overflow-y: auto;
 	}
 
 	.brand {
@@ -375,10 +371,7 @@
 	}
 	.meta { font-size: 11px; color: #6e7681; }
 
-	main {
-		padding: 20px;
-		max-width: 1600px;
-	}
+	main { padding: 20px; }
 
 	/* Task badge next to the brand */
 	.task-badge {
