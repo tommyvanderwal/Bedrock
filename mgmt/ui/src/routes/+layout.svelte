@@ -238,45 +238,9 @@
 	:global(a) { color: #58a6ff; text-decoration: none; }
 	:global(a:hover) { text-decoration: underline; }
 
-	/* Visible scrollbars on the dark theme. Linux GTK and many distros
-	   default to overlay scrollbars that auto-hide; even when shown,
-	   default thin grey thumbs blend into our background. Force a
-	   substantial, always-visible thumb so an operator can immediately
-	   tell whether more content exists below or off-screen.
-	   `scrollbar-gutter: stable` reserves the gutter even when no
-	   scroll is needed, so layouts don't jump when content height
-	   crosses the viewport boundary. */
-	:global(html) {
-		scrollbar-color: #58a6ff #161b22;     /* thumb | track (Firefox) */
-		scrollbar-width: auto;
-		scrollbar-gutter: stable;
-	}
-	:global(::-webkit-scrollbar) {
-		width: 14px; height: 14px;
-	}
-	:global(::-webkit-scrollbar-track) {
-		background: #161b22;
-		border: 1px solid #21262d;
-	}
-	:global(::-webkit-scrollbar-thumb) {
-		background: #58a6ff;                  /* link-blue, unmissable */
-		border-radius: 7px;
-		border: 3px solid #161b22;            /* shrinks visible thumb to ~8px */
-		min-height: 40px;                     /* always finger-sized */
-	}
-	:global(::-webkit-scrollbar-thumb:hover) { background: #79c0ff; }
-	:global(::-webkit-scrollbar-thumb:active) { background: #d29922; }
-	:global(::-webkit-scrollbar-corner) { background: #161b22; }
-
 	.app {
 		display: grid;
-		/* minmax(0, 1fr) allows the main column to be NARROWER than its
-		   intrinsic content min-width. Without this, wide content (e.g.
-		   the topology SVG with min-width:1100) forces the whole grid
-		   to overflow horizontally and the body's scrollbar gets stuck
-		   behind the sticky sidebar. With minmax(0,...) the main column
-		   shrinks; the inner `main` then handles its own overflow. */
-		grid-template-columns: 240px minmax(0, 1fr);
+		grid-template-columns: 240px 1fr;
 		min-height: 100vh;
 	}
 
@@ -414,10 +378,6 @@
 	main {
 		padding: 20px;
 		max-width: 1600px;
-		min-width: 0;
-		/* No explicit overflow — keep the page-level vertical scroll on
-		   the body (browser-managed). Wide content (e.g. the topology
-		   SVG) handles its own horizontal scroll via .diagram-wrap. */
 	}
 
 	/* Task badge next to the brand */
