@@ -385,9 +385,9 @@
 		padding: 20px;
 		max-width: 1600px;
 		min-width: 0;
-		overflow-x: auto;     /* page content scrolls horizontally if it
-		                         exceeds the column width (e.g. wide
-		                         topology diagram in a narrow viewport) */
+		/* No explicit overflow — keep the page-level vertical scroll on
+		   the body (browser-managed). Wide content (e.g. the topology
+		   SVG) handles its own horizontal scroll via .diagram-wrap. */
 	}
 
 	/* Task badge next to the brand */

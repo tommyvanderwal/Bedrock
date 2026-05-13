@@ -218,33 +218,35 @@
 				});
 			});
 		}
-		// Switch ports: also INSIDE the switch rectangle, centred.
+		// Switch ports: ONE port per switch (representative). Multiple
+		// protocols reporting the same physical port (e.g. CDP saying
+		// 'vlan1' and LLDP saying 'ether1' from the same wire) collapse
+		// to one glyph. Prefer LLDP (physical port name), then CDP,
+		// then MNDP.
 		for (const sw of switchList) {
 			const p = layout.switchPos.get(sw.device_key);
-			if (!p) continue;
-			const portIds = Array.from(new Set(
-				sw.connections.map(c => c.port_id || '?')
-			)).sort();
-			if (portIds.length === 0) continue;
-			const totalW = portIds.length * PORT_W + (portIds.length - 1) * PORT_GAP;
-			const startX = p.x + (SWITCH_W - totalW) / 2;
+			if (!p || sw.connections.length === 0) continue;
+			let rep = '';
+			for (const pref of ['lldp', 'cdp', 'mndp']) {
+				const c = sw.connections.find(c => c.protocol === pref && c.port_id);
+				if (c) { rep = c.port_id; break; }
+			}
+			if (!rep) rep = sw.connections[0].port_id || '?';
 			const portY = p.y + (SWITCH_H - PORT_H) / 2;
-			portIds.forEach((pid, i) => {
-				const px = startX + i * (PORT_W + PORT_GAP);
-				out.push({
-					id: `switch:${sw.device_key}|${pid}`,
-					owner: 'switch',
-					ownerId: sw.device_key,
-					nic: pid,
-					x: px + PORT_W / 2,
-					ownerY: p.y,
-					ownerH: SWITCH_H,
-					yLabel: portY + PORT_H + 11,
-					boxX: px,
-					boxY: portY,                     // INSIDE the rect
-					labelText: pid,
-					kind: 'switch',
-				});
+			const portX = p.x + SWITCH_W / 2;
+			out.push({
+				id: `switch:${sw.device_key}`,
+				owner: 'switch',
+				ownerId: sw.device_key,
+				nic: rep,
+				x: portX,
+				ownerY: p.y,
+				ownerH: SWITCH_H,
+				yLabel: portY + PORT_H + 11,
+				boxX: portX - PORT_W / 2,
+				boxY: portY,
+				labelText: rep,
+				kind: 'switch',
 			});
 		}
 		return out;
@@ -276,22 +278,23 @@
 	type Bus = {
 		id: string;
 		kind: 'lan' | 'shared';
-		memberKeys: string[];        // each is `${node}|${nic}`
+		memberPortIds: string[];     // 'node:X|nic' or 'switch:device_key'
 		infoLines: string[];
 	};
 	let buses = $derived.by((): Bus[] => {
+		// Connected components on node↔node lan/shared cables.
 		const adj = new Map<string, Set<string>>();
 		for (const L of $topology.links) {
-			const aKey = `${L.node_a}|${L.nic_a}`;
-			const bKey = `${L.node_b}|${L.nic_b}`;
-			const aKind = kindByNic.get(aKey);
-			const bKind = kindByNic.get(bKey);
+			const aId = `node:${L.node_a}|${L.nic_a}`;
+			const bId = `node:${L.node_b}|${L.nic_b}`;
+			const aKind = kindByNic.get(`${L.node_a}|${L.nic_a}`);
+			const bKind = kindByNic.get(`${L.node_b}|${L.nic_b}`);
 			if (aKind !== bKind) continue;
 			if (aKind !== 'lan' && aKind !== 'shared') continue;
-			if (!adj.has(aKey)) adj.set(aKey, new Set());
-			if (!adj.has(bKey)) adj.set(bKey, new Set());
-			adj.get(aKey)!.add(bKey);
-			adj.get(bKey)!.add(aKey);
+			if (!adj.has(aId)) adj.set(aId, new Set());
+			if (!adj.has(bId)) adj.set(bId, new Set());
+			adj.get(aId)!.add(bId);
+			adj.get(bId)!.add(aId);
 		}
 		const visited = new Set<string>();
 		const result: Bus[] = [];
@@ -307,17 +310,19 @@
 				for (const n of adj.get(k) ?? []) stack.push(n);
 			}
 			if (comp.length < 2) continue;
-			const kind = kindByNic.get(comp[0]) as 'lan' | 'shared';
+			const firstKey = comp[0].slice('node:'.length);
+			const kind = kindByNic.get(firstKey) as 'lan' | 'shared';
 			const sorted = [...comp].sort();
-			const nicName = comp[0].split('|')[1];
+			const nicName = firstKey.split('|')[1];
 			const memberLines = sorted.map(c => {
-				const [node, nic] = c.split('|');
+				const noPfx = c.slice('node:'.length);
+				const [node, nic] = noPfx.split('|');
 				return `  ${shortName(node)} · ${nic}`;
 			});
 			result.push({
 				id: `bus:${kind}:${sorted.join(',')}`,
 				kind,
-				memberKeys: sorted,
+				memberPortIds: sorted,
 				infoLines: [
 					`${kind === 'lan' ? 'LAN (shared)' : 'Mesh shared bus'} · ${nicName}`,
 					`${comp.length} NICs on this bus`,
@@ -325,44 +330,81 @@
 				],
 			});
 		}
+
+		// Fold switches into a bus when ALL of the switch's connections
+		// target NICs that are already on the same bus. That's the case
+		// when the switch IS the shared medium (e.g. an operator router
+		// every sim shares the LAN through). In that case it doesn't
+		// make sense to also draw N individual switch uplinks — one
+		// switch tail off the bus says the same thing more cleanly.
+		// Folding is restricted to the flat layout: in star mode the
+		// switch sits far above and a fold would force a tail to pass
+		// through the core box.
+		if (!layout.isStar) {
+			for (const sw of switchList) {
+				if (sw.connections.length === 0) continue;
+				const targetBuses = new Set<Bus>();
+				let allOnBus = true;
+				for (const c of sw.connections) {
+					const targetId = `node:${c.node}|${c.my_nic}`;
+					const b = result.find(bus => bus.memberPortIds.includes(targetId));
+					if (!b) { allOnBus = false; break; }
+					targetBuses.add(b);
+				}
+				if (allOnBus && targetBuses.size === 1) {
+					const bus = [...targetBuses][0];
+					const swPortId = `switch:${sw.device_key}`;
+					if (!bus.memberPortIds.includes(swPortId)) {
+						bus.memberPortIds.push(swPortId);
+					}
+					const swLine = `  ${sw.system_name || sw.device_key} (switch)`;
+					if (!bus.infoLines.includes(swLine)) bus.infoLines.push(swLine);
+				}
+			}
+		}
 		return result;
 	});
-	// Quick lookup: which bus is a given (node|nic) on, if any?
 	let busByMember = $derived.by(() => {
 		const m = new Map<string, Bus>();
-		for (const b of buses) for (const k of b.memberKeys) m.set(k, b);
+		for (const b of buses) for (const k of b.memberPortIds) m.set(k, b);
 		return m;
 	});
 
 	let cables = $derived.by((): Cable[] => {
 		const out: Cable[] = [];
-		// Switch↔node cables (from sw.connections)
+		// Switch↔node cables (from sw.connections).
+		// One cable per (switch, node, my_nic) — multiple protocols
+		// reporting the same physical wire (CDP+LLDP+MNDP) collapse to
+		// one cable that lists all protocols in its tooltip. If the
+		// switch was folded into a bus alongside the target NIC, skip:
+		// the bus trunk + switch tail says it visually.
 		for (const sw of switchList) {
-			// Dedupe to one cable per (node, my_nic, port_id) regardless
-			// of how many protocols carried the observation.
+			const swPortId = `switch:${sw.device_key}`;
+			const swBus = busByMember.get(swPortId);
 			const seen = new Set<string>();
 			for (const c of sw.connections) {
-				const pid = c.port_id || '?';
-				const key = `${sw.device_key}|${pid}|${c.node}|${c.my_nic}`;
+				const key = `${sw.device_key}|${c.node}|${c.my_nic}`;
 				if (seen.has(key)) continue;
 				seen.add(key);
-				const ap = `switch:${sw.device_key}|${pid}`;
 				const bp = `node:${c.node}|${c.my_nic}`;
-				if (!portById.get(ap) || !portById.get(bp)) continue;
-				const protos = sw.connections
-					.filter(x => x.node === c.node && x.my_nic === c.my_nic
-								&& (x.port_id || '?') === pid)
-					.map(x => x.protocol);
+				if (!portById.get(swPortId) || !portById.get(bp)) continue;
+				// Folded into a shared bus → don't draw a separate cable.
+				if (swBus && swBus === busByMember.get(bp)) continue;
+				const matches = sw.connections.filter(
+					x => x.node === c.node && x.my_nic === c.my_nic);
+				const protos = Array.from(new Set(matches.map(x => x.protocol)));
+				const portIds = Array.from(new Set(matches.map(x => x.port_id || '?')));
 				out.push({
 					id: `cable:sw|${key}`,
-					a: { portId: ap, nodeOrDevice: sw.device_key, nic: pid },
-					b: { portId: bp, nodeOrDevice: c.node,        nic: c.my_nic },
+					a: { portId: swPortId, nodeOrDevice: sw.device_key,
+					     nic: portIds.join('/') },
+					b: { portId: bp, nodeOrDevice: c.node, nic: c.my_nic },
 					kind: 'switch',
-					title: `${shortName(c.node)}/${c.my_nic}  →  ${sw.system_name || sw.device_key} ${pid}`,
+					title: `${shortName(c.node)}/${c.my_nic}  →  ${sw.system_name || sw.device_key} ${portIds.join('/')}`,
 					infoLines: [
 						`${shortName(c.node)} · ${c.my_nic}`,
 						`↕`,
-						`${sw.system_name || sw.device_key} · port ${pid}`,
+						`${sw.system_name || sw.device_key} · port ${portIds.join('/')}`,
 						`heard via ${protos.join(' / ')}`,
 						sw.mgmt_ip ? `mgmt: ${sw.mgmt_ip}` : '',
 						`last seen ${fmtAge(c.last_seen)}`,
@@ -381,8 +423,8 @@
 			if (!portById.get(ap) || !portById.get(bp)) continue;
 			const aKey = `${L.node_a}|${L.nic_a}`;
 			const bKey = `${L.node_b}|${L.nic_b}`;
-			const aBus = busByMember.get(aKey);
-			if (aBus && aBus === busByMember.get(bKey)) continue;  // folded into bus
+			const aBus = busByMember.get(ap);
+			if (aBus && aBus === busByMember.get(bp)) continue;  // folded into bus
 			const kindA = kindByNic.get(aKey) ?? 'p2p';
 			const kindB = kindByNic.get(bKey) ?? 'p2p';
 			const kind: 'lan' | 'shared' | 'p2p' =
@@ -466,20 +508,27 @@
 
 		for (const b of buses) {
 			const ports: PortDef[] = [];
-			for (const k of b.memberKeys) {
-				const p = pById.get(`node:${k}`);
+			for (const k of b.memberPortIds) {
+				const p = pById.get(k);
 				if (p) ports.push(p);
 			}
 			if (ports.length < 2) continue;
 			const xs = ports.map(p => p.x);
 			const xL = Math.min(...xs), xR = Math.max(...xs);
 			const touchesCore = !!coreNode &&
-				b.memberKeys.some(k => k.startsWith(coreNode + '|'));
+				b.memberPortIds.some(k => k === `node:${coreNode}|br0` ||
+					k.startsWith(`node:${coreNode}|`));
+			const hasSwitch = b.memberPortIds.some(k => k.startsWith('switch:'));
 			const item: ItemBus = { kind: 'bus', bus: b, xL, xR, ports, touchesCore };
-			// A bus that includes the core in star mode belongs in the
-			// mid channel (between core row and peer row). Other buses
-			// (or any bus in flat mode) go in the lower channel.
-			if (layout.isStar && touchesCore) buckets.mid.push(item);
+			// Channel placement rules:
+			//   * Bus with a switch member → UPPER channel (just below
+			//     switches), so the switch tail is short and node tails
+			//     come up to it from the node row below.
+			//   * Bus in star mode that includes the core → MID channel
+			//     between core and peer rows.
+			//   * Otherwise → LOWER channel.
+			if (hasSwitch) buckets.upper.push(item);
+			else if (layout.isStar && touchesCore) buckets.mid.push(item);
 			else buckets.lower.push(item);
 		}
 
