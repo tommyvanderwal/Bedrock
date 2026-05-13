@@ -105,16 +105,24 @@
 
 	// ─── Layout: where each node and switch sits ────────────────────────
 	function spread(count: number, w: number, boxW: number): number[] {
+		// Place box LEFT EDGES evenly so neither end overflows the
+		// canvas. First box left = margin; last box right = w - margin.
 		if (count === 0) return [];
 		const margin = 60;
-		const span = w - 2 * margin;
 		if (count === 1) return [w / 2 - boxW / 2];
+		const span = w - 2 * margin - boxW;       // total horizontal slack
 		const step = span / (count - 1);
-		return Array.from({ length: count }, (_, i) =>
-			margin + step * i - boxW / 2);
+		return Array.from({ length: count }, (_, i) => margin + step * i);
 	}
 
 	type Pos = { x: number; y: number };
+	// In star mode, the core node sits in its OWN row above the peer
+	// row, so cables core↔peer can route through a clean orthogonal
+	// channel between the two rows. Switch uplinks still route through
+	// the channel between the switch row and the core row.
+	const NODE_Y_STAR_CORE = 220;     // core row y in star mode
+	const NODE_Y_STAR_PEER = 480;     // peer row y in star mode
+
 	let layout = $derived.by(() => {
 		const switchPos = new Map<string, Pos>();
 		const swx = spread(switchList.length, SVG_W, SWITCH_W);
@@ -125,22 +133,19 @@
 		const nodePos = new Map<string, Pos>();
 		const isStar = !!coreNode && clusterNodes.includes(coreNode);
 		if (isStar) {
-			// Star: core dead-centre, peers fan above and to the sides.
-			const cx = SVG_W / 2;
-			const cy = NODE_Y_FLAT + NODE_H / 2 + 80;   // a bit lower than flat
-			nodePos.set(coreNode!, { x: cx - NODE_W / 2, y: cy - NODE_H / 2 });
+			// Core dead-centre at its own row; peers spread evenly in a
+			// row below. Both rows are flat so orthogonal routing keeps
+			// working — we just have THREE channels now (above core for
+			// switch uplinks, between core and peers for core↔peer
+			// cables, below peers for any cables not touching the core).
+			nodePos.set(coreNode!, {
+				x: SVG_W / 2 - NODE_W / 2,
+				y: NODE_Y_STAR_CORE,
+			});
 			const peers = clusterNodes.filter(n => n !== coreNode);
-			const n = peers.length;
-			const R = 250;
+			const px = spread(peers.length, SVG_W, NODE_W);
 			peers.forEach((peer, i) => {
-				const startAng = -Math.PI * 0.85;
-				const endAng   = -Math.PI * 0.15;
-				const t = n === 1 ? 0.5 : i / (n - 1);
-				const ang = startAng + t * (endAng - startAng);
-				nodePos.set(peer, {
-					x: cx + R * Math.cos(ang) - NODE_W / 2,
-					y: cy + R * Math.sin(ang) - NODE_H / 2,
-				});
+				nodePos.set(peer, { x: px[i], y: NODE_Y_STAR_PEER });
 			});
 		} else {
 			const nx = spread(clusterNodes.length, SVG_W, NODE_W);
@@ -336,27 +341,37 @@
 	};
 	let routedCables = $derived.by((): Routed[] => {
 		const pById = portById;
-		const buckets: { upper: Cable[]; lower: Cable[] } = { upper: [], lower: [] };
+		// THREE channels:
+		//   * upper — between switch row and the topmost node row; used
+		//     for every switch uplink (sw ↔ node).
+		//   * mid   — only meaningful in star mode: between the core row
+		//     and the peer row, dedicated to core↔peer cables so they
+		//     never cross through any node box.
+		//   * lower — below the deepest node row; for any cable that
+		//     wasn't placed in upper or mid (in flat mode that's every
+		//     mesh cable; in star mode it's peer↔peer cables).
+		const buckets: { upper: Cable[]; mid: Cable[]; lower: Cable[] } =
+			{ upper: [], mid: [], lower: [] };
 		for (const c of cables) {
 			const ap = pById.get(c.a.portId);
 			const bp = pById.get(c.b.portId);
 			if (!ap || !bp) continue;
-			// 'switch' cables go through the upper channel (between
-			// switch bottom and node top). Everything else routes
-			// below the node row.
-			(c.kind === 'switch' ? buckets.upper : buckets.lower).push(c);
+			if (c.kind === 'switch') {
+				buckets.upper.push(c);
+			} else if (layout.isStar && c.touchesCore) {
+				buckets.mid.push(c);
+			} else {
+				buckets.lower.push(c);
+			}
 		}
 
-		// Allocate tracks per bucket: greedy interval scheduling — sort
-		// by left X, then place each cable on the lowest track whose
-		// last 'right edge' doesn't overlap the new cable's left edge.
 		function allocate(bucket: Cable[], baseY: number): Routed[] {
 			const sorted = [...bucket].sort((c1, c2) => {
 				const a1 = pById.get(c1.a.portId)!, b1 = pById.get(c1.b.portId)!;
 				const a2 = pById.get(c2.a.portId)!, b2 = pById.get(c2.b.portId)!;
 				return Math.min(a1.x, b1.x) - Math.min(a2.x, b2.x);
 			});
-			const trackRightEdge: number[] = []; // track index → right edge x
+			const trackRightEdge: number[] = [];
 			const result: Routed[] = [];
 			for (const c of sorted) {
 				const ap = pById.get(c.a.portId)!;
@@ -365,7 +380,6 @@
 				const xR = Math.max(ap.x, bp.x);
 				let track = -1;
 				for (let t = 0; t < trackRightEdge.length; t++) {
-					// 30px horizontal gap between cables on the same track
 					if (xL > trackRightEdge[t] + 30) { track = t; break; }
 				}
 				if (track === -1) {
@@ -375,9 +389,6 @@
 					trackRightEdge[track] = xR;
 				}
 				const channelY = baseY + track * LANE_STEP;
-				// Build the orthogonal path. Each end drops/rises from
-				// the port's edge to channelY, then traverses.
-				const seg1Y = ap.side === 'top' ? channelY : channelY;
 				const path = [
 					`M ${ap.x} ${ap.yEdge}`,
 					`L ${ap.x} ${channelY}`,
@@ -395,17 +406,20 @@
 			return result;
 		}
 
-		// Upper channel base Y: just below switch row + small offset
 		const upperBase = SWITCH_Y + SWITCH_H + SWITCH_CHANNEL_TOP_OFFSET;
-		// Lower channel base Y: just below the deepest node
-		let nodeBottomY = NODE_Y_FLAT + NODE_H;
+		// Mid base — bottom of the core row (only used in star mode).
+		const midBase = NODE_Y_STAR_CORE + NODE_H + MESH_CHANNEL_TOP_OFFSET;
+		// Lower base — just below the deepest node currently rendered.
+		let nodeBottomY = 0;
 		for (const [, p] of layout.nodePos) {
 			nodeBottomY = Math.max(nodeBottomY, p.y + NODE_H);
 		}
 		const lowerBase = nodeBottomY + MESH_CHANNEL_TOP_OFFSET;
-		const upper = allocate(buckets.upper, upperBase);
-		const lower = allocate(buckets.lower, lowerBase);
-		return [...upper, ...lower];
+		return [
+			...allocate(buckets.upper, upperBase),
+			...allocate(buckets.mid,   midBase),
+			...allocate(buckets.lower, lowerBase),
+		];
 	});
 
 	// Compute total SVG height once we know how many tracks each channel needs.
