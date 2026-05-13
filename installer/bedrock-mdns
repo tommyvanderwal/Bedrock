@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Run the bedrock.local mDNS responder."""
+import sys
+sys.path.insert(0, "/usr/local/lib/bedrock")
+from lib.mdns_responder import run
+sys.exit(run())

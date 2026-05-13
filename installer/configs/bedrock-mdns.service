@@ -1,0 +1,13 @@
+[Unit]
+Description=Bedrock mDNS responder for bedrock.local
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bedrock-mdns
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

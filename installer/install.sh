@@ -128,6 +128,24 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
 systemctl daemon-reload
 systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
 
+# mDNS responder + port-80 redirector — any node on the LAN can be
+# reached by browsing to `bedrock.local`, which then 302-redirects
+# to that node's HTTPS dashboard URL.
+log "Installing bedrock-mdns + bedrock-redirect..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-mdns" \
+    -o /usr/local/bin/bedrock-mdns
+chmod +x /usr/local/bin/bedrock-mdns
+curl -fsSL "${BEDROCK_REPO}/bedrock-redirect" \
+    -o /usr/local/bin/bedrock-redirect
+chmod +x /usr/local/bin/bedrock-redirect
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-mdns.service" \
+    -o /etc/systemd/system/bedrock-mdns.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-redirect.service" \
+    -o /etc/systemd/system/bedrock-redirect.service
+systemctl daemon-reload
+systemctl enable --now bedrock-mdns.service >/dev/null 2>&1 || true
+systemctl enable --now bedrock-redirect.service >/dev/null 2>&1 || true
+
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(
     __init__.py
@@ -150,6 +168,8 @@ LIB_FILES=(
     netd.py
     l2disc.py
     cert_manager.py
+    mdns_responder.py
+    http_redirect.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Run the port-80 → HTTPS redirector."""
+import sys
+sys.path.insert(0, "/usr/local/lib/bedrock")
+from lib.http_redirect import run
+sys.exit(run())
