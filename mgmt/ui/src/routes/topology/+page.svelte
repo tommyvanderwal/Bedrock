@@ -3,18 +3,19 @@
 		type TopologyConnection, type TopologyLink } from '$lib/stores';
 
 	// ─── Focus / "core" node ────────────────────────────────────────────
-	// Empty string == show every cable. Clicking a node sets it as the
-	// focus and the diagram draws only the cables that touch it
-	// (i.e. that node's view of the cluster).
 	let coreNode = $state('');
 
-	function shortName(s: string): string {
-		return s ? s.split('.')[0] : '';
-	}
+	// ─── Hover state for highlighting + floating info card ──────────────
+	type HoverInfo = { x: number; y: number; lines: string[] } | null;
+	let hoverPortId = $state<string | null>(null);
+	let hoverCableId = $state<string | null>(null);
+	let hoverInfo = $state<HoverInfo>(null);
+
+	function shortName(s: string): string { return s ? s.split('.')[0] : ''; }
 	function fmtAge(ts: number | undefined): string {
 		if (!ts) return '';
 		const age = Date.now() / 1000 - ts;
-		if (age < 60) return `${Math.floor(age)}s ago`;
+		if (age < 60)  return `${Math.floor(age)}s ago`;
 		if (age < 3600) return `${Math.floor(age / 60)}m ago`;
 		if (age < 86400) return `${Math.floor(age / 3600)}h ago`;
 		return `${Math.floor(age / 86400)}d ago`;
@@ -35,8 +36,7 @@
 	);
 
 	// Per-node NIC list, learned from any source: mesh links + switch
-	// observations. We sort with br0 first then alphabetical so the LAN
-	// NIC is always at the left of each node card.
+	// observations. br0 first (LAN), then alphabetical (enp2s0..).
 	let nicsByNode = $derived.by(() => {
 		const m = new Map<string, string[]>();
 		const add = (node: string, nic: string) => {
@@ -62,24 +62,50 @@
 		return m;
 	});
 
-	// ─── Diagram layout ─────────────────────────────────────────────────
-	const SVG_W = 1200;
-	const SVG_H = 620;
-	const SWITCH_Y = 40;
-	const SWITCH_W = 200;
-	const SWITCH_H = 80;
-	const NODE_W  = 220;
-	const NODE_H  = 140;
-	const NODE_Y_FLAT = 420;          // Bottom row when no core selected
-	const STAR_CORE_X = SVG_W / 2;    // Centred core
-	const STAR_CORE_Y = SVG_H * 0.58;
-	const STAR_RADIUS = 230;
+	// Cable-kind inference. The mgmt rollup gives us connectivity but
+	// not "what kind of network" each NIC sits on; we derive it client-
+	// side from the per-NIC peer count.
+	//   * 'lan'    → NIC is br0 (the operator LAN; LAN NICs are always
+	//                bus-shaped via the home router or external switch)
+	//   * 'shared' → NIC sees more than one peer (full-mesh bus)
+	//   * 'p2p'   → NIC sees exactly one peer (direct cable)
+	let kindByNic = $derived.by(() => {
+		const peersPerNic = new Map<string, Set<string>>();
+		for (const L of $topology.links) {
+			const ka = `${L.node_a}|${L.nic_a}`;
+			const kb = `${L.node_b}|${L.nic_b}`;
+			(peersPerNic.get(ka) ?? peersPerNic.set(ka, new Set()).get(ka)!).add(L.node_b);
+			(peersPerNic.get(kb) ?? peersPerNic.set(kb, new Set()).get(kb)!).add(L.node_a);
+		}
+		const m = new Map<string, 'lan' | 'shared' | 'p2p'>();
+		for (const [key, peers] of peersPerNic) {
+			const [, nic] = key.split('|');
+			m.set(key, nic === 'br0' ? 'lan' : (peers.size > 1 ? 'shared' : 'p2p'));
+		}
+		return m;
+	});
 
-	type Pos = { x: number; y: number };
+	// ─── Canvas geometry ────────────────────────────────────────────────
+	const SVG_W           = 1400;
+	const SWITCH_Y        = 30;
+	const SWITCH_W        = 220;
+	const SWITCH_H        = 70;
+	const SWITCH_PAD_X    = 16;
+	const SWITCH_PORT_H   = 12;
+	const NODE_Y_FLAT     = 280;   // top edge of node box (flat layout)
+	const NODE_W          = 230;
+	const NODE_H          = 130;
+	const NODE_PAD_X      = 10;
+	const PORT_W          = 38;
+	const PORT_H          = 18;
+	const PORT_GAP        = 4;
+	const LANE_STEP       = 14;    // vertical spacing per cable channel
+	const SWITCH_CHANNEL_TOP_OFFSET = 22; // drop from switch port-bottom to first lane
+	const MESH_CHANNEL_TOP_OFFSET   = 22; // drop from node bottom to first lane
 
+	// ─── Layout: where each node and switch sits ────────────────────────
 	function spread(count: number, w: number, boxW: number): number[] {
 		if (count === 0) return [];
-		// Even spacing across the canvas leaving a small margin.
 		const margin = 60;
 		const span = w - 2 * margin;
 		if (count === 1) return [w / 2 - boxW / 2];
@@ -88,10 +114,7 @@
 			margin + step * i - boxW / 2);
 	}
 
-	// Layout returns both maps and a flag indicating which mode we're in.
-	// In flat mode: switches top row, nodes bottom row. In star mode: the
-	// selected core sits at the canvas centre and peer nodes are spread
-	// in a wide arc *above and around* the core, switches still on top.
+	type Pos = { x: number; y: number };
 	let layout = $derived.by(() => {
 		const switchPos = new Map<string, Pos>();
 		const swx = spread(switchList.length, SVG_W, SWITCH_W);
@@ -101,28 +124,22 @@
 
 		const nodePos = new Map<string, Pos>();
 		const isStar = !!coreNode && clusterNodes.includes(coreNode);
-
 		if (isStar) {
-			// Core dead-centred. Peers arranged on an arc *above and
-			// around* the core (between 200° and 340°, an upward fan) so
-			// cables flow downward into the core from naturally-placed
-			// peers and there's still room for switches at the top.
-			nodePos.set(coreNode!, {
-				x: STAR_CORE_X - NODE_W / 2,
-				y: STAR_CORE_Y - NODE_H / 2,
-			});
+			// Star: core dead-centre, peers fan above and to the sides.
+			const cx = SVG_W / 2;
+			const cy = NODE_Y_FLAT + NODE_H / 2 + 80;   // a bit lower than flat
+			nodePos.set(coreNode!, { x: cx - NODE_W / 2, y: cy - NODE_H / 2 });
 			const peers = clusterNodes.filter(n => n !== coreNode);
 			const n = peers.length;
+			const R = 250;
 			peers.forEach((peer, i) => {
-				// Angles measured clockwise from "east"; we want a fan
-				// pointing UP from the core (i.e. north-ish).
-				const startAng = -Math.PI * 0.85;   // ~ 207°
-				const endAng   = -Math.PI * 0.15;   // ~ -27° (=333°)
+				const startAng = -Math.PI * 0.85;
+				const endAng   = -Math.PI * 0.15;
 				const t = n === 1 ? 0.5 : i / (n - 1);
 				const ang = startAng + t * (endAng - startAng);
 				nodePos.set(peer, {
-					x: STAR_CORE_X + STAR_RADIUS * Math.cos(ang) - NODE_W / 2,
-					y: STAR_CORE_Y + STAR_RADIUS * Math.sin(ang) - NODE_H / 2,
+					x: cx + R * Math.cos(ang) - NODE_W / 2,
+					y: cy + R * Math.sin(ang) - NODE_H / 2,
 				});
 			});
 		} else {
@@ -134,108 +151,348 @@
 		return { nodePos, switchPos, isStar };
 	});
 
-	function nodePos(node: string): Pos | null {
-		return layout.nodePos.get(node) ?? null;
-	}
-	function switchPos(deviceKey: string): Pos | null {
-		return layout.switchPos.get(deviceKey) ?? null;
-	}
-
-	function nicAnchor(node: string, nic: string): Pos | null {
-		// Anchor at the *top* edge of the node box, slot for this NIC.
-		const p = nodePos(node);
-		if (!p) return null;
-		const nics = nicsByNode.get(node) || [];
-		const idx = nics.indexOf(nic);
-		if (idx < 0) return null;
-		const slotW = NODE_W / nics.length;
-		return { x: p.x + slotW * (idx + 0.5), y: p.y };
-	}
-	function switchAnchor(deviceKey: string): Pos | null {
-		const p = switchPos(deviceKey);
-		if (!p) return null;
-		return { x: p.x + SWITCH_W / 2, y: p.y + SWITCH_H };
-	}
-
-	type Cable = {
-		x1: number; y1: number; x2: number; y2: number;
-		kind: 'mesh' | 'switch';
-		dim: boolean;
-		key: string;
-		label: string;
+	// ─── Port positions ─────────────────────────────────────────────────
+	// Each port sits flush with the top edge of its node box (cables
+	// emerge UPWARD from the top edge into the routing channels). For
+	// switches, ports sit on the BOTTOM edge.
+	type PortDef = {
+		id: string;
+		owner: 'node' | 'switch';
+		ownerId: string;
+		nic: string;        // for nodes
+		side: 'top' | 'bottom';
+		x: number;          // centre x of port glyph
+		yEdge: number;      // y where the cable enters/exits the port
+		yLabel: number;     // y for the label text
+		boxX: number;       // top-left of port rect
+		boxY: number;
+		labelText: string;
+		kind: 'lan' | 'shared' | 'p2p' | 'switch';
 	};
-
-	let cables = $derived.by((): Cable[] => {
-		const out: Cable[] = [];
-		// Node ↔ Switch
-		for (const sw of switchList) {
-			const sa = switchAnchor(sw.device_key);
-			if (!sa) continue;
-			// Dedup: one cable per (node, nic) regardless of how many
-			// protocols carried the same observation.
-			const seen = new Set<string>();
-			for (const c of sw.connections) {
-				const key = `${sw.device_key}|${c.node}|${c.my_nic}`;
-				if (seen.has(key)) continue;
-				seen.add(key);
-				const na = nicAnchor(c.node, c.my_nic);
-				if (!na) continue;
-				const touches = !coreNode || c.node === coreNode;
+	let ports = $derived.by((): PortDef[] => {
+		const out: PortDef[] = [];
+		// Cluster-node ports: along the TOP edge of each node box.
+		for (const nodeName of clusterNodes) {
+			const p = layout.nodePos.get(nodeName);
+			if (!p) continue;
+			const nics = nicsByNode.get(nodeName) ?? [];
+			if (nics.length === 0) continue;
+			const totalW = nics.length * PORT_W + (nics.length - 1) * PORT_GAP;
+			const startX = p.x + (NODE_W - totalW) / 2;
+			nics.forEach((nic, i) => {
+				const px = startX + i * (PORT_W + PORT_GAP);
+				const kind = kindByNic.get(`${nodeName}|${nic}`)
+					?? (nic === 'br0' ? 'lan' : 'p2p');
 				out.push({
-					x1: sa.x, y1: sa.y, x2: na.x, y2: na.y,
-					kind: 'switch', dim: !touches, key,
-					label: `${shortName(c.node)}/${c.my_nic} → ` +
-						`${sw.system_name || sw.device_key} ${c.port_id || '?'}` +
-						`  (${sw.protocols.join('+')})`,
+					id: `node:${nodeName}|${nic}`,
+					owner: 'node',
+					ownerId: nodeName,
+					nic,
+					side: 'top',
+					x: px + PORT_W / 2,
+					yEdge: p.y,                       // cable enters at top of node box
+					yLabel: p.y - PORT_H - 4,
+					boxX: px,
+					boxY: p.y - PORT_H,               // port glyph sits above box
+					labelText: nic,
+					kind,
 				});
-			}
-		}
-		// Node ↔ Node
-		for (const l of $topology.links) {
-			const a = nicAnchor(l.node_a, l.nic_a);
-			const b = nicAnchor(l.node_b, l.nic_b);
-			if (!a || !b) continue;
-			const touches = !coreNode || l.node_a === coreNode || l.node_b === coreNode;
-			out.push({
-				x1: a.x, y1: a.y, x2: b.x, y2: b.y,
-				kind: 'mesh', dim: !touches,
-				key: `${l.node_a}/${l.nic_a}↔${l.node_b}/${l.nic_b}`,
-				label: `${shortName(l.node_a)}/${l.nic_a} ↔ ` +
-					`${shortName(l.node_b)}/${l.nic_b}` +
-					`  ${fmtSpeed(l.speed_mbps)} · ${l.rtt_us}µs` +
-					(l.blip_total ? ` · ${l.blip_total} blips` : ''),
 			});
 		}
-		// Render dimmed cables first so the bright ones lie on top.
-		out.sort((a, b) => Number(b.dim) - Number(a.dim));
+		// Switch ports: along the BOTTOM edge. We synthesize one port per
+		// unique 'switch port_id' value the connections array reports.
+		// Order them stable for visual coherence.
+		for (const sw of switchList) {
+			const p = layout.switchPos.get(sw.device_key);
+			if (!p) continue;
+			const portIds = Array.from(new Set(
+				sw.connections.map(c => c.port_id || '?')
+			)).sort();
+			if (portIds.length === 0) continue;
+			const totalW = portIds.length * PORT_W + (portIds.length - 1) * PORT_GAP;
+			const startX = p.x + (SWITCH_W - totalW) / 2;
+			portIds.forEach((pid, i) => {
+				const px = startX + i * (PORT_W + PORT_GAP);
+				out.push({
+					id: `switch:${sw.device_key}|${pid}`,
+					owner: 'switch',
+					ownerId: sw.device_key,
+					nic: pid,
+					side: 'bottom',
+					x: px + PORT_W / 2,
+					yEdge: p.y + SWITCH_H,           // cable exits bottom
+					yLabel: p.y + SWITCH_H + PORT_H + 14,
+					boxX: px,
+					boxY: p.y + SWITCH_H,
+					labelText: pid,
+					kind: 'switch',
+				});
+			});
+		}
 		return out;
 	});
 
+	// Quick lookups
+	let portById = $derived(new Map(ports.map(p => [p.id, p])));
+
+	// ─── Cables ─────────────────────────────────────────────────────────
+	type CableEnd = { portId: string; nodeOrDevice: string; nic: string };
+	type Cable = {
+		id: string;
+		a: CableEnd;
+		b: CableEnd;
+		kind: 'lan' | 'shared' | 'p2p' | 'switch';
+		// Title + tooltip body
+		title: string;
+		infoLines: string[];
+		// Whether this cable touches the focused core node
+		touchesCore: boolean;
+	};
+	let cables = $derived.by((): Cable[] => {
+		const out: Cable[] = [];
+		// Switch↔node cables (from sw.connections)
+		for (const sw of switchList) {
+			// Dedupe to one cable per (node, my_nic, port_id) regardless
+			// of how many protocols carried the observation.
+			const seen = new Set<string>();
+			for (const c of sw.connections) {
+				const pid = c.port_id || '?';
+				const key = `${sw.device_key}|${pid}|${c.node}|${c.my_nic}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				const ap = `switch:${sw.device_key}|${pid}`;
+				const bp = `node:${c.node}|${c.my_nic}`;
+				if (!portById.get(ap) || !portById.get(bp)) continue;
+				const protos = sw.connections
+					.filter(x => x.node === c.node && x.my_nic === c.my_nic
+								&& (x.port_id || '?') === pid)
+					.map(x => x.protocol);
+				out.push({
+					id: `cable:sw|${key}`,
+					a: { portId: ap, nodeOrDevice: sw.device_key, nic: pid },
+					b: { portId: bp, nodeOrDevice: c.node,        nic: c.my_nic },
+					kind: 'switch',
+					title: `${shortName(c.node)}/${c.my_nic}  →  ${sw.system_name || sw.device_key} ${pid}`,
+					infoLines: [
+						`${shortName(c.node)} · ${c.my_nic}`,
+						`↕`,
+						`${sw.system_name || sw.device_key} · port ${pid}`,
+						`heard via ${protos.join(' / ')}`,
+						sw.mgmt_ip ? `mgmt: ${sw.mgmt_ip}` : '',
+						`last seen ${fmtAge(c.last_seen)}`,
+					].filter(Boolean) as string[],
+					touchesCore: !!coreNode && c.node === coreNode,
+				});
+			}
+		}
+		// Node↔node cables (from topology.links)
+		for (const L of $topology.links) {
+			const ap = `node:${L.node_a}|${L.nic_a}`;
+			const bp = `node:${L.node_b}|${L.nic_b}`;
+			if (!portById.get(ap) || !portById.get(bp)) continue;
+			const kindA = kindByNic.get(`${L.node_a}|${L.nic_a}`) ?? 'p2p';
+			// nic-pair kind: both ends should agree (NIC name is shared
+			// in our edge-coloured scheme). Prefer 'lan' if either is
+			// lan, else 'shared' if either is shared, else 'p2p'.
+			const kindB = kindByNic.get(`${L.node_b}|${L.nic_b}`) ?? 'p2p';
+			const kind: 'lan' | 'shared' | 'p2p' =
+				(kindA === 'lan' || kindB === 'lan') ? 'lan' :
+				(kindA === 'shared' || kindB === 'shared') ? 'shared' : 'p2p';
+			out.push({
+				id: `cable:mesh|${L.node_a}|${L.nic_a}|${L.node_b}|${L.nic_b}`,
+				a: { portId: ap, nodeOrDevice: L.node_a, nic: L.nic_a },
+				b: { portId: bp, nodeOrDevice: L.node_b, nic: L.nic_b },
+				kind,
+				title: `${shortName(L.node_a)}/${L.nic_a}  ↔  ${shortName(L.node_b)}/${L.nic_b}`,
+				infoLines: [
+					`${shortName(L.node_a)} · ${L.nic_a}`,
+					`↔`,
+					`${shortName(L.node_b)} · ${L.nic_b}`,
+					`type: ${kind === 'lan' ? 'LAN (shared)' :
+						 kind === 'shared' ? 'mesh (shared bus)' :
+						 'direct point-to-point'}`,
+					L.speed_mbps ? `speed: ${fmtSpeed(L.speed_mbps)}` : '',
+					L.rtt_us ? `RTT: ${L.rtt_us} µs` : '',
+					L.blip_total ? `blips: ${L.blip_total}` : '',
+					`last seen ${fmtAge(L.last_seen)}`,
+				].filter(Boolean) as string[],
+				touchesCore: !!coreNode &&
+					(L.node_a === coreNode || L.node_b === coreNode),
+			});
+		}
+		return out;
+	});
+
+	// ─── Channel lane allocation ────────────────────────────────────────
+	// Each cable routes in one of two channels:
+	//   * upper channel — between switch row and node row, for switch↔node cables
+	//   * lower channel — below the node row, for node↔node cables
+	// Within a channel, each cable is given a Y-track such that
+	// horizontally-overlapping cables NEVER occupy the same track.
+	type Routed = Cable & {
+		ax: number; ay: number; bx: number; by: number;
+		channelY: number;        // Y of the horizontal traversal segment
+		path: string;            // SVG path string
+	};
+	let routedCables = $derived.by((): Routed[] => {
+		const pById = portById;
+		const buckets: { upper: Cable[]; lower: Cable[] } = { upper: [], lower: [] };
+		for (const c of cables) {
+			const ap = pById.get(c.a.portId);
+			const bp = pById.get(c.b.portId);
+			if (!ap || !bp) continue;
+			// 'switch' cables go through the upper channel (between
+			// switch bottom and node top). Everything else routes
+			// below the node row.
+			(c.kind === 'switch' ? buckets.upper : buckets.lower).push(c);
+		}
+
+		// Allocate tracks per bucket: greedy interval scheduling — sort
+		// by left X, then place each cable on the lowest track whose
+		// last 'right edge' doesn't overlap the new cable's left edge.
+		function allocate(bucket: Cable[], baseY: number): Routed[] {
+			const sorted = [...bucket].sort((c1, c2) => {
+				const a1 = pById.get(c1.a.portId)!, b1 = pById.get(c1.b.portId)!;
+				const a2 = pById.get(c2.a.portId)!, b2 = pById.get(c2.b.portId)!;
+				return Math.min(a1.x, b1.x) - Math.min(a2.x, b2.x);
+			});
+			const trackRightEdge: number[] = []; // track index → right edge x
+			const result: Routed[] = [];
+			for (const c of sorted) {
+				const ap = pById.get(c.a.portId)!;
+				const bp = pById.get(c.b.portId)!;
+				const xL = Math.min(ap.x, bp.x);
+				const xR = Math.max(ap.x, bp.x);
+				let track = -1;
+				for (let t = 0; t < trackRightEdge.length; t++) {
+					// 30px horizontal gap between cables on the same track
+					if (xL > trackRightEdge[t] + 30) { track = t; break; }
+				}
+				if (track === -1) {
+					track = trackRightEdge.length;
+					trackRightEdge.push(xR);
+				} else {
+					trackRightEdge[track] = xR;
+				}
+				const channelY = baseY + track * LANE_STEP;
+				// Build the orthogonal path. Each end drops/rises from
+				// the port's edge to channelY, then traverses.
+				const seg1Y = ap.side === 'top' ? channelY : channelY;
+				const path = [
+					`M ${ap.x} ${ap.yEdge}`,
+					`L ${ap.x} ${channelY}`,
+					`L ${bp.x} ${channelY}`,
+					`L ${bp.x} ${bp.yEdge}`,
+				].join(' ');
+				result.push({
+					...c,
+					ax: ap.x, ay: ap.yEdge,
+					bx: bp.x, by: bp.yEdge,
+					channelY,
+					path,
+				});
+			}
+			return result;
+		}
+
+		// Upper channel base Y: just below switch row + small offset
+		const upperBase = SWITCH_Y + SWITCH_H + SWITCH_CHANNEL_TOP_OFFSET;
+		// Lower channel base Y: just below the deepest node
+		let nodeBottomY = NODE_Y_FLAT + NODE_H;
+		for (const [, p] of layout.nodePos) {
+			nodeBottomY = Math.max(nodeBottomY, p.y + NODE_H);
+		}
+		const lowerBase = nodeBottomY + MESH_CHANNEL_TOP_OFFSET;
+		const upper = allocate(buckets.upper, upperBase);
+		const lower = allocate(buckets.lower, lowerBase);
+		return [...upper, ...lower];
+	});
+
+	// Compute total SVG height once we know how many tracks each channel needs.
+	let svgH = $derived.by(() => {
+		const maxY = routedCables.reduce((m, c) => Math.max(m, c.channelY), 0);
+		return Math.max(560, maxY + 80);   // 80px bottom padding
+	});
+
+	// ─── Highlight logic ────────────────────────────────────────────────
+	// Hovering a port → dim everything not touching it.
+	// Hovering a cable → dim everything not on it.
+	// No hover, no core → nothing dimmed.
+	// No hover, core set → cables not touching core are dimmed.
+	let dim = $derived.by(() => {
+		return {
+			port: (id: string): boolean => {
+				if (hoverCableId) {
+					const c = cables.find(x => x.id === hoverCableId);
+					return !c || (c.a.portId !== id && c.b.portId !== id);
+				}
+				if (hoverPortId) {
+					if (hoverPortId === id) return false;
+					return !cables.some(c =>
+						(c.a.portId === id && c.b.portId === hoverPortId) ||
+						(c.b.portId === id && c.a.portId === hoverPortId));
+				}
+				return false;
+			},
+			cable: (c: Routed): boolean => {
+				if (hoverCableId) return hoverCableId !== c.id;
+				if (hoverPortId)
+					return c.a.portId !== hoverPortId && c.b.portId !== hoverPortId;
+				if (coreNode) return !c.touchesCore;
+				return false;
+			},
+		};
+	});
+
+	// ─── Mouse handlers ─────────────────────────────────────────────────
+	function onPortEnter(ev: MouseEvent, port: PortDef) {
+		hoverPortId = port.id;
+		const peers: string[] = [];
+		for (const c of cables) {
+			if (c.a.portId === port.id) peers.push(`${shortName(c.b.nodeOrDevice)}/${c.b.nic}`);
+			if (c.b.portId === port.id) peers.push(`${shortName(c.a.nodeOrDevice)}/${c.a.nic}`);
+		}
+		hoverInfo = {
+			x: ev.clientX, y: ev.clientY,
+			lines: [
+				`${port.owner === 'node' ? shortName(port.ownerId) : (switchList.find(s => s.device_key === port.ownerId)?.system_name || port.ownerId)}`,
+				`port ${port.nic}`,
+				port.kind === 'lan'    ? 'kind: LAN (shared)' :
+				port.kind === 'shared' ? 'kind: mesh (shared bus)' :
+				port.kind === 'p2p'    ? 'kind: direct point-to-point' :
+				'kind: switch port',
+				`${peers.length} cable${peers.length === 1 ? '' : 's'}: ${peers.join(', ') || '—'}`,
+			],
+		};
+	}
+	function onCableEnter(ev: MouseEvent, cable: Routed) {
+		hoverCableId = cable.id;
+		hoverInfo = { x: ev.clientX, y: ev.clientY, lines: cable.infoLines };
+	}
+	function onLeave() {
+		hoverPortId = null;
+		hoverCableId = null;
+		hoverInfo = null;
+	}
+	function onMouseMove(ev: MouseEvent) {
+		if (hoverInfo) hoverInfo = { ...hoverInfo, x: ev.clientX, y: ev.clientY };
+	}
 	function toggleCore(name: string) {
 		coreNode = (coreNode === name) ? '' : name;
 	}
 
-	// Peer-pair summary: group all mesh links by the (a, b) pair so the
-	// detail table shows 'Node A ↔ Node B: 5 cables (LAN + 4 mesh planes)'.
-	type PairRow = {
-		a: string; b: string;
-		links: TopologyLink[];
-	};
+	// ─── Peer-pair grouping for the detail table ────────────────────────
+	type PairRow = { a: string; b: string; links: TopologyLink[] };
 	let pairRows = $derived.by((): PairRow[] => {
 		const m = new Map<string, PairRow>();
 		for (const L of $topology.links) {
 			const key = `${L.node_a}|${L.node_b}`;
 			let r = m.get(key);
-			if (!r) {
-				r = { a: L.node_a, b: L.node_b, links: [] };
-				m.set(key, r);
-			}
+			if (!r) { r = { a: L.node_a, b: L.node_b, links: [] }; m.set(key, r); }
 			r.links.push(L);
 		}
 		const out = Array.from(m.values());
-		// Stable sort by node-name pair.
 		out.sort((x, y) => (x.a + '|' + x.b).localeCompare(y.a + '|' + y.b));
-		// Sort cables within each pair: br0 first, then alphabetical.
 		for (const r of out) {
 			r.links.sort((p, q) => {
 				if (p.nic_a === 'br0' && q.nic_a !== 'br0') return -1;
@@ -253,77 +510,77 @@
 	<h1>Physical topology</h1>
 	<span class="meta">
 		{$topology.switch_count} switch{$topology.switch_count === 1 ? '' : 'es'}
-		· {$topology.link_count} mesh cable{$topology.link_count === 1 ? '' : 's'}
+		· {$topology.link_count} cluster cable{$topology.link_count === 1 ? '' : 's'}
 		· {$topology.node_count} node{$topology.node_count === 1 ? '' : 's'}
 		reporting · refreshed {fmtAge($topology.computed_at)}
 	</span>
 </div>
 
 <p class="explainer">
-	Schematic of what's physically cabled. Switch boxes at the top
-	(learned from <strong>LLDP</strong> / <strong>CDP</strong> /
-	<strong>MNDP</strong> frames). Cluster nodes at the bottom (each box
-	shows its NICs along the top edge). Lines are cables.
+	Patch-panel schematic. Switches across the top, cluster nodes across
+	the middle. Every NIC is drawn as a labeled port; cables route
+	orthogonally through dedicated channels so they never overlap.
+	Hover a port or a cable for details.
 	{#if coreNode}
-		Showing only cables that touch <strong>{shortName(coreNode)}</strong> —
-		click it again to release.
+		<strong>Showing only cables touching {shortName(coreNode)}</strong> —
+		click the box again or press <em>Reset · show all</em> to release.
 	{:else}
-		Click any node to focus on its connections.
+		Click a node box to centre it.
 	{/if}
 </p>
 
 <div class="legend">
-	<span class="legend-item"><svg width="36" height="12" viewBox="0 0 36 12"><line x1="2" y1="6" x2="34" y2="6" class="cable cable-mesh"/></svg> mesh cable (cluster node ↔ cluster node, discovery probe)</span>
-	<span class="legend-item"><svg width="36" height="12" viewBox="0 0 36 12"><line x1="2" y1="6" x2="34" y2="6" class="cable cable-switch"/></svg> switch cable (cluster node ↔ switch, LLDP / CDP / MNDP)</span>
+	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-switch"/></svg> switch uplink (LLDP / CDP / MNDP)</span>
+	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-lan"/></svg> LAN (shared via operator router)</span>
+	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-shared"/></svg> mesh shared bus</span>
+	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-p2p"/></svg> direct point-to-point</span>
 	{#if coreNode}
 		<button class="reset-btn" onclick={() => coreNode = ''}>Reset · show all</button>
-	{:else}
-		<span class="hint">Click a node box to centre it.</span>
 	{/if}
 </div>
 
-<div class="diagram-wrap">
-	<svg viewBox="0 0 {SVG_W} {SVG_H}" xmlns="http://www.w3.org/2000/svg"
-		role="img" aria-label="Physical topology">
-		<!-- Cables (drawn first so boxes lie on top) -->
-		{#each cables as c (c.key)}
-			<line x1={c.x1} y1={c.y1} x2={c.x2} y2={c.y2}
-				class="cable cable-{c.kind}" class:dim={c.dim}>
-				<title>{c.label}</title>
-			</line>
+<div class="diagram-wrap" onmousemove={onMouseMove}>
+	<svg viewBox="0 0 {SVG_W} {svgH}" xmlns="http://www.w3.org/2000/svg"
+		role="img" aria-label="Physical topology"
+		onmouseleave={onLeave}>
+
+		<!-- Cables (drawn first, boxes lie on top) -->
+		{#each routedCables as c (c.id)}
+			<g class="cable-group" class:dim={dim.cable(c)} class:hot={hoverCableId === c.id}>
+				<!-- Wide invisible hit-target to make hover easier -->
+				<path d={c.path} class="cable-hit"
+					onmouseenter={(e) => onCableEnter(e, c)}
+					onmouseleave={onLeave}/>
+				<path d={c.path} class="cable cable-{c.kind}"/>
+			</g>
 		{/each}
 
 		<!-- Switch boxes -->
 		{#each switchList as sw}
-			{@const p = switchPos(sw.device_key)}
+			{@const p = layout.switchPos.get(sw.device_key)}
 			{#if p}
 				<g class="switch-box">
-					<rect x={p.x} y={p.y} width={SWITCH_W} height={SWITCH_H} rx="6"/>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 22}
+					<rect x={p.x} y={p.y} width={SWITCH_W} height={SWITCH_H} rx="6"
+						class="switch-rect"/>
+					<text x={p.x + SWITCH_W / 2} y={p.y + 24}
 						class="switch-name" text-anchor="middle">
 						{sw.system_name || sw.device_key.toUpperCase()}
 					</text>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 40}
+					<text x={p.x + SWITCH_W / 2} y={p.y + 42}
 						class="meta-text" text-anchor="middle">
 						{sw.mgmt_ip || sw.device_key}
 					</text>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 60}
+					<text x={p.x + SWITCH_W / 2} y={p.y + 58}
 						class="proto-text" text-anchor="middle">
 						{sw.protocols.join(' · ')}
 					</text>
-					<title>{sw.system_name || sw.device_key}
-{sw.device_key}
-{#if sw.mgmt_ip}mgmt: {sw.mgmt_ip}{/if}
-{#if sw.platform}platform: {sw.platform}{/if}
-heard via {sw.protocols.join(', ')}</title>
 				</g>
 			{/if}
 		{/each}
 
-		<!-- Cluster-node boxes (clickable) -->
+		<!-- Cluster-node boxes -->
 		{#each clusterNodes as nodeName}
-			{@const p = nodePos(nodeName)}
-			{@const nics = nicsByNode.get(nodeName) || []}
+			{@const p = layout.nodePos.get(nodeName)}
 			{@const isCore = coreNode === nodeName}
 			{#if p}
 				<g class="node-box" class:core={isCore}
@@ -331,57 +588,70 @@ heard via {sw.protocols.join(', ')}</title>
 					aria-label="Focus on {nodeName}"
 					onclick={() => toggleCore(nodeName)}
 					onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCore(nodeName); } }}>
-					<rect x={p.x} y={p.y} width={NODE_W} height={NODE_H} rx="6"/>
-					<!-- NIC strip along the top edge -->
-					{#each nics as nic, i}
-						{@const slotW = NODE_W / nics.length}
-						<rect class="nic-tab"
-							x={p.x + slotW * i + 2}
-							y={p.y - 10}
-							width={Math.max(6, slotW - 4)}
-							height="14" rx="2"/>
-						<text class="nic-label"
-							x={p.x + slotW * (i + 0.5)}
-							y={p.y - 14}
-							text-anchor="middle">{nic}</text>
-					{/each}
+					<rect x={p.x} y={p.y} width={NODE_W} height={NODE_H} rx="6"
+						class="node-rect"/>
 					<text class="node-name"
-						x={p.x + NODE_W / 2} y={p.y + 50}
+						x={p.x + NODE_W / 2} y={p.y + 52}
 						text-anchor="middle">{shortName(nodeName)}</text>
 					<text class="meta-text"
-						x={p.x + NODE_W / 2} y={p.y + 72}
+						x={p.x + NODE_W / 2} y={p.y + 74}
 						text-anchor="middle">
 						{($nodes[nodeName]?.host) || ''}
 					</text>
 					{#if isCore}
 						<text class="core-tag"
-							x={p.x + NODE_W / 2} y={p.y + 100}
+							x={p.x + NODE_W / 2} y={p.y + 104}
 							text-anchor="middle">▼ core view</text>
 					{/if}
 				</g>
 			{/if}
 		{/each}
+
+		<!-- Ports (drawn last so they sit on top of cable hit-targets) -->
+		{#each ports as port (port.id)}
+			<g class="port-group" class:dim={dim.port(port.id)}
+				class:hot={hoverPortId === port.id}>
+				<rect x={port.boxX} y={port.boxY}
+					width={PORT_W} height={PORT_H} rx="2"
+					class="port-rect port-{port.kind}"
+					onmouseenter={(e) => onPortEnter(e, port)}
+					onmouseleave={onLeave}/>
+				<text x={port.x} y={port.yLabel}
+					class="port-label" text-anchor="middle">
+					{port.labelText}
+				</text>
+			</g>
+		{/each}
 	</svg>
+
+	<!-- Floating info card -->
+	{#if hoverInfo}
+		<div class="tooltip"
+			style="left:{hoverInfo.x + 14}px; top:{hoverInfo.y + 14}px">
+			{#each hoverInfo.lines as L}
+				<div>{L}</div>
+			{/each}
+		</div>
+	{/if}
 </div>
 
 {#if $topology.switch_count === 0 && $topology.link_count === 0}
 	<div class="empty">
 		<p>No physical topology data yet.</p>
-		<p class="muted">Cluster-internal cables show up once bedrock-net's
-		discovery hysteresis passes (~5 s after each cable comes up).
-		Switches/routers show up once one full LLDP / CDP / MNDP cycle
-		(~30–60 s) has flowed through to the cluster's nodes.</p>
+		<p class="muted">Cluster cables appear once bedrock-net's discovery
+		hysteresis passes (~5 s after each cable comes up). Switches and
+		routers appear once one full LLDP / CDP / MNDP cycle (~30–60 s)
+		has flowed to the cluster's nodes.</p>
 	</div>
 {/if}
 
-<!-- Detail panel: mesh cables between cluster nodes, grouped per pair.
-     This is the table version of what the SVG draws in green. -->
+<!-- Detail panel: per-pair cables -->
 {#if pairRows.length > 0}
 	<h2 class="section">Cluster cables (node ↔ node) — detail</h2>
 	<div class="cards">
 		{#each pairRows as pair (pair.a + '|' + pair.b)}
-			{@const dim = !!coreNode && pair.a !== coreNode && pair.b !== coreNode}
-			<div class="card" class:dim>
+			{@const dimmed = !!coreNode && pair.a !== coreNode && pair.b !== coreNode}
+			<div class="card" class:dim={dimmed}>
 				<div class="card-head">
 					<div class="title">
 						<span class="icon">↔</span>
@@ -391,27 +661,26 @@ heard via {sw.protocols.join(', ')}</title>
 				</div>
 				<table class="conns">
 					<thead>
-						<tr>
-							<th>{shortName(pair.a)} NIC</th>
-							<th>↔</th>
+						<tr><th>{shortName(pair.a)} NIC</th><th>↔</th>
 							<th>{shortName(pair.b)} NIC</th>
-							<th>Speed</th>
-							<th>RTT</th>
-							<th>Blips</th>
-							<th>Last seen</th>
-						</tr>
+							<th>Type</th><th>Speed</th><th>RTT</th>
+							<th>Blips</th><th>Last seen</th></tr>
 					</thead>
 					<tbody>
 						{#each pair.links as L (L.nic_a + L.nic_b)}
+							{@const k = kindByNic.get(`${L.node_a}|${L.nic_a}`) ?? 'p2p'}
 							<tr>
 								<td><code>{L.nic_a}</code></td>
 								<td class="muted">↔</td>
 								<td><code>{L.nic_b}</code></td>
+								<td><span class="kind-tag kind-{k}">{
+									k === 'lan' ? 'LAN' :
+									k === 'shared' ? 'shared' :
+									'direct'
+								}</span></td>
 								<td>{fmtSpeed(L.speed_mbps)}</td>
 								<td>{L.rtt_us ? `${L.rtt_us} µs` : ''}</td>
-								<td class:warn={L.blip_total > 0}>
-									{L.blip_total > 0 ? L.blip_total : '0'}
-								</td>
+								<td class:warn={L.blip_total > 0}>{L.blip_total > 0 ? L.blip_total : '0'}</td>
 								<td class="muted">{fmtAge(L.last_seen)}</td>
 							</tr>
 						{/each}
@@ -422,8 +691,7 @@ heard via {sw.protocols.join(', ')}</title>
 	</div>
 {/if}
 
-<!-- Detail panel: per-switch breakdown — keeps the previous card-list
-     view for operators who want the text version. -->
+<!-- Detail panel: switches -->
 {#if switchList.length > 0}
 	<h2 class="section">Switches &amp; routers — detail</h2>
 	<div class="cards">
@@ -435,9 +703,7 @@ heard via {sw.protocols.join(', ')}</title>
 					<div class="title">
 						<span class="icon">▣</span>
 						<span class="name">{sw.system_name || sw.device_key.toUpperCase()}</span>
-						{#if shared}
-							<span class="tag shared-tag">shared by {peers.size} nodes</span>
-						{/if}
+						{#if shared}<span class="tag shared-tag">shared by {peers.size} nodes</span>{/if}
 					</div>
 					<div class="ids">
 						<span class="mac">{sw.device_key}</span>
@@ -483,24 +749,18 @@ heard via {sw.protocols.join(', ')}</title>
 	h2.section { font-size: 14px; font-weight: 600; color: #c9d1d9;
 		text-transform: uppercase; letter-spacing: 1px; margin: 24px 0 12px; }
 	.meta { color: #8b949e; font-size: 12px; }
-
 	.explainer {
 		color: #8b949e; font-size: 13px; line-height: 1.55;
-		max-width: 880px; margin: 8px 0 16px;
+		max-width: 920px; margin: 8px 0 12px;
 	}
 
 	.legend {
-		display: flex;
-		gap: 24px;
-		align-items: center;
-		font-size: 12px;
-		color: #8b949e;
-		margin: 8px 0 6px;
-		flex-wrap: wrap;
+		display: flex; gap: 18px; align-items: center;
+		font-size: 12px; color: #8b949e;
+		margin: 4px 0 6px; flex-wrap: wrap;
 	}
 	.legend-item { display: inline-flex; align-items: center; gap: 6px; }
 	.legend svg { vertical-align: middle; }
-	.hint { font-style: italic; color: #6e7681; margin-left: auto; }
 	.reset-btn {
 		margin-left: auto;
 		background: #d29922; color: #000; border: none;
@@ -510,27 +770,47 @@ heard via {sw.protocols.join(', ')}</title>
 	.reset-btn:hover { background: #f0b942; }
 
 	.diagram-wrap {
+		position: relative;
 		background: #0d1117;
 		border: 1px solid #21262d;
 		border-radius: 8px;
-		padding: 8px;
+		padding: 12px;
 		margin-bottom: 16px;
 	}
 	svg { width: 100%; height: auto; display: block; }
 
-	/* Cable styling */
+	/* ─── Cables ─── */
 	.cable {
-		stroke-width: 1.8;
 		fill: none;
-		cursor: default;
+		stroke-width: 1.8;
+		stroke-linejoin: round;
+		stroke-linecap: round;
+		pointer-events: none;
 	}
-	.cable-mesh   { stroke: #3fb950; opacity: 0.85; }
-	.cable-switch { stroke: #79c0ff; opacity: 0.9; stroke-dasharray: 5 3; }
-	.cable.dim    { opacity: 0.12; }
-	.cable:hover  { stroke-width: 3; opacity: 1; }
+	.cable-lan    { stroke: #8b949e; }
+	.cable-shared { stroke: #3fb950; }
+	.cable-p2p    { stroke: #d29922; }
+	.cable-switch { stroke: #79c0ff; stroke-dasharray: 5 4; }
 
-	/* Switch boxes */
-	.switch-box rect {
+	.cable-hit {
+		fill: none;
+		stroke: transparent;
+		stroke-width: 12;     /* fat invisible hit target */
+		pointer-events: stroke;
+		cursor: pointer;
+	}
+	.cable-group.dim { opacity: 0.10; }
+	.cable-group.hot .cable { stroke-width: 3.5; filter: drop-shadow(0 0 4px currentColor); }
+
+	/* legend swatches */
+	.lk { fill: none; stroke-width: 2; stroke-linecap: round; }
+	.lk-lan    { stroke: #8b949e; }
+	.lk-shared { stroke: #3fb950; }
+	.lk-p2p    { stroke: #d29922; }
+	.lk-switch { stroke: #79c0ff; stroke-dasharray: 5 4; }
+
+	/* ─── Switch + node boxes ─── */
+	.switch-rect {
 		fill: #1f6feb22;
 		stroke: #1f6feb;
 		stroke-width: 1.5;
@@ -542,19 +822,18 @@ heard via {sw.protocols.join(', ')}</title>
 	.proto-text { fill: #6e7681; font-size: 10px; text-transform: uppercase;
 		letter-spacing: 1px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
 
-	/* Node boxes */
-	.node-box rect {
+	.node-rect {
 		fill: #161b22;
 		stroke: #30363d;
 		stroke-width: 1.5;
 		cursor: pointer;
 	}
-	.node-box.core rect {
+	.node-box.core .node-rect {
 		fill: #d2992222;
 		stroke: #d29922;
 		stroke-width: 2;
 	}
-	.node-box:hover rect { stroke: #58a6ff; }
+	.node-box:hover .node-rect { stroke: #58a6ff; }
 	.node-name { fill: #e6edf3; font-size: 14px; font-weight: 600;
 		font-family: -apple-system, BlinkMacSystemFont, sans-serif;
 		pointer-events: none; }
@@ -562,20 +841,50 @@ heard via {sw.protocols.join(', ')}</title>
 		text-transform: uppercase; letter-spacing: 1px;
 		pointer-events: none; }
 
-	/* NIC tabs along the top edge of each node */
-	.nic-tab {
-		fill: #30363d;
-		stroke: #58a6ff;
-		stroke-width: 0.8;
+	/* ─── Ports ─── */
+	.port-rect {
+		fill: #21262d;
+		stroke: #30363d;
+		stroke-width: 1.2;
+		cursor: pointer;
 	}
-	.node-box.core .nic-tab { stroke: #d29922; }
-	.nic-label {
+	.port-lan    { stroke: #8b949e; }
+	.port-shared { stroke: #3fb950; }
+	.port-p2p    { stroke: #d29922; }
+	.port-switch { stroke: #79c0ff; }
+	.port-group:hover .port-rect,
+	.port-group.hot .port-rect {
+		stroke-width: 2.4;
+		fill: #30363d;
+		filter: drop-shadow(0 0 4px currentColor);
+	}
+	.port-group.dim { opacity: 0.15; }
+
+	.port-label {
 		fill: #c9d1d9; font-size: 9px;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 		pointer-events: none;
 	}
 
-	/* Empty state */
+	/* ─── Floating tooltip ─── */
+	.tooltip {
+		position: fixed;
+		background: #0d1117f0;
+		border: 1px solid #58a6ff;
+		border-radius: 6px;
+		padding: 8px 12px;
+		font-size: 12px;
+		color: #e6edf3;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		box-shadow: 0 4px 16px #0008;
+		pointer-events: none;
+		z-index: 10;
+		max-width: 320px;
+		line-height: 1.55;
+	}
+	.tooltip div:first-child { font-weight: 600; color: #79c0ff; font-size: 13px; }
+
+	/* ─── Empty state ─── */
 	.empty {
 		background: #0d1117; border: 1px dashed #30363d; border-radius: 8px;
 		padding: 24px; color: #c9d1d9;
@@ -583,7 +892,7 @@ heard via {sw.protocols.join(', ')}</title>
 	.empty p { margin: 0 0 6px; }
 	.muted { color: #6e7681; }
 
-	/* Detail cards (carried over from the previous version) */
+	/* ─── Detail cards ─── */
 	.cards { display: grid; grid-template-columns: 1fr; gap: 16px; }
 	.card {
 		background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
@@ -593,6 +902,7 @@ heard via {sw.protocols.join(', ')}</title>
 		border-color: #1f6feb55;
 		box-shadow: 0 0 0 1px #1f6feb22 inset;
 	}
+	.card.dim { opacity: 0.45; }
 	.card-head {
 		display: flex; justify-content: space-between; align-items: baseline;
 		gap: 16px; margin-bottom: 6px; flex-wrap: wrap;
@@ -606,8 +916,6 @@ heard via {sw.protocols.join(', ')}</title>
 	}
 	.shared-tag { background: #1f6feb33; color: #79c0ff; }
 	.pair-tag   { background: #3fb95033; color: #56d364; }
-	.card.dim   { opacity: 0.45; }
-	.warn       { color: #d29922; font-weight: 600; }
 
 	.ids {
 		display: flex; gap: 12px; font-size: 12px;
@@ -618,7 +926,6 @@ heard via {sw.protocols.join(', ')}</title>
 		color: #3fb950; background: #1a7f3722;
 		padding: 1px 8px; border-radius: 4px;
 	}
-
 	.meta-row {
 		display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px;
 		color: #c9d1d9; margin-bottom: 10px; padding-bottom: 10px;
@@ -634,6 +941,15 @@ heard via {sw.protocols.join(', ')}</title>
 	.proto-lldp { background: #6f42c133; color: #d2a8ff; }
 	.proto-cdp  { background: #d2992233; color: #d29922; }
 	.proto-mndp { background: #1f6feb33; color: #79c0ff; }
+
+	.kind-tag {
+		display: inline-block; font-size: 10px; font-weight: 600;
+		padding: 1px 6px; border-radius: 3px; letter-spacing: 0.5px;
+	}
+	.kind-lan    { background: #8b949e33; color: #c9d1d9; }
+	.kind-shared { background: #3fb95033; color: #56d364; }
+	.kind-p2p    { background: #d2992233; color: #d29922; }
+	.warn { color: #d29922; font-weight: 600; }
 
 	table.conns {
 		width: 100%; border-collapse: collapse; font-size: 12px;
