@@ -239,28 +239,34 @@
 	:global(a:hover) { text-decoration: underline; }
 
 	/* Visible scrollbars on the dark theme. Linux GTK and many distros
-	   default to overlay scrollbars that hide until you scroll — that
-	   surprises operators who can't see whether more content exists.
-	   Forcing a visible thumb against the panel background fixes it. */
+	   default to overlay scrollbars that auto-hide; even when shown,
+	   default thin grey thumbs blend into our background. Force a
+	   substantial, always-visible thumb so an operator can immediately
+	   tell whether more content exists below or off-screen.
+	   `scrollbar-gutter: stable` reserves the gutter even when no
+	   scroll is needed, so layouts don't jump when content height
+	   crosses the viewport boundary. */
 	:global(html) {
-		scrollbar-color: #58a6ff #0d1117;     /* thumb | track (Firefox) */
+		scrollbar-color: #58a6ff #161b22;     /* thumb | track (Firefox) */
 		scrollbar-width: auto;
+		scrollbar-gutter: stable;
 	}
 	:global(::-webkit-scrollbar) {
-		width: 12px; height: 12px;
+		width: 14px; height: 14px;
 	}
 	:global(::-webkit-scrollbar-track) {
-		background: #0d1117;
-		border-left: 1px solid #21262d;
-		border-top:  1px solid #21262d;
+		background: #161b22;
+		border: 1px solid #21262d;
 	}
 	:global(::-webkit-scrollbar-thumb) {
-		background: #30363d;
-		border-radius: 6px;
-		border: 2px solid #0d1117;
+		background: #58a6ff;                  /* link-blue, unmissable */
+		border-radius: 7px;
+		border: 3px solid #161b22;            /* shrinks visible thumb to ~8px */
+		min-height: 40px;                     /* always finger-sized */
 	}
-	:global(::-webkit-scrollbar-thumb:hover) { background: #58a6ff; }
-	:global(::-webkit-scrollbar-corner) { background: #0d1117; }
+	:global(::-webkit-scrollbar-thumb:hover) { background: #79c0ff; }
+	:global(::-webkit-scrollbar-thumb:active) { background: #d29922; }
+	:global(::-webkit-scrollbar-corner) { background: #161b22; }
 
 	.app {
 		display: grid;
