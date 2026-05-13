@@ -238,6 +238,30 @@
 	:global(a) { color: #58a6ff; text-decoration: none; }
 	:global(a:hover) { text-decoration: underline; }
 
+	/* Visible scrollbars on the dark theme. Linux GTK and many distros
+	   default to overlay scrollbars that hide until you scroll — that
+	   surprises operators who can't see whether more content exists.
+	   Forcing a visible thumb against the panel background fixes it. */
+	:global(html) {
+		scrollbar-color: #58a6ff #0d1117;     /* thumb | track (Firefox) */
+		scrollbar-width: auto;
+	}
+	:global(::-webkit-scrollbar) {
+		width: 12px; height: 12px;
+	}
+	:global(::-webkit-scrollbar-track) {
+		background: #0d1117;
+		border-left: 1px solid #21262d;
+		border-top:  1px solid #21262d;
+	}
+	:global(::-webkit-scrollbar-thumb) {
+		background: #30363d;
+		border-radius: 6px;
+		border: 2px solid #0d1117;
+	}
+	:global(::-webkit-scrollbar-thumb:hover) { background: #58a6ff; }
+	:global(::-webkit-scrollbar-corner) { background: #0d1117; }
+
 	.app {
 		display: grid;
 		/* minmax(0, 1fr) allows the main column to be NARROWER than its
