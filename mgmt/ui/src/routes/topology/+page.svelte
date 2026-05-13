@@ -1049,13 +1049,11 @@
 		border-radius: 8px;
 		padding: 12px;
 		margin-bottom: 16px;
-		overflow-x: auto;            /* horizontal scroll if narrow viewport */
 	}
 	.diagram-wrap > svg {
 		display: block;
-		width: 100%;
-		min-width: 1100px;           /* but never squish below readable */
-		height: auto;
+		width: 100%;          /* scale fluidly with the browser column */
+		height: auto;         /* preserveAspectRatio="meet" keeps it readable */
 	}
 
 	/* ─── Cables ─── */
