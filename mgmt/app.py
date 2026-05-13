@@ -4676,4 +4676,17 @@ if ui_build.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # When the cert-refresh timer has dropped a fresh local-ip.co
+    # wildcard cert into /etc/bedrock/tls/, bind 8443 HTTPS so
+    # operators get a green padlock at https://<lan-ip-dashed>
+    # .my.local-ip.co:8443/. Without the cert, fall back to 8080
+    # HTTP. The cert-refresh systemd unit restarts this service
+    # after installing the cert, so the switch happens within
+    # seconds of the first successful refresh.
+    cert = Path("/etc/bedrock/tls/cert.pem")
+    key  = Path("/etc/bedrock/tls/key.pem")
+    if cert.exists() and key.exists():
+        uvicorn.run(app, host="0.0.0.0", port=8443,
+                    ssl_keyfile=str(key), ssl_certfile=str(cert))
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=8080)

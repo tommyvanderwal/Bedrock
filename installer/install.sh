@@ -115,6 +115,19 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-fence-watchdog.timer" \
 systemctl daemon-reload
 systemctl enable --now bedrock-fence-watchdog.timer >/dev/null 2>&1 || true
 
+# Dashboard TLS cert refresh — pulls local-ip.co's wildcard cert
+# every 24 h (OnBootSec=2min so a fresh install gets it in minutes).
+log "Installing bedrock-cert-refresh..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-cert-refresh" \
+    -o /usr/local/bin/bedrock-cert-refresh
+chmod +x /usr/local/bin/bedrock-cert-refresh
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.service" \
+    -o /etc/systemd/system/bedrock-cert-refresh.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
+    -o /etc/systemd/system/bedrock-cert-refresh.timer
+systemctl daemon-reload
+systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
+
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(
     __init__.py
@@ -135,6 +148,8 @@ LIB_FILES=(
     view_builder.py
     dashboard_install.py
     netd.py
+    l2disc.py
+    cert_manager.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

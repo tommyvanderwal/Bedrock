@@ -1,0 +1,8 @@
+[Unit]
+Description=Bedrock dashboard TLS-cert refresh (local-ip.co wildcard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bedrock-cert-refresh

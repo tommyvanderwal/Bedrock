@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Thin wrapper for /usr/local/lib/bedrock/lib/cert_manager.py.
+
+Installed by install.sh to /usr/local/bin/bedrock-cert-refresh and
+invoked by bedrock-cert-refresh.service (oneshot, triggered daily by
+the matching .timer)."""
+import sys
+sys.path.insert(0, "/usr/local/lib/bedrock")
+from lib.cert_manager import main
+sys.exit(main())

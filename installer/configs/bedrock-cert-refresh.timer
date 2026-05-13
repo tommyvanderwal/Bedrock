@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily Bedrock dashboard TLS-cert refresh
+Requires=bedrock-cert-refresh.service
+
+[Timer]
+# Run shortly after boot so a freshly installed node picks up the
+# cert before the operator first opens the dashboard, then daily.
+# Persistent=true makes the timer catch up if the node was off when
+# a scheduled run was due.
+OnBootSec=2min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=bedrock-cert-refresh.service
+
+[Install]
+WantedBy=timers.target
