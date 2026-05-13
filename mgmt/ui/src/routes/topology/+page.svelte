@@ -478,7 +478,6 @@
 	};
 
 	let routedItems = $derived.by((): { cables: Routed[]; buses: RoutedBus[] } => {
-		const pById = portById;
 		// THREE channels:
 		//   * upper — between switch row and the topmost node row; used
 		//     for every switch uplink (sw ↔ node).
@@ -496,8 +495,8 @@
 			{ upper: [], mid: [], lower: [] };
 
 		for (const c of cables) {
-			const ap = pById.get(c.a.portId);
-			const bp = pById.get(c.b.portId);
+			const ap = portById.get(c.a.portId);
+			const bp = portById.get(c.b.portId);
 			if (!ap || !bp) continue;
 			const xL = Math.min(ap.x, bp.x), xR = Math.max(ap.x, bp.x);
 			const item: ItemCable = { kind: 'cable', cable: c, xL, xR };
@@ -509,7 +508,7 @@
 		for (const b of buses) {
 			const ports: PortDef[] = [];
 			for (const k of b.memberPortIds) {
-				const p = pById.get(k);
+				const p = portById.get(k);
 				if (p) ports.push(p);
 			}
 			if (ports.length < 2) continue;
@@ -569,8 +568,8 @@
 				const channelY = baseY + track * LANE_STEP;
 
 				if (item.kind === 'cable') {
-					const ap = pById.get(item.cable.a.portId)!;
-					const bp = pById.get(item.cable.b.portId)!;
+					const ap = portById.get(item.cable.a.portId)!;
+					const bp = portById.get(item.cable.b.portId)!;
 					const ayEdge = yEdgeForChannel(ap, channelY);
 					const byEdge = yEdgeForChannel(bp, channelY);
 					const path = [
@@ -766,10 +765,18 @@
 </p>
 
 <div class="legend">
-	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-switch"/></svg> switch uplink (LLDP / CDP / MNDP)</span>
-	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-lan"/></svg> LAN (shared via operator router)</span>
-	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-shared"/></svg> mesh shared bus</span>
-	<span class="legend-item"><svg width="32" height="10" viewBox="0 0 32 10"><line x1="2" y1="5" x2="30" y2="5" class="lk lk-p2p"/></svg> direct point-to-point</span>
+	{#each [
+		['switch', 'switch uplink (LLDP / CDP / MNDP)'],
+		['lan',    'LAN (shared via operator router)'],
+		['shared', 'mesh shared bus'],
+		['p2p',    'direct point-to-point'],
+	] as [k, label]}
+		<span class="legend-item">
+			<svg width="32" height="10" viewBox="0 0 32 10">
+				<line x1="2" y1="5" x2="30" y2="5" class="lk lk-{k}"/>
+			</svg> {label}
+		</span>
+	{/each}
 	{#if coreNode}
 		<button class="reset-btn" onclick={() => coreNode = ''}>Reset · show all</button>
 	{/if}
@@ -793,7 +800,8 @@
 		<!-- Buses: ONE thick horizontal trunk per bus + thin vertical
 		     tails to each member port, replacing the N(N-1)/2 cables. -->
 		{#each routedBuses as b (b.id)}
-			<g class="bus-group" class:dim={dim.bus(b)} class:hot={hoverBusId === b.id}>
+			<g class="bus-group bus-{b.kind}"
+				class:dim={dim.bus(b)} class:hot={hoverBusId === b.id}>
 				<!-- Fat hit targets (invisible) so hover is forgiving -->
 				<line x1={b.leftX} y1={b.channelY} x2={b.rightX} y2={b.channelY}
 					class="bus-hit"
@@ -805,18 +813,14 @@
 						onmouseenter={(e) => onBusEnter(e, b)}
 						onmouseleave={onLeave}/>
 				{/each}
-				<!-- Visible trunk (thick) -->
 				<line x1={b.leftX} y1={b.channelY} x2={b.rightX} y2={b.channelY}
-					class="bus-trunk bus-{b.kind}"/>
-				<!-- Visible thin tails -->
+					class="bus-trunk"/>
 				{#each b.tails as t}
 					<line x1={t.x} y1={t.yEdge} x2={t.x} y2={b.channelY}
-						class="bus-tail bus-{b.kind}"/>
+						class="bus-tail"/>
 				{/each}
-				<!-- Tee dots at trunk/tail junctions -->
 				{#each b.tails as t}
-					<circle cx={t.x} cy={b.channelY} r="3"
-						class="bus-tee bus-{b.kind}"/>
+					<circle cx={t.x} cy={b.channelY} r="3" class="bus-tee"/>
 				{/each}
 			</g>
 		{/each}
@@ -1079,27 +1083,16 @@
 	.cable-group.dim { opacity: 0.10; }
 	.cable-group.hot .cable { stroke-width: 3.5; filter: drop-shadow(0 0 4px currentColor); }
 
-	/* ─── Bus (trunk + tails) ─── */
-	.bus-trunk {
-		fill: none;
-		stroke-linecap: round;
-		stroke-width: 5;
+	/* ─── Bus (trunk + tails). Kind class on parent <g> sets color;
+	   trunk/tail/tee inherit via currentColor. ─── */
+	.bus-shared { color: #3fb950; }
+	.bus-lan    { color: #8b949e; }
+	.bus-trunk, .bus-tail {
+		fill: none; stroke: currentColor; stroke-linecap: round;
 	}
-	.bus-tail {
-		fill: none;
-		stroke-linecap: round;
-		stroke-width: 2;
-	}
-	.bus-tee {
-		stroke: none;
-	}
-	.bus-shared      .bus-trunk,
-	.bus-shared.bus-trunk { stroke: #3fb950; }
-	.bus-shared.bus-tail  { stroke: #3fb950; }
-	.bus-shared.bus-tee   { fill:   #3fb950; }
-	.bus-lan.bus-trunk    { stroke: #8b949e; }
-	.bus-lan.bus-tail     { stroke: #8b949e; }
-	.bus-lan.bus-tee      { fill:   #8b949e; }
+	.bus-trunk { stroke-width: 5; }
+	.bus-tail  { stroke-width: 2; }
+	.bus-tee   { fill: currentColor; stroke: none; }
 	.bus-hit {
 		fill: none;
 		stroke: transparent;
@@ -1253,22 +1246,17 @@
 	}
 	.kv .k { color: #6e7681; margin-right: 4px; }
 
-	.proto {
-		display: inline-block; font-size: 10px; font-weight: 600;
-		text-transform: uppercase; padding: 1px 6px; border-radius: 3px;
-		letter-spacing: 0.5px;
-	}
-	.proto-lldp { background: #6f42c133; color: #d2a8ff; }
-	.proto-cdp  { background: #d2992233; color: #d29922; }
-	.proto-mndp { background: #1f6feb33; color: #79c0ff; }
-
-	.kind-tag {
+	.proto, .kind-tag {
 		display: inline-block; font-size: 10px; font-weight: 600;
 		padding: 1px 6px; border-radius: 3px; letter-spacing: 0.5px;
 	}
+	.proto { text-transform: uppercase; }
+	.proto-lldp  { background: #6f42c133; color: #d2a8ff; }
+	.proto-cdp,
+	.kind-p2p    { background: #d2992233; color: #d29922; }
+	.proto-mndp  { background: #1f6feb33; color: #79c0ff; }
 	.kind-lan    { background: #8b949e33; color: #c9d1d9; }
 	.kind-shared { background: #3fb95033; color: #56d364; }
-	.kind-p2p    { background: #d2992233; color: #d29922; }
 	.warn { color: #d29922; font-weight: 600; }
 
 	table.conns {
