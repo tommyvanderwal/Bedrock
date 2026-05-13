@@ -240,7 +240,13 @@
 
 	.app {
 		display: grid;
-		grid-template-columns: 240px 1fr;
+		/* minmax(0, 1fr) allows the main column to be NARROWER than its
+		   intrinsic content min-width. Without this, wide content (e.g.
+		   the topology SVG with min-width:1100) forces the whole grid
+		   to overflow horizontally and the body's scrollbar gets stuck
+		   behind the sticky sidebar. With minmax(0,...) the main column
+		   shrinks; the inner `main` then handles its own overflow. */
+		grid-template-columns: 240px minmax(0, 1fr);
 		min-height: 100vh;
 	}
 
@@ -378,6 +384,10 @@
 	main {
 		padding: 20px;
 		max-width: 1600px;
+		min-width: 0;
+		overflow-x: auto;     /* page content scrolls horizontally if it
+		                         exceeds the column width (e.g. wide
+		                         topology diagram in a narrow viewport) */
 	}
 
 	/* Task badge next to the brand */

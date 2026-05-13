@@ -9,6 +9,7 @@
 	type HoverInfo = { x: number; y: number; lines: string[] } | null;
 	let hoverPortId = $state<string | null>(null);
 	let hoverCableId = $state<string | null>(null);
+	let hoverBusId = $state<string | null>(null);
 	let hoverInfo = $state<HoverInfo>(null);
 
 	function shortName(s: string): string { return s ? s.split('.')[0] : ''; }
@@ -86,33 +87,42 @@
 	});
 
 	// ─── Canvas geometry ────────────────────────────────────────────────
-	const SVG_W           = 1400;
+	// The device rectangle is now a thin "port array" — just contains
+	// the port glyphs (vertically centred). The node's NAME / IP /
+	// CORE-VIEW tag sit OUTSIDE the rectangle to the left, in a label
+	// column that cables never cross.
+	const SVG_W           = 1600;
 	const SWITCH_Y        = 30;
-	const SWITCH_W        = 220;
-	const SWITCH_H        = 70;
-	const SWITCH_PAD_X    = 16;
-	const SWITCH_PORT_H   = 12;
-	const NODE_Y_FLAT     = 280;   // top edge of node box (flat layout)
+	const SWITCH_W        = 240;
+	const SWITCH_H        = 60;
+	const NODE_Y_FLAT     = 300;   // top edge of node rect (flat layout)
 	const NODE_W          = 230;
-	const NODE_H          = 130;
-	const NODE_PAD_X      = 10;
-	const PORT_W          = 38;
+	const NODE_H          = 50;
+	const NODE_PAD_X      = 12;
+	const PORT_W          = 34;
 	const PORT_H          = 18;
-	const PORT_GAP        = 4;
-	const LANE_STEP       = 14;    // vertical spacing per cable channel
-	const SWITCH_CHANNEL_TOP_OFFSET = 22; // drop from switch port-bottom to first lane
-	const MESH_CHANNEL_TOP_OFFSET   = 22; // drop from node bottom to first lane
+	const PORT_GAP        = 6;
+	const LABEL_W         = 140;   // width of the label column (left of rect)
+	const LABEL_GAP       = 14;    // gap between label column and rect
+	const LANE_STEP       = 14;
+	const SWITCH_CHANNEL_TOP_OFFSET = 22;
+	const MESH_CHANNEL_TOP_OFFSET   = 22;
 
-	// ─── Layout: where each node and switch sits ────────────────────────
-	function spread(count: number, w: number, boxW: number): number[] {
-		// Place box LEFT EDGES evenly so neither end overflows the
-		// canvas. First box left = margin; last box right = w - margin.
+	// ─── Layout: where each node and switch RECTANGLE sits ─────────────
+	// The label column hangs off the LEFT of each rectangle.
+	function spread(count: number, w: number, rectW: number,
+	                  labelLeft: number): number[] {
+		// Place RECTANGLE left edges so neither the leftmost label nor
+		// the rightmost rect edge overflows the canvas.
 		if (count === 0) return [];
-		const margin = 60;
-		if (count === 1) return [w / 2 - boxW / 2];
-		const span = w - 2 * margin - boxW;       // total horizontal slack
-		const step = span / (count - 1);
-		return Array.from({ length: count }, (_, i) => margin + step * i);
+		const margin = 30;
+		// First rect must clear: margin + labelLeft + LABEL_GAP
+		// Last rect right edge must clear: w - margin
+		const firstX = margin + labelLeft;
+		const lastX  = w - margin - rectW;
+		if (count === 1) return [(firstX + lastX) / 2];
+		const step = (lastX - firstX) / (count - 1);
+		return Array.from({ length: count }, (_, i) => firstX + step * i);
 	}
 
 	type Pos = { x: number; y: number };
@@ -125,7 +135,8 @@
 
 	let layout = $derived.by(() => {
 		const switchPos = new Map<string, Pos>();
-		const swx = spread(switchList.length, SVG_W, SWITCH_W);
+		// Switches also have a label column on their LEFT.
+		const swx = spread(switchList.length, SVG_W, SWITCH_W, LABEL_W + LABEL_GAP);
 		switchList.forEach((sw, i) => {
 			switchPos.set(sw.device_key, { x: swx[i], y: SWITCH_Y });
 		});
@@ -139,16 +150,16 @@
 			// switch uplinks, between core and peers for core↔peer
 			// cables, below peers for any cables not touching the core).
 			nodePos.set(coreNode!, {
-				x: SVG_W / 2 - NODE_W / 2,
+				x: SVG_W / 2 - NODE_W / 2 + (LABEL_W + LABEL_GAP) / 2,
 				y: NODE_Y_STAR_CORE,
 			});
 			const peers = clusterNodes.filter(n => n !== coreNode);
-			const px = spread(peers.length, SVG_W, NODE_W);
+			const px = spread(peers.length, SVG_W, NODE_W, LABEL_W + LABEL_GAP);
 			peers.forEach((peer, i) => {
 				nodePos.set(peer, { x: px[i], y: NODE_Y_STAR_PEER });
 			});
 		} else {
-			const nx = spread(clusterNodes.length, SVG_W, NODE_W);
+			const nx = spread(clusterNodes.length, SVG_W, NODE_W, LABEL_W + LABEL_GAP);
 			clusterNodes.forEach((name, i) => {
 				nodePos.set(name, { x: nx[i], y: NODE_Y_FLAT });
 			});
@@ -165,9 +176,9 @@
 		owner: 'node' | 'switch';
 		ownerId: string;
 		nic: string;        // for nodes
-		side: 'top' | 'bottom';
 		x: number;          // centre x of port glyph
-		yEdge: number;      // y where the cable enters/exits the port
+		ownerY: number;     // top of owner rectangle
+		ownerH: number;     // height of owner rectangle
 		yLabel: number;     // y for the label text
 		boxX: number;       // top-left of port rect
 		boxY: number;
@@ -176,7 +187,9 @@
 	};
 	let ports = $derived.by((): PortDef[] => {
 		const out: PortDef[] = [];
-		// Cluster-node ports: along the TOP edge of each node box.
+		// Cluster-node ports: INSIDE the rectangle, vertically centred.
+		// Cables exit the rectangle at top/bottom edges; the port glyph
+		// is the visible "connection point" inside.
 		for (const nodeName of clusterNodes) {
 			const p = layout.nodePos.get(nodeName);
 			if (!p) continue;
@@ -184,6 +197,7 @@
 			if (nics.length === 0) continue;
 			const totalW = nics.length * PORT_W + (nics.length - 1) * PORT_GAP;
 			const startX = p.x + (NODE_W - totalW) / 2;
+			const portY = p.y + (NODE_H - PORT_H) / 2;     // vertically centred
 			nics.forEach((nic, i) => {
 				const px = startX + i * (PORT_W + PORT_GAP);
 				const kind = kindByNic.get(`${nodeName}|${nic}`)
@@ -193,20 +207,18 @@
 					owner: 'node',
 					ownerId: nodeName,
 					nic,
-					side: 'top',
 					x: px + PORT_W / 2,
-					yEdge: p.y,                       // cable enters at top of node box
-					yLabel: p.y - PORT_H - 4,
+					ownerY: p.y,
+					ownerH: NODE_H,
+					yLabel: portY + PORT_H + 11,
 					boxX: px,
-					boxY: p.y - PORT_H,               // port glyph sits above box
+					boxY: portY,                     // INSIDE the rect
 					labelText: nic,
 					kind,
 				});
 			});
 		}
-		// Switch ports: along the BOTTOM edge. We synthesize one port per
-		// unique 'switch port_id' value the connections array reports.
-		// Order them stable for visual coherence.
+		// Switch ports: also INSIDE the switch rectangle, centred.
 		for (const sw of switchList) {
 			const p = layout.switchPos.get(sw.device_key);
 			if (!p) continue;
@@ -216,6 +228,7 @@
 			if (portIds.length === 0) continue;
 			const totalW = portIds.length * PORT_W + (portIds.length - 1) * PORT_GAP;
 			const startX = p.x + (SWITCH_W - totalW) / 2;
+			const portY = p.y + (SWITCH_H - PORT_H) / 2;
 			portIds.forEach((pid, i) => {
 				const px = startX + i * (PORT_W + PORT_GAP);
 				out.push({
@@ -223,12 +236,12 @@
 					owner: 'switch',
 					ownerId: sw.device_key,
 					nic: pid,
-					side: 'bottom',
 					x: px + PORT_W / 2,
-					yEdge: p.y + SWITCH_H,           // cable exits bottom
-					yLabel: p.y + SWITCH_H + PORT_H + 14,
+					ownerY: p.y,
+					ownerH: SWITCH_H,
+					yLabel: portY + PORT_H + 11,
 					boxX: px,
-					boxY: p.y + SWITCH_H,
+					boxY: portY,                     // INSIDE the rect
 					labelText: pid,
 					kind: 'switch',
 				});
@@ -253,6 +266,74 @@
 		// Whether this cable touches the focused core node
 		touchesCore: boolean;
 	};
+	// ─── Buses ──────────────────────────────────────────────────────────
+	// A shared bus is a connected component of NICs all on the same
+	// underlying medium (the operator LAN for br0, or the surviving
+	// mesh-plane for enp3s0). We render it as ONE thick horizontal
+	// trunk with thin vertical tails to each participating NIC, rather
+	// than rendering N(N-1)/2 individual cables that visually masquerade
+	// as a full mesh.
+	type Bus = {
+		id: string;
+		kind: 'lan' | 'shared';
+		memberKeys: string[];        // each is `${node}|${nic}`
+		infoLines: string[];
+	};
+	let buses = $derived.by((): Bus[] => {
+		const adj = new Map<string, Set<string>>();
+		for (const L of $topology.links) {
+			const aKey = `${L.node_a}|${L.nic_a}`;
+			const bKey = `${L.node_b}|${L.nic_b}`;
+			const aKind = kindByNic.get(aKey);
+			const bKind = kindByNic.get(bKey);
+			if (aKind !== bKind) continue;
+			if (aKind !== 'lan' && aKind !== 'shared') continue;
+			if (!adj.has(aKey)) adj.set(aKey, new Set());
+			if (!adj.has(bKey)) adj.set(bKey, new Set());
+			adj.get(aKey)!.add(bKey);
+			adj.get(bKey)!.add(aKey);
+		}
+		const visited = new Set<string>();
+		const result: Bus[] = [];
+		for (const start of adj.keys()) {
+			if (visited.has(start)) continue;
+			const comp: string[] = [];
+			const stack = [start];
+			while (stack.length) {
+				const k = stack.pop()!;
+				if (visited.has(k)) continue;
+				visited.add(k);
+				comp.push(k);
+				for (const n of adj.get(k) ?? []) stack.push(n);
+			}
+			if (comp.length < 2) continue;
+			const kind = kindByNic.get(comp[0]) as 'lan' | 'shared';
+			const sorted = [...comp].sort();
+			const nicName = comp[0].split('|')[1];
+			const memberLines = sorted.map(c => {
+				const [node, nic] = c.split('|');
+				return `  ${shortName(node)} · ${nic}`;
+			});
+			result.push({
+				id: `bus:${kind}:${sorted.join(',')}`,
+				kind,
+				memberKeys: sorted,
+				infoLines: [
+					`${kind === 'lan' ? 'LAN (shared)' : 'Mesh shared bus'} · ${nicName}`,
+					`${comp.length} NICs on this bus`,
+					...memberLines,
+				],
+			});
+		}
+		return result;
+	});
+	// Quick lookup: which bus is a given (node|nic) on, if any?
+	let busByMember = $derived.by(() => {
+		const m = new Map<string, Bus>();
+		for (const b of buses) for (const k of b.memberKeys) m.set(k, b);
+		return m;
+	});
+
 	let cables = $derived.by((): Cable[] => {
 		const out: Cable[] = [];
 		// Switch↔node cables (from sw.connections)
@@ -290,16 +371,20 @@
 				});
 			}
 		}
-		// Node↔node cables (from topology.links)
+		// Node↔node cables (from topology.links).
+		// Shared/LAN cables that belong to a multi-member bus are
+		// rendered as part of the bus trunk + tails — exclude them
+		// here so they're not also drawn as point-to-point cables.
 		for (const L of $topology.links) {
 			const ap = `node:${L.node_a}|${L.nic_a}`;
 			const bp = `node:${L.node_b}|${L.nic_b}`;
 			if (!portById.get(ap) || !portById.get(bp)) continue;
-			const kindA = kindByNic.get(`${L.node_a}|${L.nic_a}`) ?? 'p2p';
-			// nic-pair kind: both ends should agree (NIC name is shared
-			// in our edge-coloured scheme). Prefer 'lan' if either is
-			// lan, else 'shared' if either is shared, else 'p2p'.
-			const kindB = kindByNic.get(`${L.node_b}|${L.nic_b}`) ?? 'p2p';
+			const aKey = `${L.node_a}|${L.nic_a}`;
+			const bKey = `${L.node_b}|${L.nic_b}`;
+			const aBus = busByMember.get(aKey);
+			if (aBus && aBus === busByMember.get(bKey)) continue;  // folded into bus
+			const kindA = kindByNic.get(aKey) ?? 'p2p';
+			const kindB = kindByNic.get(bKey) ?? 'p2p';
 			const kind: 'lan' | 'shared' | 'p2p' =
 				(kindA === 'lan' || kindB === 'lan') ? 'lan' :
 				(kindA === 'shared' || kindB === 'shared') ? 'shared' : 'p2p';
@@ -339,7 +424,18 @@
 		channelY: number;        // Y of the horizontal traversal segment
 		path: string;            // SVG path string
 	};
-	let routedCables = $derived.by((): Routed[] => {
+	type RoutedBus = {
+		id: string;
+		kind: 'lan' | 'shared';
+		channelY: number;
+		leftX: number;
+		rightX: number;
+		tails: { x: number; yEdge: number; portId: string }[];
+		infoLines: string[];
+		touchesCore: boolean;
+	};
+
+	let routedItems = $derived.by((): { cables: Routed[]; buses: RoutedBus[] } => {
 		const pById = portById;
 		// THREE channels:
 		//   * upper — between switch row and the topmost node row; used
@@ -350,77 +446,134 @@
 		//   * lower — below the deepest node row; for any cable that
 		//     wasn't placed in upper or mid (in flat mode that's every
 		//     mesh cable; in star mode it's peer↔peer cables).
-		const buckets: { upper: Cable[]; mid: Cable[]; lower: Cable[] } =
+		type ItemCable = { kind: 'cable'; cable: Cable; xL: number; xR: number };
+		type ItemBus   = { kind: 'bus';   bus:   Bus;   xL: number; xR: number;
+			ports: PortDef[]; touchesCore: boolean };
+		type Item = ItemCable | ItemBus;
+		const buckets: { upper: Item[]; mid: Item[]; lower: Item[] } =
 			{ upper: [], mid: [], lower: [] };
+
 		for (const c of cables) {
 			const ap = pById.get(c.a.portId);
 			const bp = pById.get(c.b.portId);
 			if (!ap || !bp) continue;
-			if (c.kind === 'switch') {
-				buckets.upper.push(c);
-			} else if (layout.isStar && c.touchesCore) {
-				buckets.mid.push(c);
-			} else {
-				buckets.lower.push(c);
-			}
+			const xL = Math.min(ap.x, bp.x), xR = Math.max(ap.x, bp.x);
+			const item: ItemCable = { kind: 'cable', cable: c, xL, xR };
+			if (c.kind === 'switch') buckets.upper.push(item);
+			else if (layout.isStar && c.touchesCore) buckets.mid.push(item);
+			else buckets.lower.push(item);
 		}
 
-		function allocate(bucket: Cable[], baseY: number): Routed[] {
-			const sorted = [...bucket].sort((c1, c2) => {
-				const a1 = pById.get(c1.a.portId)!, b1 = pById.get(c1.b.portId)!;
-				const a2 = pById.get(c2.a.portId)!, b2 = pById.get(c2.b.portId)!;
-				return Math.min(a1.x, b1.x) - Math.min(a2.x, b2.x);
+		for (const b of buses) {
+			const ports: PortDef[] = [];
+			for (const k of b.memberKeys) {
+				const p = pById.get(`node:${k}`);
+				if (p) ports.push(p);
+			}
+			if (ports.length < 2) continue;
+			const xs = ports.map(p => p.x);
+			const xL = Math.min(...xs), xR = Math.max(...xs);
+			const touchesCore = !!coreNode &&
+				b.memberKeys.some(k => k.startsWith(coreNode + '|'));
+			const item: ItemBus = { kind: 'bus', bus: b, xL, xR, ports, touchesCore };
+			// A bus that includes the core in star mode belongs in the
+			// mid channel (between core row and peer row). Other buses
+			// (or any bus in flat mode) go in the lower channel.
+			if (layout.isStar && touchesCore) buckets.mid.push(item);
+			else buckets.lower.push(item);
+		}
+
+		// Where does the cable enter/exit a given port's owner rect,
+		// given the channel Y? If the channel is above the owner box,
+		// exit at the top edge; if below, exit at the bottom edge.
+		function yEdgeForChannel(port: PortDef, channelY: number): number {
+			if (channelY <= port.ownerY) return port.ownerY;
+			if (channelY >= port.ownerY + port.ownerH) return port.ownerY + port.ownerH;
+			// channel inside the owner — fall back to top edge
+			return port.ownerY;
+		}
+
+		function allocate(bucket: Item[], baseY: number): {
+			cables: Routed[]; buses: RoutedBus[];
+		} {
+			// Buses first (they tend to be wider; placing them on the
+			// outermost tracks keeps point-to-point cables in close
+			// lanes near the boxes).
+			const sorted = [...bucket].sort((a, b) => {
+				if (a.kind !== b.kind) return a.kind === 'bus' ? -1 : 1;
+				return a.xL - b.xL;
 			});
 			const trackRightEdge: number[] = [];
-			const result: Routed[] = [];
-			for (const c of sorted) {
-				const ap = pById.get(c.a.portId)!;
-				const bp = pById.get(c.b.portId)!;
-				const xL = Math.min(ap.x, bp.x);
-				const xR = Math.max(ap.x, bp.x);
+			const outC: Routed[] = [];
+			const outB: RoutedBus[] = [];
+			for (const item of sorted) {
 				let track = -1;
 				for (let t = 0; t < trackRightEdge.length; t++) {
-					if (xL > trackRightEdge[t] + 30) { track = t; break; }
+					if (item.xL > trackRightEdge[t] + 30) { track = t; break; }
 				}
 				if (track === -1) {
 					track = trackRightEdge.length;
-					trackRightEdge.push(xR);
+					trackRightEdge.push(item.xR);
 				} else {
-					trackRightEdge[track] = xR;
+					trackRightEdge[track] = item.xR;
 				}
 				const channelY = baseY + track * LANE_STEP;
-				const path = [
-					`M ${ap.x} ${ap.yEdge}`,
-					`L ${ap.x} ${channelY}`,
-					`L ${bp.x} ${channelY}`,
-					`L ${bp.x} ${bp.yEdge}`,
-				].join(' ');
-				result.push({
-					...c,
-					ax: ap.x, ay: ap.yEdge,
-					bx: bp.x, by: bp.yEdge,
-					channelY,
-					path,
-				});
+
+				if (item.kind === 'cable') {
+					const ap = pById.get(item.cable.a.portId)!;
+					const bp = pById.get(item.cable.b.portId)!;
+					const ayEdge = yEdgeForChannel(ap, channelY);
+					const byEdge = yEdgeForChannel(bp, channelY);
+					const path = [
+						`M ${ap.x} ${ayEdge}`,
+						`L ${ap.x} ${channelY}`,
+						`L ${bp.x} ${channelY}`,
+						`L ${bp.x} ${byEdge}`,
+					].join(' ');
+					outC.push({
+						...item.cable,
+						ax: ap.x, ay: ayEdge, bx: bp.x, by: byEdge,
+						channelY, path,
+					});
+				} else {
+					const tails = item.ports.map(p => ({
+						x: p.x,
+						yEdge: yEdgeForChannel(p, channelY),
+						portId: `node:${p.ownerId}|${p.nic}`,
+					}));
+					outB.push({
+						id: item.bus.id,
+						kind: item.bus.kind,
+						channelY,
+						leftX: item.xL,
+						rightX: item.xR,
+						tails,
+						infoLines: item.bus.infoLines,
+						touchesCore: item.touchesCore,
+					});
+				}
 			}
-			return result;
+			return { cables: outC, buses: outB };
 		}
 
 		const upperBase = SWITCH_Y + SWITCH_H + SWITCH_CHANNEL_TOP_OFFSET;
-		// Mid base — bottom of the core row (only used in star mode).
 		const midBase = NODE_Y_STAR_CORE + NODE_H + MESH_CHANNEL_TOP_OFFSET;
-		// Lower base — just below the deepest node currently rendered.
 		let nodeBottomY = 0;
 		for (const [, p] of layout.nodePos) {
 			nodeBottomY = Math.max(nodeBottomY, p.y + NODE_H);
 		}
 		const lowerBase = nodeBottomY + MESH_CHANNEL_TOP_OFFSET;
-		return [
-			...allocate(buckets.upper, upperBase),
-			...allocate(buckets.mid,   midBase),
-			...allocate(buckets.lower, lowerBase),
-		];
+		const r1 = allocate(buckets.upper, upperBase);
+		const r2 = allocate(buckets.mid,   midBase);
+		const r3 = allocate(buckets.lower, lowerBase);
+		return {
+			cables: [...r1.cables, ...r2.cables, ...r3.cables],
+			buses:  [...r1.buses,  ...r2.buses,  ...r3.buses],
+		};
 	});
+
+	let routedCables = $derived(routedItems.cables);
+	let routedBuses  = $derived(routedItems.buses);
 
 	// Compute total SVG height once we know how many tracks each channel needs.
 	let svgH = $derived.by(() => {
@@ -436,12 +589,19 @@
 	let dim = $derived.by(() => {
 		return {
 			port: (id: string): boolean => {
+				if (hoverBusId) {
+					const b = routedBuses.find(x => x.id === hoverBusId);
+					return !b || !b.tails.some(t => t.portId === id);
+				}
 				if (hoverCableId) {
 					const c = cables.find(x => x.id === hoverCableId);
 					return !c || (c.a.portId !== id && c.b.portId !== id);
 				}
 				if (hoverPortId) {
 					if (hoverPortId === id) return false;
+					// Highlight ports connected via any cable OR via a bus
+					const bus = routedBuses.find(b => b.tails.some(t => t.portId === hoverPortId));
+					if (bus && bus.tails.some(t => t.portId === id)) return false;
 					return !cables.some(c =>
 						(c.a.portId === id && c.b.portId === hoverPortId) ||
 						(c.b.portId === id && c.a.portId === hoverPortId));
@@ -449,10 +609,18 @@
 				return false;
 			},
 			cable: (c: Routed): boolean => {
+				if (hoverBusId) return true;       // any bus hover dims all cables
 				if (hoverCableId) return hoverCableId !== c.id;
 				if (hoverPortId)
 					return c.a.portId !== hoverPortId && c.b.portId !== hoverPortId;
 				if (coreNode) return !c.touchesCore;
+				return false;
+			},
+			bus: (b: RoutedBus): boolean => {
+				if (hoverBusId) return hoverBusId !== b.id;
+				if (hoverCableId) return true;     // cable hover dims buses
+				if (hoverPortId) return !b.tails.some(t => t.portId === hoverPortId);
+				if (coreNode) return !b.touchesCore;
 				return false;
 			},
 		};
@@ -483,9 +651,14 @@
 		hoverCableId = cable.id;
 		hoverInfo = { x: ev.clientX, y: ev.clientY, lines: cable.infoLines };
 	}
+	function onBusEnter(ev: MouseEvent, bus: RoutedBus) {
+		hoverBusId = bus.id;
+		hoverInfo = { x: ev.clientX, y: ev.clientY, lines: bus.infoLines };
+	}
 	function onLeave() {
 		hoverPortId = null;
 		hoverCableId = null;
+		hoverBusId = null;
 		hoverInfo = null;
 	}
 	function onMouseMove(ev: MouseEvent) {
@@ -561,7 +734,6 @@
 		<!-- Cables (drawn first, boxes lie on top) -->
 		{#each routedCables as c (c.id)}
 			<g class="cable-group" class:dim={dim.cable(c)} class:hot={hoverCableId === c.id}>
-				<!-- Wide invisible hit-target to make hover easier -->
 				<path d={c.path} class="cable-hit"
 					onmouseenter={(e) => onCableEnter(e, c)}
 					onmouseleave={onLeave}/>
@@ -569,30 +741,65 @@
 			</g>
 		{/each}
 
-		<!-- Switch boxes -->
+		<!-- Buses: ONE thick horizontal trunk per bus + thin vertical
+		     tails to each member port, replacing the N(N-1)/2 cables. -->
+		{#each routedBuses as b (b.id)}
+			<g class="bus-group" class:dim={dim.bus(b)} class:hot={hoverBusId === b.id}>
+				<!-- Fat hit targets (invisible) so hover is forgiving -->
+				<line x1={b.leftX} y1={b.channelY} x2={b.rightX} y2={b.channelY}
+					class="bus-hit"
+					onmouseenter={(e) => onBusEnter(e, b)}
+					onmouseleave={onLeave}/>
+				{#each b.tails as t}
+					<line x1={t.x} y1={t.yEdge} x2={t.x} y2={b.channelY}
+						class="bus-hit"
+						onmouseenter={(e) => onBusEnter(e, b)}
+						onmouseleave={onLeave}/>
+				{/each}
+				<!-- Visible trunk (thick) -->
+				<line x1={b.leftX} y1={b.channelY} x2={b.rightX} y2={b.channelY}
+					class="bus-trunk bus-{b.kind}"/>
+				<!-- Visible thin tails -->
+				{#each b.tails as t}
+					<line x1={t.x} y1={t.yEdge} x2={t.x} y2={b.channelY}
+						class="bus-tail bus-{b.kind}"/>
+				{/each}
+				<!-- Tee dots at trunk/tail junctions -->
+				{#each b.tails as t}
+					<circle cx={t.x} cy={b.channelY} r="3"
+						class="bus-tee bus-{b.kind}"/>
+				{/each}
+			</g>
+		{/each}
+
+		<!-- Switch boxes (rectangle = port array only) + LEFT-side label -->
 		{#each switchList as sw}
 			{@const p = layout.switchPos.get(sw.device_key)}
 			{#if p}
 				<g class="switch-box">
 					<rect x={p.x} y={p.y} width={SWITCH_W} height={SWITCH_H} rx="6"
 						class="switch-rect"/>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 24}
-						class="switch-name" text-anchor="middle">
+				</g>
+				<!-- Label column to the LEFT of the rectangle. Right-aligned
+				     so each line butts up to the rect. -->
+				<g class="device-label switch-label">
+					<text x={p.x - LABEL_GAP} y={p.y + SWITCH_H / 2 - 10}
+						text-anchor="end" class="device-name">
 						{sw.system_name || sw.device_key.toUpperCase()}
 					</text>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 42}
-						class="meta-text" text-anchor="middle">
+					<text x={p.x - LABEL_GAP} y={p.y + SWITCH_H / 2 + 6}
+						text-anchor="end" class="device-meta">
 						{sw.mgmt_ip || sw.device_key}
 					</text>
-					<text x={p.x + SWITCH_W / 2} y={p.y + 58}
-						class="proto-text" text-anchor="middle">
+					<text x={p.x - LABEL_GAP} y={p.y + SWITCH_H / 2 + 20}
+						text-anchor="end" class="device-proto">
 						{sw.protocols.join(' · ')}
 					</text>
 				</g>
 			{/if}
 		{/each}
 
-		<!-- Cluster-node boxes -->
+		<!-- Cluster-node boxes (rectangle = port array only) + LEFT-side label -->
 		{#each clusterNodes as nodeName}
 			{@const p = layout.nodePos.get(nodeName)}
 			{@const isCore = coreNode === nodeName}
@@ -604,18 +811,20 @@
 					onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCore(nodeName); } }}>
 					<rect x={p.x} y={p.y} width={NODE_W} height={NODE_H} rx="6"
 						class="node-rect"/>
-					<text class="node-name"
-						x={p.x + NODE_W / 2} y={p.y + 52}
-						text-anchor="middle">{shortName(nodeName)}</text>
-					<text class="meta-text"
-						x={p.x + NODE_W / 2} y={p.y + 74}
-						text-anchor="middle">
+				</g>
+				<g class="device-label node-label" class:core={isCore}
+					onclick={() => toggleCore(nodeName)}>
+					<text x={p.x - LABEL_GAP} y={p.y + NODE_H / 2 - 6}
+						text-anchor="end" class="device-name">
+						{shortName(nodeName)}
+					</text>
+					<text x={p.x - LABEL_GAP} y={p.y + NODE_H / 2 + 10}
+						text-anchor="end" class="device-meta">
 						{($nodes[nodeName]?.host) || ''}
 					</text>
 					{#if isCore}
-						<text class="core-tag"
-							x={p.x + NODE_W / 2} y={p.y + 104}
-							text-anchor="middle">▼ core view</text>
+						<text x={p.x - LABEL_GAP} y={p.y + NODE_H / 2 + 26}
+							text-anchor="end" class="core-tag">▼ CORE VIEW</text>
 					{/if}
 				</g>
 			{/if}
@@ -630,8 +839,9 @@
 					class="port-rect port-{port.kind}"
 					onmouseenter={(e) => onPortEnter(e, port)}
 					onmouseleave={onLeave}/>
-				<text x={port.x} y={port.yLabel}
-					class="port-label" text-anchor="middle">
+				<text x={port.x} y={port.boxY + PORT_H / 2 + 3}
+					class="port-label" text-anchor="middle"
+					pointer-events="none">
 					{port.labelText}
 				</text>
 			</g>
@@ -790,8 +1000,14 @@
 		border-radius: 8px;
 		padding: 12px;
 		margin-bottom: 16px;
+		overflow-x: auto;            /* horizontal scroll if narrow viewport */
 	}
-	svg { width: 100%; height: auto; display: block; }
+	.diagram-wrap > svg {
+		display: block;
+		width: 100%;
+		min-width: 1100px;           /* but never squish below readable */
+		height: auto;
+	}
 
 	/* ─── Cables ─── */
 	.cable {
@@ -816,6 +1032,38 @@
 	.cable-group.dim { opacity: 0.10; }
 	.cable-group.hot .cable { stroke-width: 3.5; filter: drop-shadow(0 0 4px currentColor); }
 
+	/* ─── Bus (trunk + tails) ─── */
+	.bus-trunk {
+		fill: none;
+		stroke-linecap: round;
+		stroke-width: 5;
+	}
+	.bus-tail {
+		fill: none;
+		stroke-linecap: round;
+		stroke-width: 2;
+	}
+	.bus-tee {
+		stroke: none;
+	}
+	.bus-shared      .bus-trunk,
+	.bus-shared.bus-trunk { stroke: #3fb950; }
+	.bus-shared.bus-tail  { stroke: #3fb950; }
+	.bus-shared.bus-tee   { fill:   #3fb950; }
+	.bus-lan.bus-trunk    { stroke: #8b949e; }
+	.bus-lan.bus-tail     { stroke: #8b949e; }
+	.bus-lan.bus-tee      { fill:   #8b949e; }
+	.bus-hit {
+		fill: none;
+		stroke: transparent;
+		stroke-width: 14;
+		pointer-events: stroke;
+		cursor: pointer;
+	}
+	.bus-group.dim { opacity: 0.10; }
+	.bus-group.hot .bus-trunk { stroke-width: 7; filter: drop-shadow(0 0 5px currentColor); }
+	.bus-group.hot .bus-tail  { stroke-width: 3; }
+
 	/* legend swatches */
 	.lk { fill: none; stroke-width: 2; stroke-linecap: round; }
 	.lk-lan    { stroke: #8b949e; }
@@ -829,13 +1077,6 @@
 		stroke: #1f6feb;
 		stroke-width: 1.5;
 	}
-	.switch-name { fill: #79c0ff; font-size: 14px; font-weight: 600;
-		font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
-	.meta-text { fill: #8b949e; font-size: 11px;
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-	.proto-text { fill: #6e7681; font-size: 10px; text-transform: uppercase;
-		letter-spacing: 1px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
-
 	.node-rect {
 		fill: #161b22;
 		stroke: #30363d;
@@ -848,12 +1089,29 @@
 		stroke-width: 2;
 	}
 	.node-box:hover .node-rect { stroke: #58a6ff; }
-	.node-name { fill: #e6edf3; font-size: 14px; font-weight: 600;
+
+	/* Device labels (name + IP + protos/core-tag) sit to the LEFT of
+	   the rectangle, right-aligned so each line butts up to the rect. */
+	.device-label { cursor: pointer; }
+	.device-name {
+		fill: #e6edf3; font-size: 13px; font-weight: 600;
 		font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-		pointer-events: none; }
-	.core-tag { fill: #d29922; font-size: 10px; font-weight: 700;
+	}
+	.switch-label .device-name { fill: #79c0ff; }
+	.node-label.core .device-name { fill: #d29922; }
+	.device-meta {
+		fill: #8b949e; font-size: 11px;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
+	.device-proto {
+		fill: #6e7681; font-size: 10px; text-transform: uppercase;
+		letter-spacing: 1px;
+		font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+	}
+	.core-tag {
+		fill: #d29922; font-size: 10px; font-weight: 700;
 		text-transform: uppercase; letter-spacing: 1px;
-		pointer-events: none; }
+	}
 
 	/* ─── Ports ─── */
 	.port-rect {
@@ -875,9 +1133,10 @@
 	.port-group.dim { opacity: 0.15; }
 
 	.port-label {
-		fill: #c9d1d9; font-size: 9px;
+		fill: #e6edf3; font-size: 9px; font-weight: 500;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 		pointer-events: none;
+		letter-spacing: -0.3px;
 	}
 
 	/* ─── Floating tooltip ─── */
