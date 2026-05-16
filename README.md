@@ -1,11 +1,11 @@
 # Bedrock
 
-Local-infrastructure HA virtualization platform for MSPs and small fleets.
-One AlmaLinux 9 box → cluster of 1–N nodes running KVM VMs with per-VM DRBD
+Local-infrastructure HA virtualization platform for Homelab, MSPs and small fleets.
+One AlmaLinux 10 box → cluster of 1–N nodes running KVM VMs with per-VM DRBD
 replication, live migration, witness-driven failover, and a built-in
 dashboard.
 
-No corosync. No Ceph. No PVE framework. Just plain libvirt + DRBD + LVM with
+No corosync. No PVE framework. Just plain libvirt + DRBD + LVM with
 a thin orchestrator on top.
 
 > **Status** — pushing v1.0. Storage tiers, cluster log + protocol, dashboard,
