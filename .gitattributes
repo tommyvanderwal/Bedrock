@@ -1,0 +1,3 @@
+# noVNC is a vendored upstream JavaScript VNC client.
+# Exclude from GitHub language statistics — it's not Bedrock code.
+mgmt/novnc/** linguist-vendored=true
