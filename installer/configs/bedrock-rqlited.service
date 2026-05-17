@@ -1,0 +1,67 @@
+[Unit]
+Description=Bedrock cluster-state store (rqlite, per-node instance)
+Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
+After=network-online.target bedrock-net.service
+Wants=network-online.target
+Requires=bedrock-net.service
+
+# Don't fight systemd's start-limit during burst inits — see
+# docs/mesh-network-v1-uncertainties.md §5 for the equivalent
+# bedrock-rust experience. Tunable up if needed.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=simple
+# Per-node rqlite config is materialised by rqlite_setup.py into
+# /etc/bedrock/rqlited.env before the service starts. The env file
+# contains BEDROCK_RQLITED_NODE_ID, BEDROCK_RQLITED_BIND_IP,
+# BEDROCK_RQLITED_JOIN, BEDROCK_RQLITED_DATA_DIR, and (only on
+# init/bootstrap) BEDROCK_RQLITED_BOOTSTRAP_EXPECT.
+EnvironmentFile=/etc/bedrock/rqlited.env
+
+# Pre-start guard: refuse to launch if the env-file hasn't been
+# rendered yet (state.json not yet present, loopback IP not yet
+# assigned). rqlite_setup.py is idempotent; running it here as
+# a safety net catches the boot-before-render race that the
+# mesh-network rewrite-notes flagged.
+ExecStartPre=/usr/bin/python3 /usr/local/lib/bedrock/lib/rqlite_setup.py --render-env
+
+ExecStart=/usr/local/bin/rqlited \
+    -node-id ${BEDROCK_RQLITED_NODE_ID} \
+    -http-addr 0.0.0.0:4001 \
+    -raft-addr 0.0.0.0:4002 \
+    -http-adv-addr ${BEDROCK_RQLITED_BIND_IP}:4001 \
+    -raft-adv-addr ${BEDROCK_RQLITED_BIND_IP}:4002 \
+    -on-disk \
+    ${BEDROCK_RQLITED_JOIN_FLAG} \
+    ${BEDROCK_RQLITED_BOOTSTRAP_FLAG} \
+    ${BEDROCK_RQLITED_DATA_DIR}
+
+Restart=on-failure
+RestartSec=2s
+# Loop guard — if rqlited refuses to come up repeatedly, let
+# systemd's limit catch it rather than hammering forever.
+
+# Resource bounds — rqlite at Bedrock's scale idles at ~25 MB RSS.
+# Cap at 256 MB so a runaway bug can't eat the host's RAM budget
+# for VMs.
+MemoryHigh=192M
+MemoryMax=256M
+# CPU is uncontended on dev boxes; leave unbounded for now.
+
+# Filesystem isolation: rqlited only needs its data dir + the
+# env file. ReadWritePaths is the data dir; ProtectSystem=strict
+# locks down everything else.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bedrock/rqlite
+
+# Logging — emit to journal; structured-logging follow-up can
+# layer on top.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

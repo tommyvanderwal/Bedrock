@@ -92,6 +92,23 @@ systemctl daemon-reload
 # it without a config file would just fail-loop.
 systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
 
+# rqlite — the cluster-state store (post-alpha-rewrite-notes.md D-01).
+# Per-node Raft voter, on-disk SQLite mode, bound to this node's
+# loopback /32 (set up by bedrock-net once cluster.json + state.json
+# have caught up). Installed-but-not-enabled here; the service is
+# enabled by `bedrock init` / `bedrock join` after rqlite_setup.py
+# has materialised /etc/bedrock/rqlited.env. Starting it pre-config
+# would fail-loop.
+log "Installing rqlited binary + systemd unit..."
+curl -fsSL "${BEDROCK_REPO}/binaries/rqlited" -o /usr/local/bin/rqlited
+chmod +x /usr/local/bin/rqlited
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited.service" \
+    -o /etc/systemd/system/bedrock-rqlited.service
+mkdir -p /var/lib/bedrock/rqlite
+chmod 700 /var/lib/bedrock/rqlite
+systemctl daemon-reload
+systemctl enable bedrock-rqlited.service >/dev/null 2>&1 || true
+
 # DRBD + libvirtd are NOT auto-started at boot. The mgmt service's
 # orchestrator decides when it's safe (cluster contact established,
 # role is leader/follower) and starts them imperatively. This is the
@@ -146,6 +163,17 @@ systemctl daemon-reload
 systemctl enable --now bedrock-mdns.service >/dev/null 2>&1 || true
 systemctl enable --now bedrock-redirect.service >/dev/null 2>&1 || true
 
+# sshd drop-in: turn off PerSourcePenalties for cluster-internal SSH.
+# OpenSSH 9.8+ treats the every-3s paramiko probe burst from peer mgmt
+# nodes like a brute-force attempt and locks out the source IP for up
+# to 10 min on the first LoginGraceTime trip — nodes then flap Offline
+# on every dashboard. Cluster traffic is between authenticated peers;
+# the PerSourcePenalties defence is for anonymous brute-force, not us.
+log "Disabling sshd PerSourcePenalties for cluster traffic..."
+curl -fsSL "${BEDROCK_REPO}/configs/sshd-bedrock-no-penalty.conf" \
+    -o /etc/ssh/sshd_config.d/99-bedrock-no-penalty.conf
+sshd -t && systemctl reload sshd 2>/dev/null || warn "sshd reload skipped"
+
 # Fetch the lib modules into /usr/local/lib/bedrock/lib/
 LIB_FILES=(
     __init__.py
@@ -170,6 +198,13 @@ LIB_FILES=(
     cert_manager.py
     mdns_responder.py
     http_redirect.py
+    cluster_addr.py
+    peer_auth.py
+    operator_auth.py
+    join_handshake.py
+    observability.py
+    rqlite_client.py
+    rqlite_setup.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

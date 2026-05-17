@@ -106,13 +106,17 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
     cp "$INSTALLER/bedrock-net"                "$PAYLOAD_DIR/bedrock-net"
     cp "$INSTALLER/bedrock-fence-watchdog"     "$PAYLOAD_DIR/bedrock-fence-watchdog"
+    cp "$INSTALLER/bedrock-cert-refresh"       "$PAYLOAD_DIR/bedrock-cert-refresh"
+    cp "$INSTALLER/bedrock-mdns"               "$PAYLOAD_DIR/bedrock-mdns"
+    cp "$INSTALLER/bedrock-redirect"           "$PAYLOAD_DIR/bedrock-redirect"
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
     # All cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
     # node_exporter; rust daemon: bedrock-rust). install.sh copies the
     # rust daemon to /usr/local/bin; mgmt_install + agent_install pull
     # the rest from $BEDROCK_REPO/binaries/ when `bedrock init` /
     # `bedrock join` runs.
-    for b in bedrock-rust victoria-metrics victoria-logs node_exporter; do
+    for b in bedrock-rust victoria-metrics victoria-logs node_exporter \
+             vmagent vlagent vmbackup vmrestore rqlited; do
         if [ -f "$INSTALLER/binaries/$b" ]; then
             cp "$INSTALLER/binaries/$b" "$PAYLOAD_DIR/binaries/$b"
         else
@@ -181,7 +185,10 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
 
     chmod +x "$PAYLOAD_DIR"/install.sh "$PAYLOAD_DIR"/bedrock \
               "$PAYLOAD_DIR"/bedrock-net \
-              "$PAYLOAD_DIR"/bedrock-fence-watchdog 2>/dev/null || true
+              "$PAYLOAD_DIR"/bedrock-fence-watchdog \
+              "$PAYLOAD_DIR"/bedrock-cert-refresh \
+              "$PAYLOAD_DIR"/bedrock-mdns \
+              "$PAYLOAD_DIR"/bedrock-redirect 2>/dev/null || true
     chmod +x "$PAYLOAD_DIR"/binaries/* 2>/dev/null || true
 fi
 
