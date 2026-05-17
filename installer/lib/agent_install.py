@@ -4,20 +4,76 @@ Registers with the cluster's mgmt API, deploys exporters.
 """
 
 import json
+import os
+import ssl
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
-from . import state, exporters, tier_storage, daemon_setup, dashboard_install
+from . import (state, exporters, tier_storage, daemon_setup,
+               dashboard_install, peer_auth, join_handshake)
 
 
-def _register(mgmt_url: str, name: str, host: str, drbd_ip: str, pubkey: str):
-    payload = json.dumps({"name": name, "host": host, "drbd_ip": drbd_ip,
-                          "role": "compute", "pubkey": pubkey}).encode()
+_INSECURE_CTX = ssl.create_default_context()
+_INSECURE_CTX.check_hostname = False
+_INSECURE_CTX.verify_mode = ssl.CERT_NONE
+
+
+def _http_json(method: str, url: str, body: dict | None = None, timeout: float = 10.0):
+    """Plain JSON POST/GET. Self-signed-friendly for HTTPS — the cert
+    is for `<dashed-ip>.my.local-ip.co`, never the bare IP we dial."""
+    data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        f"{mgmt_url}/api/nodes/register", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
-    r = urllib.request.urlopen(req, timeout=10)
-    return json.loads(r.read())
+        url, data=data, method=method.upper(),
+        headers={"Content-Type": "application/json"} if data else {})
+    kwargs = {"timeout": timeout}
+    if url.startswith("https://"):
+        kwargs["context"] = _INSECURE_CTX
+    with urllib.request.urlopen(req, **kwargs) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def _request_join(mgmt_url: str, node_name: str, host: str,
+                  bedrock_pubkey: str, x25519_eph_pub_b64: str,
+                  ssh_pubkey: str) -> dict:
+    return _http_json("POST", f"{mgmt_url}/api/join/request", {
+        "node_name": node_name, "host": host,
+        "bedrock_pubkey": bedrock_pubkey,
+        "x25519_eph_pubkey": x25519_eph_pub_b64,
+        "ssh_pubkey": ssh_pubkey,
+    })
+
+
+def _poll_status(mgmt_url: str, request_id: str, *,
+                 timeout_s: int = 600, interval_s: float = 2.0) -> dict:
+    """Block until the operator approves or rejects, or `timeout_s` elapses.
+    Default 10 min — enough for an operator to glance at a popup and click."""
+    from urllib.parse import quote
+    deadline = time.monotonic() + timeout_s
+    last_state = ""
+    while time.monotonic() < deadline:
+        try:
+            r = _http_json("GET",
+                f"{mgmt_url}/api/join/status?id={quote(request_id)}",
+                timeout=5)
+            st = r.get("state", "pending")
+            if st != last_state:
+                print(f"  join state: {st}")
+                last_state = st
+            if st == "approved":
+                return r
+            if st == "rejected":
+                raise RuntimeError(
+                    f"operator rejected join: {r.get('reason') or 'no reason given'}")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Request not yet replicated to this node's snapshot — wait.
+                pass
+            else:
+                raise
+        time.sleep(interval_s)
+    raise TimeoutError(f"no approval after {timeout_s}s")
 
 
 def _install_peer_pubkeys(pubkeys: list):
@@ -55,7 +111,13 @@ def install(witness: str, cluster_info: dict, repo: str):
 
     existing = cluster_info.get("nodes", [])
     node_name = hw.get("hostname", f"node{len(existing)+1}")
-    mgmt_url = cluster_info.get("mgmt_url") or f"http://{witness}:8080"
+    # Always HTTPS 8443. Master binds 8080 to loopback (for its own CLI),
+    # so off-host calls must go through 8443. cluster.key + bedrock_pubkey
+    # therefore ride encrypted on the wire. Cert verification is off
+    # (the cert is for `<dashed-ip>.my.local-ip.co`, not the bare IP we
+    # dial) — peer trust comes from operator-approved fingerprint check
+    # at the popup, not from TLS PKI.
+    mgmt_url = f"https://{witness}:8443"
 
     # Deploy exporters first — register makes mgmt rewrite scrape.yml to include us
     print("  Installing exporters...")
@@ -65,15 +127,49 @@ def install(witness: str, cluster_info: dict, repo: str):
     pub_path = Path("/root/.ssh/id_ed25519.pub")
     my_pubkey = pub_path.read_text().strip() if pub_path.exists() else ""
 
-    # Register BEFORE saving state. If the master is unreachable we want
-    # to surface the failure cleanly and leave state.json untouched, so
-    # `bedrock join` can be retried on the next attempt instead of
-    # refusing with "Already a member" (the symptom L28 documented when
-    # registration failed mid-flight). Only commit cluster_uuid + the
-    # other cluster-membership fields after register succeeds.
-    print(f"  Registering with mgmt at {mgmt_url}...")
-    result = _register(mgmt_url, node_name, mgmt_ip, drbd_ip, my_pubkey)
-    print(f"  Registered. Cluster now has {len(result.get('nodes', []))} nodes.")
+    # Generate this node's Ed25519 Bedrock identity (idempotent — file
+    # check first). The pubkey gets registered with the cluster so any
+    # peer can verify HTTP requests we sign with `peer_auth.sign(...)`.
+    bedrock_pub_hex = peer_auth.pubkey_hex()
+
+    # Approval-based join (piece #3): we ECDH a session key with the master,
+    # show the operator our Ed25519 fingerprint, and the master ships
+    # cluster.key sealed under the session key. No fallback to plain
+    # /api/nodes/register here — the old path stays for backward-compat
+    # with installers from before this code lived in the lib tree.
+    print(f"  Mgmt:           {mgmt_url}")
+    print(f"  Bedrock pubkey: {bedrock_pub_hex}")
+    eph_priv, eph_pub_b64 = join_handshake.gen_ephemeral()
+    fp = join_handshake.fingerprint(bedrock_pub_hex)
+    print(f"  Fingerprint:    {fp}")
+    print(f"  → asking master for join approval...")
+    req = _request_join(mgmt_url, node_name, mgmt_ip,
+                        bedrock_pub_hex, eph_pub_b64, my_pubkey)
+    request_id = req["request_id"]
+    print(f"  request_id: {request_id}")
+    print(f"  Compare the fingerprint above with the popup on the cluster")
+    print(f"  dashboard; click Approve to continue.")
+    approval = _poll_status(mgmt_url, request_id)
+
+    # ECDH-derived session key opens the AEAD-sealed cluster.key.
+    cluster_key = join_handshake.open_seal(
+        eph_priv, approval["master_eph_pubkey"],
+        request_id, approval["ciphertext"], approval["nonce"])
+    Path("/etc/bedrock/cluster.key").write_bytes(cluster_key)
+    os.chmod("/etc/bedrock/cluster.key", 0o600)
+    print(f"  cluster.key received ({len(cluster_key)} bytes) and stored")
+
+    # Reshape approval response to look like the old register response
+    # so the rest of install() can run unchanged.
+    result = {
+        "nodes": approval.get("nodes", []),
+        "peer_pubkeys": approval.get("peer_pubkeys", []),
+        "peer_ips": approval.get("peer_ips", []),
+        "master_drbd_ip": approval.get("master_drbd_ip", ""),
+        "loopback_ip": approval.get("loopback_ip", ""),
+        "cluster_key_hex": cluster_key.hex(),
+    }
+    print(f"  Joined. Cluster has {len(result['nodes'])} nodes.")
 
     # Now safe to commit state — registration was accepted.
     s.update({
@@ -169,7 +265,12 @@ def install(witness: str, cluster_info: dict, repo: str):
             # don't sweat exact sender_id assignment here — sorted-name
             # ordering happens in render_from_snapshot.
             sender_id=int(s["node_id"]) + 1,
-            peer_sender_ids=[1],   # master is sender_id 1 by convention
+            # Empty during bootstrap — we don't yet know peer sender_ids
+            # (sorted-name ordering happens after the snapshot folds).
+            # The watcher overwrites this within ~1s of NODE_REGISTER
+            # replicating, so the empty list never matters in practice;
+            # using [] here just keeps us honest about what we know now.
+            peer_sender_ids=[],
             peer_listen=["0.0.0.0:8200"],
             peer=[f"{master_drbd}:8200"],
             fence_interfaces=[],
@@ -218,6 +319,6 @@ def install(witness: str, cluster_info: dict, repo: str):
 
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")
-    print(f"  Dashboard: {s['mgmt_url']}  (also reachable at http://{mgmt_ip}:8080)")
+    print(f"  Dashboard: https://{mgmt_ip}:8443  or  {s['mgmt_url']}")
     print(f"  Storage:   /bedrock/{{scratch,bulk,critical}} (local LVs)")
     print(f"  Promote to N>=2 from any node:  bedrock storage promote")

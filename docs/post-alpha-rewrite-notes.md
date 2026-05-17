@@ -818,7 +818,7 @@ findings show.
 ## Arbiter LXC: network attachment
 
 Chosen form for the arbiter (decision 2026-05-16): **LXC container with
-rootfs on DRBD `tier-arbiter` volume, bridged into the host's existing
+rootfs on DRBD `tier-cluster` volume, bridged into the host's existing
 front-end bridge `br0`.** LXC over VM for boot speed (~2-4 s cold start
 vs ~10-20 s for a VM); LXC over plain systemd service for clean
 isolation and a single deployment unit (rootfs + etcd binary + config
@@ -993,8 +993,8 @@ store depends on it):
 |---|---|---|
 | 0 | Host's br0 link-local `169.254.<cluster>.<this_node>/16` already present (set at first boot, persists) | 0 |
 | 1 | `compute_election` → role=Leader | <1 ms |
-| 2 | Consult witness generation vs. local DRBD UUID for `tier-arbiter` | network round-trip to witness |
-| 3 | `drbdadm primary tier-arbiter` | ~200 ms |
+| 2 | Consult witness generation vs. local DRBD UUID for `tier-cluster` | network round-trip to witness |
+| 3 | `drbdadm primary tier-cluster` | ~200 ms |
 | 4 | Mount LXC rootfs from DRBD volume | ~100 ms |
 | 5 | Configure veth + addresses (LXC's `lxc.net.0.*`) | ~50 ms |
 | 6 | `lxc-start arbiter` (Alpine + etcd) | ~2-4 s |
@@ -1169,20 +1169,20 @@ authoritative summary of what was chosen.
   master role transitions to this host, removed when it transitions
   away. Standard `ip addr add` / `ip addr del` via a small role-change
   hook in bedrock-rust.
-- **D-06** — Arbiter's data directory is on a **shared singletons
-  DRBD volume** (new tier name `singletons`, 2-way replication
-  between physical nodes), mounted at `/var/lib/bedrock/singletons/`.
+- **D-06** — Arbiter's data directory is on a **shared cluster
+  DRBD volume** (new tier name `cluster`, 2-way replication
+  between physical nodes), mounted at `/var/lib/bedrock/cluster/`.
   Filesystem choice (XFS vs ext4) is implementation detail, not a
   v1.0 architecture decision.
 
 ### Singleton service co-location
 
-- **D-07** — All cluster-singleton services co-locate on the
-  singletons DRBD volume:
+- **D-07** — All cluster-singleton services (i.e. things that exist once cluster-wide, like the arbiter rqlite, the SeaweedFS filer, etc.) co-locate on the
+  cluster DRBD volume:
     - `rqlite-arbiter` (Raft state + WAL)
     - SeaweedFS filer SQLite (the `weed filer` metadata DB)
     - Any future singleton-shape service that fits this pattern
-- **D-08** — Master role transition = atomic move of the singletons
+- **D-08** — Master role transition = atomic move of the cluster
   FS: DRBD-promote + mount + start-all-services on the new master,
   reverse on the old master. Same lifecycle the existing tier-master
   mechanism already implements for `drbd-nfs` tiers.
@@ -1193,7 +1193,7 @@ authoritative summary of what was chosen.
   (bulk/critical). Single S3 stack. Closes the "two S3 daemons"
   problem from the earlier considerations.
 - **D-10** — Filer metadata: **SQLite single-instance on the
-  singletons DRBD volume** for v1.0. Upgrade path to PostgreSQL via
+  cluster DRBD volume** for v1.0. Upgrade path to PostgreSQL via
   `fs.meta.save` / `fs.meta.load` is **bidirectional and documented**
   (project-confirmed: "It is easy to switch between different filer
   stores ... move to distributed one or in reverse"). Migration
@@ -1353,12 +1353,12 @@ rough — calibrate after Phase A.
 
 ### Phase C — Arbiter mobility (~1 week)
 
-- New tier definition `singletons` (DRBD 2-way replicated, XFS or
-  ext4, mounted at `/var/lib/bedrock/singletons/`)
+- New tier definition `cluster` (DRBD 2-way replicated, XFS or
+  ext4, mounted at `/var/lib/bedrock/cluster/`)
 - systemd unit for `bedrock-rqlite-arbiter.service` (binds to
-  `100.X.Y.254/32`, data dir at `/var/lib/bedrock/singletons/rqlite/`)
+  `100.X.Y.254/32`, data dir at `/var/lib/bedrock/cluster/rqlite/`)
 - bedrock-rust hook on role transition:
-    - On role=Leader: DRBD-promote singletons → mount →
+    - On role=Leader: DRBD-promote `tier-cluster` → mount →
       `ip addr add 100.X.Y.254/32 dev lo` → start arbiter
     - On role=Follower: reverse sequence
 - Scenario tests: cold boot, planned `transfer-mgmt`, kill-master,
@@ -1384,7 +1384,7 @@ rough — calibrate after Phase A.
 - Replace tier-storage RustFS bulk/critical paths with SeaweedFS
   collections `bulk` / `critical` (replication=001; EC available
   at 7+ nodes per D-12)
-- SeaweedFS `filer` service on singletons DRBD with SQLite backend
+- SeaweedFS `filer` service on `tier-cluster` DRBD with SQLite backend
 - SeaweedFS `s3` gateway exposed on cluster front-end /32s
 - Migration tooling docs for `weed filer.meta.backup` upgrade path
 - Backup-target test from a separate Bedrock cluster

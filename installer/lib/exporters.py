@@ -1,4 +1,7 @@
-"""Deploy node_exporter + vm_exporter on this node."""
+"""Deploy node_exporter + vm_exporter on this node, plus the
+observability binaries (vmagent, vlagent, vmbackup, vmrestore,
+victoria-metrics, victoria-logs). Every node carries the full set
+because any node can be promoted to a metrics/logs backend slot."""
 
 import os
 import subprocess
@@ -7,6 +10,12 @@ from pathlib import Path
 BIN_DIR = Path("/opt/bedrock/bin")
 NODE_EXPORTER = BIN_DIR / "node_exporter"
 VM_EXPORTER = BIN_DIR / "vm_exporter.py"
+
+# Observability stack — agents needed on every node, backends needed on
+# whichever nodes are currently in obs_backends. Cheaper to deploy
+# everywhere than to deal with "missing binary at promotion time."
+OBS_BINS = ["vmagent", "vlagent", "vmbackup", "vmrestore",
+            "victoria-metrics", "victoria-logs"]
 
 
 def _run(cmd, check=True):
@@ -27,6 +36,21 @@ def install(repo: str):
     print("  Fetching vm_exporter...")
     _run(f"curl -fsSL -o {VM_EXPORTER} '{repo}/binaries/vm_exporter.py'")
     os.chmod(VM_EXPORTER, 0o755)
+
+    # Fetch the observability binaries. Idempotent: skip if already on
+    # disk. The reconciler in installer/lib/observability.py owns the
+    # systemd units for these — exporters.py only ensures the bytes
+    # are available.
+    for b in OBS_BINS:
+        target = BIN_DIR / b
+        if target.exists() and target.stat().st_size > 1_000_000:
+            continue
+        print(f"  Fetching {b}...")
+        try:
+            _run(f"curl -fsSL -o {target} '{repo}/binaries/{b}'")
+            os.chmod(target, 0o755)
+        except RuntimeError as e:
+            print(f"  WARN: {b} not available in repo: {e}")
 
     Path("/etc/systemd/system/node-exporter.service").write_text(
         "[Unit]\nDescription=Prometheus node_exporter\nAfter=network.target\n\n"

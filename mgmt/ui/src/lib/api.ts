@@ -1,6 +1,64 @@
-/** REST API client for Bedrock management */
+/** REST API client for Bedrock management — Bearer-token aware. */
 
 const BASE = '';  // same origin
+const TOKEN_KEY = 'bedrock_token';
+const EXP_KEY = 'bedrock_token_exp';
+
+export function setToken(token: string, exp: number) {
+	if (typeof localStorage === 'undefined') return;
+	localStorage.setItem(TOKEN_KEY, token);
+	localStorage.setItem(EXP_KEY, String(exp));
+}
+
+export function clearToken() {
+	if (typeof localStorage === 'undefined') return;
+	localStorage.removeItem(TOKEN_KEY);
+	localStorage.removeItem(EXP_KEY);
+}
+
+export function getToken(): string | null {
+	if (typeof localStorage === 'undefined') return null;
+	const t = localStorage.getItem(TOKEN_KEY);
+	if (!t) return null;
+	const exp = Number(localStorage.getItem(EXP_KEY) || '0');
+	if (exp && Date.now() / 1000 > exp - 30) {
+		clearToken();
+		return null;
+	}
+	return t;
+}
+
+// Module-local fetch that wraps the global one: adds Bearer token,
+// redirects to /login on 401. All apiGet/apiPost/etc below pick this
+// up because of lexical scoping — no callsite changes needed.
+const _origFetch: typeof globalThis.fetch = (typeof globalThis !== 'undefined' && globalThis.fetch)
+	? globalThis.fetch.bind(globalThis)
+	: ((..._a: any[]) => Promise.reject(new Error('fetch not available'))) as any;
+
+async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+	const headers = new Headers(init.headers || {});
+	const t = getToken();
+	if (t && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${t}`);
+	const r = await _origFetch(input as any, { ...init, headers });
+	if (r.status === 401 && typeof window !== 'undefined'
+		&& !window.location.pathname.startsWith('/login')) {
+		clearToken();
+		const back = window.location.pathname + window.location.search;
+		window.location.href = `/login?next=${encodeURIComponent(back)}`;
+	}
+	return r;
+}
+
+/** Public POST — no Bearer header. Used by /api/login. */
+export async function apiPostPublic(path: string, body: any) {
+	const r = await _origFetch(`${BASE}${path}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
 
 export async function apiGet(path: string) {
 	const r = await fetch(`${BASE}${path}`);
@@ -130,6 +188,7 @@ export async function uploadImport(file: File, onProgress?: (pct: number) => voi
 	return new Promise((resolve, reject) => {
 		const xhr = new XMLHttpRequest();
 		xhr.open('POST', '/api/imports/upload');
+		const _t1 = getToken(); if (_t1) xhr.setRequestHeader('Authorization', `Bearer ${_t1}`);
 		xhr.upload.onprogress = (e) => {
 			if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
 		};
@@ -187,6 +246,7 @@ export async function uploadIso(file: File, onProgress?: (pct: number) => void) 
 	return new Promise((resolve, reject) => {
 		const xhr = new XMLHttpRequest();
 		xhr.open('POST', '/api/isos/upload');
+		const _t2 = getToken(); if (_t2) xhr.setRequestHeader('Authorization', `Bearer ${_t2}`);
 		xhr.upload.onprogress = (e) => {
 			if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
 		};

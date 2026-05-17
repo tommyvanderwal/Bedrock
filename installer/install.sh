@@ -189,8 +189,8 @@ LIB_FILES=(
     workload.py
     tier_storage.py
     daemon_setup.py
-    log_entries.py
-    rust_ipc.py
+    bedrock_state.py
+    bedrock_schema.sql
     view_builder.py
     dashboard_install.py
     netd.py

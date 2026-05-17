@@ -1,9 +1,27 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { nodes, vms, witness, events } from '$lib/stores';
-	import { vmStart, vmShutdown, vmPoweroff, vmMigrate, apiGet } from '$lib/api';
+	import { nodes, vms, witness, events, pendingJoins } from '$lib/stores';
+	import { vmStart, vmShutdown, vmPoweroff, vmMigrate, apiGet, apiPost } from '$lib/api';
 	import Chart from '$lib/Chart.svelte';
 	import LogList from '$lib/LogList.svelte';
+
+	// Tracks which pending request is currently being approved/rejected
+	// so the buttons can disable themselves while the round-trip is in
+	// flight (avoid double-clicks racing).
+	let busyRequest = $state<string | null>(null);
+
+	async function approveJoin(rid: string) {
+		busyRequest = rid;
+		try { await apiPost('/api/join/approve', { request_id: rid }); }
+		finally { busyRequest = null; }
+	}
+
+	async function rejectJoin(rid: string) {
+		busyRequest = rid;
+		try { await apiPost('/api/join/reject',
+			{ request_id: rid, reason: 'denied by operator' }); }
+		finally { busyRequest = null; }
+	}
 
 	let actionStatus = $state('');
 	let nodeMetrics = $state<any>({});
@@ -68,7 +86,44 @@
 </div>
 
 <!-- Nodes -->
-<h2>Nodes</h2>
+<h2>Hosts</h2>
+
+{#if $pendingJoins.length > 0}
+	<div class="pending-list" data-testid="pending-list">
+		{#each $pendingJoins as req (req.request_id)}
+			<div class="pending-card" data-testid="join-pending">
+				<div class="pending-left">
+					<span class="pending-dot"></span>
+					<div class="pending-text">
+						<div class="pending-line1">
+							<span class="pending-tag">Pending join</span>
+							<span class="pending-name">{req.node_name}</span>
+							<span class="pending-host">{req.host}</span>
+						</div>
+						<div class="pending-fp" data-testid="join-fingerprint">
+							{req.fingerprint}
+						</div>
+					</div>
+				</div>
+				<div class="pending-actions">
+					<button class="btn-reject" disabled={busyRequest === req.request_id}
+						onclick={() => rejectJoin(req.request_id)}
+						data-testid="join-reject">Reject</button>
+					<button class="btn-approve" disabled={busyRequest === req.request_id}
+						onclick={() => approveJoin(req.request_id)}
+						data-testid="join-approve">
+						{busyRequest === req.request_id ? 'Approving…' : 'Approve'}
+					</button>
+				</div>
+			</div>
+		{/each}
+		<p class="pending-hint">
+			Compare each fingerprint with what the joining node printed on its own
+			console. Approve only when they match exactly.
+		</p>
+	</div>
+{/if}
+
 <div class="grid">
 	{#each Object.entries($nodes) as [name, node]}
 		<div class="card" class:offline={!node.online}>
@@ -181,6 +236,64 @@
 
 <style>
 	h2 { font-size: 14px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 10px; }
+
+	/* Pending join cards — full-width entries above the host grid so
+	   the operator can read the fingerprint comfortably and act on it
+	   inline. Amber accent matches the sidebar badge. */
+	.pending-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+	.pending-card {
+		background: #d2992211;
+		border: 1px solid #d2992255;
+		border-left: 3px solid #d29922;
+		border-radius: 6px;
+		padding: 12px 16px;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 14px;
+	}
+	.pending-left { display: flex; gap: 12px; align-items: center; min-width: 0; flex: 1; }
+	.pending-dot {
+		width: 10px; height: 10px; border-radius: 50%;
+		background: #d29922; flex-shrink: 0;
+		animation: pulse 1.8s infinite;
+	}
+	.pending-text { min-width: 0; flex: 1; }
+	.pending-line1 { display: flex; gap: 12px; align-items: baseline; font-size: 14px; }
+	.pending-tag {
+		background: #d29922; color: #000;
+		font-size: 10px; font-weight: 700;
+		padding: 2px 7px; border-radius: 4px;
+		text-transform: uppercase; letter-spacing: 0.5px;
+	}
+	.pending-name { color: #e6edf3; font-weight: 600; }
+	.pending-host { color: #8b949e; }
+	.pending-fp {
+		margin-top: 4px;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 13px;
+		color: #c9d1d9;
+		word-break: break-all;
+	}
+	.pending-actions { display: flex; gap: 8px; flex-shrink: 0; }
+	.pending-actions button {
+		padding: 7px 16px;
+		border-radius: 5px;
+		font-weight: 600;
+		font-size: 13px;
+		cursor: pointer;
+	}
+	.btn-reject {
+		background: #21262d; border: 1px solid #f8514955; color: #f85149;
+	}
+	.btn-reject:hover:enabled { background: #f8514922; }
+	.btn-approve {
+		background: #238636; border: 1px solid #2ea043; color: white;
+	}
+	.btn-approve:hover:enabled { background: #2ea043; }
+	.pending-actions button:disabled { opacity: 0.6; cursor: wait; }
+	.pending-hint { font-size: 12px; color: #8b949e; margin: 4px 0 0 0; }
+	@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 	.charts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 12px; margin-bottom: 8px; }
 
 	.status-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; font-size: 13px; flex-wrap: wrap; }

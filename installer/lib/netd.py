@@ -2070,65 +2070,58 @@ def i_am_mgmt_master(d: Daemon) -> bool:
 
 
 def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> bool:
-    """Append a LINK_UP / LINK_DOWN / LINK_QUALITY entry to the log via
-    rust_ipc. Only the mgmt master writes; followers return True
-    immediately so the hysteresis state machine still records "logged"
-    locally and doesn't keep retrying. The cluster-wide path table is
-    populated by the master observing its own paths and emitting
-    accordingly; followers' own paths reach cluster.json via the
+    """Persist a LINK_UP / LINK_DOWN / LINK_QUALITY observation by
+    writing/updating the corresponding row in rqlite's `paths` table.
+    Only the mgmt master writes (D-20 single-writer discipline);
+    followers return True immediately so the hysteresis state machine
+    still records "logged" locally and doesn't keep retrying. The
+    cluster-wide path table is populated by the master observing its
+    own paths; followers' own paths reach cluster.json via the
     master's reciprocal observation. Returns True on success or
-    follower-skip, False on master IPC failure (caller retries next
-    sweep)."""
+    follower-skip, False on rqlite error (caller retries next sweep).
+    """
     if not i_am_mgmt_master(d):
-        return True  # follower: don't append, but mark as logged
+        return True  # follower: don't write, but mark as logged
     try:
-        from . import log_entries as le, rust_ipc
+        from . import bedrock_state as bs
     except ImportError:
-        # When run as a script (not module), the same import works
-        # because /usr/local/lib/bedrock is on sys.path via PYTHONPATH
-        # in the systemd unit.
         sys.path.insert(0, "/usr/local/lib/bedrock")
-        from lib import log_entries as le, rust_ipc  # type: ignore
+        from lib import bedrock_state as bs  # type: ignore
 
     ts = time.time()
     my_link_addr = d.nic_addrs.get(n.my_nic, "")
-    if kind == "up":
-        payload = le.link_up(
-            node_a=d.my_node, nic_a=n.my_nic,
-            node_b=n.peer_node, nic_b=n.peer_nic,
-            link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
-            speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
-            observed_at=ts,
-        )
-    elif kind == "down":
-        payload = le.link_down(
-            node_a=d.my_node, nic_a=n.my_nic,
-            node_b=n.peer_node, nic_b=n.peer_nic,
-            reason=reason or "hysteresis",
-            observed_at=ts,
-        )
-    elif kind == "quality":
-        payload = le.link_quality(
-            node_a=d.my_node, nic_a=n.my_nic,
-            node_b=n.peer_node, nic_b=n.peer_nic,
-            link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
-            speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
-            observed_at=ts,
-        )
-    else:
-        return False
-
     try:
-        with rust_ipc.Daemon() as drd:
-            idx, _h = drd.append(payload)
-        print(f"bedrock-net: {kind} {n.peer_node}.{n.peer_nic}↔{d.my_node}.{n.my_nic} idx={idx}",
+        if kind == "up":
+            rev = bs.link_up(
+                node_a=d.my_node, nic_a=n.my_nic,
+                node_b=n.peer_node, nic_b=n.peer_nic,
+                link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
+                speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
+                observed_at=ts,
+            )
+        elif kind == "down":
+            rev = bs.link_down(
+                node_a=d.my_node, nic_a=n.my_nic,
+                node_b=n.peer_node, nic_b=n.peer_nic,
+                reason=reason or "hysteresis",
+                observed_at=ts,
+            )
+        elif kind == "quality":
+            rev = bs.link_quality(
+                node_a=d.my_node, nic_a=n.my_nic,
+                node_b=n.peer_node, nic_b=n.peer_nic,
+                link_addr_a=my_link_addr, link_addr_b=n.peer_link_addr,
+                speed_mbps=n.speed_mbps, rtt_us=n.rtt_us,
+                observed_at=ts,
+            )
+        else:
+            return False
+        print(f"bedrock-net: {kind} {n.peer_node}.{n.peer_nic}↔{d.my_node}.{n.my_nic} rev={rev}",
               file=sys.stderr, flush=True)
         return True
     except Exception as e:
-        # Transient IPC error — caller should retry next sweep. Don't
-        # spam the journal: rate-limit the log line to once per minute
-        # per (kind, peer) by stashing on Neighbour.
-        sys.stderr.write(f"bedrock-net: append {kind} failed: {e!r}\n")
+        # Transient rqlite error — caller should retry next sweep.
+        sys.stderr.write(f"bedrock-net: rqlite write {kind} failed: {e!r}\n")
         return False
 
 

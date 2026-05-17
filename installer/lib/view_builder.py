@@ -1,37 +1,43 @@
-"""Materialised-view builder.
+"""Materialised-view builder — rqlite edition.
 
-Replays the bedrock-rust log via IPC and folds typed entries into the
-two on-disk JSON files Bedrock has historically maintained ad-hoc:
+Reads the cluster state from rqlite (the post-alpha rewrite's new
+state store, D-01..D-22) and projects it into the on-disk JSON
+files Bedrock has historically maintained:
 
-  /etc/bedrock/cluster.json  — cluster_name, cluster_uuid, nodes,
-                                tiers, witnesses, params
-  /etc/bedrock/state.json    — this node's role + mgmt_url + witness_host
+  /etc/bedrock/cluster.json  — cluster-wide canonical view
+  /etc/bedrock/state.json    — this node's role + mgmt_url
 
-The log is canonical (design §3); these JSON files are caches that any
-consumer (the FastAPI app, `bedrock storage status`, the operator
-running `cat`) can read. Rebuild them with `rebuild()` whenever the
-log moves; on a real cluster a small daemon will do this in response
-to commit events. v0.1 just provides the rebuild function — callers
-invoke it explicitly after an append.
+The rqlite tables ARE the canonical store; these JSON files are
+caches that any consumer (the FastAPI app, `bedrock storage status`,
+the operator running `cat`) can read without a SQL round-trip.
+Callers invoke `rebuild()` whenever the cluster's
+bedrock_meta.revision advances; on a real cluster the orchestrator's
+`rqlite_subscriber` task does this in a watch loop.
+
+The output shape is IDENTICAL to the pre-rqlite log-replay version
+of this module — all downstream consumers (mgmt/app.py,
+orchestrator.py reactor, dashboard, CLI verbs) see the same dict
+structure they always did. Only the source of data changed.
 """
-
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from . import log_entries as le
-from . import rust_ipc
+from . import rqlite_client
 
+log = logging.getLogger("bedrock.view_builder")
 
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON = Path("/etc/bedrock/state.json")
 
 
 def empty_snapshot() -> dict:
-    """The starting shape of a snapshot — keep callers from forgetting
-    a key when they fold incrementally."""
+    """The starting shape of a snapshot — kept around so callers
+    don't have to remember the full key list. Matches the shape
+    that build_snapshot() returns for an empty cluster."""
     return {
         "cluster_name": None,
         "cluster_uuid": None,
@@ -42,378 +48,293 @@ def empty_snapshot() -> dict:
         "mgmt_master": None,
         "vms": {},
         "backup_targets": {},
-        # paths: keyed by canonical-form (a < b alphabetically) so each
-        # path appears exactly once. Direction-symmetric.
-        # Key = "node_a|nic_a|node_b|nic_b" (always in canonical order).
-        # Value = {speed_mbps, rtt_us, observed_at}.
         "paths": {},
+        "operators": {},
+        "join_requests": {},
+        "obs_backends": {"metrics": [], "logs": []},
+        # log_index name retained for backward-compat with consumers
+        # that read the field name; semantically it's now the
+        # bedrock_meta.revision (the rqlite monotonic counter).
         "log_index": 0,
     }
 
 
-def _path_key(node_a: str, nic_a: str, node_b: str, nic_b: str) -> str:
-    """Canonical-order key for path table dedup. Sort by (node, nic) tuple
-    so the same physical path is identified the same way no matter which
-    end first reported it."""
-    a = (node_a, nic_a)
-    b = (node_b, nic_b)
-    if a > b:
-        a, b = b, a
-    return f"{a[0]}|{a[1]}|{b[0]}|{b[1]}"
+# ─────────────────────────────────────────────────────────────────────
+# build_snapshot — read all relevant tables and assemble the dict
+# ─────────────────────────────────────────────────────────────────────
 
 
-def fold(entries: list[dict]) -> dict:
-    """Fold an ordered list of decoded log-entry payloads into a
-    cluster-shaped dict. Pure function — easy to unit-test.
+def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
+                   *, level: str = "weak") -> dict:
+    """Read the rqlite cluster-state tables and assemble a snapshot
+    dict matching the historical log-fold output shape.
 
-    Returns:
-        {
-            "cluster_name": str,
-            "cluster_uuid": str,
-            "nodes": {name: {host, drbd_ip, role, pubkey}},
-            "tiers": {tier: {mode, master, peers, drbd_node_ids,
-                              backend_path, garage_endpoint, version}},
-            "witnesses": {wid: {addr, witness_pubkey, encrypted_witness_key}},
-            "params": {key: value},
-            "mgmt_master": str | None,
-            "log_index": int,    # index of the last folded entry
-        }
+    `level` follows rqlite's read-consistency knob — 'weak' (default)
+    reads from this node's local Raft follower replica (sub-second
+    freshness, no leader round-trip); 'strong' goes via the leader
+    for linearizable reads. Use 'strong' only when the caller must
+    see a just-committed write.
     """
-    return fold_into(empty_snapshot(), entries)
+    owns_client = client is None
+    if owns_client:
+        client = rqlite_client.RqliteClient()
 
+    try:
+        out = empty_snapshot()
 
-def fold_into(out: dict, entries: list[dict]) -> dict:
-    """Same as fold(), but folds new entries onto an EXISTING snapshot
-    in place (and returns it). The watcher uses this to keep an
-    in-memory snapshot up to date on every poll without replaying
-    the entire log — only the entries since `out['log_index']` are
-    folded. O(new_entries), not O(log_size).
+        # cluster_info (singleton row)
+        ci = client.query_one(
+            "SELECT cluster_uuid, cluster_name, mgmt_master "
+            "FROM cluster_info WHERE id = 1",
+            level=level,
+        )
+        if ci:
+            out["cluster_uuid"] = ci["cluster_uuid"]
+            out["cluster_name"] = ci["cluster_name"]
+            out["mgmt_master"] = ci["mgmt_master"]
 
-    Caller is responsible for passing entries in strictly-increasing
-    index order and only entries newer than `out['log_index']`. The
-    fold itself is idempotent on re-fold of the same entry, but
-    duplicate folds waste cycles.
-    """
-    for entry in entries:
-        payload = le.decode(entry["payload"])
-        kind = payload.get("t")
-        out["log_index"] = entry["index"]
+        # bedrock_meta.revision → "log_index" for back-compat field
+        meta = client.query_one(
+            "SELECT revision FROM bedrock_meta WHERE id = 1",
+            level=level,
+        )
+        if meta:
+            out["log_index"] = int(meta["revision"])
 
-        if kind == le.BOOTSTRAP:
-            # First entry in every log; carries the cluster's permanent
-            # uuid. cluster_name is set by a later cluster_init entry.
-            out["cluster_uuid"] = payload["uuid"]
-
-        elif kind == le.CLUSTER_INIT:
-            out["cluster_name"] = payload["name"]
-            # Update uuid only if it differs from the bootstrap one
-            # (it shouldn't, but the explicit cluster_init entry exists
-            # so an operator can rename a cluster without rewriting
-            # every node's bootstrap).
-            out["cluster_uuid"] = payload["uuid"]
-
-        elif kind == le.NODE_REGISTER:
-            n = payload["node_name"]
-            existing = out["nodes"].get(n, {})
-            existing.update({
-                "host": payload["host"],
-                "drbd_ip": payload["drbd_ip"],
-                "role": payload.get("role", "compute"),
-                "pubkey": payload.get("pubkey", ""),
-            })
-            out["nodes"][n] = existing
-
-        elif kind == le.NODE_UNREGISTER:
-            out["nodes"].pop(payload["node_name"], None)
-            # Also strip from tier peer lists.
-            for t in out["tiers"].values():
-                if payload["node_name"] in t.get("peers", []):
-                    t["peers"] = [p for p in t["peers"] if p != payload["node_name"]]
-                t.get("drbd_node_ids", {}).pop(payload["node_name"], None)
-
-        elif kind == le.MGMT_MASTER:
-            old = out["mgmt_master"]
-            new = payload["node_name"]
-            out["mgmt_master"] = new
-            for n_name, info in out["nodes"].items():
-                if n_name == new:
-                    info["role"] = "mgmt+compute"
-                elif n_name == old and info.get("role") == "mgmt+compute":
-                    info["role"] = "compute"
-
-        elif kind == le.TIER_STATE:
-            tier = payload["tier"]
-            existing = out["tiers"].get(tier, {})
-            existing["mode"] = payload["mode"]
-            if payload.get("master") is not None:
-                existing["master"] = payload["master"]
-            if payload.get("peers"):
-                existing["peers"] = list(payload["peers"])
-            if payload.get("backend_path") is not None:
-                existing["backend_path"] = payload["backend_path"]
-            if payload.get("garage_endpoint") is not None:
-                existing["garage_endpoint"] = payload["garage_endpoint"]
-            existing["version"] = existing.get("version", 0) + 1
-            out["tiers"][tier] = existing
-
-        elif kind == le.DRBD_NODE_ID:
-            tier = payload["tier"]
-            t = out["tiers"].setdefault(tier, {"mode": "local"})
-            ids = t.setdefault("drbd_node_ids", {})
-            ids[payload["node_name"]] = payload["node_id"]
-
-        elif kind == le.DRBD_NODE_ID_FREED:
-            tier = payload["tier"]
-            t = out["tiers"].get(tier)
-            if t is not None:
-                t.get("drbd_node_ids", {}).pop(payload["node_name"], None)
-
-        elif kind == le.WITNESS_REGISTER:
-            wid = payload["witness_id"]
-            out["witnesses"][wid] = {
-                "addr": payload["addr"],
-                "witness_pubkey": payload["witness_pubkey"],
-                "encrypted_witness_key": payload["encrypted_witness_key"],
+        # nodes
+        for row in client.query(
+            "SELECT node_name, host, drbd_ip, loopback_ip, role, "
+            "pubkey, bedrock_pubkey, maintenance FROM nodes",
+            level=level,
+        ):
+            entry = {
+                "host": row["host"],
+                "drbd_ip": row["drbd_ip"],
+                "loopback_ip": row.get("loopback_ip", ""),
+                "role": row.get("role", "compute"),
+                "pubkey": row.get("pubkey", ""),
+                "bedrock_pubkey": row.get("bedrock_pubkey", ""),
             }
+            if row.get("maintenance"):
+                entry["maintenance"] = bool(row["maintenance"])
+            out["nodes"][row["node_name"]] = entry
 
-        elif kind == le.WITNESS_UNREGISTER:
-            out["witnesses"].pop(payload["witness_id"], None)
-
-        elif kind == le.PARAM_CHANGE:
-            out["params"][payload["key"]] = payload["value"]
-
-        elif kind == le.VM_CREATE_INTENT:
-            # Intent is pre-create. Record it as state="creating" so
-            # crash recovery can find unfinished creates and decide
-            # whether to resume or roll back. A subsequent VM_CREATED
-            # or VM_CREATE_FAILED entry settles the outcome.
-            out["vms"][payload["name"]] = {
-                "vm_type": payload.get("vm_type", "cattle"),
-                "host":    payload.get("host", ""),
-                "ram_mb":  payload.get("ram_mb", 0),
-                "disk_gb": payload.get("disk_gb", 0),
-                "state":   "creating",
-                "intent_index": entry["index"],
+        # tiers (+ drbd_node_ids per tier)
+        tier_rows = client.query(
+            "SELECT tier_name, mode, master, peers, backend_path, "
+            "garage_endpoint, version FROM tiers",
+            level=level,
+        )
+        for row in tier_rows:
+            tier_obj: dict = {
+                "mode": row["mode"],
+                "version": int(row.get("version") or 0),
             }
-
-        elif kind == le.VM_CREATED:
-            vm = out["vms"].setdefault(payload["name"], {})
-            vm.update({
-                "vm_type": payload.get("vm_type", vm.get("vm_type", "cattle")),
-                "host":    payload.get("host", vm.get("host", "")),
-                "ram_mb":  payload.get("ram_mb", vm.get("ram_mb", 0)),
-                "disk_gb": payload.get("disk_gb", vm.get("disk_gb", 0)),
-                "state":   "created",
-            })
-
-        elif kind == le.VM_CREATE_FAILED:
-            vm = out["vms"].setdefault(payload["name"], {})
-            vm["state"] = "create_failed"
-            vm["fail_reason"] = payload.get("reason", "")
-
-        elif kind == le.VM_DESTROYED:
-            out["vms"].pop(payload["name"], None)
-
-        elif kind == le.VM_MIGRATED:
-            vm = out["vms"].get(payload["name"])
-            if vm is not None:
-                vm["host"] = payload.get("dst_host", vm.get("host"))
-
-        elif kind == le.VM_STATE_CHANGE:
-            vm = out["vms"].get(payload["name"])
-            if vm is not None:
-                vm["state"] = payload.get("state", vm.get("state"))
-                if payload.get("host"):
-                    vm["host"] = payload["host"]
-
-        elif kind == le.NODE_MAINTENANCE:
-            n = out["nodes"].get(payload["node_name"])
-            if n is not None:
-                n["maintenance"] = bool(payload.get("on", False))
-
-        # ── mesh path table ──────────────────────────────────────────
-        elif kind == le.NODE_LOOPBACK:
-            n = out["nodes"].setdefault(payload["node_name"], {})
-            n["loopback_ip"] = payload["loopback_ip"]
-
-        elif kind in (le.LINK_UP, le.LINK_QUALITY):
-            # Canonicalise (a, b) so the same physical path is always
-            # stored with the same orientation. Whoever wrote the
-            # entry got to pick "I'm node_a", but folding swaps them
-            # to alphabetical order so per-side addresses line up
-            # with whichever node the consumer cares about.
-            na, nia = payload["node_a"], payload["nic_a"]
-            nb, nib = payload["node_b"], payload["nic_b"]
-            la = payload.get("link_addr_a", "") or ""
-            lb = payload.get("link_addr_b", "") or ""
-            if (na, nia) > (nb, nib):
-                na, nia, la, nb, nib, lb = nb, nib, lb, na, nia, la
-            key = _path_key(na, nia, nb, nib)
-            entry_age = float(payload.get("observed_at", 0.0))
-            existing = out["paths"].get(key, {})
-            # LINK_UP creates the entry; LINK_QUALITY only updates if
-            # the entry already exists (we don't want a quality update
-            # to resurrect a path that was explicitly torn down).
-            if kind == le.LINK_QUALITY and not existing:
-                continue
-            out["paths"][key] = {
-                "node_a": na, "nic_a": nia, "link_addr_a": la,
-                "node_b": nb, "nic_b": nib, "link_addr_b": lb,
-                "speed_mbps": int(payload.get("speed_mbps", 0)),
-                "rtt_us": int(payload.get("rtt_us", 0)),
-                "observed_at": entry_age,
-                "up_since": existing.get("up_since", entry_age) if kind == le.LINK_QUALITY else entry_age,
-            }
-
-        elif kind == le.LINK_DOWN:
-            key = _path_key(payload["node_a"], payload["nic_a"],
-                            payload["node_b"], payload["nic_b"])
-            out["paths"].pop(key, None)
-
-        # ── backup ─────────────────────────────────────────────────
-        elif kind == le.BACKUP_TARGET_SET:
-            targets = out.setdefault("backup_targets", {})
-            tid = payload["target_id"]
-            existing = targets.get(tid, {})
-            existing.update({
-                "id":   tid,
-                "kind": payload.get("kind", "kopia-s3"),
-                "s3_endpoint":     payload.get("s3_endpoint", ""),
-                "s3_bucket":       payload.get("s3_bucket", ""),
-                "s3_region":       payload.get("s3_region", ""),
-                "s3_disable_tls":              bool(payload.get("s3_disable_tls", False)),
-                "s3_disable_tls_verification": bool(payload.get("s3_disable_tls_verification", False)),
-                "filesystem_path": payload.get("filesystem_path", ""),
-                "override_source_prefix": payload.get("override_source_prefix", ""),
-                "cache_directory": payload.get("cache_directory", ""),
-            })
-            targets[tid] = existing
-
-        elif kind == le.BACKUP_TARGET_REMOVED:
-            (out.get("backup_targets") or {}).pop(payload["target_id"], None)
-
-        elif kind == le.BACKUP_DONE:
-            vm = out["vms"].setdefault(payload["vm"], {})
-            backups = vm.setdefault("backups", [])
-            # Multi-disk schema: `disks` is the canonical list. Legacy
-            # entries (singular `kopia_snapshot_id` at the top) get
-            # normalised into a 1-element list so the UI/restore path
-            # has one shape to deal with.
-            disks = payload.get("disks")
-            if not disks:
-                disks = [{
-                    "target_dev":  "disk0",
-                    "lv_path":     "",
-                    "kopia_snapshot_id": payload.get("kopia_snapshot_id", ""),
-                    "bytes_added": payload.get("bytes_added", 0),
-                }]
-            total_bytes = sum(int(d.get("bytes_added", 0) or 0) for d in disks)
-            primary_kid = (disks[0].get("kopia_snapshot_id") or "") if disks else ""
-            backups.append({
-                # `kopia_snapshot_id` stays at the top as the row's
-                # primary identifier (= disk0's kopia id); the UI uses it
-                # for delete/restore lookup. `disks[]` is authoritative.
-                "kopia_snapshot_id": primary_kid,
-                "disks":             disks,
-                "target_id":   payload["target_id"],
-                "source_node": payload.get("source_node", ""),
-                "bytes_added": total_bytes,    # rolled-up across disks
-                "duration_s":  payload.get("duration_s", 0.0),
-                "label":       payload.get("label", ""),
-                "fs_freeze_used": bool(payload.get("fs_freeze_used", False)),
-                "ts_index":    entry["index"],   # log index serves as timestamp
-            })
-            # Keep newest first; cap to a reasonable length so cluster.json
-            # doesn't bloat unboundedly. Older entries still in the log
-            # if anyone wants to replay.
-            backups.sort(key=lambda b: b["ts_index"], reverse=True)
-            del backups[200:]
-
-        elif kind == le.BACKUP_FAILED:
-            vm = out["vms"].setdefault(payload["vm"], {})
-            vm["last_backup_error"] = {
-                "ts_index": entry["index"],
-                "target_id": payload.get("target_id", ""),
-                "reason": payload.get("reason", ""),
-            }
-
-        elif kind == le.BACKUP_DELETED:
-            vm = out["vms"].get(payload["vm"])
-            if vm is not None:
-                vm["backups"] = [
-                    b for b in (vm.get("backups") or [])
-                    if b.get("kopia_snapshot_id") != payload["kopia_snapshot_id"]
-                ]
-
-        elif kind == le.RESTORE_DONE:
-            vm = out["vms"].setdefault(payload["vm"], {})
-            vm["last_restore"] = {
-                "ts_index":          entry["index"],
-                "kopia_snapshot_id": payload["kopia_snapshot_id"],
-                "target_id":         payload.get("target_id", ""),
-                "dest_node":         payload.get("dest_node", ""),
-            }
-
-        elif kind == le.RESTORE_FAILED:
-            vm = out["vms"].setdefault(payload["vm"], {})
-            vm["last_restore_error"] = {
-                "ts_index":          entry["index"],
-                "kopia_snapshot_id": payload.get("kopia_snapshot_id", ""),
-                "target_id":         payload.get("target_id", ""),
-                "reason":            payload.get("reason", ""),
-            }
-
-        elif kind == le.BACKUP_SCHEDULE_SET:
-            vm = out["vms"].setdefault(payload["vm"], {})
-            vm["backup_schedule"] = {
-                "target_id":       payload.get("target_id", ""),
-                "cron_expr":       payload.get("cron_expr", ""),
-                "label_prefix":    payload.get("label_prefix", "auto"),
-                "retention_count": int(payload.get("retention_count", 0)),
-                "set_at_index":    entry["index"],
-            }
-
-        elif kind == le.BACKUP_SCHEDULE_REMOVED:
-            vm = out["vms"].get(payload["vm"])
-            if vm is not None:
-                vm.pop("backup_schedule", None)
-
-        # Bootstrap entry, free-form payloads, and unknown kinds are
-        # ignored — they just record history without affecting the
-        # materialised view.
-    return out
-
-
-def rebuild(sock_path: str = rust_ipc.DEFAULT_SOCK,
-            cluster_json: Path = CLUSTER_JSON,
-            state_json: Path = STATE_JSON,
-            *,
-            this_node: str | None = None) -> dict:
-    """Pull the whole log via IPC, fold it, and rewrite the JSON caches.
-
-    `this_node` is used to project the cluster-wide view onto
-    state.json (each node's state.json holds *its* role; cluster.json
-    is identical on every node).
-    """
-    with rust_ipc.Daemon(sock_path) as d:
-        entries = list(d.read(from_index=1))
-    view = fold(entries)
-
-    cluster_json.parent.mkdir(parents=True, exist_ok=True)
-    cluster_json.write_text(json.dumps(_cluster_view(view), indent=2))
-
-    if this_node and this_node in view["nodes"]:
-        state_json.parent.mkdir(parents=True, exist_ok=True)
-        existing = {}
-        if state_json.exists():
+            if row.get("master") is not None:
+                tier_obj["master"] = row["master"]
             try:
-                existing = json.loads(state_json.read_text())
-            except json.JSONDecodeError:
-                existing = {}
-        existing.update(_state_view(view, this_node))
-        state_json.write_text(json.dumps(existing, indent=2))
+                tier_obj["peers"] = json.loads(row.get("peers") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                tier_obj["peers"] = []
+            if row.get("backend_path") is not None:
+                tier_obj["backend_path"] = row["backend_path"]
+            if row.get("garage_endpoint") is not None:
+                tier_obj["garage_endpoint"] = row["garage_endpoint"]
+            out["tiers"][row["tier_name"]] = tier_obj
 
-    return view
+        for row in client.query(
+            "SELECT tier_name, node_name, node_id FROM tier_drbd_node_ids",
+            level=level,
+        ):
+            t = out["tiers"].setdefault(row["tier_name"], {"mode": "local"})
+            t.setdefault("drbd_node_ids", {})[row["node_name"]] = int(row["node_id"])
+
+        # witnesses
+        for row in client.query(
+            "SELECT witness_id, addr, witness_pubkey, "
+            "encrypted_witness_key, backend FROM witnesses",
+            level=level,
+        ):
+            entry = {
+                "addr": row["addr"],
+                "witness_pubkey": row["witness_pubkey"],
+                "encrypted_witness_key": row["encrypted_witness_key"],
+            }
+            # D-17: backend column added so multi-backend (Echo /
+            # SMB / NFS / S3) is operator-visible. Default 'echo'
+            # for back-compat with consumers expecting just the key.
+            if row.get("backend"):
+                entry["backend"] = row["backend"]
+            out["witnesses"][row["witness_id"]] = entry
+
+        # params (open-ended k/v, value is JSON-encoded)
+        for row in client.query(
+            "SELECT key, value FROM params",
+            level=level,
+        ):
+            try:
+                out["params"][row["key"]] = json.loads(row["value"])
+            except (TypeError, json.JSONDecodeError):
+                out["params"][row["key"]] = row["value"]
+
+        # operators (login users)
+        for row in client.query(
+            "SELECT username, salt, password_hash FROM operators",
+            level=level,
+        ):
+            out["operators"][row["username"]] = {
+                "salt": row["salt"],
+                "hash": row["password_hash"],
+            }
+
+        # join_requests
+        for row in client.query(
+            "SELECT request_id, node_name, host, bedrock_pubkey, "
+            "x25519_eph_pubkey, fingerprint, state, "
+            "master_eph_pubkey, ciphertext, nonce, reason "
+            "FROM join_requests",
+            level=level,
+        ):
+            entry = {
+                "node_name": row["node_name"],
+                "host": row["host"],
+                "bedrock_pubkey": row["bedrock_pubkey"],
+                "x25519_eph_pubkey": row["x25519_eph_pubkey"],
+                "fingerprint": row["fingerprint"],
+                "state": row["state"],
+            }
+            if row["state"] == "approved":
+                entry["master_eph_pubkey"] = row.get("master_eph_pubkey", "")
+                entry["ciphertext"] = row.get("ciphertext", "")
+                entry["nonce"] = row.get("nonce", "")
+            elif row["state"] == "rejected":
+                entry["reason"] = row.get("reason", "")
+            out["join_requests"][row["request_id"]] = entry
+
+        # vms (current declared/state) + per-VM backups history
+        vm_rows = client.query(
+            "SELECT vm_name, vm_type, host, ram_mb, disk_gb, state, "
+            "intent_index, fail_reason, backup_schedule, "
+            "last_backup_error, last_restore, last_restore_err "
+            "FROM vms",
+            level=level,
+        )
+        for row in vm_rows:
+            vm: dict = {
+                "vm_type": row.get("vm_type", "cattle"),
+                "host":    row.get("host", ""),
+                "ram_mb":  int(row.get("ram_mb") or 0),
+                "disk_gb": int(row.get("disk_gb") or 0),
+                "state":   row.get("state", "created"),
+            }
+            if row.get("intent_index") is not None:
+                vm["intent_index"] = int(row["intent_index"])
+            if row.get("fail_reason"):
+                vm["fail_reason"] = row["fail_reason"]
+            for src_col, dst_key in (
+                ("backup_schedule",  "backup_schedule"),
+                ("last_backup_error", "last_backup_error"),
+                ("last_restore",     "last_restore"),
+                ("last_restore_err", "last_restore_error"),
+            ):
+                v = row.get(src_col)
+                if v:
+                    try:
+                        vm[dst_key] = json.loads(v)
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+            out["vms"][row["vm_name"]] = vm
+
+        # vm_backups — attach to the owning VM in newest-first order,
+        # capped at 200 like the old fold did.
+        for row in client.query(
+            "SELECT vm_name, primary_kopia_id, disks, target_id, "
+            "source_node, bytes_added, duration_s, label, "
+            "fs_freeze_used, ts_index "
+            "FROM vm_backups ORDER BY ts_index DESC LIMIT 1000",
+            level=level,
+        ):
+            vm = out["vms"].setdefault(row["vm_name"], {})
+            backups = vm.setdefault("backups", [])
+            if len(backups) >= 200:
+                continue
+            try:
+                disks = json.loads(row["disks"])
+            except (TypeError, json.JSONDecodeError):
+                disks = []
+            backups.append({
+                "kopia_snapshot_id": row.get("primary_kopia_id", ""),
+                "disks":             disks,
+                "target_id":         row["target_id"],
+                "source_node":       row.get("source_node", ""),
+                "bytes_added":       int(row.get("bytes_added") or 0),
+                "duration_s":        float(row.get("duration_s") or 0),
+                "label":             row.get("label", ""),
+                "fs_freeze_used":    bool(row.get("fs_freeze_used")),
+                "ts_index":          int(row["ts_index"]),
+            })
+
+        # backup_targets
+        for row in client.query(
+            "SELECT target_id, kind, s3_endpoint, s3_bucket, s3_region, "
+            "s3_disable_tls, s3_disable_tls_verification, "
+            "filesystem_path, override_source_prefix, cache_directory "
+            "FROM backup_targets",
+            level=level,
+        ):
+            out["backup_targets"][row["target_id"]] = {
+                "id":   row["target_id"],
+                "kind": row.get("kind", "kopia-s3"),
+                "s3_endpoint":     row.get("s3_endpoint", ""),
+                "s3_bucket":       row.get("s3_bucket", ""),
+                "s3_region":       row.get("s3_region", ""),
+                "s3_disable_tls":              bool(row.get("s3_disable_tls")),
+                "s3_disable_tls_verification": bool(row.get("s3_disable_tls_verification")),
+                "filesystem_path":        row.get("filesystem_path", ""),
+                "override_source_prefix": row.get("override_source_prefix", ""),
+                "cache_directory":        row.get("cache_directory", ""),
+            }
+
+        # paths (mesh topology)
+        for row in client.query(
+            "SELECT path_key, node_a, nic_a, link_addr_a, "
+            "node_b, nic_b, link_addr_b, speed_mbps, rtt_us, "
+            "observed_at, up_since FROM paths",
+            level=level,
+        ):
+            out["paths"][row["path_key"]] = {
+                "node_a":      row["node_a"],
+                "nic_a":       row["nic_a"],
+                "link_addr_a": row.get("link_addr_a", ""),
+                "node_b":      row["node_b"],
+                "nic_b":       row["nic_b"],
+                "link_addr_b": row.get("link_addr_b", ""),
+                "speed_mbps":  int(row.get("speed_mbps") or 0),
+                "rtt_us":      int(row.get("rtt_us") or 0),
+                "observed_at": float(row.get("observed_at") or 0),
+                "up_since":    float(row.get("up_since") or 0),
+            }
+
+        # obs_backends (stack, position) -> ordered list per stack
+        rows = client.query(
+            "SELECT stack, node_name, position FROM obs_backends "
+            "ORDER BY stack, position",
+            level=level,
+        )
+        backends: dict[str, list[str]] = {"metrics": [], "logs": []}
+        for row in rows:
+            backends.setdefault(row["stack"], []).append(row["node_name"])
+        out["obs_backends"] = backends
+
+        return out
+    finally:
+        if owns_client:
+            client.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Projections — cluster.json + state.json
+# ─────────────────────────────────────────────────────────────────────
 
 
 def _cluster_view(v: dict) -> dict:
@@ -421,16 +342,19 @@ def _cluster_view(v: dict) -> dict:
     return {
         "cluster_name":   v["cluster_name"],
         "cluster_uuid":   v["cluster_uuid"],
+        "mgmt_master":    v.get("mgmt_master"),
         "nodes":          v["nodes"],
         "tiers":          v["tiers"],
         "witnesses":      v["witnesses"],
         "params":         v["params"],
         "vms":            v.get("vms", {}),
         "backup_targets": v.get("backup_targets", {}),
-        # Mesh path table — replicated topology, not per-node liveness.
-        # Each node's bedrock-net daemon also keeps a sub-second gossip
-        # view in memory; only durable transitions land here.
         "paths":          v.get("paths", {}),
+        "operators":      v.get("operators", {}),
+        "join_requests":  v.get("join_requests", {}),
+        "obs_backends":   v.get("obs_backends", {"metrics": [], "logs": []}),
+        # Field name kept as 'log_index' for back-compat with existing
+        # consumers; semantically this is the rqlite revision.
         "log_index":      v["log_index"],
     }
 
@@ -443,15 +367,97 @@ def _state_view(v: dict, node_name: str) -> dict:
         v["nodes"].get(master, {}).get("host", "") if master else ""
     )
     return {
-        "node_name": node_name,
+        "node_name":    node_name,
         "cluster_name": v["cluster_name"],
         "cluster_uuid": v["cluster_uuid"],
-        "role": me.get("role", "compute"),
-        "mgmt_ip": me.get("host", ""),
-        "drbd_ip": me.get("drbd_ip", ""),
-        # Mesh identity — read by bedrock-net.service to know which /32
-        # to claim on `lo` and to advertise in probes.
-        "loopback_ip": me.get("loopback_ip", ""),
-        "mgmt_url": f"http://{master_host}:8080" if master_host else "",
-        "witness_host": master_host,  # v0.1 — phase 6 swaps in real witnesses
+        "role":         me.get("role", "compute"),
+        "mgmt_ip":      me.get("host", ""),
+        "drbd_ip":      me.get("drbd_ip", ""),
+        "loopback_ip":  me.get("loopback_ip", ""),
+        "mgmt_url":     f"http://{master_host}:8080" if master_host else "",
+        "witness_host": master_host,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# rebuild — refresh on-disk caches from rqlite
+# ─────────────────────────────────────────────────────────────────────
+
+
+def rebuild(cluster_json: Path = CLUSTER_JSON,
+            state_json: Path = STATE_JSON,
+            *,
+            this_node: str | None = None,
+            client: Optional[rqlite_client.RqliteClient] = None,
+            level: str = "weak") -> dict:
+    """Read rqlite, project, and rewrite cluster.json + state.json.
+
+    `this_node` projects the cluster-wide view onto state.json (each
+    node's state.json holds *its* role; cluster.json is identical on
+    every node).
+    """
+    view = build_snapshot(client=client, level=level)
+
+    cluster_json.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(cluster_json, _cluster_view(view))
+
+    if this_node and this_node in view["nodes"]:
+        state_json.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if state_json.exists():
+            try:
+                existing = json.loads(state_json.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+        existing.update(_state_view(view, this_node))
+        _atomic_write_json(state_json, existing)
+
+    return view
+
+
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    """Same per-call unique-tmp pattern orchestrator.py uses — see
+    L48 / lesson_orchestrator_atomic_write for the race the simple
+    tmp+rename pattern was hitting before."""
+    import os
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(obj, indent=2))
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────
+# fold_into — back-compat shim for orchestrator's incremental updates
+# ─────────────────────────────────────────────────────────────────────
+
+
+def fold_into(out: dict, entries: list) -> dict:
+    """Back-compat: replaced by direct rqlite reads.
+
+    The pre-rqlite version of view_builder folded log entries
+    incrementally so the orchestrator could keep an in-memory
+    snapshot up to date entry-by-entry. Under rqlite, the snapshot
+    IS the database — there are no "entries" to fold. The
+    orchestrator's rqlite_subscriber should call build_snapshot()
+    directly when a revision-change is observed.
+
+    This function is kept as a compatibility shim that simply
+    rebuilds the snapshot from rqlite. Any callers passing log-
+    entry dicts will see them ignored. Tracked as deprecated;
+    delete in v1.0 once orchestrator is migrated.
+    """
+    log.debug("view_builder.fold_into is deprecated under rqlite; "
+              "rebuilding from current state instead")
+    new = build_snapshot()
+    out.clear()
+    out.update(new)
+    return out

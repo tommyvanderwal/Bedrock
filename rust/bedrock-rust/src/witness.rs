@@ -27,13 +27,17 @@ use bedrock_echo_proto::{
     crypto,
     msg,
 };
-use crate::log_store::Log;
+// Post-rqlite (D-22): the witness no longer reads from a local log.
+// The heartbeat payload's `last_committed_index` / `last_committed_hash`
+// fields morph into the arbiter-volume DRBD UUID + generation
+// counter per D-16 — but until Phase D wires those in, we emit zeros
+// so the protocol remains wire-compatible with existing witness
+// devices.
 use crate::peer::PeerLiveness;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -403,15 +407,15 @@ pub fn compute_election(
 /// Spawn the lease loop. The thread heartbeats to the witness every
 /// `heartbeat_ms`; when it can't successfully heartbeat for `ttl_ms`
 /// total, it kicks self_fence().
-pub fn start_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> JoinHandle<()> {
+pub fn start_lease_loop(cfg: LeaseConfig) -> JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(e) = run_lease_loop(cfg, log) {
+        if let Err(e) = run_lease_loop(cfg) {
             log::error!("lease loop terminated: {}", e);
         }
     })
 }
 
-fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
+fn run_lease_loop(cfg: LeaseConfig) -> Result<()> {
     log::info!(
         "lease: {} witness(es) ttl={}ms heartbeat={}ms peer_sender_ids={:?}",
         cfg.witnesses.len(), cfg.ttl_ms, cfg.heartbeat_ms, cfg.peer_sender_ids,
@@ -455,11 +459,14 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
             continue;
         }
 
-        let (latest_index, latest_hash) = {
-            let lg = log.lock().unwrap();
-            lg.latest()
-        };
-        let payload = pack_own_payload(/*epoch=*/ 1, latest_index, latest_hash);
+        // D-16 morph: the per-node payload fields move from log-state
+        // echo to arbiter-DRBD-state echo (uuid + generation +
+        // last_man_standing_marker). Until Phase D wires the actual
+        // DRBD-state plumb-through, we emit zeros — wire-compatible
+        // with witness devices that ignore content, and the
+        // election logic only consults `compute_election` (visibility,
+        // not payload content).
+        let payload = pack_own_payload(/*epoch=*/ 1, 0, [0u8; 32]);
 
         // Always query STATUS_LIST: gives us per-tick visibility into
         // every other peer's witness-recency in one round-trip.
@@ -527,8 +534,8 @@ fn run_lease_loop(cfg: LeaseConfig, log: Arc<Mutex<Log>>) -> Result<()> {
             };
             if next != last_election {
                 log::info!(
-                    "election: {:?} → {:?} (idx={} tcp_peers={} witness_seen={:?} smaller_alive={})",
-                    last_election, next, latest_index,
+                    "election: {:?} → {:?} (tcp_peers={} witness_seen={:?} smaller_alive={})",
+                    last_election, next,
                     n_visible_peers, witness_seen, smaller_id_alive_anywhere,
                 );
                 last_election = next;

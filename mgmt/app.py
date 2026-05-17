@@ -14,13 +14,103 @@ from typing import Optional
 
 import paramiko
 import urllib.request
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ws import hub
 from tasks import registry as task_registry, Task
+
+# Peer-auth + operator-auth + join-handshake — these modules live in the
+# bedrock lib tree (installer-deployed) rather than mgmt's own source
+# dir so installers and mgmt share the same code.
+import sys as _sys_peerauth
+_sys_peerauth.path.insert(0, "/usr/local/lib/bedrock")
+from lib import peer_auth as _peer_auth        # noqa: E402
+from lib import operator_auth as _op_auth      # noqa: E402
+from lib import join_handshake as _join_hs     # noqa: E402
+from lib import bedrock_state as _bs           # noqa: E402
+from lib import rqlite_client as _rqlite       # noqa: E402
+
+
+async def require_peer(request: Request) -> str:
+    """FastAPI dep — accepts requests signed by a known cluster node.
+    Returns the verified node name. Raises 401 on any failure."""
+    body = await request.body()
+
+    def _lookup(node_name: str):
+        cluster = load_cluster()
+        n = (cluster.get("nodes") or {}).get(node_name) or {}
+        pk_hex = (n.get("bedrock_pubkey") or "").strip()
+        if not pk_hex:
+            return None
+        try:
+            return bytes.fromhex(pk_hex)
+        except ValueError:
+            return None
+
+    authz = request.headers.get("authorization", "")
+    try:
+        return _peer_auth.verify(authz, request.method,
+                                 request.url.path
+                                 + (("?" + request.url.query) if request.url.query else ""),
+                                 body, _lookup)
+    except ValueError as e:
+        raise HTTPException(401, f"peer auth failed: {e}")
+
+
+async def require_operator(request: Request) -> str:
+    """FastAPI dep — accepts requests with a valid `Authorization: Bearer
+    <token>` operator session token. Returns the username on success.
+    Raises 401 on any failure."""
+    authz = request.headers.get("authorization", "")
+    if not authz.startswith("Bearer "):
+        raise HTTPException(401, "missing Bearer token")
+    try:
+        payload = _op_auth.verify_token(authz[7:].strip())
+    except ValueError as e:
+        raise HTTPException(401, f"operator auth failed: {e}")
+    return payload.get("sub", "")
+
+
+async def require_operator_or_peer(request: Request) -> str:
+    """Accepts EITHER a peer Ed25519 signature OR an operator Bearer
+    token. Returns `op:<user>` or `peer:<node>` so handlers know which.
+    Use for endpoints that legitimately need both call sites (e.g. an
+    operator clicks "transfer mgmt" in the dashboard AND the receiving
+    node's mgmt service finishes the handoff by calling back)."""
+    authz = request.headers.get("authorization", "")
+    if authz.startswith("Bearer "):
+        try:
+            payload = _op_auth.verify_token(authz[7:].strip())
+            return f"op:{payload.get('sub', '')}"
+        except ValueError as e:
+            raise HTTPException(401, f"operator auth failed: {e}")
+    if authz.startswith(_peer_auth.SCHEME + " "):
+        body = await request.body()
+
+        def _lookup(node_name: str):
+            cluster = load_cluster()
+            n = (cluster.get("nodes") or {}).get(node_name) or {}
+            pk_hex = (n.get("bedrock_pubkey") or "").strip()
+            try:
+                return bytes.fromhex(pk_hex) if pk_hex else None
+            except ValueError:
+                return None
+
+        try:
+            who = _peer_auth.verify(
+                authz, request.method,
+                request.url.path + (("?" + request.url.query) if request.url.query else ""),
+                body, _lookup)
+            return f"peer:{who}"
+        except ValueError as e:
+            raise HTTPException(401, f"peer auth failed: {e}")
+    raise HTTPException(401, "missing operator or peer credentials")
+
+# (The /api/peer-test smoke endpoint is registered after `app = FastAPI()`,
+# search for it below.)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bedrock")
@@ -79,10 +169,14 @@ def write_scrape_config(cluster: dict):
         f"{libvirt_t}\n"
         f"        labels: {{cluster: {name}}}\n"
     )
-    try:
-        urllib.request.urlopen("http://127.0.0.1:8428/-/reload", timeout=2)
-    except Exception:
-        pass
+    # Scrape config consumer is now `bedrock-vmagent`. SIGHUP on this
+    # vmagent build terminates the process instead of reloading, so use
+    # restart — the persistent disk queue means a sub-second restart
+    # drops zero scrapes. Best-effort: if the unit isn't here yet (early
+    # init), the reconciler will start vmagent on the next log fold with
+    # the fresh scrape.yml already on disk.
+    subprocess.run("systemctl restart bedrock-vmagent.service",
+                   shell=True, check=False, capture_output=True, timeout=5)
 
 
 def get_nodes() -> dict:
@@ -94,34 +188,93 @@ def get_nodes() -> dict:
 _VM_META_CACHE: dict = {}
 
 # ── SSH helpers ─────────────────────────────────────────────────────────────
+#
+# Connection pool: paramiko `SSHClient` per host, reused across calls.
+# Without this, every `ssh_cmd` opened a fresh TCP+kex+auth — at N=4
+# nodes × every-3-second probe loop × 4 mgmt processes (master + 3
+# followers) sshd's pre-auth queue filled up and dropped connections
+# with "exceeded LoginGraceTime" penalty, manifesting as nodes
+# flapping between Online/Offline on the dashboard. Caching reuses
+# a single Transport per peer + opens new channels on demand, which
+# is what paramiko is designed for.
+import threading as _threading
+
+_SSH_POOL: dict[str, "paramiko.SSHClient"] = {}
+_SSH_POOL_LOCK = _threading.Lock()
+
+
+def _ssh_pool_drop(host: str) -> None:
+    """Drop the cached client for `host`, if any. Called when an
+    exec_command raises — the next call will reconnect."""
+    with _SSH_POOL_LOCK:
+        c = _SSH_POOL.pop(host, None)
+    if c is not None:
+        try: c.close()
+        except Exception: pass
+
 
 def _ssh_connect(host: str):
-    """Connect via SSH using the root@host key mesh set up by
-    agent_install (every node has every other node's pubkey)."""
+    """Get a cached paramiko client for `host`, opening a new connection
+    on first call or after a drop. Uses the root@host key mesh set up
+    by agent_install — every node has every other node's pubkey."""
+    with _SSH_POOL_LOCK:
+        c = _SSH_POOL.get(host)
+        if c is not None:
+            t = c.get_transport()
+            if t is not None and t.is_active() and t.is_alive():
+                return c
+            # Stale entry — drop and reconnect below.
+            _SSH_POOL.pop(host, None)
+            try: c.close()
+            except Exception: pass
+
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     c.connect(host, username=SSH_USER, timeout=5, allow_agent=True,
               look_for_keys=True)
+    # Keepalive packets so the connection doesn't get torn down by a
+    # NAT or firewall between probes. 20s matches the existing probe
+    # cadence (3s loop) with plenty of headroom.
+    try:
+        t = c.get_transport()
+        if t is not None:
+            t.set_keepalive(20)
+    except Exception:
+        pass
+
+    with _SSH_POOL_LOCK:
+        # Lost a race? Whoever published first wins; close ours.
+        existing = _SSH_POOL.get(host)
+        if existing is not None and existing.get_transport() and existing.get_transport().is_active():
+            try: c.close()
+            except Exception: pass
+            return existing
+        _SSH_POOL[host] = c
     return c
 
 
 def ssh_cmd(host: str, cmd: str, timeout: int = 10) -> str:
-    c = _ssh_connect(host)
-    _, so, _ = c.exec_command(cmd, timeout=timeout)
-    out = so.read().decode().strip()
-    c.close()
-    return out
+    try:
+        c = _ssh_connect(host)
+        _, so, _ = c.exec_command(cmd, timeout=timeout)
+        return so.read().decode().strip()
+    except (paramiko.SSHException, EOFError, OSError):
+        _ssh_pool_drop(host)
+        raise
 
 
 def ssh_cmd_rc(host: str, cmd: str, timeout: int = 30) -> tuple[str, int]:
     """Run cmd over SSH, return (combined_output, exit_code). Always combines
     stdout+stderr so callers never lose the failure reason."""
-    c = _ssh_connect(host)
-    _, so, se = c.exec_command(cmd, timeout=timeout)
-    out = so.read().decode().strip()
-    err = se.read().decode().strip()
-    rc = so.channel.recv_exit_status()
-    c.close()
+    try:
+        c = _ssh_connect(host)
+        _, so, se = c.exec_command(cmd, timeout=timeout)
+        out = so.read().decode().strip()
+        err = se.read().decode().strip()
+        rc = so.channel.recv_exit_status()
+    except (paramiko.SSHException, EOFError, OSError):
+        _ssh_pool_drop(host)
+        raise
     combined = (out + ("\n" + err if err else "")).strip()
     return combined, rc
 
@@ -649,6 +802,665 @@ def build_physical_topology(nodes_data: dict) -> dict:
 
 app = FastAPI(title="Bedrock Cluster Manager")
 
+
+# ── Auth middleware ─────────────────────────────────────────────────
+# Every /api/* request must carry either:
+#   - operator Bearer token (issued by /api/login), OR
+#   - peer Ed25519 signature (`Authorization: Bedrock-Ed25519 ...`)
+# Public-path allow-list covers discovery, login, the join handshake
+# (joiner doesn't yet have credentials), and the static dashboard
+# assets (the browser fetches HTML/JS/CSS before login).
+
+from fastapi.responses import JSONResponse as _JSONResponse  # noqa: E402
+
+_PUBLIC_PREFIXES = (
+    "/_app/", "/favicon", "/static/", "/assets/",
+)
+_PUBLIC_EXACT = {
+    "/", "/login", "/cluster-info", "/health",
+    "/api/login",
+    "/api/join/request", "/api/join/status",
+}
+
+
+def _is_public(path: str) -> bool:
+    if path in _PUBLIC_EXACT:
+        return True
+    for pfx in _PUBLIC_PREFIXES:
+        if path.startswith(pfx):
+            return True
+    # SvelteKit routes that the browser may hit before login (the
+    # static-adapter prerenders them). Treat all non-/api/ paths as
+    # static-page-fetches → the route guard does the redirect to /login.
+    if not path.startswith("/api/") and not path.startswith("/ws"):
+        return True
+    return False
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if _is_public(path):
+        return await call_next(request)
+
+    authz = request.headers.get("authorization", "")
+    if authz.startswith("Bearer "):
+        try:
+            _op_auth.verify_token(authz[7:].strip())
+            return await call_next(request)
+        except ValueError as e:
+            return _JSONResponse({"detail": f"operator auth: {e}"}, status_code=401)
+
+    if authz.startswith(_peer_auth.SCHEME + " "):
+        body = await request.body()
+        # Restore body for the route handler. Without this, request.body()
+        # in the handler hangs because the stream is already drained.
+
+        async def _receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request._receive = _receive
+
+        def _lookup(node_name: str):
+            cluster = load_cluster()
+            n = (cluster.get("nodes") or {}).get(node_name) or {}
+            pk_hex = (n.get("bedrock_pubkey") or "").strip()
+            try:
+                return bytes.fromhex(pk_hex) if pk_hex else None
+            except ValueError:
+                return None
+        try:
+            _peer_auth.verify(
+                authz, request.method,
+                path + (("?" + request.url.query) if request.url.query else ""),
+                body, _lookup)
+            return await call_next(request)
+        except ValueError as e:
+            return _JSONResponse({"detail": f"peer auth: {e}"}, status_code=401)
+
+    return _JSONResponse({"detail": "authentication required"}, status_code=401)
+
+
+# Smoke endpoint for the Ed25519 framework. Returns the caller's verified
+# node name. Used by tests + operators wanting to confirm that inter-node
+# signing is wired up correctly.
+@app.get("/api/peer-test")
+def peer_test(node: str = Depends(require_peer)):
+    return {"verified_caller": node}
+
+
+# ── Operator login (piece #2) ───────────────────────────────────────
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+
+# Per-IP leaky-bucket rate limiter so a brute-forcer can't fill the
+# event loop with PBKDF2 work. 5 fails/min/IP; resets on success.
+_LOGIN_BUCKET: dict[str, list[float]] = {}
+_LOGIN_MAX = 5
+_LOGIN_WINDOW_S = 60
+
+
+def _login_throttle(ip: str) -> bool:
+    """Returns True if the request should be rejected."""
+    import time as _t
+    now = _t.time()
+    bucket = [t for t in _LOGIN_BUCKET.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _LOGIN_BUCKET[ip] = bucket
+    return len(bucket) >= _LOGIN_MAX
+
+
+def _login_record_fail(ip: str) -> None:
+    import time as _t
+    _LOGIN_BUCKET.setdefault(ip, []).append(_t.time())
+
+
+@app.post("/api/login")
+def login(req: LoginReq, request: Request):
+    ip = request.client.host if request.client else "?"
+    if _login_throttle(ip):
+        raise HTTPException(429, "too many failed logins, try again in a minute")
+    ops = (load_cluster().get("operators") or {})
+    op = ops.get(req.username) or {}
+    if not _op_auth.verify_password(req.password, op.get("salt", ""), op.get("hash", "")):
+        _login_record_fail(ip)
+        # Constant-ish response time: PBKDF2 already ran for ~150ms regardless
+        # of whether the user exists. Don't differentiate "no such user" vs
+        # "wrong password" in the response.
+        raise HTTPException(401, "invalid credentials")
+    token, exp = _op_auth.mint_token(req.username)
+    push_log(f"operator {req.username!r} logged in from {ip}",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {"token": token, "exp": exp, "user": req.username}
+
+
+@app.get("/api/whoami")
+def whoami(user: str = Depends(require_operator)):
+    return {"user": user}
+
+
+# ── Operator management (passwd / list / remove) ───────────────────
+
+class OperatorSet(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/api/operators")
+def list_operators(user: str = Depends(require_operator)):
+    """Return the list of operator usernames. Hashes are NOT exposed —
+    they're write-only via the cluster log."""
+    ops = (load_cluster().get("operators") or {})
+    return {"operators": sorted(ops.keys())}
+
+
+@app.post("/api/operators/set")
+def set_operator(req: OperatorSet, user: str = Depends(require_operator)):
+    """Upsert an operator credential. `bedrock operator passwd <user>`
+    uses this — same endpoint adds a new operator OR changes an
+    existing one's password (the log entry is upsert-shaped). Operator
+    must already be authenticated; we don't require the OLD password
+    because the Bearer token already proves authority.
+    """
+    if not req.username or not req.password:
+        raise HTTPException(400, "username and password required")
+    if len(req.password) < 4:
+        raise HTTPException(400, "password too short (min 4 chars for now)")
+    salt, phash = _op_auth.hash_password(req.password)
+    try:
+        _bs.operator_set(
+            username=req.username, salt=salt, password_hash=phash)
+    except Exception as e:
+        raise HTTPException(503, f"could not set operator: {e}")
+    push_log(f"operator {user!r} set password for {req.username!r}",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {"username": req.username, "status": "set"}
+
+
+class OperatorRemove(BaseModel):
+    username: str
+
+
+@app.post("/api/operators/remove")
+def remove_operator(req: OperatorRemove, user: str = Depends(require_operator)):
+    """Delete an operator. Refuses to remove the last operator — that
+    would lock the cluster's dashboard. Also refuses to remove
+    yourself (operator must be removed by a different operator, so
+    accidental lockout requires two mistakes)."""
+    ops = (load_cluster().get("operators") or {})
+    if req.username not in ops:
+        raise HTTPException(404, f"no such operator: {req.username!r}")
+    if req.username == user:
+        raise HTTPException(400, "refusing to remove yourself; "
+                                  "ask another operator")
+    if len(ops) <= 1:
+        raise HTTPException(400, "refusing to remove the last operator "
+                                  "(cluster would lock out)")
+    try:
+        _bs.operator_remove(username=req.username)
+    except Exception as e:
+        raise HTTPException(503, f"could not remove operator: {e}")
+    push_log(f"operator {user!r} removed {req.username!r}",
+             node="mgmt", app="bedrock-mgmt", level="warn")
+    return {"username": req.username, "status": "removed"}
+
+
+# ── Join handshake (piece #3) ───────────────────────────────────────
+# A joiner doesn't yet have an operator token or a recognised peer
+# identity, so /api/join/request is UNAUTH. The privacy of the
+# handshake comes from:
+#   - operator visually verifying the Ed25519 fingerprint on approval,
+#   - X25519 ECDH so cluster.key never traverses the wire in plaintext.
+# The request id alone doesn't authorise anything: it's a handle the
+# joiner polls; the master only acts when an operator approves.
+
+class JoinRequest(BaseModel):
+    node_name: str
+    host: str
+    bedrock_pubkey: str           # joiner's Ed25519 identity (hex)
+    x25519_eph_pubkey: str        # joiner's X25519 ephemeral (base64)
+    ssh_pubkey: str = ""          # joiner's OpenSSH ed25519 line (`ssh-ed25519 …`)
+
+
+# In-memory cache of master's X25519 private halves, keyed by request_id.
+# When operator approves, we look up the private key here, do ECDH +
+# AEAD, then drop the private key. Lost on mgmt restart — joiners that
+# polled before approval and saw their request go stale need to retry,
+# which is correct UX for a security-critical handshake.
+_MASTER_EPH_PRIV: dict[str, "X25519PrivateKey"] = {}   # noqa: F821
+
+
+@app.post("/api/join/request")
+def join_request(req: JoinRequest):
+    """Joiner asks to join. We log the request (replicates everywhere
+    so any node's dashboard shows the popup); operator decides.
+
+    `ssh_pubkey` is the joiner's OpenSSH `ssh-ed25519 …` line — kept on
+    the in-process pending map (NOT in the log; we don't want to leak
+    half-baked SSH identities into the replicated state) and installed
+    on every node's authorized_keys when the operator approves.
+    """
+    rid = _join_hs.new_request_id()
+    fp = _join_hs.fingerprint(req.bedrock_pubkey)
+    try:
+        _bs.join_request(
+            request_id=rid,
+            node_name=req.node_name,
+            host=req.host,
+            bedrock_pubkey=req.bedrock_pubkey,
+            x25519_eph_pubkey=req.x25519_eph_pubkey,
+            fingerprint=fp,
+        )
+    except Exception as e:
+        raise HTTPException(503, f"could not record join request: {e}")
+    # Cache the SSH pubkey + host so the approve handler can install it
+    # without needing the joiner to re-send.
+    _PENDING_SSH_PUBKEYS[rid] = {"ssh_pubkey": req.ssh_pubkey, "host": req.host}
+    push_log(f"join request: {req.node_name} ({req.host}) fp={fp}",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {"request_id": rid, "fingerprint": fp}
+
+
+# Side-channel for the joiner's SSH pubkey + host, by request_id.
+# Lives in memory only; lost on restart. If the operator approves after
+# a mgmt restart, the approve handler still works for the crypto path
+# but skips the SSH pubkey installation — peer-SSH from this node to
+# the joiner won't work until `bedrock node refresh-keys` (TODO).
+_PENDING_SSH_PUBKEYS: dict[str, dict] = {}
+
+
+@app.get("/api/join/status")
+def join_status(id: str):
+    """Joiner polls this to learn whether an operator approved or
+    rejected. No auth — the request_id is the handle (unguessable
+    192-bit secret)."""
+    cluster = load_cluster()
+    req = (cluster.get("join_requests") or {}).get(id)
+    if not req:
+        raise HTTPException(404, "unknown request_id")
+    out = {"state": req.get("state", "pending")}
+    if out["state"] == "approved":
+        # ECDH bundle so the joiner can decrypt cluster.key.
+        out["master_eph_pubkey"] = req.get("master_eph_pubkey", "")
+        out["ciphertext"] = req.get("ciphertext", "")
+        out["nonce"] = req.get("nonce", "")
+        # Cluster membership the joiner needs to finish install. All
+        # this lives in the replicated snapshot anyway, but inlining it
+        # here saves the joiner a second authenticated round-trip.
+        node_name = req.get("node_name", "")
+        node_info = (cluster.get("nodes") or {}).get(node_name) or {}
+        peer_pubkeys = []
+        peer_ips = []
+        for n_name, n in (cluster.get("nodes") or {}).items():
+            if n_name == node_name:
+                continue
+            if n.get("pubkey"):
+                peer_pubkeys.append(n["pubkey"])
+            if n.get("host"):
+                peer_ips.append(n["host"])
+            if n.get("drbd_ip"):
+                peer_ips.append(n["drbd_ip"])
+        # mgmt-master's address — that's where the joiner's bedrock-rust
+        # dials to start log replication. Falls back to first node with
+        # "mgmt" in role if mgmt_master isn't set yet.
+        master_name = None
+        for n_name, n in (cluster.get("nodes") or {}).items():
+            if "mgmt" in (n.get("role", "") or ""):
+                master_name = n_name; break
+        master_addr = ((cluster.get("nodes") or {}).get(master_name, {})
+                       .get("loopback_ip")
+                       or (cluster.get("nodes") or {}).get(master_name, {})
+                       .get("host", "")) if master_name else ""
+        out.update({
+            "cluster_name": cluster.get("cluster_name", "bedrock"),
+            "cluster_uuid": cluster.get("cluster_uuid", ""),
+            "loopback_ip":  node_info.get("loopback_ip", ""),
+            "peer_pubkeys": peer_pubkeys,
+            "peer_ips":     sorted(set(peer_ips)),
+            "master_drbd_ip": master_addr,
+            "nodes":        list((cluster.get("nodes") or {}).keys()),
+        })
+    elif out["state"] == "rejected":
+        out["reason"] = req.get("reason", "")
+    return out
+
+
+@app.get("/api/join/pending")
+def join_pending(user: str = Depends(require_operator)):
+    """Dashboard polls this to drive the approval popup."""
+    cluster = load_cluster()
+    items = []
+    for rid, r in (cluster.get("join_requests") or {}).items():
+        if r.get("state") == "pending":
+            items.append({"request_id": rid, **r})
+    return {"pending": items}
+
+
+class JoinApprove(BaseModel):
+    request_id: str
+
+
+@app.post("/api/join/approve")
+def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
+    cluster = load_cluster()
+    pending = (cluster.get("join_requests") or {}).get(req.request_id) or {}
+    if pending.get("state") != "pending":
+        raise HTTPException(400, f"request not pending (state={pending.get('state')!r})")
+
+    # Generate master's ephemeral X25519 + seal cluster.key under the ECDH
+    # session key (HKDF salted with request_id).
+    master_priv, master_pub_b64 = _join_hs.gen_ephemeral()
+    cluster_key = Path("/etc/bedrock/cluster.key").read_bytes()
+    ciphertext_b64, nonce_b64 = _join_hs.seal(
+        master_priv, pending["x25519_eph_pubkey"],
+        req.request_id, cluster_key)
+
+    # Allocate the joiner's loopback /32 by scanning the log for taken
+    # indices (single source of truth — rqlite.nodes is authoritative,
+    # cluster.json may briefly lag).
+    used_loopbacks: set[str] = set()
+    try:
+        with _rqlite.RqliteClient() as _rc:
+            for row in _rc.query(
+                "SELECT loopback_ip FROM nodes WHERE loopback_ip <> ''",
+                level="strong",
+            ):
+                used_loopbacks.add(row["loopback_ip"])
+    except Exception:
+        used_loopbacks = {n.get("loopback_ip")
+                          for n in (cluster.get("nodes") or {}).values()
+                          if n.get("loopback_ip")}
+    _sys_peerauth.path.insert(0, "/usr/local/lib/bedrock")
+    from lib import cluster_addr as _ca
+    next_loopback = ""
+    for i in range(1, 250):
+        cand = _ca.node_loopback_ip(cluster.get("cluster_uuid", ""), i)
+        if cand not in used_loopbacks:
+            next_loopback = cand; break
+
+    # Pull joiner's SSH pubkey from the in-memory side-channel (was
+    # cached at /api/join/request time — see _PENDING_SSH_PUBKEYS).
+    ssh_info = _PENDING_SSH_PUBKEYS.pop(req.request_id, {}) or {}
+    joiner_ssh_pubkey = (ssh_info.get("ssh_pubkey") or "").strip()
+
+    # Install the joiner's SSH pubkey locally (mgmt → joiner SSH works)
+    # AND fan it out to every existing peer (peer → joiner SSH works).
+    # Without this, the moment any node tries paramiko-probe the
+    # joiner, sshd auth-fails accumulate per-source-IP penalties until
+    # OpenSSH PerSourcePenalties stops accepting from that source for
+    # up to 10 minutes — manifesting as the joiner flapping Offline on
+    # every dashboard.
+    if joiner_ssh_pubkey:
+        _append_authorized_key(joiner_ssh_pubkey)
+        for n_name, n in (cluster.get("nodes") or {}).items():
+            host = n.get("host", "")
+            if host and host != pending["host"]:
+                try:
+                    _append_authorized_key(joiner_ssh_pubkey, host)
+                except Exception as _e:
+                    push_log(f"fan-out pubkey to {host} failed: {_e}",
+                             node="mgmt", app="bedrock-mgmt", level="warn")
+
+    # Auto-promote on the 1→2 transition: if the cluster currently has
+    # only 1 metrics/logs backend, appoint the joiner as the 2nd one.
+    # N≥3 joins do NOT change the backend list — they stay agent-only
+    # nodes (decommission/promote-spare is a separate operator action,
+    # not implemented yet).
+    obs_now = (cluster.get("obs_backends") or {})
+    metrics_bk = list(obs_now.get("metrics") or [])
+    logs_bk    = list(obs_now.get("logs") or [])
+    promote_metrics = len(metrics_bk) < 2 and pending["node_name"] not in metrics_bk
+    promote_logs    = len(logs_bk)    < 2 and pending["node_name"] not in logs_bk
+    if promote_metrics:
+        metrics_bk.append(pending["node_name"])
+    if promote_logs:
+        logs_bk.append(pending["node_name"])
+
+    # If we're promoting this joiner to a backend slot AND there's an
+    # existing backend with data, seed the joiner's data dir from the
+    # existing backend BEFORE the snapshot says "joiner is a backend".
+    # That way the reactor doesn't start an empty backend that agents
+    # then dual-write into — we'd accumulate a gap until 90d
+    # Stage the auto-promote: same agents-first → seed → start ordering
+    # as `observability_promote`. See that handler for the rationale —
+    # this block keeps the same shape so behaviour stays consistent.
+
+    # Phase 1: log node_register + node_loopback + (optionally) the
+    # OBS_BACKENDS_SET that adds the joiner. Agents on every node then
+    # reconfigure to dual-write toward the joiner (queuing because the
+    # joiner's bedrock-vm isn't up yet). The joiner's reactor writes
+    # the unit file but `_can_start_vm_backend` keeps bedrock-vm
+    # stopped until the seed populates the data dir.
+    try:
+        with _rqlite.RqliteClient() as _rc:
+            _bs.node_register(
+                node_name=pending["node_name"],
+                host=pending["host"],
+                drbd_ip="",
+                role="compute",
+                pubkey=joiner_ssh_pubkey,
+                bedrock_pubkey=pending["bedrock_pubkey"],
+                client=_rc,
+            )
+            if next_loopback:
+                _bs.node_loopback(
+                    node_name=pending["node_name"],
+                    loopback_ip=next_loopback,
+                    client=_rc,
+                )
+            if promote_metrics or promote_logs:
+                _bs.obs_backends_set(
+                    metrics=metrics_bk, logs=logs_bk, client=_rc)
+            _bs.join_resolved(
+                request_id=req.request_id,
+                decision="approved",
+                master_eph_pubkey=master_pub_b64,
+                ciphertext=ciphertext_b64,
+                nonce=nonce_b64,
+                client=_rc,
+            )
+    except Exception as e:
+        raise HTTPException(503, f"could not record approval: {e}")
+
+    # Phase 2: brief wait for agents to fold the new entry + start
+    # queueing writes for the joiner.
+    if promote_metrics or promote_logs:
+        import time as _t
+        _t.sleep(2)
+
+    # Phase 3: seed the joiner's data dir from the existing backend.
+    # Writes that arrived between the snapshot point and the joiner's
+    # backend-start are safe in the agents' disk queues; they drain
+    # in phase 4.
+    if (promote_metrics and obs_now.get("metrics")) or \
+       (promote_logs and obs_now.get("logs")):
+        try:
+            from lib import observability as _obs
+            existing_metrics_bk = (obs_now.get("metrics") or [])
+            source_metrics_host = ((cluster.get("nodes") or {})
+                                   .get(existing_metrics_bk[0], {}).get("host", "")) \
+                                  if existing_metrics_bk else ""
+            target_host = pending["host"]
+
+            def _runner(host: str, cmd: str, timeout: int = 60):
+                return ssh_cmd_rc(host, cmd, timeout=timeout)
+
+            if promote_metrics and source_metrics_host:
+                push_log(f"seeding metrics backend on {pending['node_name']} from {source_metrics_host}",
+                         node="mgmt", app="bedrock-mgmt", level="info")
+                rep = _obs.seed_backend(source_metrics_host, target_host,
+                                        _runner, None)
+                push_log(f"metrics seed: {rep.get('metrics','?')}",
+                         node="mgmt", app="bedrock-mgmt", level="info")
+        except Exception as e:
+            push_log(f"seed_backend warning: {e}",
+                     node="mgmt", app="bedrock-mgmt", level="warn")
+
+    # Phase 4: start bedrock-vm on the joiner (the seed gate kept it
+    # stopped; explicit kick gets it running with the seeded data).
+    # bedrock-vl was already started by the reactor (no seed for VL).
+    if promote_metrics and pending["host"]:
+        try:
+            ssh_cmd(pending["host"], "systemctl start bedrock-vm.service", timeout=20)
+        except Exception as e:
+            push_log(f"could not start bedrock-vm on {pending['node_name']}: {e}",
+                     node="mgmt", app="bedrock-mgmt", level="warn")
+    push_log(f"operator {user!r} approved join {pending['node_name']} ({pending['host']})",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {"state": "approved", "loopback_ip": next_loopback}
+
+
+class JoinReject(BaseModel):
+    request_id: str
+    reason: str = ""
+
+
+# ── Observability backend management (operator CLI) ─────────────────
+
+class ObsPromote(BaseModel):
+    new_node: str
+    replace: str = ""
+    kind: str = "both"   # "both", "metrics", or "logs"
+
+
+@app.post("/api/observability/promote")
+def observability_promote(req: ObsPromote, user: str = Depends(require_operator)):
+    """Add or swap a backend in `obs_backends`. Runs the vmbackup-
+    vmrestore seed BEFORE flipping the snapshot so the new backend
+    isn't visible until it's caught up. Synchronous — operator CLI
+    waits on this call."""
+    cluster = load_cluster()
+    nodes = (cluster.get("nodes") or {})
+    if req.new_node not in nodes:
+        raise HTTPException(400, f"unknown node {req.new_node!r}")
+    obs = (cluster.get("obs_backends") or {})
+    metrics_bk = list(obs.get("metrics") or [])
+    logs_bk    = list(obs.get("logs") or [])
+    do_metrics = req.kind in ("both", "metrics")
+    do_logs    = req.kind in ("both", "logs")
+
+    def _slot(curr: list[str]) -> tuple[list[str], str]:
+        """Compute the post-promote list + source for seeding. Returns
+        (new_list, source_host_or_'')."""
+        if req.new_node in curr:
+            return curr, ""   # nothing to do — already a backend
+        if len(curr) < 2:
+            # Free slot available; just append.
+            return curr + [req.new_node], (nodes.get(curr[0], {}).get("host", "") if curr else "")
+        # Both slots full → must replace.
+        if not req.replace:
+            raise HTTPException(400, "both backend slots full; pass --replace")
+        if req.replace not in curr:
+            raise HTTPException(400, f"--replace {req.replace!r} not in current backend list {curr}")
+        # Seed from the OTHER existing backend (the one we're keeping).
+        keep = [b for b in curr if b != req.replace][0]
+        return [n if n != req.replace else req.new_node for n in curr], \
+               nodes.get(keep, {}).get("host", "")
+
+    new_metrics, src_metrics = (_slot(metrics_bk) if do_metrics else (metrics_bk, ""))
+    new_logs,    src_logs    = (_slot(logs_bk)    if do_logs    else (logs_bk, ""))
+
+    target_host = nodes[req.new_node].get("host", "")
+    if not target_host:
+        raise HTTPException(503, f"{req.new_node!r} has no host address")
+
+    # === Phase 1: flip the snapshot FIRST. ===
+    # This puts the new node into the agent target list everywhere.
+    # Every node's vmagent + vlagent reconfigures and starts dual-
+    # writing to the new target — which isn't accepting yet, so writes
+    # accumulate in the agent disk queue. The new node's reactor sees
+    # itself in `obs_backends` but `_can_start_vm_backend` returns
+    # False (data dir empty + not solo backend), so bedrock-vm stays
+    # stopped. bedrock-vl starts (VL has no seed path).
+    try:
+        _bs.obs_backends_set(metrics=new_metrics, logs=new_logs)
+    except Exception as e:
+        raise HTTPException(503, f"could not set obs backends: {e}")
+
+    # Give agents a moment to fold the entry + reconfigure. Two seconds
+    # is enough on the testbed; the orchestrator subscriber polls fast.
+    # If we skipped this and went straight to seed, agents would still
+    # be configured for the OLD target list and writes between snapshot
+    # and start would land only on the source — exactly the gap this
+    # reorder eliminates.
+    import time as _t
+    _t.sleep(2)
+
+    # === Phase 2: seed the new node's data dir. ===
+    # During this window: agents are buffering for the new target;
+    # source backend is still serving reads. vmbackup snapshots the
+    # source at this instant, ships, vmrestores into the target's data
+    # dir. The seed is "frozen in time" from this snapshot moment.
+    seed_report = {}
+    try:
+        from lib import observability as _obs
+
+        def _runner(host: str, cmd: str, timeout: int = 60):
+            return ssh_cmd_rc(host, cmd, timeout=timeout)
+
+        # `force=True` whenever we're replacing an existing backend.
+        # The new node might have stale data from a previous tenancy
+        # as a backend; without force, seed_backend's "data dir is
+        # not empty, skip" guard would leave that stale data in
+        # place. For a free-slot promote (cluster expansion 1→2),
+        # the empty-data-dir check is the right safety net.
+        _force = bool(req.replace)
+        if do_metrics and src_metrics and req.new_node not in metrics_bk:
+            rep = _obs.seed_backend(src_metrics, target_host, _runner, None,
+                                    force=_force)
+            seed_report["metrics"] = rep.get("metrics", "?")
+        if do_logs and src_logs and req.new_node not in logs_bk:
+            if src_logs != src_metrics or not do_metrics:
+                rep = _obs.seed_backend(src_logs, target_host, _runner, None,
+                                        force=_force)
+            seed_report["logs"] = rep.get("logs", "?")
+    except Exception as e:
+        push_log(f"obs.seed_backend warning: {e}",
+                 node="mgmt", app="bedrock-mgmt", level="warn")
+
+    # === Phase 3: start the backend daemon on the new node. ===
+    # Reactor's seed gate keeps bedrock-vm stopped until the data dir
+    # is populated. We just populated it via vmrestore, so SSH in and
+    # start it explicitly. Once it's up, agents drain their disk-queue
+    # buffers (writes that accumulated during phases 1+2) into the new
+    # backend — convergence with zero data gap.
+    if do_metrics and req.new_node in new_metrics and target_host:
+        try:
+            ssh_cmd(target_host, "systemctl start bedrock-vm.service", timeout=20)
+        except Exception as e:
+            push_log(f"could not start bedrock-vm on {req.new_node}: {e}",
+                     node="mgmt", app="bedrock-mgmt", level="warn")
+
+    _replace_disp = req.replace or "-"
+    push_log(f"operator {user!r} promoted {req.new_node!r} "
+             f"(replace={_replace_disp}, kind={req.kind})",
+             node="mgmt", app="bedrock-mgmt", level="info")
+    return {
+        "metrics_backends": new_metrics,
+        "logs_backends":    new_logs,
+        "seed_report":      seed_report,
+    }
+
+
+@app.post("/api/join/reject")
+def join_reject(req: JoinReject, user: str = Depends(require_operator)):
+    cluster = load_cluster()
+    pending = (cluster.get("join_requests") or {}).get(req.request_id) or {}
+    if pending.get("state") != "pending":
+        raise HTTPException(400, f"request not pending (state={pending.get('state')!r})")
+    try:
+        _bs.join_resolved(
+            request_id=req.request_id,
+            decision="rejected",
+            reason=req.reason or "denied by operator",
+        )
+    except Exception as e:
+        raise HTTPException(503, f"could not record rejection: {e}")
+    push_log(f"operator {user!r} rejected join {pending.get('node_name','?')}",
+             node="mgmt", app="bedrock-mgmt", level="warn")
+    return {"state": "rejected"}
+
 # ── WebSocket endpoint ──────────────────────────────────────────────────────
 
 # Last-known cluster state. The state push loop fills it; /ws and /api/cluster
@@ -658,6 +1470,14 @@ _last_state: dict = {"nodes": {}, "vms": {}, "witness": {"nodes": {}}}
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # WebSockets bypass the HTTP middleware. Token comes via query param
+    # because the browser WebSocket API can't set custom headers.
+    token = ws.query_params.get("token", "")
+    try:
+        _op_auth.verify_token(token)
+    except ValueError as e:
+        await ws.close(code=1008, reason=f"auth: {e}")
+        return
     await hub.connect(ws)
     # Push cached state immediately so the UI renders before the next refresh.
     await hub.send_to(ws, "cluster", _last_state)
@@ -795,7 +1615,8 @@ class NodeRegister(BaseModel):
     host: str
     drbd_ip: Optional[str] = None
     role: str = "compute"
-    pubkey: Optional[str] = None
+    pubkey: Optional[str] = None          # SSH ed25519 — paramiko mesh
+    bedrock_pubkey: Optional[str] = None  # Ed25519 identity — inter-node API auth
 
 
 def _append_authorized_key(pubkey: str, target_host: Optional[str] = None):
@@ -831,172 +1652,13 @@ def _read_local_pubkey() -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
-@app.post("/api/nodes/register")
-def register_node(req: NodeRegister):
-    """Called by `bedrock join` to register a new node with the cluster.
-
-    SSH mesh: the joining node sends its pubkey; we install it locally (so
-    mgmt's paramiko can reach the new node) and fan it out over existing SSH
-    trust to every previously-registered peer. In the response we return
-    every peer's pubkey so the joiner can trust them back.
-    """
-    cluster = load_cluster()
-    cluster.setdefault("nodes", {})
-
-    # Snapshot existing peers before adding this one, so we know who to fan out to.
-    prior_peers = [(name, n) for name, n in cluster["nodes"].items()
-                   if n.get("host") and n["host"] != req.host]
-
-    # Allocate a cluster identity (loopback IP) for the joiner. We
-    # number from 10.99.0.1 upwards: the mgmt master gets .1 (assigned
-    # at `bedrock init`), joiners get the lowest free /32 in the /24.
-    # /24 is enough for 250+ nodes; we'll panic loudly if we ever run
-    # out, but the design ceiling is well below that.
-    #
-    # Source of truth is the LOG, not cluster.json. cluster.json is a
-    # derived view that the orchestrator's fold transiently rewrites
-    # — between the node_register and node_loopback entries for the
-    # master at init time, the file briefly lacks the master's
-    # loopback_ip, and a concurrent register would dup-allocate .1.
-    # The log-direct read avoids that race entirely.
-    used_loopbacks: set[str] = set()
-    try:
-        import sys as _sys
-        _sys.path.insert(0, "/usr/local/lib/bedrock")
-        from lib import rust_ipc as _ipc, log_entries as _le
-        with _ipc.Daemon() as _d:
-            for _e in _d.read(from_index=1):
-                _p = _le.decode(_e["payload"])
-                if _p.get("t") == _le.NODE_LOOPBACK:
-                    lb = _p.get("loopback_ip", "")
-                    if lb:
-                        used_loopbacks.add(lb)
-    except Exception as _e:
-        log.warning(f"register: log-fold for used_loopbacks failed: {_e}; "
-                    f"falling back to cluster.json")
-        used_loopbacks = {n.get("loopback_ip") for n in cluster["nodes"].values()}
-    # Cluster's /24 lives in RFC 6598 Shared Address Space, derived
-    # from cluster_uuid (cluster_addr.cluster_loopback_prefix). Each
-    # joiner gets the lowest free /32 index.
-    import sys as _sys2
-    _sys2.path.insert(0, "/usr/local/lib/bedrock")
-    from lib import cluster_addr as _ca
-    next_loopback = ""
-    for i in range(1, 250):
-        candidate = _ca.node_loopback_ip(cluster.get("cluster_uuid", ""), i)
-        if candidate not in used_loopbacks:
-            next_loopback = candidate
-            break
-
-    cluster["nodes"][req.name] = {
-        "host": req.host,
-        "drbd_ip": req.drbd_ip or "",
-        "tb_ip": req.drbd_ip or "",  # use DRBD for migration URI (no USB4 in testbed)
-        "eno_ip": req.drbd_ip or "",
-        "role": req.role,
-        "loopback_ip": next_loopback,
-        "cockpit": f"https://{req.host}:9090",
-        "pubkey": (req.pubkey or "").strip(),
-    }
-    save_cluster(cluster)
-
-    # SSH mesh: (a) trust joiner from mgmt, (b) trust joiner from every prior peer,
-    # (c) return every peer's pubkey (including mgmt's) for the joiner to trust back.
-    peer_pubkeys = []
-    mgmt_pubkey = _read_local_pubkey()
-    if mgmt_pubkey:
-        peer_pubkeys.append(mgmt_pubkey)
-    if req.pubkey:
-        _append_authorized_key(req.pubkey)                 # mgmt trusts joiner
-        for name, n in prior_peers:
-            _append_authorized_key(req.pubkey, n["host"])  # peer trusts joiner
-    for name, n in prior_peers:
-        if n.get("pubkey"):
-            peer_pubkeys.append(n["pubkey"])
-
-    push_log(f"Node {req.name} ({req.host}) registered with cluster",
-             node="mgmt", app="bedrock-mgmt", level="info")
-
-    # L48 fix: dual-write the registration to the bedrock-rust log so
-    # the snapshot's `nodes` dict reflects the new member. Without
-    # this, downstream operations (maintenance mode, transfer-mgmt,
-    # witness arbitration) all see an empty cluster from the
-    # snapshot's perspective.
-    try:
-        from pathlib import Path as _P
-        if _P("/run/bedrock-rust.sock").exists():
-            import sys as _sys
-            _sys.path.insert(0, "/usr/local/lib/bedrock")
-            from lib import rust_ipc as _ipc, log_entries as _le
-            with _ipc.Daemon() as d:
-                # cluster_init only on the very first registration —
-                # afterwards we keep the same cluster_name + uuid.
-                if len(cluster.get("nodes", {})) == 1:
-                    d.append(_le.cluster_init(
-                        name=cluster.get("cluster_name", "bedrock"),
-                        uuid=cluster.get("cluster_uuid", ""),
-                    ))
-                d.append(_le.node_register(
-                    node_name=req.name, host=req.host,
-                    drbd_ip=req.drbd_ip or "",
-                    role="compute",
-                    pubkey=req.pubkey or "",
-                ))
-                if next_loopback:
-                    d.append(_le.node_loopback(
-                        node_name=req.name,
-                        loopback_ip=next_loopback,
-                    ))
-    except Exception as e:
-        log.warning(f"node_register log-append skipped: {e}")
-
-    # Return all peer IPs so the joining node can pre-populate known_hosts
-    # for virsh migrate / DRBD SSH over both mgmt and replication networks.
-    peer_ips = []
-    for n in cluster["nodes"].values():
-        if n.get("host"): peer_ips.append(n["host"])
-        if n.get("drbd_ip"): peer_ips.append(n["drbd_ip"])
-    # Cluster key + master's DRBD-ring IP, so the joining node's
-    # bedrock-rust daemon comes up with a matching AEAD key and knows
-    # which peer to dial. Without these, joiners would generate a fresh
-    # cluster_key (witness AEAD wouldn't validate cross-node) and have
-    # no peer to replicate from. Phase 5 cutover prerequisite.
-    cluster_key_hex = ""
-    try:
-        from pathlib import Path as _P
-        ck = _P("/etc/bedrock/cluster.key")
-        if ck.exists():
-            cluster_key_hex = ck.read_bytes().hex()
-    except Exception:
-        pass
-    # Address the joiner's bedrock-rust should dial to start log
-    # replication. Preference order:
-    #   1. loopback_ip — the mesh cluster identity. Kernel route to
-    #      the /32 picks the best NIC; bedrock-rust gets multi-path
-    #      failover for free.
-    #   2. drbd_ip — legacy dedicated peer-link.
-    #   3. host — mgmt LAN, always-true fallback.
-    # Field name kept as `master_drbd_ip` for wire-format
-    # compatibility with older joiners. The render path
-    # (daemon_setup.render_from_snapshot) applies the same
-    # preference order once the snapshot folds in.
-    master_drbd_ip = ""
-    for n_name, n in cluster.get("nodes", {}).items():
-        if "mgmt" in n.get("role", ""):
-            master_drbd_ip = (n.get("loopback_ip")
-                              or n.get("drbd_ip")
-                              or n.get("host", ""))
-            if master_drbd_ip:
-                break
-
-    return {"status": "registered", "cluster": cluster.get("cluster_name"),
-            "cluster_uuid": cluster.get("cluster_uuid", ""),
-            "nodes": list(cluster["nodes"].keys()),
-            "loopback_ip": next_loopback,
-            "peer_ips": sorted(set(peer_ips)),
-            "peer_pubkeys": peer_pubkeys,
-            "cluster_key_hex": cluster_key_hex,
-            "master_drbd_ip": master_drbd_ip}
+# /api/nodes/register removed — replaced by the join-handshake flow
+# (`POST /api/join/request` → operator approval → `POST /api/join/approve`).
+# The new flow does the same SSH-pubkey fan-out, allocates the loopback
+# IP, and logs node_register+node_loopback, but cluster.key now ships
+# AEAD-sealed under an ECDH session key (see installer/lib/join_handshake.py)
+# instead of plain in the response body. See pieces #2 + #3 of the
+# inter-node-auth work for the design.
 
 
 @app.get("/api/nodes")
@@ -1880,27 +2542,21 @@ async def api_vm_create(req: VMCreateRequest):
     # the cluster.
     home = _mgmt_node_name()
     intent_idx = None
-    intent_hash = None
+    intent_idx = None
     try:
-        from pathlib import Path as _P
-        if _P("/run/bedrock-rust.sock").exists():
-            from lib import rust_ipc as _ipc, log_entries as _le
-            with _ipc.Daemon() as d:
-                intent_idx, intent_hash = d.append(
-                    _le.vm_create_intent(
-                        name=req.name,
-                        vm_type=req.vm_type,
-                        host=home,
-                        ram_mb=int(req.ram_mb),
-                        disk_gb=int(req.disk_gb),
-                        requested_by=_os.environ.get("USER", "api"),
-                    )
-                )
+        intent_idx = _bs.vm_create_intent(
+            name=req.name,
+            vm_type=req.vm_type,
+            host=home,
+            ram_mb=int(req.ram_mb),
+            disk_gb=int(req.disk_gb),
+            requested_by=_os.environ.get("USER", "api"),
+        )
     except Exception as e:
-        # Daemon unreachable → fall through. Existing async path still
+        # rqlite unreachable → fall through. Existing async path still
         # creates the VM; we just don't get crash-recovery semantics
-        # for this run. v1 is permissive; v2 should make this fatal.
-        log.warning(f"vm_create_intent log-append skipped: {e}")
+        # for this run.
+        log.warning(f"vm_create_intent write skipped: {e}")
 
     task = task_registry().create(
         "vm.create",
@@ -1925,17 +2581,13 @@ async def api_vm_create(req: VMCreateRequest):
             task.step_done(f"provision {req.vm_type}")
             task.log(f"created: {result}")
             task.succeed()
-            # Settle the intent: append vm_created.
+            # Settle the intent: write vm_created.
             try:
-                from pathlib import Path as _P
-                if _P("/run/bedrock-rust.sock").exists():
-                    from lib import rust_ipc as _ipc, log_entries as _le
-                    with _ipc.Daemon() as d:
-                        d.append(_le.vm_created(
-                            name=req.name, vm_type=req.vm_type, host=home,
-                            ram_mb=int(req.ram_mb), disk_gb=int(req.disk_gb)))
+                _bs.vm_created(
+                    name=req.name, vm_type=req.vm_type, host=home,
+                    ram_mb=int(req.ram_mb), disk_gb=int(req.disk_gb))
             except Exception as e:
-                log.warning(f"vm_created log-append skipped: {e}")
+                log.warning(f"vm_created write skipped: {e}")
         except HTTPException as e:
             task.fail(f"{e.status_code}: {e.detail}")
             _log_create_failed(req.name, f"{e.status_code}: {e.detail}")
@@ -1945,8 +2597,7 @@ async def api_vm_create(req: VMCreateRequest):
 
     asyncio.create_task(_runner())
     return {"status": "accepted", "task_id": task.id, "name": req.name,
-            "intent_log_index": intent_idx,
-            "intent_log_hash": intent_hash.hex() if intent_hash else None}
+            "intent_revision": intent_idx}
 
 
 def _vm_create_replicated(req) -> dict:
@@ -1994,16 +2645,9 @@ def _log_create_failed(vm_name: str, reason: str) -> None:
     creator throws. Best-effort — logging shouldn't mask the original
     failure path."""
     try:
-        from pathlib import Path as _P
-        if not _P("/run/bedrock-rust.sock").exists():
-            return
-        import sys as _sys
-        _sys.path.insert(0, "/usr/local/lib/bedrock")
-        from lib import rust_ipc as _ipc, log_entries as _le
-        with _ipc.Daemon() as d:
-            d.append(_le.vm_create_failed(name=vm_name, reason=reason))
+        _bs.vm_create_failed(name=vm_name, reason=reason)
     except Exception as e:
-        log.warning(f"vm_create_failed log-append skipped: {e}")
+        log.warning(f"vm_create_failed write skipped: {e}")
 
 
 @app.delete("/api/vms/{vm_name}")
@@ -2366,10 +3010,6 @@ def api_backup_target_set(req: BackupTargetSetRequest):
 
     Credentials are NEVER in the log — only file paths and metadata
     (endpoint, bucket, region) make it into BACKUP_TARGET_SET."""
-    import sys as _sys
-    _sys.path.insert(0, "/usr/local/lib/bedrock")
-    from lib import rust_ipc as _ipc, log_entries as _le
-
     backup = _import_backup_module()
 
     propagation_warnings: list[str] = []
@@ -2428,28 +3068,27 @@ def api_backup_target_set(req: BackupTargetSetRequest):
     except Exception as e:
         raise HTTPException(400, f"backup target setup failed locally: {e}")
 
-    # ── (3) Append to log so peers get it via their reactors ──────
+    # ── (3) Persist to rqlite so peers get it via their reactors ──
     try:
-        with _ipc.Daemon() as d:
-            idx, _ = d.append(_le.backup_target_set(
-                target_id=req.target_id, kind=req.kind,
-                s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
-                s3_region=req.s3_region,
-                s3_disable_tls=req.s3_disable_tls,
-                s3_disable_tls_verification=req.s3_disable_tls_verification,
-                filesystem_path=req.filesystem_path,
-                override_source_prefix=req.override_source_prefix,
-                cache_directory=req.cache_directory,
-                reason=req.reason,
-            ))
+        rev = _bs.backup_target_set(
+            target_id=req.target_id, kind=req.kind,
+            s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
+            s3_region=req.s3_region,
+            s3_disable_tls=req.s3_disable_tls,
+            s3_disable_tls_verification=req.s3_disable_tls_verification,
+            filesystem_path=req.filesystem_path,
+            override_source_prefix=req.override_source_prefix,
+            cache_directory=req.cache_directory,
+            reason=req.reason,
+        )
     except Exception as e:
-        raise HTTPException(500, f"log append failed: {e}")
+        raise HTTPException(500, f"rqlite write failed: {e}")
 
     push_log(f"backup target {req.target_id!r} set ({req.kind})",
              app="bedrock-mgmt", level="info")
     return {
         "status": "ok",
-        "log_index": idx,
+        "revision": rev,
         "target_id": req.target_id,
         "warnings": propagation_warnings,
     }
@@ -2495,17 +3134,13 @@ def api_backups_list_all():
 
 @app.delete("/api/backup/targets/{target_id}")
 def api_backup_target_remove(target_id: str, reason: str = ""):
-    import sys as _sys
-    _sys.path.insert(0, "/usr/local/lib/bedrock")
-    from lib import rust_ipc as _ipc, log_entries as _le
     try:
-        with _ipc.Daemon() as d:
-            idx, _ = d.append(_le.backup_target_removed(
-                target_id=target_id, reason=reason or "operator-remove",
-            ))
+        rev = _bs.backup_target_removed(
+            target_id=target_id, reason=reason or "operator-remove",
+        )
     except Exception as e:
-        raise HTTPException(500, f"log append failed: {e}")
-    return {"status": "ok", "log_index": idx, "target_id": target_id}
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    return {"status": "ok", "revision": rev, "target_id": target_id}
 
 
 @app.post("/api/vms/{vm_name}/backup")
@@ -2634,8 +3269,6 @@ def api_vm_backup_schedule_set(vm_name: str, req: BackupScheduleSetRequest):
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).parent))
     import cron as _cron
-    _sys.path.insert(0, "/usr/local/lib/bedrock")
-    from lib import rust_ipc as _ipc, log_entries as _le
 
     cluster = load_cluster()
     if (cluster.get("vms") or {}).get(vm_name) is None:
@@ -2651,23 +3284,22 @@ def api_vm_backup_schedule_set(vm_name: str, req: BackupScheduleSetRequest):
         raise HTTPException(400, f"invalid cron expression: {e}")
 
     try:
-        with _ipc.Daemon() as d:
-            idx, _ = d.append(_le.backup_schedule_set(
-                vm=vm_name, target_id=req.target_id,
-                cron_expr=req.cron_expr,
-                label_prefix=req.label_prefix,
-                retention_count=req.retention_count,
-                reason=req.reason or "set via dashboard",
-            ))
+        rev = _bs.backup_schedule_set(
+            vm=vm_name, target_id=req.target_id,
+            cron_expr=req.cron_expr,
+            label_prefix=req.label_prefix,
+            retention_count=req.retention_count,
+            reason=req.reason or "set via dashboard",
+        )
     except Exception as e:
-        raise HTTPException(500, f"log append failed: {e}")
+        raise HTTPException(500, f"rqlite write failed: {e}")
 
     push_log(f"backup schedule set for VM {vm_name}: cron={req.cron_expr!r} "
              f"target={req.target_id}",
              app="bedrock-mgmt", level="info")
     return {
         "status": "ok",
-        "log_index": idx,
+        "revision": rev,
         "vm": vm_name,
         "cron_expr": req.cron_expr,
         "next_fires_utc": next_fires,
@@ -2676,17 +3308,13 @@ def api_vm_backup_schedule_set(vm_name: str, req: BackupScheduleSetRequest):
 
 @app.delete("/api/vms/{vm_name}/backup-schedule")
 def api_vm_backup_schedule_remove(vm_name: str, reason: str = ""):
-    import sys as _sys
-    _sys.path.insert(0, "/usr/local/lib/bedrock")
-    from lib import rust_ipc as _ipc, log_entries as _le
     try:
-        with _ipc.Daemon() as d:
-            idx, _ = d.append(_le.backup_schedule_removed(
-                vm=vm_name, reason=reason or "removed via dashboard",
-            ))
+        rev = _bs.backup_schedule_removed(
+            vm=vm_name, reason=reason or "removed via dashboard",
+        )
     except Exception as e:
-        raise HTTPException(500, f"log append failed: {e}")
-    return {"status": "ok", "log_index": idx, "vm": vm_name}
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    return {"status": "ok", "revision": rev, "vm": vm_name}
 
 
 @app.get("/api/cron/preview")
@@ -4675,18 +5303,38 @@ if ui_build.exists():
 # ── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import threading
     import uvicorn
-    # When the cert-refresh timer has dropped a fresh local-ip.co
-    # wildcard cert into /etc/bedrock/tls/, bind 8443 HTTPS so
-    # operators get a green padlock at https://<lan-ip-dashed>
-    # .my.local-ip.co:8443/. Without the cert, fall back to 8080
-    # HTTP. The cert-refresh systemd unit restarts this service
-    # after installing the cert, so the switch happens within
-    # seconds of the first successful refresh.
+    # Two listeners:
+    #   8080 HTTP  — intra-cluster control plane. Joiners, peer-to-peer
+    #                tier ops, storage transfers, view_builder URLs all
+    #                point here. Plain HTTP because cluster.key + the
+    #                trusted LAN are the security boundary; adding TLS
+    #                here would break every code path that constructs
+    #                http://<peer>:8080/... URLs.
+    #   8443 HTTPS — operator dashboard. Browser hits the green-padlock
+    #                wildcard cert from local-ip.co (refresh timer keeps
+    #                it ≤30 days from expiry). Only bound when a cert is
+    #                present — fresh installs serve 8080 only until the
+    #                cert-refresh OnBootSec=2min timer drops the first cert.
     cert = Path("/etc/bedrock/tls/cert.pem")
     key  = Path("/etc/bedrock/tls/key.pem")
     if cert.exists() and key.exists():
+        # 8080 → loopback only: removes the LAN attack surface for the
+        # unauthenticated control plane. The `bedrock` CLI on this node
+        # still works (it dials http://localhost:8080) and intra-process
+        # callers are fine. Anything off-host MUST go through 8443.
+        t = threading.Thread(
+            target=lambda: uvicorn.run(app, host="127.0.0.1", port=8080,
+                                       log_level="warning"),
+            daemon=True)
+        t.start()
         uvicorn.run(app, host="0.0.0.0", port=8443,
                     ssl_keyfile=str(key), ssl_certfile=str(cert))
     else:
+        # No cert yet (fresh install, cert-refresh hasn't fired). Bind
+        # 8080 LAN-wide so joiners can reach us in the gap before
+        # cert-refresh OnBootSec=2min runs. The window is brief and the
+        # next restart (triggered by cert install) flips to the safe
+        # loopback-bound layout above.
         uvicorn.run(app, host="0.0.0.0", port=8080)

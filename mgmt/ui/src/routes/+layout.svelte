@@ -3,8 +3,8 @@
 	import { page } from '$app/stores';
 	import { ws } from '$lib/ws';
 	import { nodes, vms, witness, topology, connected, lastUpdate, events, tasks,
-		type TaskInfo } from '$lib/stores';
-	import { apiGet } from '$lib/api';
+		pendingJoins, type TaskInfo } from '$lib/stores';
+	import { apiGet, getToken, clearToken } from '$lib/api';
 
 	let { children } = $props();
 
@@ -12,13 +12,40 @@
 	let vmsOpen = $state(true);
 	let taskDrawerOpen = $state(false);
 
+	// /login is a public page — render `children` only, no sidebar, no token gate.
+	let onLoginPage = $derived($page.url.pathname.startsWith('/login'));
+
 	// Reactive view of tasks: actives first, recents below. Subscribe
 	// explicitly so the badge count reacts (Svelte 5 $derived + store gotcha).
 	let tasksSnapshot = $state<TaskInfo[]>([]);
 	let activeCount = $derived(tasksSnapshot.filter(t => t.state === 'running' || t.state === 'pending').length);
 
 	onMount(() => {
+		if (onLoginPage) return;   // no ws, no fetches on the login screen
+
+		// Token gate — apiGet handles 401 redirects, but no token at all
+		// means a fresh visit and we should send the user to /login now
+		// (rather than make a no-op fetch first).
+		if (!getToken()) {
+			const back = window.location.pathname + window.location.search;
+			window.location.href = `/login?next=${encodeURIComponent(back)}`;
+			return;
+		}
+
 		ws.connect();
+
+		// Poll for pending join requests every 5s. Cheap GET; the response
+		// is empty most of the time. Stops looping if the user logs out.
+		// Result lands in the shared `pendingJoins` store so the main
+		// page (+page.svelte) can render the approval cards above the
+		// host grid, and the sidebar Hosts header can show a badge.
+		const pendingPoll = setInterval(async () => {
+			if (!getToken()) return;
+			try {
+				const r = await apiGet('/api/join/pending');
+				pendingJoins.set(r.pending || []);
+			} catch { /* 401 redirected; other errors quietly ignored */ }
+		}, 5000);
 
 		ws.on('cluster', (msg) => {
 			if (msg.nodes) nodes.set(msg.nodes);
@@ -55,8 +82,13 @@
 		}).catch(() => {});
 
 		const checkConn = setInterval(() => connected.set(ws.connected), 1000);
-		return () => { clearInterval(checkConn); unsubTasks(); };
+		return () => { clearInterval(checkConn); clearInterval(pendingPoll); unsubTasks(); };
 	});
+
+	function logout() {
+		clearToken();
+		window.location.href = '/login';
+	}
 
 	function fmtDur(ms: number | undefined): string {
 		if (!ms) return '';
@@ -81,6 +113,9 @@
 	function isActive(path: string): boolean { return curPath === path; }
 </script>
 
+{#if onLoginPage}
+	{@render children()}
+{:else}
 <div class="app">
 	<aside class="sidebar">
 		<div class="brand">
@@ -127,6 +162,12 @@
 					<a href="/hosts" class="tree-header-link">
 						<span class="tree-icon">▣</span> Hosts
 						<span class="count">{Object.keys($nodes).length}</span>
+						{#if $pendingJoins.length > 0}
+							<span class="pending-badge" data-testid="hosts-pending-badge"
+								title="{$pendingJoins.length} join request{$pendingJoins.length === 1 ? '' : 's'} awaiting approval">
+								{$pendingJoins.length}
+							</span>
+						{/if}
 					</a>
 				</div>
 				{#if hostsOpen}
@@ -175,6 +216,7 @@
 
 		<div class="sidebar-foot">
 			<div class="meta">{$lastUpdate || 'Connecting...'}</div>
+			<button class="logout" onclick={logout}>Sign out</button>
 		</div>
 	</aside>
 
@@ -225,7 +267,9 @@
 			{/if}
 		</aside>
 	{/if}
+
 </div>
+{/if}
 
 <style>
 	:global(body) {
@@ -448,4 +492,28 @@
 		overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 	}
 	@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+	.logout {
+		margin-top: 8px;
+		background: none;
+		border: 1px solid #30363d;
+		color: #8b949e;
+		font-size: 11px;
+		padding: 4px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		width: 100%;
+	}
+	.logout:hover { background: #161b22; color: #e6edf3; }
+
+	/* Pending action badge next to the Hosts header count. Amber so it
+	   stands out from the regular gray count chip; pulses so the eye
+	   catches it from a different page. */
+	.pending-badge {
+		background: #d29922; color: #000;
+		font-size: 10px; font-weight: 700;
+		padding: 1px 6px; border-radius: 8px;
+		margin-left: 4px;
+		animation: pulse 1.8s infinite;
+	}
 </style>

@@ -60,8 +60,11 @@ def cluster_loopback_net(cluster_uuid: str) -> str:
 
 def node_loopback_ip(cluster_uuid: str, node_index: int) -> str:
     """The /32 cluster identity address for `node_index` (1..250).
-    Master gets index 1; joiners get the lowest free index per
-    `mgmt /api/nodes/register`."""
+    Indices are assigned by registration order — the node that runs
+    `bedrock init` gets 1, subsequent joiners get the lowest free
+    index per `mgmt /api/nodes/register`. The mgmt-master role can
+    transfer between nodes later via `bedrock node transfer-mgmt`,
+    so don't assume `node_index == 1` means current leader."""
     if node_index < 1 or node_index > 254:
         raise ValueError(f"node_index out of range (1..254): {node_index}")
     return f"{cluster_loopback_prefix(cluster_uuid)}.{node_index}"

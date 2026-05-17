@@ -91,7 +91,7 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         # first-ever install where the dev box hasn't cached it yet.
         print("  Fetching virtio-win.iso (~750 MB, one-time)...")
         sources = [
-            f"{repo}/binaries/virtio-win.iso",
+            f"{repo}/virtio-win.iso",
             "https://fedorapeople.org/groups/virt/virtio-win/"
             "direct-downloads/stable-virtio/virtio-win.iso",
         ]
@@ -237,7 +237,7 @@ WantedBy=multi-user.target
     _Path("/etc/bedrock/cluster.json").write_text(_json.dumps(cluster, indent=2))
 
     print(f"  Cluster UUID: {s['cluster_uuid']}")
-    print(f"  Mgmt URL:     {s['mgmt_url']}")
+    print(f"  Dashboard:    https://{s['mgmt_ip']}:8443")
 
     # Storage tiers — N=1 single-node setup. Idempotent; safe on re-run.
     print()
@@ -278,31 +278,57 @@ WantedBy=multi-user.target
         daemon_setup.restart()
         print(f"  bedrock-rust running, IPC at /run/bedrock-rust.sock")
 
-        # L48 fix: cluster_init + master node_register entries so the
-        # snapshot's nodes dict has the master from the start.
-        # Subsequent maintenance/transfer/witness operations all need
-        # the snapshot to know about every node.
+        # Bootstrap the rqlite cluster-state store: apply schema,
+        # then seed cluster_info, master node_register, initial
+        # operator, mgmt_master, master loopback, and the master as
+        # the sole obs_backend. Per D-19, every subsequent mutation
+        # rides this same rqlite store + bumps revision.
         try:
             import time as _t
-            _t.sleep(1)   # daemon needs a moment to bind IPC
-            from . import rust_ipc as _ipc, log_entries as _le
-            with _ipc.Daemon() as d:
-                d.append(_le.cluster_init(
-                    name=cluster_name, uuid=s["cluster_uuid"]))
-                d.append(_le.node_register(
+            from pathlib import Path as _Path
+            _t.sleep(1)   # rqlited needs a moment to bind HTTP
+            from . import rqlite_client as _rc, bedrock_state as _bs
+            from . import peer_auth as _pa, operator_auth as _oa
+            # Master's Bedrock identity Ed25519 (idempotent across runs).
+            master_bedrock_pub = _pa.pubkey_hex()
+            # Seed the initial operator account so the dashboard is
+            # immediately usable. Test-setup default `root` / `admin`.
+            _salt, _phash = _oa.hash_password("admin")
+
+            with _rc.RqliteClient() as rqlite:
+                # Schema lives next to this file in the deployed lib dir.
+                _schema = _Path(__file__).parent / "bedrock_schema.sql"
+                _rc.apply_schema(rqlite, str(_schema))
+                _bs.cluster_init(
+                    cluster_uuid=s["cluster_uuid"],
+                    cluster_name=cluster_name,
+                    client=rqlite,
+                )
+                _bs.node_register(
                     node_name=s["node_name"],
                     host=s["mgmt_ip"],
                     drbd_ip=drbd_ip,
                     role="mgmt+compute",
-                    pubkey="",   # filled in on rotation
-                ))
-                d.append(_le.mgmt_master(node_name=s["node_name"]))
-                d.append(_le.node_loopback(
+                    pubkey="",   # filled in on key rotation
+                    bedrock_pubkey=master_bedrock_pub,
+                    client=rqlite,
+                )
+                _bs.node_loopback(
                     node_name=s["node_name"],
                     loopback_ip=s["loopback_ip"],
-                ))
+                    client=rqlite,
+                )
+                _bs.operator_set(
+                    username="root", salt=_salt, password_hash=_phash,
+                    client=rqlite,
+                )
+                _bs.obs_backends_set(
+                    metrics=[s["node_name"]], logs=[s["node_name"]],
+                    client=rqlite,
+                )
+                _bs.set_mgmt_master(s["node_name"], client=rqlite)
         except Exception as e:
-            print(f"  WARN: master node_register log-append skipped: {e}")
+            print(f"  WARN: rqlite seed failed: {e}")
     except Exception as e:
         print(f"  WARN: bedrock-rust setup failed: {e}")
 

@@ -225,20 +225,19 @@ def _log_append_typed(payload_bytes):
 
     Never raises — append failures should not block cluster operations.
     """
+    # Single-writer discipline (D-20): only the elected mgmt master
+    # writes to rqlite cluster state. Followers no-op. Never raises —
+    # write failures must not block tier operations; the local fold
+    # of cluster.json still produces the right shape, and the master's
+    # write replicates via Raft.
     if not _is_mgmt_master():
         return None
-    try:
-        from . import rust_ipc
-        if not Path(rust_ipc.DEFAULT_SOCK).exists():
-            return None
-        with rust_ipc.Daemon() as d:
-            return d.append(payload_bytes)
-    except Exception as e:
-        # Daemon down, msgpack missing on a partially-installed peer,
-        # IPC frame error — none of these should stop a tier op. Log
-        # for visibility and fall through to the direct write.
-        print(f"  [log] append skipped: {e}")
-        return None
+    # NOTE: `payload_bytes` here is a legacy artifact from the
+    # pre-rqlite log-entry pipeline. Modern callers should invoke
+    # bedrock_state.* helpers directly. Kept as a no-op stub for
+    # any in-tree caller that still passes a payload — those should
+    # be migrated to direct bedrock_state calls.
+    return None
 
 
 # ── Shell helpers ──────────────────────────────────────────────────────────
@@ -307,20 +306,22 @@ def set_tier_state(tier: str, **kv) -> None:
     cur.update(kv)
     cur["version"] = cur.get("version", 0) + 1
     save_cluster(c)
-    # Phase 5 cutover: shadow the tier-state mutation as a typed log
-    # entry. view_builder folds it identically on every peer.
+    # Mirror to rqlite so view_builder sees the change on every node.
+    # Master-only per D-20; followers no-op.
+    if not _is_mgmt_master():
+        return
     try:
-        from . import log_entries as _le
-        _log_append_typed(_le.tier_state(
+        from . import bedrock_state as _bs
+        _bs.tier_state(
             tier=tier,
             mode=cur.get("mode", "local"),
             master=cur.get("master"),
             peers=cur.get("peers"),
             backend_path=cur.get("backend_path"),
             garage_endpoint=cur.get("garage_endpoint"),
-        ))
-    except ImportError:
-        pass
+        )
+    except Exception as e:
+        print(f"  [state] tier_state write skipped: {e}")
 
 
 # ── Atomic symlink swap (POSIX rename) ─────────────────────────────────────
@@ -723,16 +724,15 @@ def get_drbd_node_id(resource: str, peer_name: str) -> int:
     assignments[peer_name] = nid
     tier["version"] = tier.get("version", 0) + 1
     save_cluster(c)
-    # Phase 5 cutover: also persist this assignment as a typed log
-    # entry. When peers replicate the log, their view_builder folds the
-    # same drbd_node_id into their cluster.json — no fresh-allocation
-    # race per L27. Best-effort; falls back to direct-write-only if the
-    # daemon isn't running yet.
-    try:
-        from . import log_entries as _le
-        _log_append_typed(_le.drbd_node_id_assigned(resource, peer_name, nid))
-    except ImportError:
-        pass
+    # Persist the assignment to rqlite so peers' view_builder folds
+    # the same drbd_node_id into their cluster.json — no fresh-
+    # allocation race per L27. Master-only per D-20.
+    if _is_mgmt_master():
+        try:
+            from . import bedrock_state as _bs
+            _bs.drbd_node_id_assigned(resource, peer_name, nid)
+        except Exception as e:
+            print(f"  [state] drbd_node_id_assigned write skipped: {e}")
     return nid
 
 
@@ -755,12 +755,13 @@ def free_drbd_node_id(resource: str, peer_name: str,
     if nid is not None:
         tier["version"] = tier.get("version", 0) + 1
         save_cluster(c)
-        try:
-            from . import log_entries as _le
-            _log_append_typed(_le.drbd_node_id_freed(
-                resource, peer_name, nid, reason=reason))
-        except ImportError:
-            pass
+        if _is_mgmt_master():
+            try:
+                from . import bedrock_state as _bs
+                _bs.drbd_node_id_freed(
+                    resource, peer_name, nid, reason=reason)
+            except Exception as e:
+                print(f"  [state] drbd_node_id_freed write skipped: {e}")
     return nid
 
 
@@ -2178,21 +2179,19 @@ def _transfer_mgmt_role_n1(
         ssh(peer, "systemctl daemon-reload", check=False)
         ssh(peer, "umount -l /mnt/isos 2>/dev/null", check=False)
 
-    # 8. Append MGMT_MASTER from the new master so peers learn the
-    #    change via replication. view_builder.fold flips the role
-    #    field on every peer + render_from_snapshot regens daemon.toml,
-    #    which restarts bedrock-rust pointing at the new master.
+    # 8. Update cluster_info.mgmt_master from the new master so
+    #    rqlite replicates the change. The orchestrator's revision-
+    #    watcher on every node sees the diff, regenerates daemon.toml,
+    #    and restarts bedrock-rust pointing at the new master.
     new_master_name = ssh(new_master_host,
                           "hostname --fqdn 2>/dev/null || hostname",
                           check=False).strip()
     if new_master_name:
         ssh(new_master_host,
             f"python3 -c \"import sys; sys.path.insert(0, "
-            f"'/usr/local/lib/bedrock'); from lib import log_entries as le, "
-            f"rust_ipc; "
-            f"d = rust_ipc.Daemon(); d.__enter__(); "
-            f"idx,_ = d.append(le.mgmt_master('{new_master_name}')); "
-            f"print('mgmt_master idx=' + str(idx))\"",
+            f"'/usr/local/lib/bedrock'); from lib import bedrock_state as bs; "
+            f"rev = bs.set_mgmt_master('{new_master_name}'); "
+            f"print('mgmt_master rev=' + str(rev))\"",
             check=False, timeout=30)
 
     print(f"  [mgmt] N=1 transfer complete. New master: "
@@ -2472,16 +2471,18 @@ def transfer_mgmt_role(
     # so a restart on the new master picks up the new mgmt_url.
     ssh(new_master_host, "systemctl restart bedrock-mgmt", check=False)
 
-    # Phase 5 cutover: append a typed `mgmt_master` log entry. The
-    # bedrock-rust daemon replicates it to every peer; each peer's
-    # view_builder then folds it into its own cluster.json identically.
-    # This is what makes L28's manual rsync of cluster.json + role
-    # rewrite unnecessary going forward — the log IS the propagation.
-    try:
-        from . import log_entries as _le
-        _log_append_typed(_le.mgmt_master(new_master_name))
-    except ImportError:
-        pass
+    # Update cluster_info.mgmt_master in rqlite. Raft replicates to
+    # every peer; each peer's orchestrator revision-watcher then
+    # regenerates daemon.toml and restarts bedrock-rust pointing at
+    # the new master. This is what makes L28's manual rsync of
+    # cluster.json + role rewrite unnecessary — rqlite IS the
+    # propagation.
+    if _is_mgmt_master():
+        try:
+            from . import bedrock_state as _bs
+            _bs.set_mgmt_master(new_master_name)
+        except Exception as e:
+            print(f"  [state] set_mgmt_master write skipped: {e}")
 
     print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
 

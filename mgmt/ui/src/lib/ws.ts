@@ -13,8 +13,14 @@ class BedrockWS {
 	private reconnectTimer: number | null = null;
 
 	connect() {
+		// Token via query param because the browser WebSocket API can't
+		// set Authorization headers. The token is the same JWT-HS256
+		// used for /api/* and verified by mgmt's /ws handler.
 		const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-		this.ws = new WebSocket(`${proto}//${location.host}/ws`);
+		let token = '';
+		try { token = localStorage.getItem('bedrock_token') || ''; } catch {}
+		const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+		this.ws = new WebSocket(`${proto}//${location.host}/ws${qs}`);
 
 		this.ws.onmessage = (e) => {
 			try {

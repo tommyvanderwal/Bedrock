@@ -134,3 +134,15 @@ export const connected = writable(false);
 export const lastUpdate = writable<string>('');
 // Task registry — keyed by task id. Updated via WS 'task' channel.
 export const tasks = writable<Record<string, TaskInfo>>({});
+
+// Pending join requests. +layout polls /api/join/pending every 5s and
+// writes them here; the main page (+page.svelte) renders them above the
+// host grid so the operator can approve/reject inline.
+export interface PendingJoin {
+	request_id: string;
+	node_name: string;
+	host: string;
+	fingerprint: string;
+	bedrock_pubkey: string;
+}
+export const pendingJoins = writable<PendingJoin[]>([]);

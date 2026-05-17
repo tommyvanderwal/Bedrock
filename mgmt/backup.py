@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/bedrock")
 
-from lib import log_entries as le, rust_ipc, state as state_mod
+from lib import bedrock_state as bs, state as state_mod
 
 log = logging.getLogger("bedrock.backup")
 
@@ -242,12 +242,10 @@ def _kopia_cache_arg(target_id: str) -> str:
     return f"--cache-directory={shlex.quote(_kopia_cache_dir(target_id, target.get('cache_directory') or ''))}"
 
 
-# ── log helpers ──────────────────────────────────────────────────────────
-
-def _log_append(payload_bytes: bytes) -> tuple[int, bytes]:
-    """Best-effort log append via IPC. Raises on full failure."""
-    with rust_ipc.Daemon() as d:
-        return d.append(payload_bytes)
+# ── state-write helpers (rqlite) ─────────────────────────────────────────
+#
+# Replaces the old bedrock-rust log-append path. Mutations go directly to
+# rqlite via bedrock_state.* helpers (which bump bedrock_meta.revision).
 
 
 # ── public: backup target setup ──────────────────────────────────────────
@@ -750,10 +748,10 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
         reason = f"{type(e).__name__}: {e}"
         log.error("backup[%s] failed after %.1fs: %s", vm_name, duration, reason)
         try:
-            _log_append(le.backup_failed(
+            bs.backup_failed(
                 vm=vm_name, target_id=target_id, reason=reason,
                 source_node=home_node_name, label=snap_label,
-            ))
+            )
         except Exception:
             pass
         raise
@@ -763,14 +761,14 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
     log.info("backup[%s] done: %d disk(s), %d bytes added total, %.1fs, "
              "fs_freeze_used=%s",
              vm_name, len(disk_results), total_bytes, duration, fs_freeze_used)
-    _log_append(le.backup_done(
+    bs.backup_done(
         vm=vm_name, target_id=target_id,
         disks=disk_results,
         source_node=home_node_name,
         duration_s=duration,
         label=snap_label,
         fs_freeze_used=fs_freeze_used,
-    ))
+    )
     return {
         "disks": disk_results,
         "duration_s": duration,
@@ -964,11 +962,11 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
         reason = f"{type(e).__name__}: {e}"
         log.error("restore[%s] failed: %s", vm_name, reason)
         try:
-            _log_append(le.restore_failed(
+            bs.restore_failed(
                 vm=vm_name, target_id=target_id,
                 kopia_snapshot_id=kopia_snapshot_id,
                 reason=reason, dest_node=dest_node_name,
-            ))
+            )
         except Exception:
             pass
         raise
@@ -976,11 +974,11 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
     duration = time.monotonic() - started
     log.info("restore[%s] done: %d disk(s) in %.1fs",
              vm_name, len(restored), duration)
-    _log_append(le.restore_done(
+    bs.restore_done(
         vm=vm_name, target_id=target_id,
         kopia_snapshot_id=kopia_snapshot_id,
         dest_node=dest_node_name, duration_s=duration,
-    ))
+    )
     return {
         "kopia_snapshot_id": kopia_snapshot_id,
         "disks": restored,
@@ -1008,10 +1006,10 @@ def delete_backup(target_id: str, kopia_snapshot_id: str, vm_name: str,
         f"  snapshot delete {shlex.quote(kopia_snapshot_id)} "
     )
     _ssh(ssh_host, cmd)
-    _log_append(le.backup_deleted(
+    bs.backup_deleted(
         vm=vm_name, target_id=target_id,
         kopia_snapshot_id=kopia_snapshot_id, reason=reason,
-    ))
+    )
 
 
 # ── small lookup helpers ────────────────────────────────────────────────

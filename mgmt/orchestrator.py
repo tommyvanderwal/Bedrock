@@ -1,27 +1,35 @@
-"""Bedrock management-plane orchestrator.
+"""Bedrock management-plane orchestrator (rqlite edition).
 
-Replaces the standalone bedrock-watcher process. Runs as a set of
-asyncio tasks inside the bedrock-mgmt FastAPI process — one Python
-process per node, hosting:
+Per docs/post-alpha-rewrite-notes.md D-01..D-22, cluster state lives
+in rqlite. This orchestrator runs as a set of asyncio tasks inside
+the bedrock-mgmt FastAPI process — one Python process per node,
+hosting:
 
-  ① log_subscriber       fold log → cluster.json + state.json + daemon.toml
-                          regen + restart bedrock-rust on toml change
-  ② boot_orchestrator    on startup: wait for clear cluster role, then
-                          start DRBD / promote-or-secondary per cluster.json
-                          NFS export (master) or mount (follower)
-                          libvirtd + VMs that belong here
-  ③ fence_responder      on fence marker: pause running VMs + exportfs -au
-                          (cleanup is FAST — seconds, not minutes).
-                          Then unfence (interfaces up, marker cleared),
-                          wait for role to settle, reconcile paused VMs
-                          against the now-current log:
-                              moved/destroyed → virsh destroy + drbdadm
-                                                secondary on its resource
+  ① rqlite_subscriber    poll bedrock_meta.revision; on advance,
+                          rebuild snapshot from rqlite, project to
+                          cluster.json + state.json + daemon.toml,
+                          bounce bedrock-rust on toml change, run
+                          the snapshot-diff reactor.
+  ② boot_orchestrator    on startup: wait for clear cluster role,
+                          then start DRBD / promote-or-secondary per
+                          cluster.json + NFS export (master) or mount
+                          (follower) + libvirtd + VMs that belong
+                          here.
+  ③ fence_responder      on fence marker: pause running VMs +
+                          exportfs -au (cleanup is FAST — seconds).
+                          Then unfence (interfaces up, marker
+                          cleared), wait for role to settle,
+                          reconcile paused VMs against the now-
+                          current cluster state:
+                              moved/destroyed → virsh destroy +
+                                                drbdadm secondary
                               still ours      → virsh resume
-                          re-run start_local_services for re-promotion.
-  ④ reactor              react to ongoing log entries — vm_migrated,
-                          vm_destroyed, tier_state.master change (NFS
-                          remount), once services are up.
+                          re-run start_local_services for
+                          re-promotion.
+  ④ reactor              snapshot-diff-driven side-effects —
+                          vm-host changed, tier_state.master changed
+                          (NFS remount), backup_target appeared,
+                          etc., once services are up.
 
 Single source of role truth: /run/bedrock-rust.role, written by the
 Rust daemon on every election change ("leader" / "follower" /
@@ -36,6 +44,7 @@ cleanup" case.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -47,7 +56,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/bedrock")
 
-from lib import view_builder, daemon_setup, rust_ipc, log_entries
+from lib import view_builder, daemon_setup, rqlite_client
 
 log = logging.getLogger("bedrock.orchestrator")
 
@@ -62,10 +71,17 @@ ROLE_FILE = Path("/run/bedrock-rust.role")
 # fence-to-reboot cap is the independent watchdog timer.
 FENCE_CLEANUP_TIMEOUT_S = 30.0
 
-# Live in-memory snapshot, updated by log_subscriber and read by other
-# tasks (and by the FastAPI handlers that want fresh state).
+# Live in-memory snapshot, updated by rqlite_subscriber and read by
+# other tasks (and by the FastAPI handlers that want fresh state).
 _SNAPSHOT: dict = view_builder.empty_snapshot()
+# bedrock_meta.revision of the last snapshot we observed.
+# Field name retained as _LAST_LOG_IDX for back-compat with existing
+# external readers; semantically it's now the rqlite revision.
 _LAST_LOG_IDX: int = 0
+# Previous snapshot — kept so the reactor can diff prev→cur to drive
+# transition handling (vm_destroyed, vm_migrated, etc.) the same way
+# the old log-replay reactor did on per-entry events.
+_PREV_SNAPSHOT: dict = view_builder.empty_snapshot()
 _SERVICES_STARTED: bool = False
 
 
@@ -180,59 +196,57 @@ def get_snapshot() -> dict:
     return _SNAPSHOT
 
 
-# ── ① log_subscriber ─────────────────────────────────────────────────────
+# ── ① rqlite_subscriber ──────────────────────────────────────────────────
 
-async def log_subscriber():
-    """Subscribe to bedrock-rust IPC; on each committed entry, fold into
-    the in-memory snapshot, write cluster.json + state.json + daemon.toml,
-    and bounce bedrock-rust if daemon.toml changed."""
+async def rqlite_subscriber():
+    """Watch the rqlite cluster-state store's revision counter; on
+    every advance, rebuild the snapshot, project to cluster.json +
+    state.json + daemon.toml, run the reactor on the snapshot diff,
+    and bounce bedrock-rust if daemon.toml changed.
+
+    Replaces the old bedrock-rust IPC log subscriber. Poll-based
+    (per rqlite's HTTP semantics) at ~500ms cadence; the reactor
+    sees one consolidated revision-advance per tick even if many
+    mutations landed within it.
+    """
     self_name = _self_node_name()
-    log.info("subscriber: starting (node=%r)", self_name)
+    log.info("rqlite_subscriber: starting (node=%r)", self_name)
     loop = asyncio.get_event_loop()
     while True:
         try:
             await loop.run_in_executor(None, _subscriber_pass, self_name)
         except Exception as e:
-            log.warning("subscriber: ipc unreachable: %s", e)
+            log.warning("rqlite_subscriber: rqlite unreachable: %s", e)
         await asyncio.sleep(2)
 
 
 def _subscriber_pass(self_name: str) -> None:
-    """One subscribe lifecycle: catch up, then drain Subscribe until error
-    or gap. Called from a thread executor (the IPC client is sync)."""
+    """One subscriber lifecycle: poll bedrock_meta.revision and on
+    each advance, refresh state. Called from a thread executor (the
+    rqlite client is sync)."""
     global _LAST_LOG_IDX
     last_toml_hash = _daemon_toml_hash()
-
-    with rust_ipc.Daemon() as d:
-        cur = d.status()["latest_index"]
-        if cur > _LAST_LOG_IDX:
-            log.info("subscriber: catching up %d..%d", _LAST_LOG_IDX + 1, cur)
-            for entry in d.read(from_index=_LAST_LOG_IDX + 1, to=cur):
-                last_toml_hash = _apply_entry(entry, self_name, last_toml_hash)
-
-    with rust_ipc.Daemon() as d:
-        for entry in d.subscribe():
-            if entry["index"] <= _LAST_LOG_IDX:
-                continue
-            if entry["index"] != _LAST_LOG_IDX + 1:
-                log.warning("subscriber: gap (have %d, got %d) — re-syncing",
-                            _LAST_LOG_IDX, entry["index"])
-                return
-            last_toml_hash = _apply_entry(entry, self_name, last_toml_hash)
+    with rqlite_client.RqliteClient() as rc:
+        for rev in rc.watch(since_revision=_LAST_LOG_IDX, interval_s=0.5):
+            last_toml_hash = _apply_revision(rc, rev, self_name, last_toml_hash)
 
 
-def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
-    """Fold one entry; project to disk; restart bedrock-rust if its
-    config changed; queue a reactor task. Returns the post-apply hash."""
-    global _LAST_LOG_IDX
-    view_builder.fold_into(_SNAPSHOT, [entry])
-    _LAST_LOG_IDX = entry["index"]
+def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
+                    self_name: str, last_toml_hash: bytes) -> bytes:
+    """Refresh the in-memory snapshot from rqlite, project to disk,
+    restart bedrock-rust if its config changed, queue a reactor task.
+    Returns the post-apply daemon.toml hash."""
+    global _LAST_LOG_IDX, _PREV_SNAPSHOT
+    prev = copy.deepcopy(_SNAPSHOT)
+    new = view_builder.build_snapshot(client=rc)
+    _SNAPSHOT.clear()
+    _SNAPSHOT.update(new)
+    _LAST_LOG_IDX = int(new.get("log_index", revision))
 
     try:
         CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
-        CLUSTER_JSON.write_text(
-            json.dumps(view_builder._cluster_view(_SNAPSHOT), indent=2)
-        )
+        view_builder._atomic_write_json(
+            CLUSTER_JSON, view_builder._cluster_view(_SNAPSHOT))
         if self_name and self_name in (_SNAPSHOT.get("nodes") or {}):
             existing = {}
             if STATE_JSON.exists():
@@ -241,34 +255,42 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
                 except Exception:
                     pass
             existing.update(view_builder._state_view(_SNAPSHOT, self_name))
-            STATE_JSON.write_text(json.dumps(existing, indent=2))
+            view_builder._atomic_write_json(STATE_JSON, existing)
     except Exception as e:
-        log.warning("subscriber: projection write at idx %d: %s",
-                    entry["index"], e)
+        log.warning("rqlite_subscriber: projection write at rev %d: %s",
+                    revision, e)
 
     try:
         daemon_setup.render_from_snapshot(_SNAPSHOT, self_name)
     except Exception as e:
-        log.warning("subscriber: render_from_snapshot at idx %d: %s",
-                    entry["index"], e)
+        log.warning("rqlite_subscriber: render_from_snapshot at rev %d: %s",
+                    revision, e)
+        _PREV_SNAPSHOT = prev
         return last_toml_hash
+
+    # Observability reconciler — converge local vmagent/vlagent and
+    # (conditionally) bedrock-vm / bedrock-vl to whatever the snapshot's
+    # obs_backends list says. Idempotent.
+    try:
+        from lib import observability as _obs
+        _obs.reconcile(_SNAPSHOT, self_name)
+    except Exception as e:
+        log.warning("rqlite_subscriber: obs.reconcile at rev %d: %s",
+                    revision, e)
+
     new_hash = _daemon_toml_hash()
     if new_hash != last_toml_hash:
-        log.info("subscriber: idx %d changed daemon.toml; restarting bedrock-rust",
-                 entry["index"])
+        log.info("rqlite_subscriber: rev %d changed daemon.toml; "
+                 "restarting bedrock-rust", revision)
         try:
             daemon_setup.restart()
         except Exception as e:
-            log.warning("subscriber: restart bedrock-rust: %s", e)
+            log.warning("rqlite_subscriber: restart bedrock-rust: %s", e)
+            _PREV_SNAPSHOT = prev
             return last_toml_hash
         last_toml_hash = new_hash
 
-    # Mesh path-table changes also drive DRBD's multi-path config:
-    # when a LINK_UP / LINK_DOWN / LINK_QUALITY entry folds in, the
-    # snapshot's `paths` section shifts, and any tier currently in
-    # DRBD mode regenerates its tier-<resource>.res file with fresh
-    # `path` blocks. Idempotent + a no-op in N=1 (no DRBD configured),
-    # so it's cheap to call on every entry.
+    # DRBD multi-path config regen on mesh path-table change.
     try:
         from installer.lib import tier_storage as _ts  # type: ignore
     except ImportError:
@@ -282,16 +304,20 @@ def _apply_entry(entry: dict, self_name: str, last_toml_hash: bytes) -> bytes:
         try:
             _ts.regen_drbd_configs_from_snapshot(_SNAPSHOT)
         except Exception as e:
-            log.warning("subscriber: drbd config regen at idx %d: %s",
-                        entry["index"], e)
+            log.warning("rqlite_subscriber: drbd config regen at rev %d: %s",
+                        revision, e)
 
+    # Snapshot-diff reactor — on each revision advance, derive
+    # transitions from prev→cur and run side effects (vm destroyed,
+    # vm host changed, tier master changed, backup target added).
     try:
         loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(_reactor(entry, self_name))
+            lambda: asyncio.create_task(_reactor_diff(prev, _SNAPSHOT, self_name))
         )
     except Exception:
         pass
+    _PREV_SNAPSHOT = prev
 
     return last_toml_hash
 
@@ -556,59 +582,85 @@ async def _reconcile_paused_vms():
             subprocess.run(["virsh", "resume", vm_name], check=False)
 
 
-# ── ④ reactor ────────────────────────────────────────────────────────────
+# ── ④ reactor — snapshot-diff driven ─────────────────────────────────────
 
-async def _reactor(entry: dict, self_name: str):
-    """Per-entry reactions to log changes that affect this node's VMs
-    or storage. Only active after boot_orchestrator has started services;
-    otherwise it's a no-op (the boot path will catch up on missed work)."""
+async def _reactor_diff(prev: dict, cur: dict, self_name: str):
+    """Run side-effects derived from prev→cur snapshot transitions.
+    Replaces the old per-log-entry reactor — under rqlite there are
+    no entries to dispatch on, just before/after snapshots. The diff
+    surfaces the same transitions the old reactor reacted to:
+
+      - VMs that disappeared from cur.vms → virsh destroy + undefine
+      - VMs whose host changed → start/destroy locally as appropriate
+      - tiers whose master changed (drbd-nfs mode) → promote / remount
+      - backup_targets that appeared → kopia repository connect
+
+    Only active after boot_orchestrator has started services; the
+    boot path picks up any state that the reactor skipped while
+    services were still starting.
+    """
     if not _SERVICES_STARTED:
         return
 
-    import msgpack
-    try:
-        payload = msgpack.unpackb(entry["payload"], raw=False)
-    except Exception:
-        return
-    t = payload.get("t")
+    prev_vms = prev.get("vms") or {}
+    cur_vms = cur.get("vms") or {}
 
-    if t == log_entries.VM_DESTROYED:
-        name = payload.get("name", "")
-        if name:
-            subprocess.run(["virsh", "destroy", name], check=False)
-            subprocess.run(["virsh", "undefine", name], check=False)
-    elif t == log_entries.VM_MIGRATED:
-        name = payload.get("name", "")
-        dst = payload.get("dst_host", "")
-        if dst == self_name:
-            log.info("reactor: vm_migrated TO us — virsh start %s", name)
+    # VMs that disappeared (destroyed) — clean up local copy.
+    for name in prev_vms.keys() - cur_vms.keys():
+        log.info("reactor: vm %s destroyed — virsh destroy + undefine", name)
+        subprocess.run(["virsh", "destroy", name], check=False)
+        subprocess.run(["virsh", "undefine", name], check=False)
+
+    # VMs whose host changed (migrated).
+    for name in prev_vms.keys() & cur_vms.keys():
+        prev_host = (prev_vms[name] or {}).get("host", "")
+        cur_host = (cur_vms[name] or {}).get("host", "")
+        if prev_host == cur_host:
+            continue
+        if cur_host == self_name:
+            log.info("reactor: vm %s migrated TO us — virsh start", name)
             subprocess.run(["virsh", "start", name], check=False)
-        else:
-            log.info("reactor: vm_migrated AWAY — destroying local %s", name)
+        elif prev_host == self_name:
+            log.info("reactor: vm %s migrated AWAY (now on %s) — "
+                     "destroying local copy", name, cur_host)
             subprocess.run(["virsh", "destroy", name], check=False)
-    elif t == log_entries.TIER_STATE:
-        await _react_tier_state(payload, self_name)
-    elif t == log_entries.BACKUP_TARGET_SET:
-        await _react_backup_target_set(payload)
+
+    # Tiers whose master changed (drbd-nfs only).
+    prev_tiers = prev.get("tiers") or {}
+    cur_tiers = cur.get("tiers") or {}
+    for tier_name, cur_t in cur_tiers.items():
+        if cur_t.get("mode") != "drbd-nfs":
+            continue
+        prev_t = prev_tiers.get(tier_name, {})
+        if prev_t.get("master") == cur_t.get("master"):
+            continue
+        await _react_tier_master_change(
+            tier_name, cur_t.get("master"), self_name)
+
+    # backup_targets that appeared (or had their config refreshed).
+    prev_targets = prev.get("backup_targets") or {}
+    cur_targets = cur.get("backup_targets") or {}
+    for tid, target in cur_targets.items():
+        if prev_targets.get(tid) == target:
+            continue
+        await _react_backup_target_set(tid, target)
 
 
-async def _react_tier_state(payload: dict, self_name: str):
-    """A tier_state entry can change who the master is — for the
-    drbd-nfs case that means everyone needs to re-evaluate where they
-    mount NFS from (and whether they should be promoting/demoting).
+async def _react_tier_master_change(tier_name: str, new_master: str | None,
+                                    self_name: str):
+    """A drbd-nfs tier's master changed. If we're the new master:
+    drbdadm primary + NFS export. Otherwise: remount NFS from the
+    new master's drbd_ip.
 
-    Idempotent: rendering for the role we already have is a no-op."""
-    if payload.get("mode") != "drbd-nfs":
-        return
-    new_master = payload.get("master")
-    tier_name = payload.get("tier", "")
+    Idempotent — running with the role we already have is a no-op
+    at the drbdadm / nfs level.
+    """
     res = f"tier-{tier_name}"
-
     cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
     nodes = cluster.get("nodes", {}) or {}
 
     if new_master == self_name:
-        log.info("reactor: tier_state %s master=us; drbdadm primary + re-export",
+        log.info("reactor: tier %s master=us; drbdadm primary + re-export",
                  tier_name)
         subprocess.run(["drbdadm", "primary", res], check=False)
         try:
@@ -619,14 +671,12 @@ async def _react_tier_state(payload: dict, self_name: str):
         except Exception as e:
             log.warning("reactor: NFS export failed: %s", e)
     else:
-        master_node = nodes.get(new_master, {})
-        master_drbd_ip = master_node.get("drbd_ip")
+        master_node = nodes.get(new_master or "", {})
+        master_drbd_ip = (master_node or {}).get("drbd_ip")
         if not master_drbd_ip:
             return
-        log.info("reactor: tier_state %s master=%s; remount NFS from %s",
+        log.info("reactor: tier %s master=%s; remount NFS from %s",
                  tier_name, new_master, master_drbd_ip)
-        # Fast remount: lazy-unmount any existing mount that points at
-        # the wrong server, then re-mount via the canonical helper.
         for t in ("bulk", "critical"):
             mp = f"/var/lib/bedrock/mounts/{t}-drbd"
             subprocess.run(["umount", "-l", mp], check=False)
@@ -637,23 +687,19 @@ async def _react_tier_state(payload: dict, self_name: str):
             log.warning("reactor: NFS remount failed: %s", e)
 
 
-async def _react_backup_target_set(payload: dict):
-    """A backup target was configured cluster-wide. Run `kopia repository
-    connect` on this node so subsequent backup/restore invocations work.
+async def _react_backup_target_set(target_id: str, target: dict):
+    """A backup target appeared or was reconfigured. Run `kopia
+    repository connect` locally so subsequent backup/restore
+    invocations work.
 
-    No-op on credentials/key file missing — the operator is expected to
+    No-op on missing credentials/key file — operator is expected to
     drop /etc/bedrock/backup.key and
     /etc/bedrock/backup-credentials/<target_id>.env onto every node
-    before issuing the target-set. If they're missing, this connect
-    fails and we log a warning; nothing else breaks. Re-running the
-    target-set after the files arrive will retry."""
-    target_id = payload.get("target_id")
-    kind = payload.get("kind", "kopia-s3")
+    before issuing the target-set."""
     if not target_id:
         return
     try:
         sys.path.insert(0, "/usr/local/lib/bedrock")
-        # mgmt/backup.py is alongside us under mgmt/.
         sys.path.insert(0, str(Path(__file__).parent))
         import backup as bedrock_backup  # type: ignore
     except Exception as e:
@@ -664,19 +710,20 @@ async def _react_backup_target_set(payload: dict):
         await loop.run_in_executor(
             None,
             lambda: bedrock_backup.configure_target_locally(
-                target_id=target_id, kind=kind,
-                s3_endpoint=payload.get("s3_endpoint", ""),
-                s3_bucket=payload.get("s3_bucket", ""),
-                s3_region=payload.get("s3_region", ""),
-                s3_disable_tls=bool(payload.get("s3_disable_tls", False)),
-                s3_disable_tls_verification=bool(payload.get("s3_disable_tls_verification", False)),
-                filesystem_path=payload.get("filesystem_path", ""),
-                override_source_prefix=payload.get("override_source_prefix", ""),
-                cache_directory=payload.get("cache_directory", ""),
+                target_id=target_id, kind=target.get("kind", "kopia-s3"),
+                s3_endpoint=target.get("s3_endpoint", ""),
+                s3_bucket=target.get("s3_bucket", ""),
+                s3_region=target.get("s3_region", ""),
+                s3_disable_tls=bool(target.get("s3_disable_tls", False)),
+                s3_disable_tls_verification=bool(
+                    target.get("s3_disable_tls_verification", False)),
+                filesystem_path=target.get("filesystem_path", ""),
+                override_source_prefix=target.get("override_source_prefix", ""),
+                cache_directory=target.get("cache_directory", ""),
             ),
         )
         log.info("reactor: kopia repository connected (target=%s, kind=%s)",
-                 target_id, kind)
+                 target_id, target.get("kind", "kopia-s3"))
     except Exception as e:
         log.warning("reactor: kopia connect for target=%s failed: %s",
                     target_id, e)
@@ -844,7 +891,7 @@ async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
 def start_all():
     """Spawn the orchestrator's tasks on the running event loop. Called
     from FastAPI's startup hook in mgmt/app.py."""
-    asyncio.create_task(log_subscriber())
+    asyncio.create_task(rqlite_subscriber())
     asyncio.create_task(fence_responder())
     asyncio.create_task(boot_orchestrator())
     asyncio.create_task(backup_scheduler())

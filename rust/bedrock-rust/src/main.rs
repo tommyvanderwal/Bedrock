@@ -1,7 +1,25 @@
-//! Bedrock cluster-protocol daemon.
+//! Bedrock cluster-protocol daemon — post-rewrite (D-22) edition.
 //!
-//! v0.1 scope: append-only hash-chained log + an Echo witness client.
-//! Designed per `docs/cluster-protocol-design.md` and the v1 plan.
+//! Scope after the rqlite migration:
+//!   * Witness lease loop + `compute_election` + self-fence
+//!   * Peer-liveness TCP heartbeat (NOT log replication)
+//!   * Status / role IPC for Python orchestrator + CLI
+//!
+//! What we used to do (and don't anymore):
+//!   * Hash-chained log store → replaced by rqlite (see
+//!     docs/post-alpha-rewrite-notes.md D-01..D-22)
+//!   * Log replication over multi-link TCP → rqlite Raft does this
+//!   * Append / Read / Subscribe IPC verbs → replaced by direct
+//!     SQL writes via installer/lib/bedrock_state.py and reads via
+//!     installer/lib/view_builder.py
+//!
+//! What stays in Rust (the actual Bedrock value-add):
+//!   * Witness-aware election with weighted voting (10/node +
+//!     1/witness) — no off-the-shelf consensus speaks this.
+//!   * Self-fence: bring NICs down on lease loss, write
+//!     /tmp/bedrock-rust.fence for the Python fence-responder.
+//!   * Peer TCP keepalive — fast "is the peer alive" signal,
+//!     independent of rqlite's HTTP health.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -9,22 +27,15 @@ use std::path::PathBuf;
 
 mod config;
 mod ipc;
-mod log_store;
-mod payload;
 mod peer;
 mod witness;
 
-/// Default location for the cluster log on disk.
-const DEFAULT_LOG_DIR: &str = "/var/lib/bedrock/log";
 /// Default location for the IPC socket.
 const DEFAULT_IPC_SOCK: &str = "/run/bedrock-rust.sock";
 
 #[derive(Parser)]
 #[command(name = "bedrock-rust", version, about = "Bedrock cluster-protocol daemon")]
 struct Cli {
-    /// Path to the log directory (segment files live here).
-    #[arg(long, global = true, default_value = DEFAULT_LOG_DIR)]
-    log_dir: PathBuf,
     /// Path to the IPC Unix socket.
     #[arg(long, global = true, default_value = DEFAULT_IPC_SOCK)]
     ipc_sock: PathBuf,
@@ -35,7 +46,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the long-lived daemon: log + IPC + (later) lease loop + peer.
+    /// Run the long-lived daemon: IPC + peer heartbeat + witness lease.
     Daemon {
         /// Read settings from a TOML config file. Any CLI flag still
         /// overrides the file. The systemd unit uses
@@ -43,17 +54,15 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Peer addresses to connect to. Repeat for multiple paths
-        /// (per design §7: ≥1 cable, ideally 2 — RJ45 + USB4 — for
-        /// orthogonality. The system stays operational with as few as
-        /// one working path).
+        /// (per design: ≥1 cable, ideally 2 for orthogonality).
         #[arg(long)]
         peer: Vec<String>,
-        /// TCP listen addresses for incoming peer connections. Repeat
+        /// TCP listen addresses for incoming peer heartbeats. Repeat
         /// for multiple paths. Defaults to a single 0.0.0.0:8200.
         #[arg(long)]
         peer_listen: Vec<String>,
-        /// This node's role at startup. Phase 8 auto-elects from
-        /// witness state when set to `auto`.
+        /// This node's role at startup. Election overrides once
+        /// witness data is in.
         #[arg(long, value_enum, default_value_t = peer::Role::Standalone)]
         role: peer::Role,
         /// 32-byte cluster key, hex (peer auth + witness AEAD).
@@ -61,7 +70,8 @@ enum Cmd {
         cluster_key: Option<String>,
         #[arg(long)]
         cluster_key_file: Option<PathBuf>,
-        /// Optional witness host (for the lease loop).
+        /// Optional witness host (legacy single-witness flag — prefer
+        /// witnesses list in daemon.toml).
         #[arg(long)]
         witness_host: Option<String>,
         #[arg(long, default_value_t = 12321)]
@@ -86,11 +96,6 @@ enum Cmd {
         #[arg(long, default_value = "")]
         fence_interfaces: String,
     },
-    /// Log management subcommands.
-    Log {
-        #[command(subcommand)]
-        op: LogCmd,
-    },
     /// Echo witness subcommands.
     Witness {
         #[command(subcommand)]
@@ -99,37 +104,10 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
-enum LogCmd {
-    /// Initialise a fresh log with the bootstrap "Hello World!" entry.
-    Init {
-        /// Cluster UUID. Defaults to a fresh v4 UUID.
-        #[arg(long)]
-        cluster_uuid: Option<String>,
-    },
-    /// Append a payload entry. Reads payload from stdin if not given.
-    Append {
-        /// Inline payload (UTF-8). Mutually exclusive with --file and stdin.
-        #[arg(long)]
-        text: Option<String>,
-        /// File path to read the payload from.
-        #[arg(long)]
-        file: Option<PathBuf>,
-    },
-    /// Show entries from `from` to `to` (inclusive). Defaults: full log.
-    Show {
-        #[arg(long, default_value_t = 1)]
-        from: u64,
-        #[arg(long)]
-        to: Option<u64>,
-    },
-    /// Walk every entry in the log and verify the hash chain. Exits non-zero
-    /// at the first divergence.
-    Verify,
-}
-
-#[derive(Subcommand)]
 enum WitnessCmd {
-    /// Send a single HEARTBEAT carrying the current log tail and print the witness's reply.
+    /// Send a single HEARTBEAT and print the witness's reply.
+    /// Useful for diagnosing a witness from the CLI without spinning
+    /// up the full daemon.
     Heartbeat {
         /// Witness host (IPv4 or hostname). Default: localhost.
         #[arg(long, default_value = "127.0.0.1")]
@@ -181,7 +159,6 @@ fn main() -> Result<()> {
             fence_interfaces,
         } => run_daemon(
             config,
-            cli.log_dir,
             cli.ipc_sock,
             peer_addr,
             peer_listen,
@@ -197,88 +174,6 @@ fn main() -> Result<()> {
             heartbeat_ms,
             fence_interfaces,
         ),
-        Cmd::Log { op } => match op {
-            LogCmd::Init { cluster_uuid } => {
-                let uuid = cluster_uuid
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let log = log_store::Log::init(&cli.log_dir, &uuid)
-                    .context("log init failed")?;
-                let (idx, hash) = log.latest();
-                println!("Initialised log at {}", cli.log_dir.display());
-                println!("  cluster_uuid: {}", uuid);
-                println!("  index: {}, hash: {}", idx, hex::encode(hash));
-                Ok(())
-            }
-            LogCmd::Append { text, file } => {
-                let payload = match (text, file) {
-                    (Some(t), None) => t.into_bytes(),
-                    (None, Some(p)) => std::fs::read(&p)
-                        .with_context(|| format!("reading {}", p.display()))?,
-                    (None, None) => {
-                        use std::io::Read;
-                        let mut buf = Vec::new();
-                        std::io::stdin().read_to_end(&mut buf)?;
-                        buf
-                    }
-                    _ => anyhow::bail!("--text and --file are mutually exclusive"),
-                };
-                let mut log = log_store::Log::open(&cli.log_dir).context("log open failed")?;
-                let entry = log.append(payload::Kind::Opaque, &payload)
-                    .context("append failed")?;
-                println!("appended index={} hash={}", entry.index, hex::encode(entry.hash));
-                Ok(())
-            }
-            LogCmd::Show { from, to } => {
-                let log = log_store::Log::open(&cli.log_dir).context("log open failed")?;
-                let to = to.unwrap_or_else(|| log.latest().0);
-                for idx in from..=to {
-                    match log.read(idx) {
-                        Ok(Some(e)) => {
-                            println!(
-                                "[{}] kind={:?} prev={} hash={} payload={} bytes",
-                                e.index,
-                                payload::Kind::from_u8(e.kind),
-                                hex::encode(&e.prev_hash[..6]),
-                                hex::encode(&e.hash[..6]),
-                                e.payload.len()
-                            );
-                            // Print the payload as text only if it's
-                            // free-form — typed (msgpack) entries are
-                            // best inspected via the Python view-builder.
-                            if matches!(payload::Kind::from_u8(e.kind), Some(payload::Kind::Opaque)) {
-                                if let Ok(s) = std::str::from_utf8(&e.payload) {
-                                    if !s.is_empty() {
-                                        println!("    text: {}", s);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            eprintln!("(index {} not found — log truncated?)", idx);
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("error reading index {}: {}", idx, e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Ok(())
-            }
-            LogCmd::Verify => {
-                let log = log_store::Log::open(&cli.log_dir).context("log open failed")?;
-                match log.verify() {
-                    Ok(n) => {
-                        println!("OK — {} entries verified, hash chain intact", n);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("DIVERGENCE: {}", e);
-                        std::process::exit(2);
-                    }
-                }
-            }
-        },
         Cmd::Witness { op } => match op {
             WitnessCmd::Heartbeat {
                 host,
@@ -292,11 +187,15 @@ fn main() -> Result<()> {
             } => {
                 let cluster_key = read_key32(cluster_key, cluster_key_file, "cluster_key")?;
                 let witness_pubkey = read_key32(witness_pubkey, witness_pubkey_file, "witness_pubkey")?;
-                let log = log_store::Log::open(&cli.log_dir).context("log open failed")?;
-                let (idx, hash) = log.latest();
+                // Post-rewrite (D-16): the witness's per-node payload
+                // morphs from log-state echo to DRBD-state echo
+                // (uuid + generation + last_man_standing_marker). For
+                // the CLI heartbeat invocation we send zeros — the
+                // call is for diagnostics, not for actually steering
+                // the election from the command line.
                 witness::heartbeat_once(
                     &host, port, &cluster_key, &witness_pubkey,
-                    sender_id, query_target, idx, hash,
+                    sender_id, query_target, 0, [0u8; 32],
                 )?;
                 Ok(())
             }
@@ -307,7 +206,6 @@ fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_daemon(
     config_path: Option<PathBuf>,
-    log_dir: PathBuf,
     ipc_sock: PathBuf,
     cli_peer: Vec<String>,
     cli_peer_listen: Vec<String>,
@@ -323,22 +221,12 @@ fn run_daemon(
     cli_heartbeat_ms: u64,
     cli_fence_interfaces: String,
 ) -> Result<()> {
-    // Merge config-file values with CLI flags. Rule: any CLI value that
-    // was supplied overrides the file. We can tell "supplied" only for
-    // Option<>-typed flags; for Vec<> CLI we let "non-empty" mean
-    // "supplied"; for the always-defaulted scalars (witness_port,
-    // sender_id, ttl, heartbeat) the CLI wins always — these have
-    // sensible defaults from clap.
     let cfg_file = if let Some(p) = config_path.as_ref() {
         Some(config::DaemonConfig::load(p).with_context(|| format!("read {}", p.display()))?)
     } else {
         None
     };
 
-    let log_dir = cfg_file.as_ref()
-        .and_then(|c| c.log_dir.clone())
-        .filter(|_| log_dir == PathBuf::from(DEFAULT_LOG_DIR))
-        .unwrap_or(log_dir);
     let ipc_sock = cfg_file.as_ref()
         .and_then(|c| c.ipc_sock.clone())
         .filter(|_| ipc_sock == PathBuf::from(DEFAULT_IPC_SOCK))
@@ -376,15 +264,11 @@ fn run_daemon(
         cli_fence_interfaces.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
     };
 
-    let log = log_store::Log::open(&log_dir).context("log open failed")?;
-    // Shared between IPC (PeerStatus surface, CommitNotifier) and peer
-    // transport (per-link bookkeeping, on_commit). Both must point at
-    // the same instances or the watcher would never wake on replicated
-    // commits and `_wait_replicated` would always look empty.
+    // Shared between IPC (PeerStatus surface) and peer transport
+    // (per-link bookkeeping). Same registry instance for both so
+    // status reads reflect live peer state.
     let registry = peer::new_peer_registry();
-    let commit = ipc::CommitNotifier::new();
-    let server = ipc::Server::new(ipc_sock.clone(), log, registry.clone(), commit.clone());
-    let log_handle = std::sync::Arc::clone(&server.log);
+    let server = ipc::Server::new(ipc_sock.clone(), registry.clone());
 
     let listen_addrs = if peer_listen.is_empty() {
         vec!["0.0.0.0:8200".to_string()]
@@ -392,7 +276,7 @@ fn run_daemon(
         peer_listen
     };
     // Resolve role: CLI value wins if it's anything other than the
-    // default Standalone; otherwise use what daemon.toml says.
+    // default Standalone; otherwise use daemon.toml.
     let role = if cli_role != peer::Role::Standalone {
         cli_role
     } else if let Some(r) = cfg_file.as_ref().and_then(|c| c.role.as_ref()) {
@@ -407,13 +291,11 @@ fn run_daemon(
     log::info!("role: {:?}", role);
     let peer_liveness = peer::new_peer_liveness();
     let _peer = peer::start(peer::Config {
-        log: std::sync::Arc::clone(&log_handle),
         listen_addrs,
         connect_to: peer_addr,
         role,
         liveness: std::sync::Arc::clone(&peer_liveness),
         registry: registry.clone(),
-        on_commit: commit.clone(),
     })?;
 
     // Witness configuration. Resolve from the config file when present;
@@ -461,15 +343,14 @@ fn run_daemon(
             peer_registry: registry.clone(),
             peer_in_maintenance,
         };
-        Some(witness::start_lease_loop(cfg, std::sync::Arc::clone(&log_handle)))
+        Some(witness::start_lease_loop(cfg))
     } else {
         log::info!("daemon: no witnesses configured; lease loop disabled (standalone mode)");
         None
     };
     let _lease = lease_handle;
 
-    log::info!("bedrock-rust daemon: log_dir={} ipc={}",
-               log_dir.display(), ipc_sock.display());
+    log::info!("bedrock-rust daemon: ipc={}", ipc_sock.display());
     server.serve()
 }
 

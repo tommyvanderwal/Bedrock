@@ -231,7 +231,7 @@ def _cmd_node_leave(target: str, reason: str):
     Idempotent: removing a node that's already gone is a no-op append
     plus a no-op SSH (best-effort).
     """
-    from lib import log_entries as le, rust_ipc, view_builder, state as _state
+    from lib import bedrock_state as bs, view_builder, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
     if target == self_name:
@@ -243,11 +243,11 @@ def _cmd_node_leave(target: str, reason: str):
         print(f"  {target}: not in cluster snapshot — nothing to do")
         return 0
 
-    # 1. Master appends node_unregister. Single-writer log contract:
-    #    only the mgmt master writes; replication carries.
-    with rust_ipc.Daemon() as d:
-        idx, _h = d.append(le.node_unregister(node_name=target, reason=reason))
-        print(f"  appended idx={idx} node_unregister({target}, reason={reason!r})")
+    # 1. Master writes node_unregister to rqlite. Single-writer
+    #    discipline (D-20): only the mgmt master mutates; rqlite
+    #    replicates via Raft.
+    rev = bs.node_unregister(node_name=target, reason=reason)
+    print(f"  rev={rev} node_unregister({target}, reason={reason!r})")
 
     # 2. Master regenerates its own daemon.toml from the new snapshot
     #    so its peer_sender_ids drops the leaving node immediately.
@@ -282,18 +282,17 @@ def _cmd_node_leave(target: str, reason: str):
 
 
 def _cmd_node_maint(target: str, mode: str):
-    """Append node_maintenance_set to the log. Each node's local
-    config-watcher then regenerates daemon.toml + restarts bedrock-rust
-    based on its replicated copy of the log. No SSH-fanout — the log
-    IS the propagation.
+    """Toggle a node's maintenance flag in rqlite. Each node's
+    orchestrator watches the rqlite revision and re-renders its
+    daemon.toml on change — no SSH-fanout, rqlite IS the propagation
+    channel.
     """
-    from lib import log_entries as le, rust_ipc
+    from lib import bedrock_state as bs
     on = (mode == "on")
-    with rust_ipc.Daemon() as d:
-        idx, h = d.append(le.node_maintenance(node_name=target, on=on))
-        print(f"  appended idx={idx} node_maintenance_set({target}, on={on})")
-    print(f"  Log entry committed locally; replication propagates to peers.")
-    print(f"  Each node's mgmt orchestrator regenerates daemon.toml on log change.")
+    rev = bs.node_maintenance(node_name=target, on=on)
+    print(f"  rev={rev} node_maintenance_set({target}, on={on})")
+    print(f"  Rqlite committed; replication propagates to peers.")
+    print(f"  Each node's orchestrator regenerates daemon.toml on revision change.")
     print(f"  When you take {target} offline now, surviving nodes won't fence.")
 
 
@@ -315,20 +314,19 @@ def cmd_vm(args):
 
 def cmd_witness(args):
     """Manage cluster witnesses. add/rm/list. Each add/rm:
-       1) appends a typed log entry on this node (master),
-       2) lets the leader's tail-push replicate to all peers (~150ms),
-       3) regenerates /etc/bedrock/daemon.toml on every node,
-       4) restarts bedrock-rust on every node.
+       1) writes a row to the rqlite witnesses table on this node
+          (master), 2) Raft replicates to all rqlite peers,
+       3) each node's orchestrator regenerates /etc/bedrock/daemon.toml
+       on rqlite-revision change, 4) restarts bedrock-rust on every node.
 
-    The daemon is restart-safe by design — the log is canonical, so
+    The daemon is restart-safe by design — rqlite is canonical, so
     nothing in RAM is load-bearing. Peer connections + witness
     sessions reconnect within seconds of the restart.
     """
-    from lib import log_entries as le, rust_ipc, view_builder, daemon_setup
-    import subprocess as _sp
+    from lib import bedrock_state as bs, view_builder
 
     if args.action == "list":
-        v = view_builder.fold(list(_read_log()))
+        v = view_builder.build_snapshot()
         ws = v.get("witnesses", {}) or {}
         if not ws:
             print("(no witnesses configured)")
@@ -344,81 +342,58 @@ def cmd_witness(args):
             port = int(port_s)
         else:
             host, port = host_port, 12321
-        with rust_ipc.Daemon() as d:
-            idx, h = d.append(le.witness_register(
-                witness_id=args.id,
-                addr=f"{host}:{port}",
-                witness_pubkey_hex=args.pubkey,
-                # v0.1: cluster_key is shared per-cluster; per-witness
-                # encrypted keys (design §10) are deferred. Emit empty
-                # string so the schema slot exists.
-                encrypted_witness_key_hex="",
-            ))
-            print(f"  appended idx={idx} witness_register({args.id})")
+        rev = bs.witness_register(
+            witness_id=args.id,
+            addr=f"{host}:{port}",
+            witness_pubkey_hex=args.pubkey,
+            # v0.1: cluster_key is shared per-cluster; per-witness
+            # encrypted keys (design §10) are deferred. Empty string
+            # so the schema slot exists.
+            encrypted_witness_key_hex="",
+        )
+        print(f"  rev={rev} witness_register({args.id})")
         _propagate_daemon_config(args.id)
         return
 
     if args.action == "rm":
-        with rust_ipc.Daemon() as d:
-            idx, h = d.append(le.witness_unregister(args.id))
-            print(f"  appended idx={idx} witness_unregister({args.id})")
+        rev = bs.witness_unregister(args.id)
+        print(f"  rev={rev} witness_unregister({args.id})")
         _propagate_daemon_config(args.id)
         return
 
 
-def _read_log():
-    """Helper: yield every log entry via IPC."""
-    from lib import rust_ipc
-    with rust_ipc.Daemon() as d:
-        for e in d.read(from_index=1):
-            yield e
-
-
-def _wait_replicated(target_index: int, timeout_s: float = 10.0) -> bool:
-    """Wait until every connected peer host has acked `target_index`.
-
-    Each peer is reachable over ≥1 TCP link (per design §7: ≥1 cable,
-    ideally 2). Acks only flow on the link that's actively replicating;
-    the other links sit idle reporting last_acked_index=0. So we group
-    links by remote host (IP) and require ANY link per host to have
-    acked >= target — that means the peer node has the entry, regardless
-    of which cable carried it.
-
-    No peer links → trivially satisfied (single-node cluster: local
-    append is its own commit).
+def _wait_replicated(target_revision: int, timeout_s: float = 10.0) -> bool:
+    """Wait until rqlite reports a revision >= `target_revision` via a
+    strong-consistency read. Under rqlite, replication is via Raft and
+    a `strong` read goes through the leader — so once that returns a
+    revision >= target, the change is durably committed cluster-wide.
 
     Returns True on success, False on timeout. Timeout is non-fatal
-    upstream — the entry is in the local log and will replicate
-    eventually; the caller just can't yet promise "every peer has it."
+    upstream — the change is already in rqlite locally and will
+    converge; the caller just can't yet promise "every peer has it."
     """
     import time as _t
-    from lib import rust_ipc
+    from lib import rqlite_client as _rc
     deadline = _t.time() + timeout_s
     while True:
         try:
-            with rust_ipc.Daemon() as d:
-                links = d.peer_status()
+            with _rc.RqliteClient() as rqlite:
+                row = rqlite.query_one(
+                    "SELECT revision FROM bedrock_meta WHERE id = 1",
+                    level="strong",
+                )
+                cur = int((row or {}).get("revision") or 0)
         except Exception as e:
             if _t.time() >= deadline:
-                print(f"  warn: peer_status unreachable: {e}")
+                print(f"  warn: rqlite unreachable: {e}")
                 return False
             _t.sleep(0.2)
             continue
-        if not links:
-            return True
-        # Group max-acked by peer host (everything before the last :PORT).
-        per_host: dict[str, int] = {}
-        for l in links:
-            addr = l.get("address", "")
-            host = addr.rsplit(":", 1)[0] if ":" in addr else addr
-            cur = per_host.get(host, 0)
-            per_host[host] = max(cur, int(l.get("last_acked_index", 0)))
-        worst_host_idx = min(per_host.values()) if per_host else 0
-        if worst_host_idx >= target_index:
+        if cur >= target_revision:
             return True
         if _t.time() >= deadline:
-            print(f"  warn: replication timeout — worst host acked={worst_host_idx} "
-                  f"< target={target_index} (hosts={list(per_host.items())})")
+            print(f"  warn: replication timeout — cur revision={cur} "
+                  f"< target={target_revision}")
             return False
         _t.sleep(0.2)
 
@@ -443,7 +418,7 @@ def _propagate_daemon_config(reason: str) -> None:
     print(f"  [{reason}] {self_name}: daemon.toml regenerated from snapshot, daemon restarted")
     print(f"  [{reason}] peers will pick up the change via their local watchers (no SSH needed)")
     # Brief pause for replication so a follow-up status command sees
-    # the propagated state. Real per-peer ACK polling is queued.
+    # the propagated state.
     _wait_replicated(snapshot.get("log_index", 0))
 
 
@@ -880,6 +855,175 @@ def cmd_storage(args):
         return
 
 
+def _op_token(mgmt_url: str) -> str:
+    """Get an operator Bearer token. Prefer $BEDROCK_OPERATOR_TOKEN
+    (CI / scripted use), else prompt for username + password if we
+    have a TTY. Exit with a clear message if neither path is open
+    so scripts get a real error instead of a Python traceback."""
+    import urllib.request as _ur
+    import getpass as _gp
+    t = os.environ.get("BEDROCK_OPERATOR_TOKEN", "")
+    if t:
+        return t
+    if not sys.stdin.isatty():
+        print("ERROR: no operator token. Set BEDROCK_OPERATOR_TOKEN= "
+              "or run interactively.", file=sys.stderr)
+        sys.exit(2)
+    user = input("Operator username [root]: ").strip() or "root"
+    pw = _gp.getpass(f"Password for {user}: ")
+    payload = json.dumps({"username": user, "password": pw}).encode()
+    req = _ur.Request(mgmt_url + "/api/login", data=payload,
+                      headers={"Content-Type": "application/json"})
+    return json.loads(_ur.urlopen(req, timeout=5).read())["token"]
+
+
+def cmd_operator(args):
+    """`bedrock operator {list,passwd,rm}` — manage dashboard login users.
+
+    Operators live in the replicated cluster snapshot (OPERATOR_SET /
+    OPERATOR_REMOVE log entries), so changes propagate to every node
+    within ~1s.
+    """
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import getpass as _gp
+    mgmt_url = "http://localhost:8080"
+    token = _op_token(mgmt_url)
+    auth = {"Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"}
+
+    if args.action == "list":
+        r = _ur.urlopen(_ur.Request(mgmt_url + "/api/operators",
+                                    headers={"Authorization": f"Bearer {token}"}),
+                        timeout=5)
+        ops = json.loads(r.read())["operators"]
+        print("Operators:")
+        for u in ops:
+            print(f"  {u}")
+        return 0
+
+    if args.action == "passwd":
+        # Confirm new password (no echo).
+        p1 = _gp.getpass(f"New password for {args.username}: ")
+        p2 = _gp.getpass("Confirm new password:           ")
+        if p1 != p2:
+            print("ERROR: passwords do not match")
+            return 1
+        if len(p1) < 4:
+            print("ERROR: password too short (min 4 chars)")
+            return 1
+        body = json.dumps({"username": args.username, "password": p1}).encode()
+        req = _ur.Request(mgmt_url + "/api/operators/set",
+                          data=body, headers=auth)
+        try:
+            r = _ur.urlopen(req, timeout=10)
+            print(json.loads(r.read()))
+            return 0
+        except _ue.HTTPError as e:
+            print(f"ERROR: {e.code} {e.read().decode()[:200]}")
+            return 1
+
+    if args.action == "rm":
+        body = json.dumps({"username": args.username}).encode()
+        req = _ur.Request(mgmt_url + "/api/operators/remove",
+                          data=body, headers=auth)
+        try:
+            r = _ur.urlopen(req, timeout=10)
+            print(json.loads(r.read()))
+            return 0
+        except _ue.HTTPError as e:
+            print(f"ERROR: {e.code} {e.read().decode()[:200]}")
+            return 1
+
+
+def cmd_observability(args):
+    """`bedrock observability ...` — query/modify metrics+logs HA layout.
+
+    `status` shows the current backend assignment from cluster.json.
+    `promote <node>` adds a node to a backend slot. If both slots are
+    full, --replace <existing> is required to make room. The mgmt API
+    runs the vmbackup-vmrestore seed before flipping the snapshot so
+    queries to the new backend return data the moment it appears in
+    cluster.json.
+    """
+    import urllib.request
+    import urllib.error
+    import getpass
+
+    # CLI always runs on the local node, so dial the local mgmt directly.
+    # state.json's mgmt_url points at the node's LAN IP, which is on 8080
+    # only via loopback (8080 binds to 127.0.0.1 since the auth split).
+    mgmt_url = "http://localhost:8080"
+
+    if args.action == "status":
+        # /cluster-info is public; read the cluster.json directly for
+        # the obs_backends field (not in /cluster-info today, by design
+        # — that endpoint is for discovery only).
+        try:
+            cfg = json.loads(Path("/etc/bedrock/cluster.json").read_text())
+        except Exception as e:
+            print(f"ERROR reading cluster.json: {e}")
+            return 1
+        obs = cfg.get("obs_backends") or {}
+        nodes = cfg.get("nodes") or {}
+        print(f"Cluster: {cfg.get('cluster_name','?')}")
+        print(f"  Metrics backends: {obs.get('metrics') or '<none>'}")
+        print(f"  Logs backends:    {obs.get('logs') or '<none>'}")
+        print(f"  Agent-only nodes:")
+        for n in sorted(nodes.keys()):
+            if n not in (obs.get("metrics") or []) and n not in (obs.get("logs") or []):
+                print(f"    - {n}")
+        return 0
+
+    if args.action == "promote":
+        # Need an operator token. Prompt for password if we don't already
+        # have one stashed in env (test setup: BEDROCK_OPERATOR_TOKEN).
+        token = os.environ.get("BEDROCK_OPERATOR_TOKEN", "")
+        if not token:
+            user = input("Operator username [root]: ").strip() or "root"
+            pw = getpass.getpass(f"Password for {user}: ")
+            try:
+                payload = json.dumps({"username": user, "password": pw}).encode()
+                req = urllib.request.Request(
+                    mgmt_url + "/api/login", data=payload,
+                    headers={"Content-Type": "application/json"})
+                resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+                token = resp["token"]
+            except Exception as e:
+                print(f"ERROR: login failed: {e}")
+                return 1
+
+        body = json.dumps({
+            "new_node": args.new_node,
+            "replace":  args.replace or "",
+            "kind":     args.kind,
+        }).encode()
+        req = urllib.request.Request(
+            mgmt_url + "/api/observability/promote",
+            data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {token}"})
+        try:
+            print(f"Promoting {args.new_node!r}"
+                  f"{(' replacing ' + args.replace) if args.replace else ''} "
+                  f"(kind={args.kind})...")
+            print("  Running vmbackup-vmrestore seed — may take a minute "
+                  "on a populated cluster.")
+            resp = json.loads(urllib.request.urlopen(req, timeout=600).read())
+            print(f"  done. metrics: {resp.get('metrics_backends')}, "
+                  f"logs: {resp.get('logs_backends')}")
+            if resp.get("seed_report"):
+                for kind, status in resp["seed_report"].items():
+                    print(f"  seed[{kind}]: {status}")
+            return 0
+        except urllib.error.HTTPError as e:
+            print(f"ERROR: {e.code} {e.read().decode()[:200]}")
+            return 1
+        except Exception as e:
+            print(f"ERROR: {e}")
+            return 1
+
+
 # ── argparse ───────────────────────────────────────────────────────────────
 
 def main():
@@ -982,6 +1126,37 @@ def main():
     p_ps.add_argument("--sk", required=True)
     p_ps.add_argument("--endpoint-drbd", required=True)
     p_st.set_defaults(func=cmd_storage)
+
+    p_op = sub.add_parser("operator",
+        help="Dashboard login users (list / passwd / rm)")
+    p_op_sub = p_op.add_subparsers(dest="action", required=True)
+    p_op_sub.add_parser("list", help="List configured operators")
+    p_op_pw = p_op_sub.add_parser("passwd",
+        help="Set/change an operator password (creates new operator "
+             "if username doesn't exist yet)")
+    p_op_pw.add_argument("username", help="operator username")
+    p_op_rm = p_op_sub.add_parser("rm",
+        help="Remove an operator (refuses to remove the last one or yourself)")
+    p_op_rm.add_argument("username", help="operator username")
+    p_op.set_defaults(func=cmd_operator)
+
+    p_obs = sub.add_parser("observability",
+        help="Metrics + logs HA — 2 designated backends, agents on every node")
+    p_obs_sub = p_obs.add_subparsers(dest="action", required=True)
+    p_obs_sub.add_parser("status", help="Show current backend assignment")
+    p_obs_promote = p_obs_sub.add_parser("promote",
+        help="Promote a node to a backend slot (vmbackup-vmrestore seed, "
+             "appends OBS_BACKENDS_SET). Use --replace to swap an existing "
+             "backend (decommission flow).")
+    p_obs_promote.add_argument("new_node",
+        help="cluster.json node name to add as a backend")
+    p_obs_promote.add_argument("--replace", default=None,
+        help="existing backend node to swap out (required when both slots "
+             "are already filled)")
+    p_obs_promote.add_argument("--kind", choices=["both", "metrics", "logs"],
+        default="both",
+        help="which backend type to promote — defaults to both")
+    p_obs.set_defaults(func=cmd_observability)
 
     args = p.parse_args()
     rc = args.func(args)

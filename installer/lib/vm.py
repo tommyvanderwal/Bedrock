@@ -148,23 +148,21 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
         _create_vipet(nodes, home_node_name, peers, name, ram, disk)
     print(f"  VM {name} created. Status: bedrock vm list")
 
-    # L47: append a typed log entry so view_builder's `vms` dict tracks
-    # this. On crash recovery: "what was running here?" → answered
-    # from the log alone. Best-effort — daemon down is non-fatal.
+    # Persist the VM's existence + initial running state to rqlite so
+    # view_builder's `vms` dict tracks it. On crash recovery: "what
+    # was running here?" → answered from rqlite. Best-effort —
+    # rqlite unreachable is non-fatal.
     try:
-        from . import log_entries as _le, rust_ipc as _ipc
-        from pathlib import Path as _P
-        if _P(_ipc.DEFAULT_SOCK).exists():
-            with _ipc.Daemon() as d:
-                d.append(_le.vm_created(
-                    name=name, vm_type=vm_type, host=home_node_name,
-                    ram_mb=int(ram), disk_gb=int(disk),
-                ))
-                d.append(_le.vm_state_change(
-                    name=name, host=home_node_name, state="running",
-                ))
+        from . import bedrock_state as _bs
+        _bs.vm_created(
+            name=name, vm_type=vm_type, host=home_node_name,
+            ram_mb=int(ram), disk_gb=int(disk),
+        )
+        _bs.vm_state_change(
+            name=name, host=home_node_name, state="running",
+        )
     except Exception as e:
-        print(f"  [log] vm_created append skipped: {e}")
+        print(f"  [state] vm_created write skipped: {e}")
 
 
 def _download_alpine_on_node(host: str):
@@ -397,15 +395,10 @@ def migrate_vm(state, name: str, target: str):
     # response is the source of truth; here we just record what we
     # asked for.
     try:
-        from . import log_entries as _le, rust_ipc as _ipc
-        from pathlib import Path as _P
-        if _P(_ipc.DEFAULT_SOCK).exists():
-            with _ipc.Daemon() as d:
-                d.append(_le.vm_migrated(
-                    name=name, src_host="?", dst_host=target or "?",
-                ))
+        from . import bedrock_state as _bs
+        _bs.vm_migrated(name=name, src_host="?", dst_host=target or "?")
     except Exception as e:
-        print(f"  [log] vm_migrated append skipped: {e}")
+        print(f"  [state] vm_migrated write skipped: {e}")
 
 
 def delete_vm(state, name: str):
@@ -437,12 +430,9 @@ def delete_vm(state, name: str):
 
     print(f"VM {name} deleted.")
 
-    # L47: log the destruction so the view_builder's vms dict drops it.
+    # Persist the destruction so view_builder's vms dict drops it.
     try:
-        from . import log_entries as _le, rust_ipc as _ipc
-        from pathlib import Path as _P
-        if _P(_ipc.DEFAULT_SOCK).exists():
-            with _ipc.Daemon() as d:
-                d.append(_le.vm_destroyed(name=name))
+        from . import bedrock_state as _bs
+        _bs.vm_destroyed(name=name)
     except Exception as e:
-        print(f"  [log] vm_destroyed append skipped: {e}")
+        print(f"  [state] vm_destroyed write skipped: {e}")

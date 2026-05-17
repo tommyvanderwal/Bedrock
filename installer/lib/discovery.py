@@ -2,6 +2,7 @@
 
 import json
 import socket
+import ssl
 import urllib.request
 from typing import Optional, List
 
@@ -12,7 +13,22 @@ COMMON_WITNESS_IPS = [
     "192.168.2.254",  # gateway
 ]
 WITNESS_PORT = 9443
-MGMT_PORT = 8080  # fallback if witness unavailable — use mgmt /cluster-info
+MGMT_PORT_HTTPS = 8443  # primary: mgmt serves HTTPS once cert-refresh has run
+MGMT_PORT_HTTP  = 8080  # legacy: only used pre-cert (now rare)
+
+# Self-signed-friendly context for HTTPS scans. The cert is issued for
+# `<dashed-ip>.my.local-ip.co`, not the bare IP we're scanning, so name
+# verification would always fail. Discovery only needs to fetch a public
+# JSON endpoint — no secrets in transit — so disabling verification is safe.
+_INSECURE_CTX = ssl.create_default_context()
+_INSECURE_CTX.check_hostname = False
+_INSECURE_CTX.verify_mode = ssl.CERT_NONE
+
+
+def _open(url: str, timeout: float = 2.0):
+    if url.startswith("https://"):
+        return urllib.request.urlopen(url, timeout=timeout, context=_INSECURE_CTX)
+    return urllib.request.urlopen(url, timeout=timeout)
 
 
 def _can_reach(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -53,12 +69,15 @@ def find_witness() -> Optional[str]:
             except Exception:
                 pass
 
-    # Scan subnet for mgmt nodes (port 8080 /cluster-info)
+    # Scan subnet for mgmt nodes — HTTPS 8443 first (current default once
+    # cert-refresh has run), HTTP 8080 fallback for pre-cert installs.
     subnet_hosts = _get_local_subnet_hosts()[:50]  # first 50 IPs quickly
     for host in subnet_hosts:
-        if _can_reach(host, MGMT_PORT, timeout=0.3):
+        for port, scheme in ((MGMT_PORT_HTTPS, "https"), (MGMT_PORT_HTTP, "http")):
+            if not _can_reach(host, port, timeout=0.3):
+                continue
             try:
-                r = urllib.request.urlopen(f"http://{host}:{MGMT_PORT}/cluster-info", timeout=1)
+                r = _open(f"{scheme}://{host}:{port}/cluster-info", timeout=1)
                 if r.status == 200:
                     return host
             except Exception:
@@ -68,19 +87,21 @@ def find_witness() -> Optional[str]:
 
 
 def query_cluster(host: str) -> Optional[dict]:
-    """Query for cluster info. Tries witness (9443) first, then mgmt (8080)."""
+    """Query for cluster info. Tries witness (9443), HTTPS mgmt (8443),
+    then legacy HTTP mgmt (8080)."""
     # Try witness
     try:
-        r = urllib.request.urlopen(f"http://{host}:{WITNESS_PORT}/cluster-info", timeout=3)
+        r = _open(f"http://{host}:{WITNESS_PORT}/cluster-info", timeout=3)
         return json.loads(r.read())
     except Exception:
         pass
-    # Try mgmt dashboard /cluster-info
-    try:
-        r = urllib.request.urlopen(f"http://{host}:{MGMT_PORT}/cluster-info", timeout=3)
-        return json.loads(r.read())
-    except Exception:
-        pass
+    # Try mgmt dashboard /cluster-info — HTTPS first, HTTP fallback.
+    for port, scheme in ((MGMT_PORT_HTTPS, "https"), (MGMT_PORT_HTTP, "http")):
+        try:
+            r = _open(f"{scheme}://{host}:{port}/cluster-info", timeout=3)
+            return json.loads(r.read())
+        except Exception:
+            pass
     # Fallback: witness /status only
     try:
         r = urllib.request.urlopen(f"http://{host}:{WITNESS_PORT}/status", timeout=3)
