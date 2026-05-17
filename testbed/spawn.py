@@ -462,14 +462,41 @@ def cmd_reset(args):
 def get_mgmt_ip(i: int) -> str | None:
     """Get the bedrock-mgmt IP of a sim node.
 
-    With cloud-init pinning a static IP per index, we can return it
-    directly once the VM exists. The agent-based fallback below is kept
-    for the no-static-IP edge case (image without our cloud-init).
+    Resolution order:
+      1. `virsh domifaddr --source arp` — works for any running sim
+         that's exchanged ARP on the bridge. Most reliable when
+         bedrock-mgmt is bridged to the host LAN and DHCP from the
+         home router landed somewhere unpredictable (not the
+         hardcoded .201+i convention).
+      2. `virsh domifaddr --source agent` — needs qemu-guest-agent
+         installed in the guest. Falls back here if ARP empty.
+      3. Hardcoded mgmt_ip(i) — last resort, only correct if the
+         home router happens to honour the .201-.210 reservation.
     """
     hostname = node_name(i)
     if not node_exists(i):
         return None
-    # Static IP per node index — set by cloud-init from MGMT_PREFIX.
+
+    out, _ = virsh("domifaddr", hostname, "--source", "arp", capture=True)
+    for line in (out or "").splitlines():
+        cols = line.split()
+        if len(cols) >= 4 and cols[0].startswith("vnet") and "/" in cols[-1]:
+            ip = cols[-1].split("/")[0]
+            if ip and not ip.startswith(("169.254.", "127.")) and "." in ip:
+                # First non-link-local, non-loopback IPv4 wins —
+                # the bedrock-mgmt NIC's vnet is the first one
+                # in the XML, so its ARP entry is first.
+                return ip
+
+    out, _ = virsh("domifaddr", hostname, "--source", "agent", capture=True)
+    for line in (out or "").splitlines():
+        cols = line.split()
+        if len(cols) >= 4 and "/" in cols[-1]:
+            ip = cols[-1].split("/")[0]
+            if (ip and not ip.startswith(("169.254.", "127.", "10.99."))
+                and "." in ip):
+                return ip
+
     return mgmt_ip(i)
 
     # Try virsh domifaddr (works for NAT)
