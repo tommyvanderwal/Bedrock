@@ -50,6 +50,15 @@ DATA_DIR         = Path("/var/lib/bedrock/rqlite")
 RAFT_PORT = 4002
 HTTP_PORT = 4001
 
+# Arbiter env path — separate so the arbiter rqlited unit reads its
+# own config without colliding with the per-node rqlited's.
+ARBITER_ENV     = Path("/etc/bedrock/rqlited-arbiter.env")
+ARBITER_DATA_DIR = Path("/var/lib/bedrock/cluster/rqlite")
+# Arbiter node-id: 254 to match its /24 octet (per D-05) and to
+# stay distinct from any per-node id (which are 1..N from sorted
+# index). 0 is reserved by rqlite as "auto"; we avoid it.
+ARBITER_NODE_ID  = 254
+
 
 def _read_json(path: Path) -> dict:
     try:
@@ -175,6 +184,77 @@ def render_env_file(
 
     # Atomic env-file write: write to a temp file then rename. Avoids
     # half-written-env crashes if systemd reads concurrently.
+    tmp_path = env_path.with_suffix(env_path.suffix + ".tmp")
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{k}={v}" for k, v in env.items()]
+    tmp_path.write_text("\n".join(lines) + "\n")
+    os.replace(tmp_path, env_path)
+
+    return env
+
+
+def render_arbiter_env_file(
+    *,
+    cluster_path: Path = CLUSTER_JSON,
+    state_path: Path = STATE_JSON,
+    env_path: Path = ARBITER_ENV,
+    data_dir: Path = ARBITER_DATA_DIR,
+) -> dict:
+    """Materialise /etc/bedrock/rqlited-arbiter.env for the arbiter
+    rqlite daemon. The arbiter binds to `100.X.Y.254/32` (D-05) and
+    joins the existing per-node rqlite peers.
+
+    Called from cluster_arbiter.promote_to_arbiter_host() right
+    before systemctl start bedrock-rqlited-arbiter — at that point
+    the .254/32 has just been claimed on lo, so the bind address
+    is locally reachable.
+
+    Raises RuntimeError if the cluster snapshot isn't ready (we
+    can't derive the .254 IP without cluster_uuid).
+    """
+    from . import cluster_arbiter as ca
+
+    cluster = _read_json(cluster_path)
+    state = _read_json(state_path)
+
+    arbiter_ip = ca.arbiter_loopback_ip()
+    if not arbiter_ip:
+        raise RuntimeError(
+            "rqlite_setup: arbiter IP unknown — cluster.json must "
+            "contain cluster_uuid before the arbiter can start"
+        )
+
+    # Peer list: every per-node rqlite (i.e. every other node's
+    # loopback at the Raft port). The arbiter joins those peers
+    # rather than the other arbiter (there's only ever one).
+    my_node = state.get("node_name", "")
+    peers = _peer_loopbacks(cluster, my_node)
+    # Include this node's own per-node rqlite too — the arbiter is
+    # a separate Raft node on the same host, so it dials the per-
+    # node rqlite at the same loopback.
+    my_loopback = state.get("loopback_ip", "")
+    if my_loopback and my_loopback not in peers:
+        peers.append(my_loopback)
+
+    if not peers:
+        raise RuntimeError(
+            "rqlite_setup: no per-node rqlite peers known — arbiter "
+            "can't bootstrap without at least one peer to join"
+        )
+
+    env: dict[str, str] = {
+        "BEDROCK_ARBITER_NODE_ID": str(ARBITER_NODE_ID),
+        "BEDROCK_ARBITER_BIND_IP": arbiter_ip,
+        "BEDROCK_ARBITER_DATA_DIR": str(data_dir),
+        # Bootstrap-expect 0 / no flag — the per-node rqlite cluster
+        # is already formed by the time the arbiter joins, so we
+        # always -join, never -bootstrap-expect.
+        "BEDROCK_ARBITER_BOOTSTRAP_FLAG": "",
+        "BEDROCK_ARBITER_JOIN_FLAG":
+            "-join " + ",".join(f"{ip}:{RAFT_PORT}" for ip in peers),
+    }
+
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp_path = env_path.with_suffix(env_path.suffix + ".tmp")
     tmp_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{k}={v}" for k, v in env.items()]

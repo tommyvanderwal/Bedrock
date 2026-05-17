@@ -104,8 +104,13 @@ curl -fsSL "${BEDROCK_REPO}/binaries/rqlited" -o /usr/local/bin/rqlited
 chmod +x /usr/local/bin/rqlited
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited.service" \
     -o /etc/systemd/system/bedrock-rqlited.service
-mkdir -p /var/lib/bedrock/rqlite
-chmod 700 /var/lib/bedrock/rqlite
+# Arbiter unit (D-04) — installed but NOT enabled. cluster_arbiter.py
+# starts/stops it imperatively as part of the master role transition;
+# the orchestrator's revision-watcher calls converge() on every change.
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited-arbiter.service" \
+    -o /etc/systemd/system/bedrock-rqlited-arbiter.service
+mkdir -p /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
+chmod 700 /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
 systemctl daemon-reload
 systemctl enable bedrock-rqlited.service >/dev/null 2>&1 || true
 
@@ -192,6 +197,7 @@ LIB_FILES=(
     bedrock_state.py
     bedrock_schema.sql
     view_builder.py
+    cluster_arbiter.py
     dashboard_install.py
     netd.py
     l2disc.py

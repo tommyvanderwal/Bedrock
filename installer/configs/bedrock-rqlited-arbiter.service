@@ -1,0 +1,63 @@
+[Unit]
+Description=Bedrock cluster-state store — ARBITER rqlite (D-04)
+Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
+# The arbiter only starts AFTER the per-node rqlite is up AND the
+# tier-cluster DRBD volume is mounted with the arbiter's data dir
+# accessible. cluster_arbiter.py's promote_to_arbiter_host() drives
+# the actual sequencing — this unit is started by that script, not
+# enabled standalone.
+After=network-online.target bedrock-net.service bedrock-rqlited.service
+Wants=network-online.target
+Requires=bedrock-net.service
+# Allow several restarts during master-role transitions before
+# systemd gives up — each transition demotes-then-promotes which
+# can produce a quick stop/start.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bedrock/rqlited-arbiter.env
+
+# Refuse to run if cluster_arbiter.py says we're not the
+# hosting node (DRBD secondary, no mount, no .254 on lo).
+# cluster_arbiter.py's promote_to_arbiter_host() puts everything
+# in place; this guard catches "operator manually started the
+# unit on a non-leader" mistakes.
+ExecStartPre=/usr/bin/python3 -c "import sys; sys.path.insert(0, '/usr/local/lib/bedrock'); from lib import cluster_arbiter as a; s = a.arbiter_status(); sys.exit(0 if (s['drbd_role'] == 'Primary' and s['mounted'] and s['ip_present']) else 1)"
+
+ExecStart=/usr/local/bin/rqlited \
+    -node-id ${BEDROCK_ARBITER_NODE_ID} \
+    -http-addr ${BEDROCK_ARBITER_BIND_IP}:4001 \
+    -raft-addr ${BEDROCK_ARBITER_BIND_IP}:4002 \
+    -http-adv-addr ${BEDROCK_ARBITER_BIND_IP}:4001 \
+    -raft-adv-addr ${BEDROCK_ARBITER_BIND_IP}:4002 \
+    -on-disk \
+    ${BEDROCK_ARBITER_JOIN_FLAG} \
+    ${BEDROCK_ARBITER_BOOTSTRAP_FLAG} \
+    ${BEDROCK_ARBITER_DATA_DIR}
+
+Restart=on-failure
+RestartSec=3s
+
+# Arbiter is a 3rd voter; doesn't carry much state. Cap RAM lower
+# than the per-node unit since arbiter shouldn't have a large
+# working set.
+MemoryHigh=128M
+MemoryMax=192M
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Arbiter writes its WAL + snapshot under the tier-cluster mount.
+ReadWritePaths=/var/lib/bedrock/cluster
+
+StandardOutput=journal
+StandardError=journal
+
+# NOT enabled by default — cluster_arbiter.py starts/stops this
+# imperatively as part of the master role transition. The
+# orchestrator's revision-watcher invokes converge() on every
+# revision change.
+[Install]
+WantedBy=

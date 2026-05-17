@@ -307,6 +307,21 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             log.warning("rqlite_subscriber: drbd config regen at rev %d: %s",
                         revision, e)
 
+    # Arbiter mobility (D-04..D-08): converge based on whether this
+    # node currently holds the mgmt master role. promote/demote is
+    # idempotent so this is safe on every revision tick.
+    try:
+        try:
+            from installer.lib import cluster_arbiter as _ca  # type: ignore
+        except ImportError:
+            import sys as _sys2
+            _sys2.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import cluster_arbiter as _ca  # type: ignore
+        _ca.converge()
+    except Exception as e:
+        log.warning("rqlite_subscriber: cluster_arbiter converge at rev %d: %s",
+                    revision, e)
+
     # Snapshot-diff reactor — on each revision advance, derive
     # transitions from prev→cur and run side effects (vm destroyed,
     # vm host changed, tier master changed, backup target added).
