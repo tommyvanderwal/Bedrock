@@ -105,12 +105,34 @@ def arbiter_loopback_ip() -> str:
 
 
 def _drbd_role() -> str:
-    """Returns 'Primary' / 'Secondary' / 'Unknown' for tier-cluster."""
+    """Returns 'Primary' / 'Secondary' / 'Unknown' for tier-cluster.
+    'Unknown' covers both "drbdadm errored" and "resource not
+    configured" (N=1 case, where no DRBD resource exists at all)."""
     rc, out, _ = _run(["drbdadm", "role", TIER_RESOURCE])
     if rc != 0:
         return "Unknown"
     head = (out or "").strip().split("/")[0]
     return head or "Unknown"
+
+
+def _drbd_resource_exists() -> bool:
+    """True if tier-cluster is a configured DRBD resource on this
+    node. False at N=1 (no DRBD needed — singleton services run
+    directly on the local FS) or before the tier is set up by the
+    install path."""
+    rc, _, _ = _run(["drbdadm", "dump", TIER_RESOURCE])
+    return rc == 0
+
+
+def _cluster_size() -> int:
+    """How many nodes are in the cluster snapshot. N=1 means we
+    can skip every DRBD step (no peer, no replication needed) and
+    just run the singleton services on the local FS."""
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except Exception:
+        return 0
+    return len(cluster.get("nodes") or {})
 
 
 def _drbd_promote() -> None:
@@ -227,27 +249,46 @@ def _svc_stop(unit: str) -> None:
 
 
 def promote_to_arbiter_host() -> dict:
-    """Take over hosting the arbiter on this node. Sequence:
+    """Take over hosting the cluster-singleton services on this node.
 
-      1. DRBD-promote tier-cluster (idempotent)
-      2. Mount /var/lib/bedrock/cluster (idempotent)
-      3. Ensure arbiter data dir exists with mode 0700
-      4. Claim 100.X.Y.254/32 on lo (idempotent)
-      5. Render /etc/bedrock/rqlited-arbiter.env (idempotent)
-      6. systemctl start bedrock-rqlited-arbiter (idempotent)
+    Two modes:
 
-    Returns the post-state dict from arbiter_status(). Raises on
-    a step that genuinely couldn't complete — DRBD-promote failure
-    (peer still primary?), mount failure (FS corruption?), etc.
+      * N=1 (no tier-cluster DRBD resource): the singleton directory
+        is just a regular path on the local FS. No DRBD-promote, no
+        mount, no .254 floating IP, no arbiter rqlite (the single
+        per-node rqlite is already the only voter and self-elected
+        leader). filer + s3 still start so the S3 endpoint is up.
 
-    Idempotent: safe to call on every role-change tick. If we're
-    already hosting the arbiter, all steps no-op.
+      * N>=2 (tier-cluster DRBD exists): full sequence —
+          1. DRBD-promote tier-cluster
+          2. Mount /var/lib/bedrock/cluster
+          3. Ensure arbiter data dir exists (mode 0700)
+          4. Claim 100.X.Y.254/32 on lo
+          5. Render /etc/bedrock/rqlited-arbiter.env
+          6. systemctl start bedrock-rqlited-arbiter
+        Then filer + s3 start in either mode.
+
+    Returns the post-state dict. Raises on a step that genuinely
+    couldn't complete. Idempotent: safe to call on every role tick.
     """
-    log.info("arbiter: promoting this node to arbiter host")
-    _drbd_promote()
-    _mount()
-    ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
-    ip = _ip_add()
+    n = _cluster_size()
+    drbd_present = _drbd_resource_exists()
+    ip = ""
+
+    if drbd_present:
+        log.info("arbiter: promoting (N=%d, tier-cluster DRBD present)", n)
+        _drbd_promote()
+        _mount()
+        ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ip = _ip_add()
+    else:
+        # N=1 mode (or pre-DRBD-setup): create the singleton dir
+        # directly on the local FS so filer's DB has a home.
+        log.info("arbiter: promoting (N=%d, no tier-cluster DRBD — "
+                 "running singletons directly on local FS)", n)
+        MOUNT_POINT.mkdir(parents=True, exist_ok=True, mode=0o755)
+        ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # No .254/32 needed — there's no rqlite-arbiter at N=1.
     # Now that the IP is on lo, materialise the env file. (The env
     # file's BEDROCK_ARBITER_BIND_IP refers to .254 — we need .254
     # bound before rqlited tries to bind, which is what the ExecStart
@@ -260,8 +301,11 @@ def promote_to_arbiter_host() -> dict:
         sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import rqlite_setup  # type: ignore
         from lib import seaweedfs  # type: ignore
-    rqlite_setup.render_arbiter_env_file()
-    _svc_start(ARBITER_SVC)
+    if drbd_present:
+        rqlite_setup.render_arbiter_env_file()
+        _svc_start(ARBITER_SVC)
+    # else: N=1 → no arbiter rqlite; the single per-node rqlite is
+    # the sole Raft voter and is already running.
     # SeaweedFS filer + S3 also follow the master role (D-07: every
     # cluster-wide singleton lives on the tier-cluster DRBD volume).
     # filer's SQLite metadata DB is at /var/lib/bedrock/cluster/
@@ -276,16 +320,25 @@ def promote_to_arbiter_host() -> dict:
 
 
 def demote_arbiter_host() -> dict:
-    """Stop hosting the arbiter. Reverse of promote: stop S3 + filer
-    (they rely on the mount), stop the arbiter rqlite, release the
-    .254 IP, unmount tier-cluster, drbdadm secondary.
+    """Stop hosting the singleton services. Reverse of promote.
 
-    Idempotent: safe to call on every role-change tick. If we're
-    not currently the arbiter host, all steps no-op.
+    Two modes mirroring promote_to_arbiter_host():
+
+      * If tier-cluster DRBD is present: stop filer + s3, stop
+        arbiter rqlite, release .254 IP, unmount, drbdadm secondary.
+
+      * N=1 (no DRBD): stop filer + s3, nothing else to do — the
+        rqlite is still running for cluster state (it's the only
+        voter at N=1, and demote on a master that's still the only
+        node doesn't actually demote anything, just stops singletons
+        that would re-start on the next converge tick).
+
+    Idempotent.
     """
-    log.info("arbiter: demoting this node (was arbiter host)")
+    log.info("arbiter: demoting this node (was singleton host)")
+    drbd_present = _drbd_resource_exists()
     # SeaweedFS S3 + filer first — they use the mount, must stop
-    # before umount.
+    # before umount. Also valid at N=1; they just stop.
     try:
         try:
             from . import seaweedfs
@@ -296,10 +349,11 @@ def demote_arbiter_host() -> dict:
         seaweedfs.demote_filer_host()
     except Exception as e:
         log.warning("arbiter: SeaweedFS filer demote failed: %s", e)
-    _svc_stop(ARBITER_SVC)
-    _ip_del()
-    _umount()
-    _drbd_secondary()
+    if drbd_present:
+        _svc_stop(ARBITER_SVC)
+        _ip_del()
+        _umount()
+        _drbd_secondary()
     return arbiter_status()
 
 
@@ -326,14 +380,33 @@ def i_should_host_arbiter() -> bool:
 
 
 def converge() -> dict:
-    """Single-shot converge: if I should host arbiter and don't,
+    """Single-shot converge: if I should host singletons and don't,
     promote; if I shouldn't and do, demote. Called from the
     orchestrator's revision-watcher and from boot_orchestrator
     after role settles.
+
+    "Hosting" at N>=2 means: arbiter rqlite running on .254 + DRBD
+    primary + mount + filer + s3. At N=1 it means: filer + s3 only.
+    Detection looks at the arbiter rqlite service for N>=2 and the
+    filer service for N=1.
     """
     should_host = i_should_host_arbiter()
     status = arbiter_status()
-    am_host = status["service_active"] and status["ip_present"]
+    drbd_present = _drbd_resource_exists()
+    if drbd_present:
+        am_host = status["service_active"] and status["ip_present"]
+    else:
+        # N=1: am_host = filer is running
+        try:
+            try:
+                from . import seaweedfs
+            except ImportError:
+                import sys
+                sys.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import seaweedfs  # type: ignore
+            am_host = seaweedfs.is_filer_active()
+        except Exception:
+            am_host = False
     if should_host and not am_host:
         return promote_to_arbiter_host()
     if not should_host and am_host:

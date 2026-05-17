@@ -277,19 +277,15 @@ def _systemctl(action: str, unit: str) -> tuple[int, str, str]:
 
 
 def _svc_active(unit: str) -> bool:
-    rc, _, _ = subprocess.run(
+    r = subprocess.run(
         ["systemctl", "is-active", "--quiet", unit],
-        capture_output=False
-    ), None, None
-    return rc == 0 if isinstance(rc, int) else False
+        capture_output=True,
+    )
+    return r.returncode == 0
 
 
 def is_filer_active() -> bool:
-    r = subprocess.run(
-        ["systemctl", "is-active", "--quiet", "bedrock-weed-filer.service"],
-        capture_output=False,
-    )
-    return r.returncode == 0
+    return _svc_active("bedrock-weed-filer.service")
 
 
 def promote_to_filer_host() -> None:
