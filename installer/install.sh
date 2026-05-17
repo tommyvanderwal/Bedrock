@@ -102,6 +102,26 @@ systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
 log "Installing rqlited binary + systemd unit..."
 curl -fsSL "${BEDROCK_REPO}/binaries/rqlited" -o /usr/local/bin/rqlited
 chmod +x /usr/local/bin/rqlited
+
+# SeaweedFS — unified S3 stack (D-09). Replaces Garage + RustFS.
+# master + volume run on EVERY node; filer + s3 follow the mgmt
+# master via cluster_arbiter.py (D-07).
+log "Installing weed binary + SeaweedFS systemd units..."
+curl -fsSL "${BEDROCK_REPO}/binaries/weed" -o /usr/local/bin/weed
+chmod +x /usr/local/bin/weed
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-master.service" \
+    -o /etc/systemd/system/bedrock-weed-master.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-volume.service" \
+    -o /etc/systemd/system/bedrock-weed-volume.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-filer.service" \
+    -o /etc/systemd/system/bedrock-weed-filer.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-s3.service" \
+    -o /etc/systemd/system/bedrock-weed-s3.service
+mkdir -p /var/lib/bedrock/seaweedfs/master /var/lib/bedrock/seaweedfs/volumes
+chmod 755 /var/lib/bedrock/seaweedfs
+# Master + volume enabled at install time so every node hosts them
+# automatically once `bedrock init` / `bedrock join` writes the env
+# file. Filer + s3 are owned by cluster_arbiter.py.
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited.service" \
     -o /etc/systemd/system/bedrock-rqlited.service
 # Arbiter unit (D-04) — installed but NOT enabled. cluster_arbiter.py
@@ -198,6 +218,7 @@ LIB_FILES=(
     bedrock_schema.sql
     view_builder.py
     cluster_arbiter.py
+    seaweedfs.py
     dashboard_install.py
     netd.py
     l2disc.py

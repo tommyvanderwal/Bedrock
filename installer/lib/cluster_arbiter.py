@@ -254,25 +254,48 @@ def promote_to_arbiter_host() -> dict:
     # in the unit will do.)
     try:
         from . import rqlite_setup
+        from . import seaweedfs
     except ImportError:
         import sys
         sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import rqlite_setup  # type: ignore
+        from lib import seaweedfs  # type: ignore
     rqlite_setup.render_arbiter_env_file()
     _svc_start(ARBITER_SVC)
+    # SeaweedFS filer + S3 also follow the master role (D-07: every
+    # cluster-wide singleton lives on the tier-cluster DRBD volume).
+    # filer's SQLite metadata DB is at /var/lib/bedrock/cluster/
+    # seaweedfs/filer.db — same mount.
+    try:
+        seaweedfs.promote_to_filer_host()
+    except Exception as e:
+        log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
     log.info("arbiter: promotion complete (ip=%s mount=%s)",
              ip, MOUNT_POINT)
     return arbiter_status()
 
 
 def demote_arbiter_host() -> dict:
-    """Stop hosting the arbiter. Reverse of promote: stop the
-    service, release the IP, unmount, drbdadm secondary.
+    """Stop hosting the arbiter. Reverse of promote: stop S3 + filer
+    (they rely on the mount), stop the arbiter rqlite, release the
+    .254 IP, unmount tier-cluster, drbdadm secondary.
 
     Idempotent: safe to call on every role-change tick. If we're
     not currently the arbiter host, all steps no-op.
     """
     log.info("arbiter: demoting this node (was arbiter host)")
+    # SeaweedFS S3 + filer first — they use the mount, must stop
+    # before umount.
+    try:
+        try:
+            from . import seaweedfs
+        except ImportError:
+            import sys
+            sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import seaweedfs  # type: ignore
+        seaweedfs.demote_filer_host()
+    except Exception as e:
+        log.warning("arbiter: SeaweedFS filer demote failed: %s", e)
     _svc_stop(ARBITER_SVC)
     _ip_del()
     _umount()

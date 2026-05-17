@@ -116,11 +116,40 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     # the rest from $BEDROCK_REPO/binaries/ when `bedrock init` /
     # `bedrock join` runs.
     for b in bedrock-rust victoria-metrics victoria-logs node_exporter \
-             vmagent vlagent vmbackup vmrestore rqlited; do
+             vmagent vlagent vmbackup vmrestore rqlited weed; do
         if [ -f "$INSTALLER/binaries/$b" ]; then
             cp "$INSTALLER/binaries/$b" "$PAYLOAD_DIR/binaries/$b"
         else
-            echo "  WARN: $INSTALLER/binaries/$b not found — produce it first" >&2
+            # Auto-fetch missing upstream binaries we know how to find.
+            # Each upstream URL is pinned to a specific version below;
+            # bump as needed when upgrading. Kept here (not in git)
+            # because some of these (weed at 144 MB, vmbackup at 65 MB)
+            # exceed GitHub's per-file size cap.
+            case "$b" in
+                weed)
+                    echo "  fetching weed v4.25 ($b not in git)..."
+                    curl -fSL --progress-bar -o /tmp/weed.tgz \
+                        "https://github.com/seaweedfs/seaweedfs/releases/download/4.25/linux_amd64.tar.gz" \
+                        && tar xzf /tmp/weed.tgz -C /tmp \
+                        && install -m 0755 /tmp/weed "$PAYLOAD_DIR/binaries/$b" \
+                        && install -m 0755 /tmp/weed "$INSTALLER/binaries/$b" \
+                        && rm -f /tmp/weed.tgz /tmp/weed
+                    ;;
+                rqlited)
+                    echo "  fetching rqlited v10.0.5 ($b not in git)..."
+                    curl -fSL --progress-bar -o /tmp/rqlite.tgz \
+                        "https://github.com/rqlite/rqlite/releases/download/v10.0.5/rqlite-v10.0.5-linux-amd64.tar.gz" \
+                        && tar xzf /tmp/rqlite.tgz -C /tmp \
+                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited \
+                                          "$PAYLOAD_DIR/binaries/$b" \
+                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited \
+                                          "$INSTALLER/binaries/$b" \
+                        && rm -rf /tmp/rqlite.tgz /tmp/rqlite-v10.0.5-linux-amd64
+                    ;;
+                *)
+                    echo "  WARN: $INSTALLER/binaries/$b not found — produce it first" >&2
+                    ;;
+            esac
         fi
     done
     # Python helper bundled alongside the static binaries.

@@ -1,0 +1,39 @@
+[Unit]
+Description=SeaweedFS master (cluster coordinator)
+Documentation=https://github.com/seaweedfs/seaweedfs/wiki
+After=network-online.target bedrock-net.service
+Wants=network-online.target
+Requires=bedrock-net.service
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Runs on every node — master HA at N≥2. Binds to this node's
+# loopback /32 (the cluster identity IP — bedrock-net advertises it,
+# kernel routes through the best physical NIC).
+EnvironmentFile=/etc/bedrock/seaweedfs.env
+
+ExecStart=/usr/local/bin/weed master \
+    -ip=${SEAWEED_LOOPBACK_IP} \
+    -port=9333 \
+    -port.grpc=19333 \
+    -mdir=/var/lib/bedrock/seaweedfs/master \
+    -peers=${SEAWEED_MASTER_PEERS} \
+    -resumeState=true
+
+Restart=on-failure
+RestartSec=3s
+MemoryHigh=128M
+MemoryMax=192M
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bedrock/seaweedfs/master
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

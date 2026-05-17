@@ -8,3 +8,8 @@ testbed/state/
 installer/iso-build/build/
 installer/iso-build/output/
 installer/iso-build/payload/
+
+# Large upstream binaries — build-iso.sh re-fetches them at build time
+# from pinned upstream URLs. GitHub has a 100 MB per-file limit;
+# `weed` (144 MB) and similar live outside git for this reason.
+installer/binaries/weed

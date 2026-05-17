@@ -1,0 +1,37 @@
+[Unit]
+Description=SeaweedFS S3 API gateway
+Documentation=https://github.com/seaweedfs/seaweedfs/wiki/AmazonS3-API
+After=network-online.target bedrock-weed-filer.service
+Wants=network-online.target
+Requires=bedrock-weed-filer.service
+# Like the filer, NOT enabled by default — moves with the mgmt-
+# master role via cluster_arbiter.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bedrock/seaweedfs.env
+
+# Listens on 0.0.0.0:8333 so external S3 clients (Kopia, awscli,
+# rclone) can connect via the operator-LAN IP. The filer endpoint
+# is the master's loopback /32, reachable via the mesh.
+ExecStart=/usr/local/bin/weed s3 \
+    -filer=${SEAWEED_LOOPBACK_IP}:8888 \
+    -port=8333 \
+    -config=/etc/bedrock/seaweedfs-s3.json
+
+Restart=on-failure
+RestartSec=3s
+MemoryHigh=128M
+MemoryMax=192M
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=
