@@ -233,7 +233,13 @@ def write_env_file(*, volume_max: int = 50,
             "seaweedfs: loopback_ip not in state.json — can't render env"
         )
     all_masters = sorted([my_lo] + _peer_loopbacks())
-    peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
+    if len(all_masters) <= 1:
+        # SeaweedFS 'none' = single-master mode (no peer-list Raft).
+        # Documented in `weed master --help`. Avoids the master
+        # complaining about "peer list contains only self".
+        peers = "none"
+    else:
+        peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
 
     env = {
         "SEAWEED_LOOPBACK_IP":      my_lo,
@@ -250,15 +256,22 @@ def write_env_file(*, volume_max: int = 50,
 
 
 def write_s3_config() -> None:
-    """Render the S3 API config. v1.0 ships with anonymous-allow-all
-    + the operator setting credentials per-bucket via `weed shell`.
-    Future: pull credentials from rqlite operators/secrets table."""
+    """Render the S3 API config. v1.0 testbed default: anonymous
+    Read+Write+List. Operator can lock down per-bucket via
+    `weed shell` once credentials are in place. Future:
+    pull credentials from rqlite operators/secrets table."""
     S3_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     cfg = {
         "identities": [
             {
                 "name": "anonymous",
-                "actions": ["Read"],
+                # Read + Write + List + Tagging covers the
+                # marker-PUT/GET round trip the scale-lifecycle test
+                # does, and the typical Kopia/awscli/rclone backup
+                # flows. Operators must override this before any
+                # production deploy.
+                "actions": ["Read", "Write", "List", "Tagging",
+                            "Admin"],
             }
         ]
     }

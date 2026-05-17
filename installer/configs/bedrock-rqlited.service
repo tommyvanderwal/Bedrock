@@ -27,16 +27,22 @@ EnvironmentFile=/etc/bedrock/rqlited.env
 # mesh-network rewrite-notes flagged.
 ExecStartPre=/usr/bin/python3 /usr/local/lib/bedrock/lib/rqlite_setup.py --render-env
 
-ExecStart=/usr/local/bin/rqlited \
-    -node-id ${BEDROCK_RQLITED_NODE_ID} \
+# Use /bin/sh -c so the env-var values that contain spaces
+# (BEDROCK_RQLITED_JOIN_FLAG="-join host1:4002,host2:4002",
+#  BEDROCK_RQLITED_BOOTSTRAP_FLAG="-bootstrap-expect 1")
+# get word-split into separate argv entries. Without this,
+# systemd passes each env-var value as a single token and
+# rqlited rejects "-bootstrap-expect 1" as one flag.
+# rqlite v10: on-disk SQLite is the only mode; no -on-disk flag.
+ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
+    -node-id "$BEDROCK_RQLITED_NODE_ID" \
     -http-addr 0.0.0.0:4001 \
     -raft-addr 0.0.0.0:4002 \
-    -http-adv-addr ${BEDROCK_RQLITED_BIND_IP}:4001 \
-    -raft-adv-addr ${BEDROCK_RQLITED_BIND_IP}:4002 \
-    -on-disk \
-    ${BEDROCK_RQLITED_JOIN_FLAG} \
-    ${BEDROCK_RQLITED_BOOTSTRAP_FLAG} \
-    ${BEDROCK_RQLITED_DATA_DIR}
+    -http-adv-addr "$BEDROCK_RQLITED_BIND_IP:4001" \
+    -raft-adv-addr "$BEDROCK_RQLITED_BIND_IP:4002" \
+    $BEDROCK_RQLITED_JOIN_FLAG \
+    $BEDROCK_RQLITED_BOOTSTRAP_FLAG \
+    "$BEDROCK_RQLITED_DATA_DIR"'
 
 Restart=on-failure
 RestartSec=2s
@@ -51,12 +57,13 @@ MemoryMax=256M
 # CPU is uncontended on dev boxes; leave unbounded for now.
 
 # Filesystem isolation: rqlited only needs its data dir + the
-# env file. ReadWritePaths is the data dir; ProtectSystem=strict
-# locks down everything else.
+# env file. ReadWritePaths covers the data dir AND /etc/bedrock
+# (the ExecStartPre's rqlite_setup --render-env writes the env
+# file there at boot when state.json has caught up).
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/bedrock/rqlite
+ReadWritePaths=/var/lib/bedrock/rqlite /etc/bedrock
 
 # Logging — emit to journal; structured-logging follow-up can
 # layer on top.

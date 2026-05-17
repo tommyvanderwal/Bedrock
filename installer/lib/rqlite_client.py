@@ -484,20 +484,34 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
     (CREATE TABLE IF NOT EXISTS everywhere). Run once at install
     time on the elected master; replicates to all rqlite peers via
     Raft.
+
+    SQL splitter strips `-- single-line` and `/* block */` comments
+    BEFORE splitting on `;` — so a semicolon inside a comment
+    doesn't fragment the surrounding CREATE statement.
     """
     with open(schema_sql_path, "r", encoding="utf-8") as f:
         sql = f.read()
-    # rqlite's /db/execute accepts multiple semicolon-separated
-    # statements when each is a separate list entry. Split on
-    # statement boundaries, ignoring comments and empty chunks.
+    # Strip /* ... */ block comments first.
+    import re as _re
+    sql = _re.sub(r"/\*.*?\*/", "", sql, flags=_re.DOTALL)
+    # Strip `-- ...` line comments (whole-line and trailing). Keep
+    # the newline so line breaks within statements are preserved.
+    cleaned_lines = []
+    for line in sql.splitlines():
+        # Find a `--` that isn't inside a string literal. Simple
+        # heuristic: split at the first `--` not preceded by `"`
+        # or `'`. Good enough for our schema (no `--` in literals).
+        idx = line.find("--")
+        if idx >= 0:
+            line = line[:idx]
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+    # Now split on `;` and submit non-empty statements.
     statements: list[str] = []
-    for chunk in sql.split(";"):
-        stripped = "\n".join(
-            line for line in chunk.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ).strip()
-        if stripped:
-            statements.append(stripped + ";")
+    for chunk in cleaned.split(";"):
+        s = chunk.strip()
+        if s:
+            statements.append(s + ";")
     if not statements:
         return
     client.execute(statements, transaction=True)

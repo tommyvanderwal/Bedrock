@@ -117,6 +117,17 @@ echo "[stage-a] payload copied: $(du -sh "$DST" | cut -f1)"
 
 set -euo pipefail
 
+# Testbed convenience: drop the dev-box operator's public key into
+# root's authorized_keys so test scripts can SSH key-based. Real
+# deployments leave authorized_keys empty (passwd auth only until
+# operator wires their own key).
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+cat > /root/.ssh/authorized_keys <<'PUBKEY_EOF'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXS8J+TpzUuO2WDCeSxV9baR5p7p14ZtaXWRvVlZgqp tommy@HP-G1a
+PUBKEY_EOF
+chmod 600 /root/.ssh/authorized_keys
+
 # First-boot one-shot service: runs install.sh against the local
 # payload. Self-disables after success so it never re-runs.
 cat > /etc/systemd/system/bedrock-firstboot.service <<'EOF'

@@ -53,8 +53,18 @@ fi
 # ── Install minimal prereqs ────────────────────────────────────────────────
 
 log "Installing prerequisites..."
-dnf install -y -q python3 python3-pip curl >/dev/null 2>&1 || {
+dnf install -y -q python3 python3-pip curl python3-httpx >/dev/null 2>&1 || {
     warn "dnf install failed (already installed?). Continuing."
+}
+# httpx is the rqlite_client.py HTTP transport (D-01). Pull from pip
+# if the dnf repo didn't have it — the bedrock-install ISO bundles
+# wheels via the dashboard_install path but rqlite_client is loaded
+# earlier than that, so it needs to be available globally.
+python3 -c "import httpx" 2>/dev/null || {
+    log "Installing httpx via pip (offline wheels first, online fallback)..."
+    pip install --break-system-packages --no-index --find-links="${BEDROCK_REPO#file://}/wheels" httpx 2>/dev/null \
+        || pip install --break-system-packages httpx 2>/dev/null \
+        || warn "httpx install failed; rqlite_client will not work"
 }
 
 # ── Download bedrock CLI + lib ─────────────────────────────────────────────

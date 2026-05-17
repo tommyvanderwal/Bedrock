@@ -233,7 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_vm_backups_kopia    ON vm_backups(primary_kopia_i
 
 -- Canonical-order path key: "a_node|a_nic|b_node|b_nic" with
 -- (a_node, a_nic) sorted alphabetically below (b_node, b_nic).
--- Computed by the writer; stored as-is.
+-- Computed by the writer + stored as-is (a < b).
 CREATE TABLE IF NOT EXISTS paths (
     path_key         TEXT PRIMARY KEY,
     node_a           TEXT NOT NULL,

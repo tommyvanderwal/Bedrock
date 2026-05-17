@@ -105,28 +105,36 @@ vm_running() {
         || echo "0"
 }
 
-# Put + Get a marker file via the master's S3 endpoint. Marker name
-# carries the test phase so we can verify cross-transition durability.
+# Put + Get a marker file via the master's S3 endpoint.
+#
+# Uses curl directly — anonymous SeaweedFS S3 (per the testbed s3.json
+# in seaweedfs.py write_s3_config()) accepts unsigned PUT/GET without
+# needing the awscli package on every sim. Bucket auto-created on
+# first PUT (SeaweedFS S3 gateway behaviour).
+s3_endpoint_for() {
+    local node=$1
+    sssh "$node" "python3 -c 'import json; c=json.load(open(\"/etc/bedrock/cluster.json\")); n=c[\"nodes\"].get(c[\"mgmt_master\"],{}); print(n.get(\"host\",\"\"))'"
+}
+
 s3_put_marker() {
     local node=$1 phase=$2
     local master_ip
-    master_ip=$(sssh "$node" "python3 -c 'import json; c=json.load(open(\"/etc/bedrock/cluster.json\")); n=c[\"nodes\"].get(c[\"mgmt_master\"],{}); print(n.get(\"host\",\"\"))'")
+    master_ip=$(s3_endpoint_for "$node")
     [ -z "$master_ip" ] && fail "s3_put_marker: no master host"
-    local marker="/tmp/bedrock-scale-marker-$phase.txt"
-    sssh "$node" "echo 'phase=$phase ts=$(date -Iseconds)' > $marker && \
-        AWS_ACCESS_KEY_ID=anonymous AWS_SECRET_ACCESS_KEY=anonymous \
-        aws --endpoint-url http://$master_ip:8333 s3 cp $marker s3://bedrock-test/marker-$phase.txt 2>&1 \
-        | tail -5"
+    local body
+    body="phase=$phase ts=$(date -Iseconds)"
+    sssh "$node" "curl -sS -X PUT --data-raw $(printf %q "$body") \
+        http://${master_ip}:8333/bedrock-test/marker-${phase}.txt \
+        -w 'HTTP %{http_code}\n' | tail -2"
 }
 
 s3_get_marker() {
     local node=$1 phase=$2
     local master_ip
-    master_ip=$(sssh "$node" "python3 -c 'import json; c=json.load(open(\"/etc/bedrock/cluster.json\")); n=c[\"nodes\"].get(c[\"mgmt_master\"],{}); print(n.get(\"host\",\"\"))'")
+    master_ip=$(s3_endpoint_for "$node")
     [ -z "$master_ip" ] && return 1
-    sssh "$node" "AWS_ACCESS_KEY_ID=anonymous AWS_SECRET_ACCESS_KEY=anonymous \
-        aws --endpoint-url http://$master_ip:8333 s3 cp s3://bedrock-test/marker-$phase.txt - 2>/dev/null" \
-        | tee /tmp/recovered-marker-$phase.txt
+    sssh "$node" "curl -sS --fail \
+        http://${master_ip}:8333/bedrock-test/marker-${phase}.txt"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -276,9 +284,11 @@ start_cattle_vm() {
 put_s3_marker_and_verify() {
     local phase=$1 probe_node=$2
     note "S3 marker round-trip @ $phase"
-    s3_put_marker "$probe_node" "$phase" || note "s3_put_marker non-zero — bucket may not yet exist; creating..."
-    sssh "$probe_node" "AWS_ACCESS_KEY_ID=anonymous AWS_SECRET_ACCESS_KEY=anonymous \
-        aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://bedrock-test 2>&1 | tail -3" || true
+    local master_ip; master_ip=$(s3_endpoint_for "$probe_node")
+    # Create bucket if needed (idempotent PUT — SeaweedFS S3
+    # returns 200 or already-exists, both OK).
+    sssh "$probe_node" "curl -sS -X PUT http://${master_ip}:8333/bedrock-test/ \
+        -w 'HTTP %{http_code}\n' | tail -1" || true
     s3_put_marker "$probe_node" "$phase" || fail "s3 put failed at $phase"
     local recovered
     recovered=$(s3_get_marker "$probe_node" "$phase" || echo "")

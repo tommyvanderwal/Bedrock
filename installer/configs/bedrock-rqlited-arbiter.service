@@ -26,16 +26,17 @@ EnvironmentFile=/etc/bedrock/rqlited-arbiter.env
 # unit on a non-leader" mistakes.
 ExecStartPre=/usr/bin/python3 -c "import sys; sys.path.insert(0, '/usr/local/lib/bedrock'); from lib import cluster_arbiter as a; s = a.arbiter_status(); sys.exit(0 if (s['drbd_role'] == 'Primary' and s['mounted'] and s['ip_present']) else 1)"
 
-ExecStart=/usr/local/bin/rqlited \
-    -node-id ${BEDROCK_ARBITER_NODE_ID} \
-    -http-addr ${BEDROCK_ARBITER_BIND_IP}:4001 \
-    -raft-addr ${BEDROCK_ARBITER_BIND_IP}:4002 \
-    -http-adv-addr ${BEDROCK_ARBITER_BIND_IP}:4001 \
-    -raft-adv-addr ${BEDROCK_ARBITER_BIND_IP}:4002 \
-    -on-disk \
-    ${BEDROCK_ARBITER_JOIN_FLAG} \
-    ${BEDROCK_ARBITER_BOOTSTRAP_FLAG} \
-    ${BEDROCK_ARBITER_DATA_DIR}
+# /bin/sh -c so multi-word env values get word-split. rqlite v10:
+# on-disk is the only mode; no -on-disk flag needed.
+ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
+    -node-id "$BEDROCK_ARBITER_NODE_ID" \
+    -http-addr "$BEDROCK_ARBITER_BIND_IP:4001" \
+    -raft-addr "$BEDROCK_ARBITER_BIND_IP:4002" \
+    -http-adv-addr "$BEDROCK_ARBITER_BIND_IP:4001" \
+    -raft-adv-addr "$BEDROCK_ARBITER_BIND_IP:4002" \
+    $BEDROCK_ARBITER_JOIN_FLAG \
+    $BEDROCK_ARBITER_BOOTSTRAP_FLAG \
+    "$BEDROCK_ARBITER_DATA_DIR"'
 
 Restart=on-failure
 RestartSec=3s
@@ -50,7 +51,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 # Arbiter writes its WAL + snapshot under the tier-cluster mount.
-ReadWritePaths=/var/lib/bedrock/cluster
+# /etc/bedrock for the env file that cluster_arbiter.py renders.
+ReadWritePaths=/var/lib/bedrock/cluster /etc/bedrock
 
 StandardOutput=journal
 StandardError=journal

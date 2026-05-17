@@ -157,6 +157,9 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
         cp "$INSTALLER/binaries/vm_exporter.py" "$PAYLOAD_DIR/binaries/vm_exporter.py"
     fi
     cp "$INSTALLER/lib/"*.py                   "$PAYLOAD_DIR/lib/"
+    # Non-Python lib assets — bedrock_schema.sql is consumed by
+    # mgmt_install at `bedrock init` time to bootstrap rqlite.
+    cp "$INSTALLER/lib/"*.sql                  "$PAYLOAD_DIR/lib/" 2>/dev/null || true
     cp -r "$INSTALLER/configs/"*               "$PAYLOAD_DIR/configs/" 2>/dev/null || true
 
     # 2b. ELRepo + DRBD RPMs — pinned versions for reproducibility.
