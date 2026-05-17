@@ -1131,3 +1131,286 @@ actually USE all of them simultaneously for non-DRBD traffic
 (libvirt migrate, NFS, dashboard inter-node, the future etcd
 control plane). Today they're warm spares. Bandwidth aggregation
 without operator configuration is a real upgrade.
+
+---
+
+## Locked decisions (2026-05-17)
+
+The architectural design phase concludes here. Decisions below are
+**binding** for the v1.0 rewrite. Earlier sections of this doc remain
+as the journey-log of what was considered; this section is the
+authoritative summary of what was chosen.
+
+### State store and consensus
+
+- **D-01** — Cluster state lives in **rqlite** (on-disk SQLite mode).
+  HTTP/JSON wire protocol, MIT licensed, ~25 MB RSS per node,
+  inspectable via stock `sqlite3` against the .db file. Bedrock's
+  per-hour QPS doesn't need etcd's gRPC watch fidelity; rqlite's
+  poll-based subscription is sufficient.
+- **D-02** — 3 rqlite instances per HA cluster: one per physical
+  node + one **arbiter** instance hosted on the elected master.
+  Quorum = 2 of 3.
+- **D-03** — Witness arbitration (Layer 1) is **not replaced**.
+  bedrock-rust's `compute_election` + weighted votes + self-fence
+  stays. Witness layer remains Bedrock-native; rqlite doesn't know
+  about it. The arbiter rqlite is what makes rqlite's strict
+  1-vote-per-node Raft work at 2 physical nodes — witness handles
+  the partition arbitration, arbiter handles the rqlite vote count.
+
+### Arbiter form
+
+- **D-04** — Arbiter rqlite runs as a **bare systemd service**, NOT
+  in an LXC. Co-resident with the elected master. The LXC form was
+  considered and dropped: it adds rootfs/kernel-boot overhead without
+  contributing to consensus correctness.
+- **D-05** — Arbiter's network identity is `100.X.Y.254/32` (top of
+  cluster /24) — a secondary /32 added to master's `lo` when the
+  master role transitions to this host, removed when it transitions
+  away. Standard `ip addr add` / `ip addr del` via a small role-change
+  hook in bedrock-rust.
+- **D-06** — Arbiter's data directory is on a **shared singletons
+  DRBD volume** (new tier name `singletons`, 2-way replication
+  between physical nodes), mounted at `/var/lib/bedrock/singletons/`.
+  Filesystem choice is XFS or ext4 — doesn't materially matter.
+
+### Singleton service co-location
+
+- **D-07** — All cluster-singleton services co-locate on the
+  singletons DRBD volume:
+    - `rqlite-arbiter` (Raft state + WAL)
+    - SeaweedFS filer SQLite (the `weed filer` metadata DB)
+    - Any future singleton-shape service that fits this pattern
+- **D-08** — Master role transition = atomic move of the singletons
+  FS: DRBD-promote + mount + start-all-services on the new master,
+  reverse on the old master. Same lifecycle the existing tier-master
+  mechanism already implements for `drbd-nfs` tiers.
+
+### Storage backend
+
+- **D-09** — **SeaweedFS** replaces both Garage (scratch) and RustFS
+  (bulk/critical). Single S3 stack. Closes the "two S3 daemons"
+  problem from the earlier considerations.
+- **D-10** — Filer metadata: **SQLite single-instance on the
+  singletons DRBD volume** for v1.0. Upgrade path to PostgreSQL via
+  `fs.meta.save` / `fs.meta.load` is **bidirectional and documented**
+  (project-confirmed: "It is easy to switch between different filer
+  stores ... move to distributed one or in reverse"). Migration
+  doesn't move any file data — only filer metadata.
+- **D-11** — SeaweedFS S3 endpoint is **externally exposed** on the
+  cluster's front-end IPs. Bedrock acts as an S3 target for other
+  Bedrock clusters, Kopia, awscli, rclone, or any S3 client. Enables
+  the "1-node NAS box backs up the 2-node cluster" composition.
+- **D-12** — Per-collection replication policy:
+    - `scratch` → `replication=000` (no redundancy, ephemeral)
+    - `working`, `models` → `replication=001` (one copy on each side)
+    - `backups` → `replication=001` (no EC until 7+ nodes; OSS EC
+      is hardcoded at 10+4 and only distributes cleanly at 7+ disks)
+
+### Routing layer (bedrock-net)
+
+- **D-13** — Panic catch-all changes from "via freshest neighbour" to
+  **"via mgmt-master loopback"**. Routes any cluster-prefix /24
+  destination via the current master by default. The arbiter `.254/32`
+  flows through naturally; no extra advertisement code needed. Master
+  doesn't install a /24-via-self route on itself (would loop) —
+  master's table uses a sinkhole or absence at this position.
+- **D-14** — Local-metric latency contribution **floors to 0 below
+  1 ms**. Sub-ms is noise on a healthy LAN; bandwidth dominates the
+  metric.
+- **D-15** — **ECMP** across paths with tied metric — kernel
+  multi-nexthop routes with `fib_multipath_hash_policy=1` (L4-hash).
+  Bandwidth aggregation across all direct cables, not just primary-
+  with-warm-spares. Bucketed bandwidth comparison so minor speed-
+  detection noise doesn't split ties.
+
+### Witness layer
+
+- **D-16** — Witness payload morphs from `(epoch, last_log_index,
+  last_log_hash)` to `(arbiter_drbd_uuid, generation,
+  last_man_standing_marker)`. Same mathematical structure (monotonic
+  counter + state fingerprint, third independent observer), different
+  semantic. Closes the cold-boot DRBD-both-Secondary gap from
+  `04-boot-recovery-gaps.md`.
+- **D-17** — Witness backend trait abstracts Echo (UDP / MikroTik /
+  ESP32) and **fileshare** (SMB / NFS / S3) backends. The single-
+  witness lease loop in `witness.rs` already supports `Vec<WitnessSpec>`;
+  what's new is the per-backend protocol implementation. Multi-
+  backend simultaneous configuration ("Echo+NAS-S3 both active") is
+  allowed; explicit quorum-of-witnesses logic (3-of-5 voting across
+  witnesses) is **parked for after v1.0**.
+- **D-18** — Witness is **critical at the failover moment only**.
+  After one side has gone solo and bumped its generation in the
+  witness, it can keep running even if the witness becomes unreachable
+  ("last-man-standing" mode). Witness availability is not a continuous
+  quorum requirement.
+
+### Work-queue model
+
+- **D-19** — The cluster state store doubles as the work queue.
+  Operator requests → INTENT rows in rqlite; the owning node observes
+  via poll/watch, performs idempotent work, writes OUTCOME rows. This
+  pattern is already in `log_entries.py` today
+  (`VM_CREATE_INTENT` → `VM_CREATED` / `VM_CREATE_FAILED`); it
+  carries forward unchanged into rqlite tables.
+- **D-20** — Single-writer enforcement is **application-discipline**:
+  only the elected master writes to rqlite state-mutation tables;
+  reads are unrestricted. The hash-chain defense-in-depth of today's
+  log is intentionally given up; recovered via Python's role-check
+  gate at every write site. Bug-class regression flagged; well-trodden
+  pattern in k8s + etcd-based systems.
+
+### Operator contract
+
+- **D-21** — User-visible v1.0 promise for S3:
+  > *"S3 storage has RF=2 for data and metadata. Brief 5xx errors
+  > during cluster maintenance (arbiter failover, planned reboots);
+  > all 5xx responses are retry-able. Tested-compatible with
+  > retry-aware clients (Kopia, awscli, rclone). PostgreSQL upgrade
+  > path available in v1.x for fully-HA filer metadata."*
+
+### Bedrock-rust scope after the rewrite
+
+- **D-22** — bedrock-rust shrinks to:
+    - Witness lease loop + `compute_election`
+    - Self-fence sequence
+    - Peer-liveness TCP heartbeat (NOT log replication)
+    - Status / role / peer-status IPC
+    - bedrock-net mesh + routing (or that splits to a separate daemon —
+      decision deferred, doesn't affect the rewrite)
+  **~870 LOC retained**; ~1600 LOC of log + replication code deletes
+  (per the earlier LOC-accounting table).
+
+### Out of scope for v1.0
+
+- Multi-witness explicit quorum voting (3-of-5)
+- LXC-based arbiter (systemd-service form is the v1.0 default;
+  LXC remains a possible future re-encapsulation if isolation
+  needs surface)
+- PostgreSQL filer metadata (upgrade path documented, default is
+  SQLite-on-DRBD)
+- Operator UI for witness selection / storage tier settings (parked
+  to the dashboard cycle)
+- ESP32 witness firmware (Phase 7 of cluster-protocol v1 plan,
+  still deferred)
+- Multi-link transport in bedrock-rust peer protocol (mesh + ECMP
+  obviates this for routing; if needed for direct Raft transport it's
+  an additional change)
+
+---
+
+## Rework plan
+
+Roughly sized phases. Each is a coherent unit; sequencing reflects
+what must work before the next can be exercised. All sizes are
+rough — calibrate after Phase A.
+
+### Phase A — Foundation prep (~3-5 days)
+
+- bedrock-net: change panic-route emission from "via freshest" to
+  "via current mgmt-master" (read from snapshot)
+- bedrock-net: floor `lat_cost` to 0 below 1 ms in `local_metric`
+- bedrock-net: emit ECMP multi-nexthop routes for tied paths;
+  set `net.ipv4.fib_multipath_hash_policy=1` via sysctl
+- Verify on testbed (existing chaos harness covers paths and
+  cross-loopback ping)
+
+### Phase B — rqlite integration (~1-2 weeks)
+
+- Package rqlite binary into install.sh + iso-build payload
+- systemd unit for `bedrock-rqlite-node@.service` (binds to node's
+  loopback /32, data dir on local LV)
+- Python `rqlite_client.py` wrapper around `httpx.AsyncClient`
+  (replaces `rust_ipc.py` for state reads/writes)
+- Define `bedrock_schema.sql` — one table per current log_entries.py
+  type (nodes, tiers, vms, witnesses, params, operators, etc.)
+  with appropriate keys and ordering columns
+- Re-point `view_builder.py` fold loop to consume from rqlite via
+  poll-watch
+- **Dual-run validation period**: keep bedrock-rust's log running
+  alongside rqlite; write to both, reactor consumes from rqlite,
+  diff snapshots periodically to catch divergence
+
+### Phase C — Arbiter mobility (~1 week)
+
+- New tier definition `singletons` (DRBD 2-way replicated, XFS or
+  ext4, mounted at `/var/lib/bedrock/singletons/`)
+- systemd unit for `bedrock-rqlite-arbiter.service` (binds to
+  `100.X.Y.254/32`, data dir at `/var/lib/bedrock/singletons/rqlite/`)
+- bedrock-rust hook on role transition:
+    - On role=Leader: DRBD-promote singletons → mount →
+      `ip addr add 100.X.Y.254/32 dev lo` → start arbiter
+    - On role=Follower: reverse sequence
+- Scenario tests: cold boot, planned `transfer-mgmt`, kill-master,
+  network partition, both-nodes-simultaneous-boot
+
+### Phase D — bedrock-rust shrinkage (~1 week)
+
+- Delete `log_store.rs`, `peer.rs` replication path, `ipc.rs`
+  Append/Read/Subscribe handlers, `payload.rs`
+- Morph witness payload: `(uuid, generation, marker)` replaces
+  `(idx, hash)` in `witness.rs` Echo HEARTBEAT
+- Remove the orchestrator's "restart bedrock-rust on daemon.toml
+  change" pattern (bedrock-rust now reads peer membership from
+  rqlite via Python passing it through `/run/bedrock-rust.peers`
+  or equivalent file)
+- Verify on testbed: every existing scenario passes
+
+### Phase E — SeaweedFS migration (~2 weeks)
+
+- Package `weed` binary into install.sh + iso-build
+- Replace tier-storage Garage scratch path with SeaweedFS
+  collection `scratch` (replication=000)
+- Replace tier-storage RustFS bulk/critical paths with SeaweedFS
+  collections `bulk` / `critical` (replication=001; EC available
+  at 7+ nodes per D-12)
+- SeaweedFS `filer` service on singletons DRBD with SQLite backend
+- SeaweedFS `s3` gateway exposed on cluster front-end /32s
+- Migration tooling docs for `weed filer.meta.backup` upgrade path
+- Backup-target test from a separate Bedrock cluster
+
+### Phase F — 1-node NAS mode (~3-5 days)
+
+- N=1 configuration with no arbiter, no DRBD (all roles local on
+  one node)
+- SeaweedFS `replication=000` for all collections at N=1
+- Operator docs: "Bedrock as a single-node NAS"
+- Test as backup target for a separate 2-node Bedrock cluster
+
+### Phase G — Cleanup + ship (~1 week)
+
+- README, install guide, operator handbook refresh
+- Remove deprecated CLI verbs, deprecated config keys
+- v1.0 release notes
+
+### Risk callouts
+
+- **Phase B dual-run validation is non-negotiable.** Most rqlite
+  migration risk is "subtle semantic differences" — concurrent writes,
+  ordering guarantees, watch event delivery. Run both for a real
+  week before flipping the cutover switch.
+- **Phase C arbiter mobility has the most operational sharp edges.**
+  DRBD-promote + mount + service start has many ways to fail mid-
+  sequence. Pre-/post-condition checks at each step; reversibility
+  on each failure.
+- **Phase E SeaweedFS EC compaction** under realistic backup-churn
+  workload is still unbenchmarked (see "Storage rewrite known
+  caveats" earlier). Run a backup-load test before committing the
+  bulk/critical tier to EC mode. v1.0 ships with replication-only
+  per D-12, so EC compaction is post-v1.0 concern in practice.
+
+### LOC delta estimate
+
+| | Delete | Add | Net |
+|---|---|---|---|
+| Rust (bedrock-rust) | ~1600 | ~150 (witness payload morph, /32 mgmt hooks) | **-1450** |
+| Python (mgmt + installer/lib) | ~600 (encoders, rust_ipc, log-subscriber paths) | ~800 (rqlite_client, arbiter glue, seaweedfs install) | **+200** |
+| Bedrock-net | 0 | ~200 (panic-via-master, ECMP, latency floor) | **+200** |
+| Install/config (toml, systemd units, scripts) | ~500 (Garage + RustFS configs) | ~300 (rqlite + SeaweedFS configs) | **-200** |
+| **Total** | **~2700** | **~1450** | **-1250** |
+
+Net code reduction ~1250 lines, with the surviving code doing more.
+Most of what disappears is reimplementing wheels the rqlite + SeaweedFS
+teams have spent years polishing; most of what stays is the actual
+Bedrock value-add (witness arbitration, mesh routing, fence sequencing,
+floating-singleton mobility).
