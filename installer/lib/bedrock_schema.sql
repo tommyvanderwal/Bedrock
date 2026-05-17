@@ -1,0 +1,264 @@
+-- Bedrock cluster-state schema for rqlite (on-disk SQLite mode).
+--
+-- This is the v1.0 replacement for the bedrock-rust hash-chained log.
+-- Per docs/post-alpha-rewrite-notes.md D-01..D-22:
+--
+--   * Cluster state lives in rqlite — strong consistency via Raft,
+--     HTTP/JSON wire protocol, MIT licensed, sqlite3-inspectable on
+--     disk.
+--   * The schema preserves the same logical shape as today's
+--     view_builder.py fold output, so mgmt/app.py, orchestrator.py,
+--     and the rest of the read-side don't change semantically — only
+--     the source of data changes.
+--   * Mutations bump `bedrock_meta.revision` (monotonic) — that's
+--     the replacement for the log's `log_index`. Subscribers
+--     (orchestrator.py reactor) poll for revision changes.
+--   * Where today's `log_entries.py` had a free-form payload bytes
+--     blob, here we have typed columns. JSON columns are used for
+--     lists/maps that don't have a fixed cardinality (tier peers,
+--     drbd_node_ids per tier, VM backup history).
+--
+-- Conventions:
+--   * Every table has an `updated_at INTEGER` epoch-seconds column,
+--     for forensics + cache-staleness checks.
+--   * Composite-PK tables (tier_drbd_node_ids, vm_backups) use
+--     surrogate INTEGER PRIMARY KEY plus a UNIQUE constraint on the
+--     business key, so rows can be addressed cheaply.
+--   * Work-queue tables (vm_intents, backup_intents) follow the
+--     INTENT → OUTCOME pattern (D-19): a row appears with
+--     state='pending', the owning node observes via watch/poll,
+--     does idempotent work, transitions the row to 'completed'
+--     or 'failed'.
+
+-- ─────────────────────────────────────────────────────────────────
+-- Meta — singleton row holding the cluster revision counter
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS bedrock_meta (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
+    revision     INTEGER NOT NULL DEFAULT 0,
+    schema_ver   INTEGER NOT NULL DEFAULT 1,
+    bootstrapped_at INTEGER
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Cluster identity — singleton row
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS cluster_info (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
+    cluster_uuid  TEXT NOT NULL,
+    cluster_name  TEXT,
+    mgmt_master   TEXT,
+    updated_at    INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Membership
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_name        TEXT PRIMARY KEY,
+    host             TEXT NOT NULL,
+    drbd_ip          TEXT NOT NULL,
+    loopback_ip      TEXT NOT NULL DEFAULT '',
+    role             TEXT NOT NULL DEFAULT 'compute',  -- 'compute' | 'mgmt+compute'
+    pubkey           TEXT NOT NULL DEFAULT '',          -- SSH ed25519
+    bedrock_pubkey   TEXT NOT NULL DEFAULT '',          -- inter-node API signing
+    maintenance      INTEGER NOT NULL DEFAULT 0,        -- bool 0/1
+    updated_at       INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Storage tiers
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS tiers (
+    tier_name        TEXT PRIMARY KEY,
+    mode             TEXT NOT NULL,
+    master           TEXT,
+    peers            TEXT NOT NULL DEFAULT '[]',        -- JSON array of node names
+    backend_path     TEXT,
+    garage_endpoint  TEXT,
+    version          INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL
+);
+
+-- Permanent per-tier DRBD node-id assignments (per L3: node-ids are
+-- permanent for a resource). Composite key (tier_name, node_name).
+CREATE TABLE IF NOT EXISTS tier_drbd_node_ids (
+    tier_name   TEXT NOT NULL,
+    node_name   TEXT NOT NULL,
+    node_id     INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (tier_name, node_name)
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Witnesses
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS witnesses (
+    witness_id              TEXT PRIMARY KEY,
+    addr                    TEXT NOT NULL,
+    witness_pubkey          TEXT NOT NULL,    -- hex
+    encrypted_witness_key   TEXT NOT NULL,    -- hex (AEAD-wrapped per-witness key)
+    backend                 TEXT NOT NULL DEFAULT 'echo',  -- 'echo' | 'smb' | 'nfs' | 's3' (D-17)
+    updated_at              INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Cluster parameters — open-ended key/value
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS params (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,    -- JSON-encoded for any value type
+    updated_at  INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Operator logins (dashboard auth)
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS operators (
+    username       TEXT PRIMARY KEY,
+    salt           TEXT NOT NULL,
+    password_hash  TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Join handshake — pending and resolved join requests
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS join_requests (
+    request_id           TEXT PRIMARY KEY,
+    node_name            TEXT NOT NULL,
+    host                 TEXT NOT NULL,
+    bedrock_pubkey       TEXT NOT NULL,
+    x25519_eph_pubkey    TEXT NOT NULL,
+    fingerprint          TEXT NOT NULL,
+    state                TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'approved' | 'rejected'
+    master_eph_pubkey    TEXT NOT NULL DEFAULT '',
+    ciphertext           TEXT NOT NULL DEFAULT '',
+    nonce                TEXT NOT NULL DEFAULT '',
+    reason               TEXT NOT NULL DEFAULT '',
+    created_at           INTEGER NOT NULL,
+    resolved_at          INTEGER
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- VMs — declared state + last-known runtime state
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS vms (
+    vm_name           TEXT PRIMARY KEY,
+    vm_type           TEXT NOT NULL DEFAULT 'cattle',
+    host              TEXT NOT NULL DEFAULT '',
+    ram_mb            INTEGER NOT NULL DEFAULT 0,
+    disk_gb           INTEGER NOT NULL DEFAULT 0,
+    state             TEXT NOT NULL DEFAULT 'creating', -- 'creating'|'created'|'create_failed'|'running'|'shut off'|'paused'|...
+    intent_index      INTEGER,  -- the bedrock_meta.revision when the intent was filed
+    fail_reason       TEXT,
+    backup_schedule   TEXT,     -- JSON {target_id, cron_expr, label_prefix, retention_count, set_at_index}
+    last_backup_error TEXT,     -- JSON {ts_index, target_id, reason}
+    last_restore      TEXT,     -- JSON {ts_index, kopia_snapshot_id, target_id, dest_node}
+    last_restore_err  TEXT,     -- JSON {ts_index, kopia_snapshot_id, target_id, reason}
+    updated_at        INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- VM intents — INTENT/OUTCOME work queue (D-19)
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS vm_intents (
+    intent_id     TEXT PRIMARY KEY,        -- UUID
+    vm_name       TEXT NOT NULL,
+    intent_type   TEXT NOT NULL,           -- 'create' | 'destroy' | 'migrate' | 'state_change'
+    payload       TEXT NOT NULL,           -- JSON of the operation-specific fields
+    requested_by  TEXT NOT NULL DEFAULT '',
+    state         TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'in_progress' | 'completed' | 'failed'
+    result        TEXT,                    -- JSON of outcome details (kopia_snapshot_id for backup, etc.)
+    error         TEXT,
+    owning_node   TEXT NOT NULL DEFAULT '', -- which node should execute (often payload-dependent)
+    created_at    INTEGER NOT NULL,
+    started_at    INTEGER,
+    completed_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_vm_intents_state  ON vm_intents(state);
+CREATE INDEX IF NOT EXISTS idx_vm_intents_vm     ON vm_intents(vm_name);
+CREATE INDEX IF NOT EXISTS idx_vm_intents_owner  ON vm_intents(owning_node, state);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Backup targets + history
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS backup_targets (
+    target_id                       TEXT PRIMARY KEY,
+    kind                            TEXT NOT NULL DEFAULT 'kopia-s3',  -- 'kopia-s3' | 'kopia-fs'
+    s3_endpoint                     TEXT NOT NULL DEFAULT '',
+    s3_bucket                       TEXT NOT NULL DEFAULT '',
+    s3_region                       TEXT NOT NULL DEFAULT '',
+    s3_disable_tls                  INTEGER NOT NULL DEFAULT 0,
+    s3_disable_tls_verification     INTEGER NOT NULL DEFAULT 0,
+    filesystem_path                 TEXT NOT NULL DEFAULT '',
+    override_source_prefix          TEXT NOT NULL DEFAULT '',
+    cache_directory                 TEXT NOT NULL DEFAULT '',
+    updated_at                      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vm_backups (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    vm_name             TEXT NOT NULL,
+    target_id           TEXT NOT NULL,
+    source_node         TEXT NOT NULL DEFAULT '',
+    disks               TEXT NOT NULL,          -- JSON array: [{target_dev,lv_path,kopia_snapshot_id,bytes_added}, ...]
+    primary_kopia_id    TEXT NOT NULL,          -- disks[0].kopia_snapshot_id, denormalised for UI lookup
+    bytes_added         INTEGER NOT NULL DEFAULT 0,  -- rolled up across disks
+    duration_s          REAL NOT NULL DEFAULT 0,
+    label               TEXT NOT NULL DEFAULT '',
+    fs_freeze_used      INTEGER NOT NULL DEFAULT 0,
+    ts_index            INTEGER NOT NULL,       -- bedrock_meta.revision at backup time
+    created_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vm_backups_vm       ON vm_backups(vm_name, ts_index DESC);
+CREATE INDEX IF NOT EXISTS idx_vm_backups_kopia    ON vm_backups(primary_kopia_id);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Mesh path table — bedrock-net's LINK_UP/DOWN/QUALITY equivalent
+-- ─────────────────────────────────────────────────────────────────
+
+-- Canonical-order path key: "a_node|a_nic|b_node|b_nic" with
+-- (a_node, a_nic) sorted alphabetically below (b_node, b_nic).
+-- Computed by the writer; stored as-is.
+CREATE TABLE IF NOT EXISTS paths (
+    path_key         TEXT PRIMARY KEY,
+    node_a           TEXT NOT NULL,
+    nic_a            TEXT NOT NULL,
+    link_addr_a      TEXT NOT NULL DEFAULT '',
+    node_b           TEXT NOT NULL,
+    nic_b            TEXT NOT NULL,
+    link_addr_b      TEXT NOT NULL DEFAULT '',
+    speed_mbps       INTEGER NOT NULL DEFAULT 0,
+    rtt_us           INTEGER NOT NULL DEFAULT 0,
+    observed_at      REAL NOT NULL DEFAULT 0,
+    up_since         REAL NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Observability backends — designated VM/VL nodes (the 2-node
+-- dual-write pattern). Each row = one designated backend node for
+-- one of the two stacks.
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS obs_backends (
+    stack       TEXT NOT NULL,         -- 'metrics' | 'logs'
+    node_name   TEXT NOT NULL,
+    position    INTEGER NOT NULL,      -- 0 or 1 (which of the 2 dual-write targets)
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (stack, position)
+);
