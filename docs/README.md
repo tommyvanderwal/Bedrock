@@ -72,12 +72,22 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | Component | Port | Doc |
 |---|---|---|
 | mgmt dashboard (FastAPI + Svelte) | 8080 | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
+| **rqlite (cluster-state store)** | 4001 HTTP / 4002 Raft | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **rqlite-arbiter (3rd voter, follows mgmt master)** | same ports on `100.X.Y.254/32` | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **SeaweedFS master + volume + filer + s3** | 9333 / 8080 / 8888 / 8333 | [`components/storage-tiers.md`](components/storage-tiers.md) |
 | VictoriaMetrics | 8428 | [`components/metrics.md`](components/metrics.md) |
 | VictoriaLogs | 9428 (syslog 5140) | [`components/metrics.md`](components/metrics.md) |
 | node_exporter + vm_exporter | 9100 / 9177 | [`components/exporters.md`](components/exporters.md) |
 | DRBD | kernel + port 7000+minor | [`components/drbd.md`](components/drbd.md) |
 | bedrock-net (mesh discovery + routing) | UDP 7732 (discovery) + ICMP echo (latency) + UDP 7733 (advertisement) | [`06-mesh-network.md`](06-mesh-network.md) |
+| bedrock-rust (witness + fence + peer heartbeat — POST-REWRITE) | TCP 8200 peer | [`03-witness-and-orchestrator.md`](03-witness-and-orchestrator.md) |
 | Cockpit | 9090 | —  (upstream docs) |
+
+> **Post-0.8-alpha rewrite (2026-05-18)**: cluster state lives in
+> **rqlite**; the bedrock-rust hash-chained log is gone. S3 storage
+> uses **SeaweedFS** (Garage + RustFS retired). See
+> [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md) for
+> the full design rationale (D-01..D-22).
 
 ---
 

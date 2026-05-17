@@ -1,5 +1,19 @@
 # Bedrock Witness & Failover Orchestrator
 
+> **Updated 2026-05-18**: Bedrock's witness model is unchanged in
+> shape — passive third-observer heartbeat tracker, weighted-vote
+> election in bedrock-rust, self-fence on lease loss. What changed
+> in the post-0.8-alpha rewrite is the cluster-state layer
+> underneath: the bedrock-rust hash-chained log is gone, replaced
+> by rqlite (see [`01-rqlite-state-store.md`](01-rqlite-state-store.md)
+> and [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)).
+> The witness payload morph (D-16) shifts the per-node fields the
+> witness echoes from log-state `(epoch, last_log_index,
+> last_log_hash)` to DRBD-state `(arbiter_drbd_uuid, generation,
+> last_man_standing_marker)` — same mathematical structure, the
+> wire layout is unchanged so existing witness devices still work
+> during the transition.
+
 ## Architecture Overview
 
 ```

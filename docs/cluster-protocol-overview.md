@@ -1,5 +1,29 @@
 # Bedrock cluster protocol — high-level overview
 
+> ⚠️ **HISTORICAL (pre-rewrite, 2026-04-29 era)**. The hash-chained
+> log + per-node bedrock-rust replication described here was retired
+> in the post-0.8-alpha rewrite. Cluster state now lives in **rqlite**
+> (see [`01-rqlite-state-store.md`](01-rqlite-state-store.md) and
+> [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)
+> D-01..D-22).
+>
+> What still applies from this doc:
+>   - Witness PASSIVE role, weighted-vote election
+>     (`compute_election`, 10/node + 1/witness), self-fence sequence,
+>     fence-cleanup 270 s window — all unchanged.
+>
+> What's different now (read the rewrite-notes for current shape):
+>   - "Log replication / hash chain" → rqlite's internal Raft.
+>   - "Append-only typed entries" → SQL upserts to rqlite tables
+>     (see `installer/lib/bedrock_schema.sql` +
+>     `installer/lib/bedrock_state.py`).
+>   - "Snapshot + log compaction (Phase 7 deferred)" → handled by
+>     rqlite internally; not Bedrock's problem.
+>   - "Witness echoes (epoch, log_index, log_hash)" → morphs to
+>     (arbiter_drbd_uuid, generation, last_man_standing) per D-16;
+>     wire format unchanged so existing witness devices remain
+>     compatible during the transition.
+
 Audience: operator reviewing the design at a glance. ~10 minutes.
 
 This document is the **one place** to understand what the cluster

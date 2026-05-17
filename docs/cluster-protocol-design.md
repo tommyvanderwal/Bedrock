@@ -1,5 +1,15 @@
 # Bedrock — Cluster Operations & State Design
 
+> ⚠️ **HISTORICAL (pre-rewrite design, 2026-04 era)**. This document
+> captured the design that led to the 0.8-alpha hash-chained log
+> implementation. That log was retired in the post-0.8-alpha rewrite;
+> cluster state now lives in **rqlite**. Current architecture lives
+> in [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)
+> (D-01..D-22). Witness arbitration concepts here (PASSIVE
+> third-observer, weighted votes, self-fence) survive unchanged;
+> everything about log replication, hash chaining, snapshots,
+> log compaction, etc., is now rqlite's problem.
+
 This document captures the architectural decisions confirmed in design discussion. It states **what** to build and **why**, and stays light on **how** — the existing Bedrock code base and Claude Code working sessions will fill in implementation details. The goal is to keep architecture coherent across implementation work without prematurely fixing details that should be decided in code.
 
 Every item here is a confirmed decision, not a proposal. New ideas should be discussed and confirmed before being added.

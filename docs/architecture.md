@@ -140,8 +140,19 @@ Operator (browser)                       mgmt node (node1)
 ```
 
 The operator never talks to compute nodes directly. All state-changing actions
-go **through mgmt → SSH fan-out**. mgmt holds one writable source of truth:
-`/etc/bedrock/cluster.json`. Compute nodes are stateless orchestration targets.
+go **through mgmt → rqlite write → orchestrator reactor**. The canonical
+state store is **rqlite** (Raft-replicated SQLite, see
+[`01-rqlite-state-store.md`](01-rqlite-state-store.md)); `/etc/bedrock/cluster.json`
+is a regenerated cache projection of the rqlite tables and is
+rewritten on every revision change. Compute nodes are stateless
+orchestration targets that observe rqlite changes via the
+`rqlite_subscriber` task and converge their local state accordingly.
+
+The earlier "bedrock-rust hash-chained log" model was retired in the
+post-0.8-alpha rewrite (see [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)
+D-01..D-22). bedrock-rust now scopes to witness arbitration +
+self-fence + peer-liveness heartbeat + status IPC only; it no
+longer carries a log or replicates state.
 
 ## Components in one paragraph each
 

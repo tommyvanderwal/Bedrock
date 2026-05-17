@@ -1,5 +1,19 @@
 # Cluster protocol v1 — implementation plan
 
+> ⚠️ **SUPERSEDED**. This is the implementation plan that produced
+> the 0.8-alpha bedrock-rust log. That code path was retired in the
+> post-0.8-alpha rewrite. The current rewrite plan lives in
+> [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)
+> (D-01..D-22 + Phases A-G). The Phase 7 items listed here
+> (snapshot + log compaction, multi-witness, ESP32 firmware,
+> hardware watchdog, monthly key rotation) are either:
+>   - handled by rqlite (snapshot + compaction),
+>   - in-scope-for-v1.0 but not the current rewrite phase
+>     (multi-witness, ESP32 firmware), or
+>   - still deferred (monthly key rotation, hardware watchdog).
+>
+> Kept for historical reference. New work tracks the rewrite phases.
+
 Companion to [`docs/cluster-protocol-design.md`](cluster-protocol-design.md)
 (the architecture doc the operator pasted). This file says **what code
 to write, in what order, with what scope cuts**, so we ship a
