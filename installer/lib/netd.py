@@ -690,6 +690,40 @@ def load_state() -> tuple[bytes, str, str, str]:
     return cluster_key, cluster_uuid, my_node, my_loopback
 
 
+def ensure_routing_sysctls() -> None:
+    """Apply routing-layer sysctls that the bedrock-net design relies on.
+
+    Idempotent (writing the desired value to /proc/sys/... is a no-op
+    when already set). Skipped silently if /proc is read-only (e.g.
+    inside an unprivileged container during tests) — the daemon would
+    fail elsewhere first in that case.
+
+    Sysctls applied:
+
+    * `net.ipv4.fib_multipath_hash_policy=1` — kernel hashes flows
+      across ECMP nexthops using the L4 5-tuple (src/dst IP +
+      src/dst port + protocol). Without this, the kernel uses L3
+      hashing only, which would pin every flow with the same
+      (src_IP, dst_IP) to the same nexthop. For Bedrock's pattern
+      of "few clients, many flows" (e.g. DRBD's connection-per-
+      path machinery hitting peer.loopback), L4 hashing actually
+      distributes traffic across cables. See post-alpha-rewrite-
+      notes.md D-15.
+    """
+    knobs = {
+        "/proc/sys/net/ipv4/fib_multipath_hash_policy": "1",
+    }
+    for path, value in knobs.items():
+        try:
+            current = Path(path).read_text().strip()
+            if current != value:
+                Path(path).write_text(value)
+        except OSError as e:
+            sys.stderr.write(
+                f"bedrock-net: could not set {path}={value}: {e}\n"
+            )
+
+
 def ensure_loopback_ip(loopback_ip: str) -> None:
     """Idempotent. Add the cluster identity IP as a /32 on `lo` if not
     already there. Survives reboots when state.json is read on
@@ -722,6 +756,8 @@ def run_daemon():
 
     if my_loopback:
         ensure_loopback_ip(my_loopback)
+
+    ensure_routing_sysctls()
 
     d = Daemon(
         cluster_key=cluster_key,
@@ -2000,7 +2036,13 @@ def local_metric(bw_mbps: int, latency_us: int,
 
     bandwidth term: 1_000_000 / Mbps      → 12 at 80G, 100 at 10G,
                                              400 at 2.5G, 1000 at 1G
-    latency term:   us / 100              → 1 per 100 µs of RTT
+    latency term:   max(0, us-1000) / 100 → 0 below 1 ms (LAN noise
+                                             floor), then 1 per 100 µs
+                                             above. Sub-ms is noise on
+                                             a healthy LAN; bandwidth
+                                             should dominate at local
+                                             scale. See post-alpha-
+                                             rewrite-notes.md D-14.
     flap penalty:   +50 if up_since < 60 s (additive, predictable —
                                              not a multiplier)
     loss penalty:   +500 × min(1, loss×20) → graded, not binary
@@ -2008,7 +2050,7 @@ def local_metric(bw_mbps: int, latency_us: int,
     See docs/06-mesh-network.md §protocol 3.
     """
     bw_cost  = 1_000_000 / max(int(bw_mbps), 1)
-    lat_cost = max(int(latency_us), 0) / 100
+    lat_cost = max(0, int(latency_us) - 1000) / 100   # floor below 1 ms
     flap     = 50 if age_s < 60 else 0
     loss     = 500 * min(1.0, max(0.0, loss_rate) * 20)
     return int(bw_cost + lat_cost + flap + loss)
@@ -2201,12 +2243,39 @@ def compute_routes(d: Daemon) -> list[str]:
 
     for peer, lst in by_peer.items():
         lst.sort(key=_path_cost)
-        for i, n in enumerate(lst):
+        # Group paths by tied cost — paths with identical
+        # local_metric (after sub-ms latency floor + bucketed bandwidth)
+        # get emitted as a single multipath route. Kernel hashes flows
+        # across nexthops via fib_multipath_hash_policy=1 (set in
+        # ensure_routing_sysctls). See post-alpha-rewrite-notes.md D-15.
+        tier_groups: list[tuple[int, list]] = []
+        for n in lst:
             if not n.peer_link_addr:
                 continue
+            cost = _path_cost(n)[0]
+            if tier_groups and tier_groups[-1][0] == cost:
+                tier_groups[-1][1].append(n)
+            else:
+                tier_groups.append((cost, [n]))
+        for i, (_cost, tier_paths) in enumerate(tier_groups):
             metric = METRIC_DIRECT_BASE + i
-            spec = (f"{n.peer_loopback}/32 via {n.peer_link_addr} "
-                    f"dev {n.my_nic} metric {metric}")
+            if len(tier_paths) == 1:
+                n = tier_paths[0]
+                spec = (f"{n.peer_loopback}/32 via {n.peer_link_addr} "
+                        f"dev {n.my_nic} metric {metric}")
+            else:
+                # ECMP multipath: stable order on (peer_link_addr,
+                # my_nic) so every fold writes the same spec.
+                tier_paths_sorted = sorted(
+                    tier_paths,
+                    key=lambda p: (p.peer_link_addr, p.my_nic),
+                )
+                hops = " ".join(
+                    f"nexthop via {p.peer_link_addr} dev {p.my_nic} weight 1"
+                    for p in tier_paths_sorted
+                )
+                spec = (f"{tier_paths_sorted[0].peer_loopback}/32 "
+                        f"{hops} metric {metric}")
             routes.append(spec)
 
     # 3. Transit /32s (protocol 3, path-vector). For each cluster peer
@@ -2234,25 +2303,86 @@ def compute_routes(d: Daemon) -> list[str]:
                 f"dev {nb.my_nic} metric {METRIC_TRANSIT_BASE + i}")
         routes.append(spec)
 
-    # Panic-neighbour catch-all: the freshest neighbour overall acts
-    # as default gateway for the whole cluster /24. If the peer has a
-    # specific route at lower metric it wins; this kicks in when we
-    # have NO specific route to a peer (e.g. a node we haven't yet
-    # heard from but the operator already plumbed it).
+    # Panic-via-master catch-all: route the whole cluster /24 via the
+    # current mgmt-master's best-known path. The arbiter's "cluster IP"
+    # at the top of the /24 (D-05) reaches the master this way without
+    # any extra advertisement; future cluster-singleton service IPs
+    # ride the same path. See post-alpha-rewrite-notes.md D-13.
+    #
+    # Fallback: if cluster.json is missing or the master is unknown at
+    # this tick (bootstrap, before mgmt is up), fall back to the
+    # historical freshest-neighbour rule. Master itself doesn't install
+    # a /24-via-self route (loop) — it terminates the .254 traffic
+    # locally via the secondary /32 on its lo (set by orchestrator on
+    # role transition; see D-05).
     if d.neighbours:
-        freshest = max(
-            (n for n in d.neighbours.values() if n.logged_up and n.peer_link_addr),
-            key=lambda n: n.last_seen,
-            default=None,
-        )
-        if freshest:
-            from . import cluster_addr as _ca
-            net = _ca.cluster_loopback_net(d.cluster_uuid)
-            routes.append(
-                f"{net} via {freshest.peer_link_addr} "
-                f"dev {freshest.my_nic} metric {METRIC_PANIC}"
+        from . import cluster_addr as _ca
+        net = _ca.cluster_loopback_net(d.cluster_uuid)
+
+        master_node, master_lo = _mgmt_master_loopback(d.my_node)
+        panic_spec: str | None = None
+
+        if master_node and master_node == d.my_node:
+            # I am the master — don't install /24-via-self.
+            pass
+        elif master_node:
+            # Find a next-hop to reach the master. Direct beats transit.
+            direct_list = by_peer.get(master_node, [])
+            if direct_list:
+                # by_peer entries were sorted by _path_cost above; the
+                # first entry is the best direct path to master.
+                best = direct_list[0]
+                if best.peer_link_addr:
+                    panic_spec = (
+                        f"{net} via {best.peer_link_addr} "
+                        f"dev {best.my_nic} metric {METRIC_PANIC}"
+                    )
+            elif master_node in d.best_transit_paths:
+                nb = d.best_transit_paths[master_node].get("neighbour")
+                if nb and nb.peer_link_addr:
+                    panic_spec = (
+                        f"{net} via {nb.peer_link_addr} "
+                        f"dev {nb.my_nic} metric {METRIC_PANIC}"
+                    )
+
+        if panic_spec is None and master_node != d.my_node:
+            # Master unknown OR known but unreachable — fall back to
+            # freshest neighbour so the cluster is still routable
+            # during bootstrap and master-down transients.
+            freshest = max(
+                (n for n in d.neighbours.values()
+                 if n.logged_up and n.peer_link_addr),
+                key=lambda n: n.last_seen,
+                default=None,
             )
+            if freshest:
+                panic_spec = (
+                    f"{net} via {freshest.peer_link_addr} "
+                    f"dev {freshest.my_nic} metric {METRIC_PANIC}"
+                )
+
+        if panic_spec:
+            routes.append(panic_spec)
     return routes
+
+
+def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
+    """Read (mgmt_master_node_name, master_loopback_ip) from cluster.json.
+    Returns ('', '') if cluster.json is absent, malformed, has no master
+    set, or the master node has no loopback recorded. Used by
+    compute_routes() for the /24-via-master panic catch-all (D-13).
+    Master may be `my_node` itself — caller decides to skip in that case.
+    """
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except Exception:
+        return ("", "")
+    master = cluster.get("mgmt_master") or ""
+    if not master:
+        return ("", "")
+    nodes = cluster.get("nodes") or {}
+    lo = (nodes.get(master) or {}).get("loopback_ip") or ""
+    return (master, lo)
 
 
 def current_cluster_routes(cluster_uuid: str) -> list[str]:
@@ -2260,7 +2390,12 @@ def current_cluster_routes(cluster_uuid: str) -> list[str]:
     to this cluster's address block. We identify our routes by
     destination match:
       * <cluster_prefix>.0/24 panic catch-all
-      * /32 inside <cluster_prefix>.0/24 (per-peer loopback)
+      * /32 inside <cluster_prefix>.0/24 (per-peer loopback) — may
+        be single-path OR multipath (ECMP, D-15). Multipath routes
+        appear in `ip route show` as a header line followed by
+        indented `nexthop` continuation lines; we re-join them into
+        the single-string form we emit so the diff round-trips
+        cleanly.
       * /32 inside 169.254.0.0/16 with `scope link` (per-peer
         link-local — the kernel's auto-installed /16 connected
         routes don't have a /32 prefix, so we don't trip on them)
@@ -2274,9 +2409,22 @@ def current_cluster_routes(cluster_uuid: str) -> list[str]:
         ["ip", "-4", "route", "show"],
         capture_output=True, text=True,
     ).stdout
-    keep = []
+
+    # First pass: join multipath continuation lines (lines starting
+    # with whitespace are continuations of the previous header).
+    joined: list[str] = []
     for line in out.splitlines():
-        line = line.strip()
+        if not line.strip():
+            continue
+        if line.startswith((" ", "\t")):
+            if joined:
+                joined[-1] = joined[-1] + " " + line.strip()
+            continue
+        joined.append(line.rstrip())
+
+    keep: list[str] = []
+    for line in joined:
+        line = _normalize_route_line(line.strip())
         if line.startswith(prefix):
             if " src " in line:
                 continue
@@ -2288,6 +2436,59 @@ def current_cluster_routes(cluster_uuid: str) -> list[str]:
                 keep.append(line)
             continue
     return keep
+
+
+def _normalize_route_line(line: str) -> str:
+    """Convert `ip route show` output to the same form `compute_routes`
+    emits, so set-based diffs work cleanly.
+
+    Three normalisations:
+
+    1. **Add /32 suffix** to bare-IP destinations. `ip route show`
+       prints `100.X.Y.2 via ...` for host routes; we emit
+       `100.X.Y.2/32 via ...`. Without this, every tick the diff
+       sees current ≠ desired and churns the route table.
+    2. **Drop kernel-added annotations** (`proto`, `pref`, `src`,
+       `table`, `linkdown`, `onlink`). We never emit these, so they
+       shouldn't appear in the desired set.
+    3. **Move `metric N` to the tail of multipath routes** —
+       `ip route show` puts metric on the header line while we emit
+       it after all nexthop blocks.
+    """
+    tokens = line.split()
+    if not tokens:
+        return ""
+
+    # 1. /32 suffix on bare-IP destinations.
+    dest = tokens[0]
+    if "/" not in dest and dest.count(".") == 3 and dest[0].isdigit():
+        tokens[0] = dest + "/32"
+
+    # 2. Strip kernel-added annotations.
+    out_tokens: list[str] = []
+    skip_next = False
+    drop_flags_with_value = {"proto", "pref", "src", "table"}
+    drop_flags_no_value = {"linkdown", "onlink"}
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in drop_flags_with_value:
+            skip_next = True
+            continue
+        if tok in drop_flags_no_value:
+            continue
+        out_tokens.append(tok)
+
+    # 3. Multipath: move metric to tail if it appears before nexthop.
+    if "nexthop" in out_tokens and "metric" in out_tokens:
+        metric_idx = out_tokens.index("metric")
+        nh_idx = out_tokens.index("nexthop")
+        if metric_idx + 1 < len(out_tokens) and metric_idx < nh_idx:
+            metric_val = out_tokens[metric_idx + 1]
+            del out_tokens[metric_idx:metric_idx + 2]
+            out_tokens += ["metric", metric_val]
+    return " ".join(out_tokens)
 
 
 def run_silent(cmd: list[str]) -> int:

@@ -1172,7 +1172,8 @@ authoritative summary of what was chosen.
 - **D-06** — Arbiter's data directory is on a **shared singletons
   DRBD volume** (new tier name `singletons`, 2-way replication
   between physical nodes), mounted at `/var/lib/bedrock/singletons/`.
-  Filesystem choice is XFS or ext4 — doesn't materially matter.
+  Filesystem choice (XFS vs ext4) is implementation detail, not a
+  v1.0 architecture decision.
 
 ### Singleton service co-location
 
@@ -1201,11 +1202,13 @@ authoritative summary of what was chosen.
   cluster's front-end IPs. Bedrock acts as an S3 target for other
   Bedrock clusters, Kopia, awscli, rclone, or any S3 client. Enables
   the "1-node NAS box backs up the 2-node cluster" composition.
-- **D-12** — Per-collection replication policy:
-    - `scratch` → `replication=000` (no redundancy, ephemeral)
-    - `working`, `models` → `replication=001` (one copy on each side)
-    - `backups` → `replication=001` (no EC until 7+ nodes; OSS EC
-      is hardcoded at 10+4 and only distributes cleanly at 7+ disks)
+- **D-12** — Replication policy is **per-collection, operator-set**,
+  using SeaweedFS's native `replication=xyz` 3-digit notation
+  (DC/rack/server scopes). The current rewrite establishes the
+  mechanism; specific defaults per tier (scratch / working / models /
+  backups) are operator-tunable and not v1.0 architectural decisions.
+  OSS EC is hardcoded at 10+4 and only distributes cleanly at 7+
+  disks; smaller clusters use replication-only.
 
 ### Routing layer (bedrock-net)
 
@@ -1262,12 +1265,18 @@ authoritative summary of what was chosen.
 
 ### Operator contract
 
-- **D-21** — User-visible v1.0 promise for S3:
-  > *"S3 storage has RF=2 for data and metadata. Brief 5xx errors
-  > during cluster maintenance (arbiter failover, planned reboots);
-  > all 5xx responses are retry-able. Tested-compatible with
-  > retry-aware clients (Kopia, awscli, rclone). PostgreSQL upgrade
-  > path available in v1.x for fully-HA filer metadata."*
+- **D-21** — User-visible storage promise is **per-tier**, not
+  cluster-wide. Each S3 collection declares its own replication mode
+  in cluster.json; the contract for each is the SeaweedFS-native
+  semantic (`replication=000` no redundancy, `replication=001` one
+  extra copy across nodes, etc.). Single-node Bedrock has no
+  redundancy by construction. Two-node clusters can run
+  RAID-1-style `replication=001` collections. Other tier shapes
+  (RAID-0-style striped, EC at 7+ nodes, etc.) are valid options
+  to add later but are not v1.0 decisions. S3 5xx behaviour during
+  cluster maintenance is documented and retry-compatible with
+  Kopia / awscli / rclone — exact failure-mode catalogue is a
+  docs-cycle deliverable, not a here-and-now decision.
 
 ### Bedrock-rust scope after the rewrite
 
@@ -1281,21 +1290,32 @@ authoritative summary of what was chosen.
   **~870 LOC retained**; ~1600 LOC of log + replication code deletes
   (per the earlier LOC-accounting table).
 
-### Out of scope for v1.0
+### In scope for v1.0 but NOT in the current rewrite phase
 
-- Multi-witness explicit quorum voting (3-of-5)
-- LXC-based arbiter (systemd-service form is the v1.0 default;
-  LXC remains a possible future re-encapsulation if isolation
-  needs surface)
-- PostgreSQL filer metadata (upgrade path documented, default is
-  SQLite-on-DRBD)
-- Operator UI for witness selection / storage tier settings (parked
-  to the dashboard cycle)
+- **Multi-witness explicit quorum voting** (3-of-5 across witness
+  backends). Architecture supports it (`Vec<WitnessSpec>` already
+  exists); operator-facing quorum semantics and the per-backend
+  protocol implementations come after the plumbing rewrite below.
+- **Operator UI** for witness selection, storage tier settings,
+  arbiter status, etc. Bedrock cannot ship v1.0 without this —
+  it's a critical part of the product, not optional. The current
+  rewrite is **0.8.x plumbing**; the dashboard cycle that makes
+  it operator-usable comes after the plumbing is stable.
+- **Fileshare witness backends** (SMB / NFS / S3). Same plumbing-
+  first/UX-second sequencing.
+
+### Out of scope for v1.0 (deferred to v1.x or later)
+
+- LXC-based arbiter form (the systemd-service form is the chosen
+  v1.0 default; LXC remains a possible future re-encapsulation
+  if isolation needs surface)
+- PostgreSQL filer metadata (the migration tooling exists in
+  SeaweedFS; the v1.0 default is SQLite-on-DRBD)
 - ESP32 witness firmware (Phase 7 of cluster-protocol v1 plan,
   still deferred)
-- Multi-link transport in bedrock-rust peer protocol (mesh + ECMP
-  obviates this for routing; if needed for direct Raft transport it's
-  an additional change)
+- Multi-link transport in bedrock-rust's own peer protocol
+  (mesh + ECMP cover routing; direct Raft transport over multiple
+  links is a separate change if ever needed)
 
 ---
 
