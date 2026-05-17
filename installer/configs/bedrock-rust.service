@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/bedrock-rust --log-dir /var/lib/bedrock/log --ipc-sock /run/bedrock-rust.sock daemon --config /etc/bedrock/daemon.toml
+ExecStart=/usr/local/bin/bedrock-rust --ipc-sock /run/bedrock-rust.sock daemon --config /etc/bedrock/daemon.toml
 Restart=on-failure
 RestartSec=2
 # During init, mgmt_install appends 4-6 log entries in <1 s and the
