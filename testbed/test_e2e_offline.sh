@@ -142,6 +142,26 @@ mgmt_master() {
     sssh "$node" 'python3 -c "import json; print(json.load(open(\"/etc/bedrock/cluster.json\")).get(\"mgmt_master\",\"\"))"'
 }
 
+master_sim_idx() {
+    # Returns the sim index (1..4) whose node_name matches the cluster's
+    # current mgmt_master. Useful after a failover where sim-1 may no
+    # longer be the master.
+    local mm
+    mm=$(mgmt_master 1 2>/dev/null) \
+        || mm=$(mgmt_master 2 2>/dev/null) \
+        || mm=$(mgmt_master 3 2>/dev/null) \
+        || mm=$(mgmt_master 4 2>/dev/null)
+    [ -z "$mm" ] && { echo 1; return; }
+    for i in 1 2 3 4; do
+        local nm
+        nm=$(sssh "$i" 'python3 -c "import json; print(json.load(open(\"/etc/bedrock/state.json\")).get(\"node_name\",\"\"))"' 2>/dev/null)
+        if [ "$nm" = "$mm" ]; then
+            echo "$i"; return
+        fi
+    done
+    echo 1
+}
+
 assert_arbiter_active_on_master() {
     local probe_node=$1
     local master
@@ -332,10 +352,66 @@ for i in 1 2 3 4; do
 done
 
 # ─────────────────────────────────────────────────────────────────
-# 5b. Isolation test — drop the current leader for 25s, observe
-#     peer behaviour, restore network, verify consistency.
+# 5a. SeaweedFS ISO library is FUSE-mounted on every node and is
+#     a single shared namespace via the filer.
 # ─────────────────────────────────────────────────────────────────
-step "5b. Isolation: drop sim-1 (current leader) for 25s"
+step "5a. ISO library — mount + cross-node visibility"
+for i in 1 2 3 4; do
+    if sssh $i 'mountpoint -q /mnt/isos && grep -q "fuse.seaweedfs" /proc/mounts'; then
+        pass "sim-$i: /mnt/isos is a SeaweedFS FUSE mount"
+    else
+        mark_fail "sim-$i: /mnt/isos NOT mounted via SeaweedFS FUSE"
+    fi
+done
+# Place a marker on sim-1 and verify it shows up on all peers.
+MARKER_NAME="iso-test-$(date +%s).txt"
+sssh 1 "echo 'cross-node-iso-marker' > /mnt/isos/$MARKER_NAME && sync" \
+    || mark_fail "sim-1 couldn't write to /mnt/isos"
+sleep 6
+for i in 1 2 3 4; do
+    got=$(sssh $i "cat /mnt/isos/$MARKER_NAME 2>/dev/null" || echo "")
+    if [ "$got" = "cross-node-iso-marker" ]; then
+        pass "sim-$i sees the ISO-library marker"
+    else
+        mark_fail "sim-$i: marker missing or wrong (got: '${got:0:60}')"
+    fi
+done
+sssh 1 "rm -f /mnt/isos/$MARKER_NAME"
+
+# ─────────────────────────────────────────────────────────────────
+# 5b. Storage promote — critical tier to DRBD-replicated. Bulk
+#     stays SeaweedFS-distributed; scratch stays local LV.
+# ─────────────────────────────────────────────────────────────────
+step "5b. Storage promote — critical tier to DRBD"
+sssh 1 'bedrock storage promote 2>&1 | tail -20' || mark_fail "bedrock storage promote returned non-zero"
+sleep 8
+# Critical tier mode should be 'drbd' in cluster snapshot.
+TIER_MODE=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mode FROM tiers WHERE tier_name=\\\"critical\\\"\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+if [ "$TIER_MODE" = "drbd" ]; then
+    pass "critical tier mode = drbd"
+else
+    mark_fail "critical tier mode = '$TIER_MODE' (expected 'drbd')"
+fi
+# Arbiter rqlite should be active on master after promote.
+if sssh 1 'systemctl is-active --quiet bedrock-rqlited-arbiter'; then
+    pass "arbiter rqlite active on master post-promote"
+else
+    mark_fail "arbiter rqlite NOT active on master post-promote"
+fi
+# .254/32 should be on master's lo.
+ARB_IP=$(sssh 1 'python3 -c "import sys; sys.path.insert(0,\"/usr/local/lib/bedrock\"); from lib import cluster_arbiter as ca; print(ca.arbiter_loopback_ip())"' 2>/dev/null || echo "")
+if [ -n "$ARB_IP" ] && sssh 1 "ip -4 addr show lo | grep -q '$ARB_IP/'"; then
+    pass "arbiter VIP $ARB_IP claimed on master's lo"
+else
+    mark_fail "arbiter VIP $ARB_IP NOT on master's lo"
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# 5c. Isolation test — drop the current leader for 90s (past the
+#     witness/fence thresholds), observe failover, restore network,
+#     verify consistency.
+# ─────────────────────────────────────────────────────────────────
+step "5c. Isolation: drop sim-1 (current leader) for 90s"
 
 WS_IP=$(ip route get $(sim_ip 1) 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
 [ -z "$WS_IP" ] && WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -358,12 +434,12 @@ for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; d
 echo isolated
 '" || mark_fail "couldn't apply iptables on sim-1"
 
-note "sim-1 isolated; sleeping 25s..."
-sleep 25
+note "sim-1 isolated; sleeping 90s..."
+sleep 90
 
 # Observe from sim-2 (still connected to sim-3/4 mesh)
 note "--- DURING isolation, view from sim-2 ---"
-sssh 2 'curl -fsSL --max-time 3 http://127.0.0.1:4001/nodes 2>&1 | python3 -c "
+sssh 2 'curl -fsSL --max-time 5 http://127.0.0.1:4001/nodes 2>&1 | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 leaders = [k for k,v in d.items() if v.get(\"leader\")]
@@ -372,12 +448,50 @@ print(\"  /nodes leader:\", leaders or \"NONE\")
 print(\"  /nodes reachable:\", reach)
 "' || note "sim-2 rqlite unresponsive during isolation"
 
-DURING_MASTER=$(sssh 2 'curl -fsSL --max-time 3 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' || echo "")
+DURING_MASTER=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' || echo "")
 note "during-isolation mgmt_master (sim-2 view): ${DURING_MASTER:-unknown}"
+if [ -n "$DURING_MASTER" ] && [ "$DURING_MASTER" != "$PRE_MASTER" ]; then
+    pass "failover: mgmt_master moved $PRE_MASTER → $DURING_MASTER"
+else
+    mark_fail "failover: mgmt_master did NOT move during 90s isolation (still $DURING_MASTER)"
+fi
 
-# Check sim-1's own fence/services state
+# Check whether .254 VIP moved to the new master
+NEW_MASTER_LO=$(sssh 2 "curl -fsSL --max-time 5 'http://127.0.0.1:4001/db/query?level=strong' -d '[\"SELECT loopback_ip FROM nodes WHERE node_name=\\\"$DURING_MASTER\\\"\"]' 2>/dev/null | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")'" 2>/dev/null || echo "")
+ARB_IP=$(sssh 2 'python3 -c "import sys; sys.path.insert(0,\"/usr/local/lib/bedrock\"); from lib import cluster_arbiter as ca; print(ca.arbiter_loopback_ip())"' 2>/dev/null || echo "")
+# Find which sim hosts the new master
+NEW_MASTER_SIM=""
+for i in 2 3 4; do
+    nm=$(sssh $i 'python3 -c "import json; print(json.load(open(\"/etc/bedrock/state.json\")).get(\"node_name\",\"\"))"' 2>/dev/null)
+    if [ "$nm" = "$DURING_MASTER" ]; then NEW_MASTER_SIM=$i; break; fi
+done
+if [ -n "$NEW_MASTER_SIM" ] && [ -n "$ARB_IP" ] && sssh $NEW_MASTER_SIM "ip -4 addr show lo | grep -q '$ARB_IP/'"; then
+    pass "failover: arbiter VIP $ARB_IP claimed on new master (sim-$NEW_MASTER_SIM)"
+else
+    mark_fail "failover: arbiter VIP $ARB_IP NOT on new master ($DURING_MASTER, sim-$NEW_MASTER_SIM)"
+fi
+# Arbiter rqlite + filer should be active on the new master
+if [ -n "$NEW_MASTER_SIM" ] && sssh $NEW_MASTER_SIM "systemctl is-active --quiet bedrock-rqlited-arbiter"; then
+    pass "failover: arbiter rqlite active on new master"
+else
+    mark_fail "failover: arbiter rqlite NOT active on new master"
+fi
+if [ -n "$NEW_MASTER_SIM" ] && sssh $NEW_MASTER_SIM "systemctl is-active --quiet bedrock-weed-filer"; then
+    pass "failover: filer active on new master"
+else
+    mark_fail "failover: filer NOT active on new master"
+fi
+
+# Check sim-1's own fence/services state — it should have self-fenced
 note "--- sim-1 internal view during isolation ---"
-sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rust 2>&1 | head -6; echo ---; test -f /run/bedrock-rust.fence && echo "fence marker present" || echo "no fence marker"; ip addr show lo 2>&1 | grep "inet 100\\." | head -3' || note "sim-1 introspect failed"
+sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rqlited-arbiter bedrock-rust 2>&1 | head -6; echo ---; test -f /run/bedrock-rust.fence && echo "fence marker present" || echo "no fence marker"; ip -4 addr show lo 2>&1 | grep -E "100\\." | head -3' || note "sim-1 introspect failed"
+
+# .254 must NOT be on sim-1's lo (released as part of self-fence)
+if sssh 1 "ip -4 addr show lo | grep -q '$ARB_IP/' 2>/dev/null"; then
+    mark_fail "self-fence: arbiter VIP $ARB_IP still on sim-1's lo (should have been released)"
+else
+    pass "self-fence: arbiter VIP $ARB_IP released from sim-1's lo"
+fi
 
 # Restore connectivity on sim-1
 note "--- restoring connectivity on sim-1 ---"
@@ -424,7 +538,10 @@ POST_MASTER=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -
 note "post-rejoin mgmt_master: $POST_MASTER (was: $PRE_MASTER, during: ${DURING_MASTER:-?})"
 
 step "6. Cattle VM lifecycle"
-sssh 1 'bedrock vm create cattle-test --type cattle --ram 256 --disk 1 2>&1 | tail -3' || note "vm create returned non-zero"
+MASTER_SIM=$(master_sim_idx)
+note "current master is sim-$MASTER_SIM"
+sssh "$MASTER_SIM" 'bedrock vm create cattle-test --type cattle --ram 256 --disk 1 2>&1 | tail -3' \
+    || note "vm create returned non-zero"
 sleep 30
 assert_vm_on_one_node "cattle-test" 4
 
@@ -435,7 +552,8 @@ sim_node_name() {
 step "7. Scale-down: sim-4 leaves → N=3"
 NN=$(sim_node_name 4)
 [ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host = (SELECT host FROM nodes ORDER BY host DESC LIMIT 1) LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
-sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
+MASTER_SIM=$(master_sim_idx)
+sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 3
 # Note: rqlite voters DON'T auto-shrink — `bedrock node leave` removes
@@ -448,7 +566,8 @@ s3_verify_history 1 n1 n2 n3 n4
 step "8. Scale-down: sim-3 leaves → N=2"
 NN=$(sim_node_name 3)
 [ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.22\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
-sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
+MASTER_SIM=$(master_sim_idx)
+sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 2
 assert_master_can_reach_peers 1
@@ -458,7 +577,8 @@ s3_verify_history 1 n1 n2 n3 n4
 step "9. Scale-down: sim-2 leaves → N=1"
 NN=$(sim_node_name 2)
 [ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.20\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
-sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
+MASTER_SIM=$(master_sim_idx)
+sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 1
 assert_arbiter_active_on_master 1
