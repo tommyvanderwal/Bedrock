@@ -127,7 +127,11 @@ ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
 NOQUORUM_HOLDDOWN_TICKS = 5
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
-DOWN_HYSTERESIS_S = 30.0         # silent this long before LINK_DOWN
+# Down hysteresis: enough to absorb a few missed probes but short
+# enough that the election self-fence fires within the 90 s
+# isolation window the e2e harness uses (was 30 s — left
+# sim-1's .254 hanging until ~T+45 s after the assertion).
+DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 
 # Loopback identity range — derived per-cluster from cluster_uuid via

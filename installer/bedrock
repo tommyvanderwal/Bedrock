@@ -498,8 +498,37 @@ def cmd_storage(args):
         if rc != 0:
             print(f"  peer transition returned {rc}")
             return 1
-        print("Critical-tier promotion complete. Initial DRBD sync runs "
-              "in background — check `drbdadm status tier-critical`.")
+        # Wait for the initial DRBD sync to actually finish — peer's
+        # secondary needs UpToDate data BEFORE a future failover can
+        # promote it without --force-data-loss. Filer's leveldb3
+        # writes (any S3 PUT) only land on a fully-synced peer; if
+        # we return early and a failover fires immediately, every
+        # pre-promote marker name gets lost on sim-2.
+        print("Waiting for initial DRBD sync to complete...")
+        import subprocess as _sp_sync, time as _t_sync
+        deadline = _t_sync.monotonic() + 180.0
+        synced = False
+        while _t_sync.monotonic() < deadline:
+            out = _sp_sync.run(
+                ["drbdadm", "status", "tier-critical"],
+                capture_output=True, text=True
+            ).stdout
+            # Both sides must report disk:UpToDate (one local, one peer)
+            uptodate = out.count("disk:UpToDate")
+            if uptodate >= 2 and "Sync" not in out:
+                synced = True
+                break
+            _t_sync.sleep(2)
+        if synced:
+            print("  initial sync complete — secondary is UpToDate")
+        else:
+            print("  WARN: initial sync did not complete within 180 s; "
+                  "failover before sync finishes may lose recent writes")
+        # Flush filer's leveldb3 buffers to disk so the just-PUT
+        # markers are durable on the DRBD volume (not just in the
+        # filer's RAM cache).
+        _sp_sync.run(["sync"], check=False, timeout=10)
+        print("Critical-tier promotion complete.")
         return
 
     if args.action == "_peer-promote":

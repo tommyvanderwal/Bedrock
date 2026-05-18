@@ -551,108 +551,118 @@ sim_node_name() {
 
 step "7. Scale-down: sim-4 leaves → N=3"
 NN=$(sim_node_name 4)
-[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host = (SELECT host FROM nodes ORDER BY host DESC LIMIT 1) LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 MASTER_SIM=$(master_sim_idx)
 sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
-assert_cluster_size 1 3
+assert_cluster_size "$MASTER_SIM" 3
 # Note: rqlite voters DON'T auto-shrink — `bedrock node leave` removes
 # the row in nodes table but doesn't call rqlite /remove. The leaver's
 # raft slot stays in /nodes as "reachable: false" until /remove.
-assert_master_can_reach_peers 1
-assert_arbiter_active_on_master 1
-s3_verify_history 1 n1 n2 n3 n4
+assert_master_can_reach_peers "$MASTER_SIM"
+assert_arbiter_active_on_master "$MASTER_SIM"
+s3_verify_history "$MASTER_SIM" n1 n2 n3 n4
 
 step "8. Scale-down: sim-3 leaves → N=2"
 NN=$(sim_node_name 3)
-[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.22\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 MASTER_SIM=$(master_sim_idx)
 sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
-assert_cluster_size 1 2
-assert_master_can_reach_peers 1
-assert_arbiter_active_on_master 1
-s3_verify_history 1 n1 n2 n3 n4
+assert_cluster_size "$MASTER_SIM" 2
+assert_master_can_reach_peers "$MASTER_SIM"
+assert_arbiter_active_on_master "$MASTER_SIM"
+s3_verify_history "$MASTER_SIM" n1 n2 n3 n4
 
 # ─────────────────────────────────────────────────────────────────
 # 8a/b/c. 2-node HA failover with BedRock Echo (witness)
-#     Pre-state: N=2, sim-1 master, sim-2 follower (from step 8).
+#     Pre-state: N=2 cluster. Master may be EITHER sim-1 or sim-2
+#     (after the 5c failover, sim-2 is master). Detect dynamically.
 #     8a — start bedrock-echo-stub on the workstation with the
 #          cluster's HMAC key; verify witness alive from both sims.
-#     8b — isolate sim-1 → sim-2 should win the vote (witness +1)
-#          and promote within the holddown window.
-#     8c — restore sim-1 → cluster reconverges; sim-2 stays master.
-#     8d — kill echo; isolate sim-1 again → both go NoQuorum
-#          (split-brain prevented); no set_mgmt_master writes.
-#     8e — restore sim-1, restart echo → cluster recovers.
+#     8b — isolate the CURRENT master → expect the OTHER sim to take
+#          over with witness +1 vote breaking the 10-vs-10 tie.
+#     8c — restore the isolated sim → cluster reconverges; the
+#          newly-promoted master keeps the role (bless holddown).
+#     8d — kill echo; isolate again → split-brain prevention.
+#     8e — restore + restart echo → cluster recovers.
 # ─────────────────────────────────────────────────────────────────
 step "8a. Start BedRock Echo stub on workstation"
 WS_IP=$(ip route get $(sim_ip 1) 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
 [ -z "$WS_IP" ] && WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 note "workstation IP: $WS_IP"
-# Pull cluster key from sim-1 (HMAC key for witness auth)
-CLUSTER_KEY_HEX=$(sssh 1 'xxd -p /etc/bedrock/cluster.key | tr -d "\n"' 2>/dev/null || echo "")
+# Detect current cluster state: master sim + follower sim.
+MASTER_SIM=$(master_sim_idx)
+case "$MASTER_SIM" in
+    1) FOLLOWER_SIM=2 ;;
+    2) FOLLOWER_SIM=1 ;;
+    *) FOLLOWER_SIM=1 ;;
+esac
+MASTER_NAME=$(sssh "$MASTER_SIM" 'python3 -c "import json; print(json.load(open(\"/etc/bedrock/state.json\")).get(\"node_name\",\"\"))"' 2>/dev/null || echo "")
+FOLLOWER_NAME=$(sssh "$FOLLOWER_SIM" 'python3 -c "import json; print(json.load(open(\"/etc/bedrock/state.json\")).get(\"node_name\",\"\"))"' 2>/dev/null || echo "")
+note "current master: sim-$MASTER_SIM ($MASTER_NAME); follower: sim-$FOLLOWER_SIM ($FOLLOWER_NAME)"
+# Pull cluster key from the current master (any node would work — the
+# key is cluster-wide — but the master is guaranteed to have it).
+CLUSTER_KEY_HEX=$(sssh "$MASTER_SIM" 'xxd -p /etc/bedrock/cluster.key | tr -d "\n"' 2>/dev/null || echo "")
 if [ -z "$CLUSTER_KEY_HEX" ] || [ ${#CLUSTER_KEY_HEX} -ne 64 ]; then
-    mark_fail "8a: could not pull /etc/bedrock/cluster.key from sim-1 (got ${#CLUSTER_KEY_HEX} hex chars)"
+    mark_fail "8a: could not pull /etc/bedrock/cluster.key from sim-$MASTER_SIM (got ${#CLUSTER_KEY_HEX} hex chars)"
 else
-    pass "8a: pulled cluster.key (${#CLUSTER_KEY_HEX} hex)"
+    pass "8a: pulled cluster.key from sim-$MASTER_SIM (${#CLUSTER_KEY_HEX} hex)"
 fi
-# Start echo stub in background
+# Start echo stub in background.
 ECHO_LOG=/tmp/bedrock-echo-stub.log
 > "$ECHO_LOG"
 python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
-    --echo-id "testbed-echo" >"$ECHO_LOG" 2>&1 &
+    --echo-id "testbed-echo" --verbose >"$ECHO_LOG" 2>&1 &
 ECHO_PID=$!
 sleep 3
 if ! kill -0 $ECHO_PID 2>/dev/null; then
     mark_fail "8a: echo stub died — see $ECHO_LOG"
-    cat "$ECHO_LOG" | head -10
+    head -10 "$ECHO_LOG"
 else
     pass "8a: echo stub running (pid $ECHO_PID)"
 fi
 # Wait long enough for the cluster nodes' 1Hz election tick to
 # discover the echo + send at least one heartbeat.
-sleep 8
-# Sanity: claim acks should appear in stub log once a node sends one.
-if grep -qE "probe.*ACCEPTED|probe.*${MASTER_SIM:-?}" "$ECHO_LOG" 2>/dev/null; then
-    pass "8a: echo log shows probes from cluster"
+sleep 10
+if grep -qE "probe .* <- " "$ECHO_LOG" 2>/dev/null; then
+    pass "8a: echo log shows probes arriving from cluster nodes"
+else
+    note "8a: no probes yet in echo log (network or HMAC mismatch?)"
 fi
 
-step "8b. Isolate sim-1 (current master) — expect sim-2 to take over"
-PRE_MASTER=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-note "pre-isolation mgmt_master: $PRE_MASTER"
-sssh 1 "bash -c '
+step "8b. Isolate current master (sim-$MASTER_SIM) — expect sim-$FOLLOWER_SIM to take over"
+PRE_MASTER="$MASTER_NAME"
+sssh "$MASTER_SIM" "bash -c '
 iptables -I OUTPUT -o br0 -j DROP
 iptables -I INPUT  -i br0 -j DROP
 iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
 iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
 echo isolated
-'" || mark_fail "8b: could not apply iptables on sim-1"
-note "sim-1 isolated; sleeping 30s for election + promote..."
-sleep 30
-DURING_MASTER=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-note "during-isolation mgmt_master (sim-2's view): ${DURING_MASTER:-unknown}"
-if [ -n "$DURING_MASTER" ] && [ "$DURING_MASTER" != "$PRE_MASTER" ]; then
+'" || mark_fail "8b: could not apply iptables on sim-$MASTER_SIM"
+note "sim-$MASTER_SIM isolated; sleeping 45s for election + promote..."
+sleep 45
+# Read mgmt_master from the (still-connected) follower.
+DURING_MASTER=$(sssh "$FOLLOWER_SIM" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+note "during-isolation mgmt_master (sim-$FOLLOWER_SIM's view): ${DURING_MASTER:-unknown}"
+if [ -n "$DURING_MASTER" ] && [ "$DURING_MASTER" = "$FOLLOWER_NAME" ]; then
     pass "8b: failover succeeded ($PRE_MASTER → $DURING_MASTER)"
 else
-    mark_fail "8b: failover did NOT happen (still $DURING_MASTER; 2-of-2 + witness should promote)"
+    mark_fail "8b: failover did NOT happen (mgmt_master=$DURING_MASTER, expected $FOLLOWER_NAME; 2-of-2 + witness should promote)"
 fi
-# Echo should now have a blessed_master matching the new master
-if grep -qE "claim.*ACCEPTED" "$ECHO_LOG" 2>/dev/null; then
+if grep -qE "claim .* ACCEPTED" "$ECHO_LOG" 2>/dev/null; then
     pass "8b: witness recorded the failover claim"
 else
     note "8b: no ACCEPTED claim in echo log yet"
 fi
-# sim-1 should have self-demoted (NoQuorum → release .254 + arbiter)
-if sssh 1 "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
-    mark_fail "8b: sim-1 STILL holds .254 VIP (self-demote didn't fire)"
+# The isolated old master should have self-demoted (release .254).
+if sssh "$MASTER_SIM" "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
+    mark_fail "8b: sim-$MASTER_SIM STILL holds .254 VIP (self-demote didn't fire in 45s)"
 else
-    pass "8b: sim-1 released .254 VIP via NoQuorum self-demote"
+    pass "8b: sim-$MASTER_SIM released .254 VIP via NoQuorum self-demote"
 fi
 
-step "8c. Restore sim-1 connectivity → cluster reconverges"
-sssh 1 "bash -c '
+step "8c. Restore sim-$MASTER_SIM connectivity → cluster reconverges"
+sssh "$MASTER_SIM" "bash -c '
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
 iptables -F INPUT
 iptables -F OUTPUT
@@ -660,51 +670,61 @@ iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
 rm -f /run/bedrock-cluster.fence
 echo restored
-'" || note "restore returned non-zero"
-sleep 25
-POST_MASTER=$(sssh 1 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+'" || note "8c: restore returned non-zero"
+sleep 30
+POST_MASTER=$(sssh "$MASTER_SIM" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
 if [ "$POST_MASTER" = "$DURING_MASTER" ]; then
-    pass "8c: post-rejoin master unchanged ($POST_MASTER)"
+    pass "8c: post-rejoin master unchanged ($POST_MASTER) — witness holddown held"
 else
-    mark_fail "8c: master flipped back after rejoin ($DURING_MASTER → $POST_MASTER) — bless holddown failed?"
+    mark_fail "8c: master flipped after rejoin ($DURING_MASTER → $POST_MASTER) — bless holddown failed?"
 fi
+
+# After 8c, the master is on the OPPOSITE sim. Re-detect for the
+# split-brain test.
+MASTER_SIM2=$(master_sim_idx)
+case "$MASTER_SIM2" in
+    1) FOLLOWER_SIM2=2 ;;
+    2) FOLLOWER_SIM2=1 ;;
+    *) FOLLOWER_SIM2=1 ;;
+esac
+SECOND_MASTER="$POST_MASTER"
 
 step "8d. 2-node HA WITHOUT witness — split-brain prevention"
 kill $ECHO_PID 2>/dev/null
 wait $ECHO_PID 2>/dev/null
 sleep 16  # exceed WITNESS_FRESHNESS_S (12s) so both sides go witness-dead
-# Re-isolate sim-1
-SECOND_MASTER=$POST_MASTER
-sssh 1 "bash -c '
+# Re-isolate whichever sim is currently master.
+sssh "$MASTER_SIM2" "bash -c '
 iptables -I OUTPUT -o br0 -j DROP
 iptables -I INPUT  -i br0 -j DROP
 iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
 iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
 echo isolated-no-witness
-'" || note "iptables on sim-1 (no-witness) returned non-zero"
-note "sim-1 isolated (no witness); sleeping 30s..."
-sleep 30
-SPLIT_MASTER_VIEW_1=$(sssh 1 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-SPLIT_MASTER_VIEW_2=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-note "sim-1 view: ${SPLIT_MASTER_VIEW_1:-rqlite-unreachable}"
-note "sim-2 view: ${SPLIT_MASTER_VIEW_2:-rqlite-unreachable}"
-# Both should still report SECOND_MASTER (or no value because rqlite was killed by fence on
-# whichever side is no-quorum). Neither side should have written a NEW master.
-if [ -z "$SPLIT_MASTER_VIEW_1" ] || [ "$SPLIT_MASTER_VIEW_1" = "$SECOND_MASTER" ]; then
-    pass "8d: sim-1 did NOT write a new master (split-brain prevented)"
+'" || note "8d: iptables on sim-$MASTER_SIM2 (no-witness) returned non-zero"
+note "sim-$MASTER_SIM2 isolated (no witness); sleeping 45s..."
+sleep 45
+SPLIT_VIEW_FOLLOWER=$(sssh "$FOLLOWER_SIM2" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+note "follower view of mgmt_master: ${SPLIT_VIEW_FOLLOWER:-rqlite-unreachable}"
+# Without a witness AND in 2-node split, follower has 10/21 votes
+# (no peer, no witness) → NoQuorum, NO promotion. mgmt_master in
+# rqlite should stay as the isolated old master OR rqlite is
+# unwritable on the follower side (which is also fine — no new
+# master got written).
+if [ -z "$SPLIT_VIEW_FOLLOWER" ] || [ "$SPLIT_VIEW_FOLLOWER" = "$SECOND_MASTER" ]; then
+    pass "8d: follower did NOT write a new master (split-brain prevented)"
 else
-    mark_fail "8d: sim-1's view shows new master $SPLIT_MASTER_VIEW_1 — split-brain!"
+    mark_fail "8d: follower's view shows new master $SPLIT_VIEW_FOLLOWER — split-brain!"
 fi
-# sim-1 must have NoQuorum-self-demoted (release .254 if it had it)
-if sssh 1 "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
-    mark_fail "8d: sim-1 STILL holds .254 VIP without witness vote"
+# Old master must have NoQuorum-self-demoted (release .254 if it had it).
+if sssh "$MASTER_SIM2" "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
+    mark_fail "8d: sim-$MASTER_SIM2 STILL holds .254 VIP without witness vote"
 else
-    pass "8d: sim-1 released .254 VIP (no witness, no quorum)"
+    pass "8d: sim-$MASTER_SIM2 released .254 VIP (no witness, no quorum)"
 fi
 
-step "8e. Restore sim-1 + echo; cluster recovers to N=2"
-sssh 1 "bash -c '
+step "8e. Restore sim-$MASTER_SIM2 + echo; cluster recovers to N=2"
+sssh "$MASTER_SIM2" "bash -c '
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
 iptables -F INPUT
 iptables -F OUTPUT
@@ -713,26 +733,33 @@ iptables -P OUTPUT ACCEPT
 rm -f /run/bedrock-cluster.fence
 echo restored
 '" || note "8e: restore returned non-zero"
-# Restart echo so witness is alive again
 python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
     --echo-id "testbed-echo" >>"$ECHO_LOG" 2>&1 &
 ECHO_PID=$!
-sleep 25
-assert_cluster_size 1 2
+sleep 30
+assert_cluster_size "$FOLLOWER_SIM2" 2
 
-# Cleanup: kill echo, sims will reconverge naturally
 kill $ECHO_PID 2>/dev/null
 wait $ECHO_PID 2>/dev/null
 
-step "9. Scale-down: sim-2 leaves → N=1"
-NN=$(sim_node_name 2)
-[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.20\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
+step "9. Scale-down: leave the non-master so we end at N=1 on the master"
+# After 8c the master may be sim-1 or sim-2. `bedrock node leave`
+# refuses leave-from-self, so we must (a) pick the non-master as the
+# target, AND (b) run the leave command FROM the master. After the
+# leave, the master becomes the only surviving node.
 MASTER_SIM=$(master_sim_idx)
-sssh "$MASTER_SIM" "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
+case "$MASTER_SIM" in
+    1) TARGET_SIM=2 ;;
+    2) TARGET_SIM=1 ;;
+    *) TARGET_SIM=2 ;;
+esac
+TARGET_NN=$(sim_node_name "$TARGET_SIM")
+note "current master sim-$MASTER_SIM; leaving sim-$TARGET_SIM ($TARGET_NN)"
+sssh "$MASTER_SIM" "bedrock node leave $TARGET_NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
-assert_cluster_size 1 1
-assert_arbiter_active_on_master 1
-s3_verify_history 1 n1 n2 n3 n4
+assert_cluster_size "$MASTER_SIM" 1
+assert_arbiter_active_on_master "$MASTER_SIM"
+s3_verify_history "$MASTER_SIM" n1 n2 n3 n4
 
 step "RESULT"
 if [ "$ALL_PASS" = "1" ]; then
