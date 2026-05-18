@@ -375,14 +375,14 @@ async def _start_local_services():
 
 async def fence_responder():
     """Watch /run/bedrock-cluster.fence. On appearance, run cleanup
-    (pause VMs) within FENCE_CLEANUP_TIMEOUT_S,
-    bring interfaces back up + clear the marker, wait for cluster
-    membership to re-establish, reconcile paused VMs against the
-    now-current log, and (re-)start local services.
+    (pause VMs) within FENCE_CLEANUP_TIMEOUT_S. Then poll for the
+    election to leave NoQuorum (cluster.json's mgmt_master becomes
+    reachable from rqlite) BEFORE clearing the marker — otherwise the
+    election re-flags NoQuorum on the next tick and we flap.
 
     The independent bedrock-fence-watchdog timer reboots the node if
     the marker stays around > 5 min — that covers the case where this
-    task itself crashes mid-cleanup."""
+    task itself crashes mid-cleanup or rejoin never completes."""
     global _SERVICES_STARTED
     while True:
         await asyncio.sleep(1)
@@ -405,18 +405,29 @@ async def fence_responder():
                       "the watchdog", e)
             return
 
+        # Wait for the election to leave NoQuorum before unlinking the
+        # marker — otherwise election would re-create it on the next
+        # tick and we'd flap. _wait_for_role returns 'leader'/'follower'
+        # once cluster.json has a recorded mgmt_master from rqlite (i.e.
+        # the cluster has reformed quorum and a leader has been elected).
+        log.info("fence: cleanup done; waiting for quorum to return before "
+                 "clearing marker")
+        role = await _wait_for_role(timeout_s=120.0)
+        if role not in ("leader", "follower"):
+            log.warning("fence: still no quorum after 120s — leaving marker "
+                        "for watchdog reboot")
+            return
+
         try:
             FENCE_MARKER.unlink()
-            log.info("fence: marker cleared — election will resume on next tick")
+            log.info("fence: quorum back as %s; marker cleared", role)
         except FileNotFoundError:
             pass
 
-        # Cluster contact re-evaluates. The log subscriber catches us
-        # up via Read+Subscribe; cluster.json reflects the cluster's
-        # truth about who's master, who runs which VM, etc. by the
-        # time _wait_for_role returns a settled role.
+        # Cluster contact re-evaluates. Role is already known (the
+        # wait above only returns on a settled role), so reconcile +
+        # restart services without waiting again.
         _SERVICES_STARTED = False
-        role = await _wait_for_role(timeout_s=120.0)
         if role in ("leader", "follower"):
             await _reconcile_paused_vms()
             await _start_local_services()

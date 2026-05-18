@@ -850,7 +850,10 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         # in NoQuorum. Without this, an isolated master keeps the
         # singletons up and would serve stale data to a still-attached
         # peer (the operator's workstation, in the e2e isolation test).
-        if prev_outcome != _election.Outcome.NO_QUORUM.value:
+        # `demoted_in_cycle` flag fires the demote ONCE per NoQuorum
+        # episode (not every tick — a noop replay does no harm but
+        # the log churn is misleading).
+        if not getattr(d, "demoted_in_cycle", False):
             try:
                 try:
                     from . import cluster_arbiter as _ca
@@ -867,6 +870,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                         "stop arbiter rqlite, drbdadm secondary)\n"
                     )
                     _ca.demote_arbiter_host()
+                d.demoted_in_cycle = True
             except Exception as e:
                 sys.stderr.write(
                     f"bedrock-net: NoQuorum self-demote failed: {e!r}\n"
