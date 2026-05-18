@@ -574,6 +574,156 @@ assert_master_can_reach_peers 1
 assert_arbiter_active_on_master 1
 s3_verify_history 1 n1 n2 n3 n4
 
+# ─────────────────────────────────────────────────────────────────
+# 8a/b/c. 2-node HA failover with BedRock Echo (witness)
+#     Pre-state: N=2, sim-1 master, sim-2 follower (from step 8).
+#     8a — start bedrock-echo-stub on the workstation with the
+#          cluster's HMAC key; verify witness alive from both sims.
+#     8b — isolate sim-1 → sim-2 should win the vote (witness +1)
+#          and promote within the holddown window.
+#     8c — restore sim-1 → cluster reconverges; sim-2 stays master.
+#     8d — kill echo; isolate sim-1 again → both go NoQuorum
+#          (split-brain prevented); no set_mgmt_master writes.
+#     8e — restore sim-1, restart echo → cluster recovers.
+# ─────────────────────────────────────────────────────────────────
+step "8a. Start BedRock Echo stub on workstation"
+WS_IP=$(ip route get $(sim_ip 1) 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+[ -z "$WS_IP" ] && WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+note "workstation IP: $WS_IP"
+# Pull cluster key from sim-1 (HMAC key for witness auth)
+CLUSTER_KEY_HEX=$(sssh 1 'xxd -p /etc/bedrock/cluster.key | tr -d "\n"' 2>/dev/null || echo "")
+if [ -z "$CLUSTER_KEY_HEX" ] || [ ${#CLUSTER_KEY_HEX} -ne 64 ]; then
+    mark_fail "8a: could not pull /etc/bedrock/cluster.key from sim-1 (got ${#CLUSTER_KEY_HEX} hex chars)"
+else
+    pass "8a: pulled cluster.key (${#CLUSTER_KEY_HEX} hex)"
+fi
+# Start echo stub in background
+ECHO_LOG=/tmp/bedrock-echo-stub.log
+> "$ECHO_LOG"
+python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
+    --echo-id "testbed-echo" >"$ECHO_LOG" 2>&1 &
+ECHO_PID=$!
+sleep 3
+if ! kill -0 $ECHO_PID 2>/dev/null; then
+    mark_fail "8a: echo stub died — see $ECHO_LOG"
+    cat "$ECHO_LOG" | head -10
+else
+    pass "8a: echo stub running (pid $ECHO_PID)"
+fi
+# Wait long enough for the cluster nodes' 1Hz election tick to
+# discover the echo + send at least one heartbeat.
+sleep 8
+# Sanity: claim acks should appear in stub log once a node sends one.
+if grep -qE "probe.*ACCEPTED|probe.*${MASTER_SIM:-?}" "$ECHO_LOG" 2>/dev/null; then
+    pass "8a: echo log shows probes from cluster"
+fi
+
+step "8b. Isolate sim-1 (current master) — expect sim-2 to take over"
+PRE_MASTER=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+note "pre-isolation mgmt_master: $PRE_MASTER"
+sssh 1 "bash -c '
+iptables -I OUTPUT -o br0 -j DROP
+iptables -I INPUT  -i br0 -j DROP
+iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
+iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
+echo isolated
+'" || mark_fail "8b: could not apply iptables on sim-1"
+note "sim-1 isolated; sleeping 30s for election + promote..."
+sleep 30
+DURING_MASTER=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+note "during-isolation mgmt_master (sim-2's view): ${DURING_MASTER:-unknown}"
+if [ -n "$DURING_MASTER" ] && [ "$DURING_MASTER" != "$PRE_MASTER" ]; then
+    pass "8b: failover succeeded ($PRE_MASTER → $DURING_MASTER)"
+else
+    mark_fail "8b: failover did NOT happen (still $DURING_MASTER; 2-of-2 + witness should promote)"
+fi
+# Echo should now have a blessed_master matching the new master
+if grep -qE "claim.*ACCEPTED" "$ECHO_LOG" 2>/dev/null; then
+    pass "8b: witness recorded the failover claim"
+else
+    note "8b: no ACCEPTED claim in echo log yet"
+fi
+# sim-1 should have self-demoted (NoQuorum → release .254 + arbiter)
+if sssh 1 "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
+    mark_fail "8b: sim-1 STILL holds .254 VIP (self-demote didn't fire)"
+else
+    pass "8b: sim-1 released .254 VIP via NoQuorum self-demote"
+fi
+
+step "8c. Restore sim-1 connectivity → cluster reconverges"
+sssh 1 "bash -c '
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
+iptables -F INPUT
+iptables -F OUTPUT
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
+rm -f /run/bedrock-cluster.fence
+echo restored
+'" || note "restore returned non-zero"
+sleep 25
+POST_MASTER=$(sssh 1 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+if [ "$POST_MASTER" = "$DURING_MASTER" ]; then
+    pass "8c: post-rejoin master unchanged ($POST_MASTER)"
+else
+    mark_fail "8c: master flipped back after rejoin ($DURING_MASTER → $POST_MASTER) — bless holddown failed?"
+fi
+
+step "8d. 2-node HA WITHOUT witness — split-brain prevention"
+kill $ECHO_PID 2>/dev/null
+wait $ECHO_PID 2>/dev/null
+sleep 16  # exceed WITNESS_FRESHNESS_S (12s) so both sides go witness-dead
+# Re-isolate sim-1
+SECOND_MASTER=$POST_MASTER
+sssh 1 "bash -c '
+iptables -I OUTPUT -o br0 -j DROP
+iptables -I INPUT  -i br0 -j DROP
+iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
+iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
+echo isolated-no-witness
+'" || note "iptables on sim-1 (no-witness) returned non-zero"
+note "sim-1 isolated (no witness); sleeping 30s..."
+sleep 30
+SPLIT_MASTER_VIEW_1=$(sssh 1 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+SPLIT_MASTER_VIEW_2=$(sssh 2 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
+note "sim-1 view: ${SPLIT_MASTER_VIEW_1:-rqlite-unreachable}"
+note "sim-2 view: ${SPLIT_MASTER_VIEW_2:-rqlite-unreachable}"
+# Both should still report SECOND_MASTER (or no value because rqlite was killed by fence on
+# whichever side is no-quorum). Neither side should have written a NEW master.
+if [ -z "$SPLIT_MASTER_VIEW_1" ] || [ "$SPLIT_MASTER_VIEW_1" = "$SECOND_MASTER" ]; then
+    pass "8d: sim-1 did NOT write a new master (split-brain prevented)"
+else
+    mark_fail "8d: sim-1's view shows new master $SPLIT_MASTER_VIEW_1 — split-brain!"
+fi
+# sim-1 must have NoQuorum-self-demoted (release .254 if it had it)
+if sssh 1 "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
+    mark_fail "8d: sim-1 STILL holds .254 VIP without witness vote"
+else
+    pass "8d: sim-1 released .254 VIP (no witness, no quorum)"
+fi
+
+step "8e. Restore sim-1 + echo; cluster recovers to N=2"
+sssh 1 "bash -c '
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
+iptables -F INPUT
+iptables -F OUTPUT
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
+rm -f /run/bedrock-cluster.fence
+echo restored
+'" || note "8e: restore returned non-zero"
+# Restart echo so witness is alive again
+python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
+    --echo-id "testbed-echo" >>"$ECHO_LOG" 2>&1 &
+ECHO_PID=$!
+sleep 25
+assert_cluster_size 1 2
+
+# Cleanup: kill echo, sims will reconverge naturally
+kill $ECHO_PID 2>/dev/null
+wait $ECHO_PID 2>/dev/null
+
 step "9. Scale-down: sim-2 leaves → N=1"
 NN=$(sim_node_name 2)
 [ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.20\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')

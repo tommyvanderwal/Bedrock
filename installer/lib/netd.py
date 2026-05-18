@@ -120,6 +120,11 @@ PROBE_TTL   = 1                  # link-local only; never crosses routers
 PROBE_INTERVAL = 1.0             # seconds between probes per interface
 TICK_INTERVAL  = 0.25            # main loop tick
 ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
+# Number of consecutive NoQuorum ticks before we drop fence marker /
+# demote singletons. Bedrock-net's first ~5s after startup has
+# neighbours=0 → looks like NoQuorum until probes complete; without
+# this hold-down we'd self-fence on every restart.
+NOQUORUM_HOLDDOWN_TICKS = 5
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 DOWN_HYSTERESIS_S = 30.0         # silent this long before LINK_DOWN
@@ -826,6 +831,16 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
 
     # 6. Act on outcome.
     if result.outcome == _election.Outcome.NO_QUORUM:
+        # Hold-down: only treat NoQuorum as actionable after it has
+        # persisted for HOLDDOWN_TICKS consecutive ticks (≈ 5 s).
+        # Without this, every fresh start of bedrock-net spent ≥ a
+        # second with neighbours=0 → 10/11 votes → fence; the
+        # subsequent neighbour discovery flipped back to leader the
+        # next tick, but the singletons had already been torn down
+        # on the way through.
+        d.noquorum_streak = getattr(d, "noquorum_streak", 0) + 1
+        if d.noquorum_streak < NOQUORUM_HOLDDOWN_TICKS:
+            return result.outcome.value
         _election.write_fence_marker(result.reason)
         # If we were hosting the cluster singletons (.254 VIP, arbiter
         # rqlite, filer) at the moment quorum was lost, demote them
@@ -872,6 +887,10 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                 f"bedrock-net: set_mgmt_master failed: {e!r} "
                 f"(will retry next tick)\n"
             )
+
+    # Reset NoQuorum streak when we leave the NoQuorum state.
+    if result.outcome != _election.Outcome.NO_QUORUM:
+        d.noquorum_streak = 0
 
     # If we are mgmt_master AND have just finished promoting the
     # arbiter (drbd primary + mount + .254 + arbiter rqlite up),
@@ -2377,12 +2396,28 @@ def emit_routes(d: Daemon) -> None:
     desired_set = set(desired)
     current_set = set(current)
 
-    for cmd in current_set - desired_set:
-        run_silent(["ip", "route", "del"] + cmd.split())
-    for cmd in desired_set - current_set:
+    to_del = current_set - desired_set
+    to_add = desired_set - current_set
+    if to_del or to_add:
+        sys.stderr.write(
+            f"bedrock-net: emit_routes: +{len(to_add)} -{len(to_del)} "
+            f"(desired={len(desired_set)} current={len(current_set)})\n"
+        )
+    for cmd in to_del:
+        rc = subprocess.run(["ip", "route", "del"] + cmd.split(),
+                            capture_output=True, text=True).returncode
+        if rc != 0:
+            sys.stderr.write(f"bedrock-net: route del failed [{cmd}] rc={rc}\n")
+    for cmd in to_add:
         # `replace` instead of `add` so a stale leftover doesn't make
         # the add fail.
-        run_silent(["ip", "route", "replace"] + cmd.split())
+        rc = subprocess.run(["ip", "route", "replace"] + cmd.split(),
+                            capture_output=True, text=True)
+        if rc.returncode != 0:
+            sys.stderr.write(
+                f"bedrock-net: route replace failed [{cmd}] "
+                f"rc={rc.returncode} stderr={rc.stderr.strip()}\n"
+            )
 
     d.last_routes_signature = sig
 
@@ -2477,6 +2512,10 @@ def compute_routes(d: Daemon) -> list[str]:
             else:
                 # ECMP multipath: stable order on (peer_link_addr,
                 # my_nic) so every fold writes the same spec.
+                # `iproute2` requires `metric` BEFORE the `nexthop`
+                # list — putting it after produces:
+                #   Error: "nexthop" or end of line is expected
+                #   instead of "metric"
                 tier_paths_sorted = sorted(
                     tier_paths,
                     key=lambda p: (p.peer_link_addr, p.my_nic),
@@ -2486,7 +2525,7 @@ def compute_routes(d: Daemon) -> list[str]:
                     for p in tier_paths_sorted
                 )
                 spec = (f"{tier_paths_sorted[0].peer_loopback}/32 "
-                        f"{hops} metric {metric}")
+                        f"metric {metric} {hops}")
             routes.append(spec)
 
     # 3. Transit /32s (protocol 3, path-vector). For each cluster peer
@@ -2662,9 +2701,11 @@ def _normalize_route_line(line: str) -> str:
     2. **Drop kernel-added annotations** (`proto`, `pref`, `src`,
        `table`, `linkdown`, `onlink`). We never emit these, so they
        shouldn't appear in the desired set.
-    3. **Move `metric N` to the tail of multipath routes** —
-       `ip route show` puts metric on the header line while we emit
-       it after all nexthop blocks.
+    3. **Move `metric N` to BEFORE the nexthop list** —
+       iproute2's `ip route replace` requires that form ("metric"
+       AFTER nexthop is a syntax error). compute_routes emits
+       metric-first; we normalise the kernel's tail-form readback
+       to match.
     """
     tokens = line.split()
     if not tokens:
@@ -2691,14 +2732,17 @@ def _normalize_route_line(line: str) -> str:
             continue
         out_tokens.append(tok)
 
-    # 3. Multipath: move metric to tail if it appears before nexthop.
+    # 3. Multipath: move metric to BEFORE the first nexthop (the form
+    # iproute2 accepts in `ip route replace`).
     if "nexthop" in out_tokens and "metric" in out_tokens:
         metric_idx = out_tokens.index("metric")
         nh_idx = out_tokens.index("nexthop")
-        if metric_idx + 1 < len(out_tokens) and metric_idx < nh_idx:
+        if metric_idx + 1 < len(out_tokens) and metric_idx > nh_idx:
             metric_val = out_tokens[metric_idx + 1]
             del out_tokens[metric_idx:metric_idx + 2]
-            out_tokens += ["metric", metric_val]
+            # Re-find nexthop index after the deletion (may have shifted).
+            nh_idx = out_tokens.index("nexthop")
+            out_tokens[nh_idx:nh_idx] = ["metric", metric_val]
     return " ".join(out_tokens)
 
 
