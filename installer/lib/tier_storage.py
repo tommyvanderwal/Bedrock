@@ -1684,7 +1684,11 @@ def node_reset_local() -> None:
 
     # 3. Unmount anything bedrock-touched. Two passes (normal then lazy)
     #    to handle any stuck handles per L16.
+    #    /var/lib/bedrock/cluster is the cluster_arbiter DRBD mount —
+    #    must come FIRST and BEFORE drbdadm down (which would otherwise
+    #    refuse because the device is "open" by the mount).
     mounts = (
+        "/var/lib/bedrock/cluster",
         "/var/lib/bedrock/mounts/critical-drbd",
         "/var/lib/bedrock/local/scratch",
         "/var/lib/bedrock/local/bulk",
@@ -1696,6 +1700,16 @@ def node_reset_local() -> None:
         if run_ok(f"mountpoint -q {mp}"):
             run(f"umount {mp} 2>/dev/null || umount -l {mp} 2>/dev/null",
                 check=False)
+    # Try drbdadm down AGAIN after unmounts (the first attempt at step 2
+    # may have failed because the mount was still open). Order:
+    # umount → drbdadm down → rm .res. Without the second drbdadm down,
+    # /dev/drbd1101 stays attached and the next create-md fails with
+    # "Device '1101' is configured".
+    for tier in ("critical",):
+        run(f"drbdadm down tier-{tier} 2>/dev/null", check=False)
+        run(f"drbdsetup down tier-{tier} 2>/dev/null", check=False)
+        run(f"drbdsetup detach {tier} 2>/dev/null", check=False)
+        run(f"drbdsetup del-resource tier-{tier} 2>/dev/null", check=False)
 
     # 4. Drop fstab lines for anything bedrock-related.
     fstab = Path("/etc/fstab")
