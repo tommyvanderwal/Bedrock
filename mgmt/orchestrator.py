@@ -59,8 +59,7 @@ log = logging.getLogger("bedrock.orchestrator")
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON = Path("/etc/bedrock/state.json")
 DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
-FENCE_MARKER = Path("/tmp/bedrock-rust.fence")
-ROLE_FILE = Path("/run/bedrock-rust.role")
+FENCE_MARKER = Path("/run/bedrock-cluster.fence")
 
 # Cleanup itself is fast — virsh suspend on local VMs is seconds.
 # This is the cap on the cleanup procedure only; the broader 5-min
@@ -100,15 +99,6 @@ def _fence_interfaces() -> list[str]:
     if not m:
         return []
     return [s.strip().strip('"') for s in m.group(1).split(",") if s.strip().strip('"')]
-
-
-def _current_role() -> str:
-    if not ROLE_FILE.exists():
-        return ""
-    try:
-        return ROLE_FILE.read_text().strip()
-    except Exception:
-        return ""
 
 
 def _daemon_toml_hash() -> bytes:
@@ -353,17 +343,25 @@ async def boot_orchestrator():
 
 
 async def _wait_for_role(timeout_s: float) -> str:
-    """Poll /run/bedrock-rust.role until it reports a clear quorum-having
-    role, or the timeout expires."""
+    """Poll cluster.json until we have a quorum-recorded mgmt_master.
+    Returns 'leader' if we are master, 'follower' if a peer is, or
+    'fenced' / 'unknown' on timeout. cluster.json is written by the
+    rqlite subscriber every tick from the canonical rqlite state, so
+    this becomes 'follower' or 'leader' as soon as quorum is back."""
     deadline = time.monotonic() + timeout_s
+    self_name = _self_node_name()
     while time.monotonic() < deadline:
         if FENCE_MARKER.exists():
             return "fenced"
-        r = _current_role()
-        if r in ("leader", "follower"):
-            return r
+        try:
+            cluster = json.loads(CLUSTER_JSON.read_text())
+        except (OSError, ValueError):
+            cluster = {}
+        master = cluster.get("mgmt_master") or ""
+        if master:
+            return "leader" if master == self_name else "follower"
         await asyncio.sleep(1)
-    return _current_role() or "unknown"
+    return "unknown"
 
 
 async def _start_local_services():
@@ -422,7 +420,7 @@ async def _start_local_services():
 # ── ③ fence_responder ────────────────────────────────────────────────────
 
 async def fence_responder():
-    """Watch /tmp/bedrock-rust.fence. On appearance, run cleanup
+    """Watch /run/bedrock-cluster.fence. On appearance, run cleanup
     (pause VMs) within FENCE_CLEANUP_TIMEOUT_S,
     bring interfaces back up + clear the marker, wait for cluster
     membership to re-establish, reconcile paused VMs against the
@@ -682,7 +680,12 @@ async def backup_scheduler():
 
 
 def _is_leader() -> bool:
-    return _current_role() == "leader"
+    """True iff cluster.json says we are mgmt_master."""
+    try:
+        master = json.loads(CLUSTER_JSON.read_text()).get("mgmt_master") or ""
+    except (OSError, ValueError):
+        return False
+    return master == _self_node_name()
 
 
 async def _scheduler_tick():

@@ -1,7 +1,7 @@
 #!/bin/bash
 # bedrock-fence-watchdog — independent of bedrock-mgmt.
 #
-# Reboots the node if /tmp/bedrock-rust.fence has been present for
+# Reboots the node if /run/bedrock-cluster.fence has been present for
 # longer than MAX_AGE seconds. Runs every 30 s as a systemd timer.
 # Does NOT depend on bedrock-mgmt being alive — that's the whole
 # point. If mgmt's fence_responder crashes mid-cleanup, this is what
@@ -11,7 +11,7 @@
 # up + unfences within ~30 s), this script never sees a stale marker.
 set -u
 
-MARKER=/tmp/bedrock-rust.fence
+MARKER=/run/bedrock-cluster.fence
 MAX_AGE=300   # 5 minutes — aligns with AD/Kerberos TGT renewal
 
 [ -f "$MARKER" ] || exit 0

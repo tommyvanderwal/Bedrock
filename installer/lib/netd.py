@@ -119,6 +119,7 @@ PROBE_PORT  = 7732               # 'BR' = 0x4252 → 7732 prime nearby
 PROBE_TTL   = 1                  # link-local only; never crosses routers
 PROBE_INTERVAL = 1.0             # seconds between probes per interface
 TICK_INTERVAL  = 0.25            # main loop tick
+ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 DOWN_HYSTERESIS_S = 30.0         # silent this long before LINK_DOWN
@@ -762,6 +763,87 @@ def ensure_loopback_ip(loopback_ip: str) -> None:
                        capture_output=True, text=True)
 
 
+def _election_tick(d, ws, _witness, _election, prev_outcome):
+    """One election tick. Side-effects:
+      - heartbeats / re-discovers the witness
+      - on Leader transition + we're not currently mgmt_master: writes
+        bs.set_mgmt_master(self) to rqlite (Raft enforces single-writer)
+      - on NoQuorum transition: drops the fence marker
+      - on transition back to Leader/Follower from Fenced: nothing
+        (orchestrator's fence_responder clears the marker after cleanup)
+    Returns the new outcome string (for logging on transition only)."""
+    # 1. Witness IO (best-effort).
+    try:
+        if _witness.needs_reprobe(ws):
+            _witness.broadcast_probe(ws, ["255.255.255.255"])
+        else:
+            _witness.heartbeat_all(ws)
+        _witness.drain_replies(ws)
+    except Exception as e:
+        sys.stderr.write(f"bedrock-net: witness IO error: {e!r}\n")
+
+    # 2. Peer liveness from netd's own neighbour table.
+    peer_liveness: dict[str, bool] = {}
+    for n in d.neighbours.values():
+        if not n.peer_node:
+            continue
+        # ANY logged-up link to a peer = the peer is reachable.
+        peer_liveness[n.peer_node] = peer_liveness.get(n.peer_node, False) or n.logged_up
+
+    # 3. Cluster snapshot from cluster.json (lightweight read each tick).
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except (OSError, ValueError):
+        return prev_outcome
+    nodes = cluster.get("nodes") or {}
+    if not nodes or d.my_node not in nodes:
+        # Not yet bootstrapped; nothing to elect.
+        return prev_outcome
+    node_loopbacks = {name: (info or {}).get("loopback_ip", "")
+                      for name, info in nodes.items()}
+    current_master = cluster.get("mgmt_master") or None
+
+    # 4. Decide.
+    result = _election.compute(
+        self_name=d.my_node,
+        self_loopback=d.my_loopback,
+        peer_liveness=peer_liveness,
+        node_loopbacks=node_loopbacks,
+        witness_alive=_witness.is_alive(ws),
+        current_mgmt_master=current_master,
+    )
+
+    # 5. Log transitions.
+    if prev_outcome != result.outcome.value:
+        sys.stderr.write(
+            f"bedrock-net: election {prev_outcome or '<init>'} → "
+            f"{result.outcome.value} ({result.reason}; "
+            f"votes={result.my_votes}/{result.majority} of {result.total_votes})\n"
+        )
+
+    # 6. Act on outcome.
+    if result.outcome == _election.Outcome.NO_QUORUM:
+        _election.write_fence_marker(result.reason)
+    elif result.should_set_mgmt_master:
+        try:
+            try:
+                from . import bedrock_state as _bs
+            except ImportError:
+                from lib import bedrock_state as _bs  # type: ignore
+            rev = _bs.set_mgmt_master(d.my_node)
+            sys.stderr.write(
+                f"bedrock-net: election promoted self to mgmt_master "
+                f"(rqlite rev={rev})\n"
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"bedrock-net: set_mgmt_master failed: {e!r} "
+                f"(will retry next tick)\n"
+            )
+
+    return result.outcome.value
+
+
 def run_daemon():
     cluster_key, cluster_uuid, my_node, my_loopback = load_state()
     if not my_loopback:
@@ -804,6 +886,36 @@ def run_daemon():
           f"loopback={my_loopback or '<not yet assigned>'}",
           file=sys.stderr, flush=True)
 
+    # ── Election + witness ────────────────────────────────────────
+    # Bedrock-net is the only Python process that sees the live peer
+    # liveness table (Neighbour.logged_up), so the election lives here
+    # rather than as a sibling daemon. The election only *proposes*
+    # `bs.set_mgmt_master(self)`; rqlite Raft is the actual writer of
+    # record. Witness state is best-effort — no witness on the LAN
+    # just means 2-node clusters can't auto-failover (split-brain
+    # prevention), which is the correct behaviour.
+    try:
+        from . import witness as _witness, election as _election
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import witness as _witness, election as _election  # type: ignore
+    ws = _witness.WitnessState(
+        cluster_uuid=cluster_uuid,
+        cluster_key=_witness.load_cluster_key(),
+        my_node=my_node,
+    )
+    try:
+        ws.sock = _witness.open_socket()
+    except OSError as _e:
+        sys.stderr.write(
+            f"bedrock-net: witness socket open failed: {_e}; "
+            f"election runs without witness vote\n"
+        )
+        ws.sock = None
+    last_election_outcome = None
+    last_election_at = 0.0
+
     last_probe = 0.0
     last_route_emit = 0.0
     last_icmp = 0.0
@@ -845,6 +957,11 @@ def run_daemon():
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
                 last_route_emit = now
+            # ── Election + witness tick ────────────────────────────
+            if now - last_election_at >= ELECTION_INTERVAL_S:
+                last_election_outcome = _election_tick(
+                    d, ws, _witness, _election, last_election_outcome)
+                last_election_at = now
             if now - last_status >= 30.0:
                 logged = sum(1 for n in d.neighbours.values() if n.logged_up)
                 advs = [
