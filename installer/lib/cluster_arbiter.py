@@ -7,7 +7,7 @@ Per docs/post-alpha-rewrite-notes.md D-04..D-08:
     rqlite (which doesn't natively understand Bedrock's
     witness-weighted election) needs at N=2 physical.
   * The arbiter's data + WAL live on a shared DRBD volume named
-    `tier-cluster`, mounted at `/var/lib/bedrock/cluster/`. The
+    `tier-critical`, mounted at `/var/lib/bedrock/cluster/`. The
     SeaweedFS filer's SQLite metadata also lives here (Phase E),
     so the same DRBD-promote + mount sequence moves all
     cluster-wide singletons together.
@@ -45,12 +45,12 @@ from typing import Optional
 
 log = logging.getLogger("bedrock.cluster_arbiter")
 
-# tier-cluster: the shared DRBD volume hosting all cluster-singleton
+# tier-critical: the shared DRBD volume hosting all cluster-singleton
 # services (rqlite-arbiter, SeaweedFS filer metadata, future
 # singletons). Must align with the resource name set up by
 # tier_storage.setup_cluster_tier() (Phase E does the install-side
 # plumbing).
-TIER_RESOURCE   = "tier-cluster"
+TIER_RESOURCE   = "tier-critical"
 MOUNT_POINT     = Path("/var/lib/bedrock/cluster")
 ARBITER_DATA    = MOUNT_POINT / "rqlite"
 ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
@@ -105,7 +105,7 @@ def arbiter_loopback_ip() -> str:
 
 
 def _drbd_role() -> str:
-    """Returns 'Primary' / 'Secondary' / 'Unknown' for tier-cluster.
+    """Returns 'Primary' / 'Secondary' / 'Unknown' for tier-critical.
     'Unknown' covers both "drbdadm errored" and "resource not
     configured" (N=1 case, where no DRBD resource exists at all)."""
     rc, out, _ = _run(["drbdadm", "role", TIER_RESOURCE])
@@ -116,7 +116,7 @@ def _drbd_role() -> str:
 
 
 def _drbd_resource_exists() -> bool:
-    """True if tier-cluster is a configured DRBD resource on this
+    """True if tier-critical is a configured DRBD resource on this
     node. False at N=1 (no DRBD needed — singleton services run
     directly on the local FS) or before the tier is set up by the
     install path."""

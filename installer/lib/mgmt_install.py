@@ -352,11 +352,21 @@ WantedBy=multi-user.target
                     cluster_name=cluster_name,
                     client=rqlite,
                 )
+                # Master's own SSH pubkey — required so any future
+                # joiner can SSH back here (master → peer SSH is used
+                # by storage promote and node leave). Without this,
+                # the joiner's _install_peer_pubkeys gets an empty
+                # entry for the master.
+                try:
+                    _master_pubkey = _Path("/root/.ssh/id_ed25519.pub") \
+                        .read_text().strip()
+                except Exception:
+                    _master_pubkey = ""
                 _bs.node_register(
                     node_name=s["node_name"],
                     host=s["mgmt_ip"],
                     role="mgmt+compute",
-                    pubkey="",   # filled in on key rotation
+                    pubkey=_master_pubkey,
                     bedrock_pubkey=master_bedrock_pub,
                     client=rqlite,
                 )

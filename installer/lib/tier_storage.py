@@ -592,10 +592,16 @@ def ensure_thinpool() -> None:
             f"root LV (≤16 GB), or `lvremove` unused LVs in {VG} before "
             f"re-running bedrock bootstrap.")
 
-    # 3. Create thin pool with ~all free space minus 512 MB safety
-    #    headroom (LVM keeps a small reserve for thin metadata growth).
-    pool_size_mb = int(free_mb - 512)
-    print(f"  [tier] Creating thin pool {VG}/{THINPOOL} ({pool_size_mb} MB)")
+    # 3. Create thin pool with most free space, but leave a reserve
+    #    of 512 MB for LVM thin-pool metadata growth and ~256 MB for
+    #    the future thick tier-meta LVs (each 32 MB, max 4 of them at
+    #    1 per DRBD resource; we keep 256 MB headroom). Without this
+    #    reserve, `bedrock storage promote` fails to lvcreate
+    #    tier-critical-meta with "VG has insufficient free space".
+    headroom_mb = 512 + 256
+    pool_size_mb = int(free_mb - headroom_mb)
+    print(f"  [tier] Creating thin pool {VG}/{THINPOOL} ({pool_size_mb} MB, "
+          f"{headroom_mb} MB held back for thin-pool meta + DRBD meta LVs)")
     run(f"lvcreate -L {pool_size_mb}M -T {VG}/{THINPOOL} -y")
 
 
@@ -1061,7 +1067,11 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     assert tier == "critical", tier
     minor = DRBD_MINORS[tier]
     local_mount = str(LOCAL_ROOT / tier)
-    drbd_mount = str(MOUNTS_ROOT / f"{tier}-drbd")
+    # critical-tier DRBD volume mounts at /var/lib/bedrock/cluster
+    # (the cluster-singleton root, matches cluster_arbiter.MOUNT_POINT).
+    # That's where the filer's leveldb3 + arbiter rqlite data live so
+    # they follow the master role via DRBD primary/secondary handoff.
+    drbd_mount = "/var/lib/bedrock/cluster"
     drbd_dev = f"/dev/drbd{minor}"
 
     # 1. Create the meta LV (tiny, thick) — lives outside the thin pool so

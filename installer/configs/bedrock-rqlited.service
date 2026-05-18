@@ -36,8 +36,8 @@ ExecStartPre=/usr/bin/python3 /usr/local/lib/bedrock/lib/rqlite_setup.py --rende
 # rqlite v10: on-disk SQLite is the only mode; no -on-disk flag.
 ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -node-id "$BEDROCK_RQLITED_NODE_ID" \
-    -http-addr 0.0.0.0:4001 \
-    -raft-addr 0.0.0.0:4002 \
+    -http-addr "$BEDROCK_RQLITED_BIND_IP:4001" \
+    -raft-addr "$BEDROCK_RQLITED_BIND_IP:4002" \
     -http-adv-addr "$BEDROCK_RQLITED_BIND_IP:4001" \
     -raft-adv-addr "$BEDROCK_RQLITED_BIND_IP:4002" \
     $BEDROCK_RQLITED_JOIN_FLAG \
