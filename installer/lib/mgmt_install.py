@@ -330,10 +330,10 @@ WantedBy=multi-user.target
                 if rc.returncode != 0:
                     continue
                 try:
-                    state = _json.loads(rc.stdout.decode())["store"]["raft"]["state"]
+                    raft_state = _json.loads(rc.stdout.decode())["store"]["raft"]["state"]
                 except Exception:
                     continue
-                if state == "Leader":
+                if raft_state == "Leader":
                     break
             else:
                 print(f"  WARN: rqlited didn't reach Leader within 30s")

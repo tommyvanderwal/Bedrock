@@ -53,19 +53,29 @@ fi
 # ── Install minimal prereqs ────────────────────────────────────────────────
 
 log "Installing prerequisites..."
-dnf install -y -q python3 python3-pip curl python3-httpx >/dev/null 2>&1 || {
-    warn "dnf install failed (already installed?). Continuing."
+# python3 + python3-pip + curl are in AlmaLinux 10 BaseOS. python3-httpx
+# is NOT in AlmaLinux's repos so we always install httpx from the
+# bundled wheel cache via pip (the alternative — putting httpx in dnf —
+# is a no-op at best and on AlmaLinux 10 makes the line return 1 which
+# previously bricked the rqlite_client transport at firstboot).
+dnf install -y -q python3 python3-pip curl >/dev/null 2>&1 || {
+    warn "dnf install python3/pip/curl returned non-zero (already installed?). Continuing."
 }
-# httpx is the rqlite_client.py HTTP transport (D-01). Pull from pip
-# if the dnf repo didn't have it — the bedrock-install ISO bundles
-# wheels via the dashboard_install path but rqlite_client is loaded
-# earlier than that, so it needs to be available globally.
-python3 -c "import httpx" 2>/dev/null || {
-    log "Installing httpx via pip (offline wheels first, online fallback)..."
-    pip install --break-system-packages --no-index --find-links="${BEDROCK_REPO#file://}/wheels" httpx 2>/dev/null \
-        || pip install --break-system-packages httpx 2>/dev/null \
-        || warn "httpx install failed; rqlite_client will not work"
-}
+# httpx is the rqlite_client.py HTTP transport. Install from the
+# bundled wheel cache (always offline at firstboot). Failure here is
+# fatal — without httpx, the rqlite_client can't reach the cluster
+# state store and `bedrock init` will silently produce an empty
+# rqlite (see lessons-log: 25s init-with-no-httpx debug session).
+log "Installing httpx via pip (offline wheels)..."
+WHEELS_DIR="${BEDROCK_REPO#file://}/wheels"
+if [ ! -d "$WHEELS_DIR" ]; then
+    die "wheels dir missing: $WHEELS_DIR"
+fi
+python3 -m pip install --break-system-packages --no-index \
+    --find-links="$WHEELS_DIR" httpx \
+    || die "httpx install failed — see pip output above. rqlite_client cannot work without it."
+python3 -c "import httpx; print('  [bedrock] httpx', httpx.__version__, 'ready')" \
+    || die "httpx installed but not importable"
 
 # ── Download bedrock CLI + lib ─────────────────────────────────────────────
 

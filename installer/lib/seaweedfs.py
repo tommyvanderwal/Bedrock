@@ -368,18 +368,31 @@ def ensure_iso_library_mount() -> None:
     """Install a systemd unit that FUSE-mounts the filer's /isos
     subtree at /mnt/isos, and start it. Idempotent.
 
-    The filer endpoint is the cluster's loopback master VIP (.254/32)
-    when present, otherwise the local filer at this node's loopback.
-    Mesh routing makes either choice see the live filer.
+    The filer endpoint is the **current mgmt-master's loopback /32**
+    (read from cluster.json's `mgmt_master` field). At N=1 that's
+    "self"; at N≥2 it follows the master via mesh routing — the same
+    /32 stays reachable as the master role moves (the mesh updates
+    routes within seconds of a transition).
     """
-    from . import cluster_arbiter as _ca
+    import json as _json
 
     ISO_MOUNTPOINT.mkdir(parents=True, exist_ok=True)
-    my_lo = _my_loopback()
-    arb_lo = _ca.arbiter_loopback_ip()
-    # Filer always reachable on its local loopback; .254 follows the
-    # mgmt master so peers can dial the active filer from anywhere.
-    filer_target = f"{arb_lo or my_lo}:8888"
+
+    # Resolve the master's loopback from cluster.json. Fall back to
+    # this node's own loopback if cluster.json isn't ready yet (very
+    # early bootstrap); that's safe because at that point the master
+    # IS self.
+    filer_host = _my_loopback()
+    try:
+        cluster = _json.loads(CLUSTER_JSON.read_text())
+        mm = cluster.get("mgmt_master", "")
+        if mm:
+            mm_lo = (cluster.get("nodes") or {}).get(mm, {}).get("loopback_ip", "")
+            if mm_lo:
+                filer_host = mm_lo
+    except Exception:
+        pass
+    filer_target = f"{filer_host}:8888"
 
     unit = (
         "[Unit]\n"
@@ -388,7 +401,11 @@ def ensure_iso_library_mount() -> None:
         "Wants=network-online.target\n"
         "\n"
         "[Service]\n"
-        "Type=notify\n"
+        # weed mount doesn't sd_notify; Type=simple lets systemd report
+        # active as soon as the process exists. weed retries internally
+        # if the filer isn't up yet, so the mount eventually completes
+        # in the background — never block the caller.
+        "Type=simple\n"
         f"ExecStartPre=/usr/bin/mkdir -p {ISO_MOUNTPOINT}\n"
         f"ExecStart=/usr/local/bin/weed mount -filer={filer_target} "
         f"-dir={ISO_MOUNTPOINT} -filer.path={ISO_FILER_PATH} "
@@ -403,12 +420,21 @@ def ensure_iso_library_mount() -> None:
     )
     unit_path = Path(f"/etc/systemd/system/{ISO_MOUNT_UNIT}")
     existing = unit_path.read_text() if unit_path.exists() else ""
-    if existing != unit:
+    needs_restart = (existing != unit)
+    if needs_restart:
         unit_path.write_text(unit)
         subprocess.run(["systemctl", "daemon-reload"], check=False, timeout=10)
+    # --no-block so we never deadlock the caller waiting for the FUSE
+    # mount to come up; weed retries internally until the filer is
+    # reachable.
     subprocess.run(
-        ["systemctl", "enable", "--now", ISO_MOUNT_UNIT],
-        check=False, timeout=30,
+        ["systemctl", "enable", "--no-block", ISO_MOUNT_UNIT],
+        check=False, timeout=10,
+    )
+    action = "restart" if needs_restart else "start"
+    subprocess.run(
+        ["systemctl", action, "--no-block", ISO_MOUNT_UNIT],
+        check=False, timeout=10,
     )
     log.info("seaweedfs: ISO library mounted at %s via filer=%s",
              ISO_MOUNTPOINT, filer_target)

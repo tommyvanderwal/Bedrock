@@ -322,6 +322,22 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
         log.warning("rqlite_subscriber: cluster_arbiter converge at rev %d: %s",
                     revision, e)
 
+    # ISO library FUSE mount targets the current mgmt-master's
+    # loopback /32. Re-render the unit on every revision tick so the
+    # mount target follows the master across role transitions.
+    # Idempotent: ensure_iso_library_mount only rewrites the unit +
+    # daemon-reloads + restarts when the rendered content actually
+    # changed.
+    try:
+        try:
+            from installer.lib import seaweedfs as _sw  # type: ignore
+        except ImportError:
+            from lib import seaweedfs as _sw  # type: ignore
+        _sw.ensure_iso_library_mount()
+    except Exception as e:
+        log.warning("rqlite_subscriber: iso_library_mount at rev %d: %s",
+                    revision, e)
+
     # Snapshot-diff reactor — on each revision advance, derive
     # transitions from prev→cur and run side effects (vm destroyed,
     # vm host changed, tier master changed, backup target added).

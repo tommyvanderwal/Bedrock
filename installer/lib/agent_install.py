@@ -37,18 +37,39 @@ def _http_json(method: str, url: str, body: dict | None = None, timeout: float =
 def _request_join(mgmt_url: str, node_name: str, host: str,
                   bedrock_pubkey: str, x25519_eph_pub_b64: str,
                   ssh_pubkey: str) -> dict:
-    return _http_json("POST", f"{mgmt_url}/api/join/request", {
+    body = {
         "node_name": node_name, "host": host,
         "bedrock_pubkey": bedrock_pubkey,
         "x25519_eph_pubkey": x25519_eph_pub_b64,
         "ssh_pubkey": ssh_pubkey,
-    })
+    }
+    # Retry the initial POST through transient errors: master's mgmt
+    # service may still be coming up, or mesh routing may be settling.
+    # 30s is the failure budget — beyond that the operator should
+    # diagnose; we don't sit here forever.
+    deadline = time.monotonic() + 30
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return _http_json("POST", f"{mgmt_url}/api/join/request", body)
+        except (urllib.error.URLError, TimeoutError,
+                ConnectionError, OSError) as e:
+            last_err = e
+            time.sleep(2)
+    raise RuntimeError(f"could not reach {mgmt_url} after 30s: {last_err}")
 
 
 def _poll_status(mgmt_url: str, request_id: str, *,
                  timeout_s: int = 600, interval_s: float = 2.0) -> dict:
     """Block until the operator approves or rejects, or `timeout_s` elapses.
-    Default 10 min — enough for an operator to glance at a popup and click."""
+    Default 10 min — enough for an operator to glance at a popup and click.
+
+    Transient connect / timeout errors are swallowed and retried. Only
+    404 (request_id not yet replicated) and explicit reject get
+    surfaced; everything else gets one more attempt in `interval_s`.
+    Without this tolerance, a single slow round-trip during master's
+    bedrock-mgmt startup kills the joiner with a traceback.
+    """
     from urllib.parse import quote
     deadline = time.monotonic() + timeout_s
     last_state = ""
@@ -72,6 +93,12 @@ def _poll_status(mgmt_url: str, request_id: str, *,
                 pass
             else:
                 raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            # mgmt API not reachable right this second (still warming
+            # up after init, or transient mesh path flap). Try again.
+            if last_state != "warming-up":
+                print(f"  join state: waiting for mgmt API ({type(e).__name__})")
+                last_state = "warming-up"
         time.sleep(interval_s)
     raise TimeoutError(f"no approval after {timeout_s}s")
 
