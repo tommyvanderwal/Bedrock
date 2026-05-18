@@ -488,14 +488,50 @@ def get_mgmt_ip(i: int) -> str | None:
                 # in the XML, so its ARP entry is first.
                 return ip
 
+    # Look up the MGMT_NET MAC up-front so we can filter the
+    # agent's per-NIC output (sim guests run libvirt themselves and
+    # claim a 192.168.122.1 virbr0 that mustn't shadow the real
+    # mgmt-bridge IP).
+    iflist, _ = virsh("domiflist", hostname, capture=True)
+    mgmt_mac = None
+    for line in (iflist or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[2] == MGMT_NET:
+            mgmt_mac = parts[4].lower()
+            break
+
     out, _ = virsh("domifaddr", hostname, "--source", "agent", capture=True)
+    last_mac = ""
     for line in (out or "").splitlines():
         cols = line.split()
+        if len(cols) >= 4 and ":" in (cols[1] if len(cols) >= 4 else ""):
+            last_mac = cols[1].lower()
         if len(cols) >= 4 and "/" in cols[-1]:
             ip = cols[-1].split("/")[0]
             if (ip and not ip.startswith(("169.254.", "127.", "10.99."))
                 and "." in ip):
+                if mgmt_mac and last_mac and last_mac != mgmt_mac:
+                    continue
                 return ip
+
+    # Fallback: host's `ip neigh` keyed on the bedrock-mgmt NIC MAC.
+    # virsh domifaddr --source arp uses libvirt's own ARP cache which
+    # can be stale; the host's neighbour table is always current.
+    out, _ = virsh("domiflist", hostname, capture=True)
+    mgmt_mac = None
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[2] == MGMT_NET:
+            mgmt_mac = parts[4].lower()
+            break
+    if mgmt_mac:
+        arp_out, _ = run(["ip", "neigh"], capture=True)
+        for line in (arp_out or "").splitlines():
+            cols = line.split()
+            if len(cols) >= 5 and cols[4].lower() == mgmt_mac:
+                ip = cols[0]
+                if ip and not ip.startswith(("169.254.", "127.")):
+                    return ip
 
     return mgmt_ip(i)
 

@@ -21,7 +21,7 @@ ExecStart=/usr/local/bin/weed volume \
     -dir=/var/lib/bedrock/seaweedfs/volumes \
     -disk=${SEAWEED_VOLUME_DISK_TYPE} \
     -max=${SEAWEED_VOLUME_MAX} \
-    -mserver=${SEAWEED_MASTER_PEERS}
+    -mserver=${SEAWEED_FILER_MASTERS}
 
 Restart=on-failure
 RestartSec=3s

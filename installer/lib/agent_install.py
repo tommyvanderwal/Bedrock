@@ -401,6 +401,22 @@ def install(witness: str, cluster_info: dict, repo: str):
     except Exception as e:
         print(f"  WARN: rqlited start failed: {e}")
 
+    # SeaweedFS master + volume — every node hosts both (peer-of-
+    # everyone HA pattern). Filer + s3 stay stopped on followers;
+    # cluster_arbiter.converge() promotes them on this node only
+    # if/when this node becomes mgmt master.
+    print("  Starting SeaweedFS master + volume...")
+    try:
+        from . import seaweedfs as _sw
+        _sw.ensure_install()
+        _sw.write_env_file()
+        _sw.write_master_config()
+        _sw.write_filer_config()
+        _sw.write_s3_config()
+        _sw.promote_to_master_volume_host()
+    except Exception as e:
+        print(f"  WARN: SeaweedFS setup failed: {e}")
+
     # Install + start the dashboard (FastAPI + Svelte UI). Reachable
     # at http://<this-node>:8080. The follower's mgmt API serves the
     # same cluster-wide picture from /etc/bedrock/cluster.json (kept

@@ -22,8 +22,9 @@ ExecStart=/usr/local/bin/weed filer \
     -ip=${SEAWEED_LOOPBACK_IP} \
     -port=8888 \
     -port.grpc=18888 \
-    -master=${SEAWEED_MASTER_PEERS} \
-    -config=/etc/bedrock/seaweedfs-filer.toml
+    -master=${SEAWEED_FILER_MASTERS}
+# Filer reads /etc/seaweedfs/filer.toml from the well-known search
+# paths; no `-config` flag in weed 4.25's filer subcommand.
 
 Restart=on-failure
 RestartSec=3s
@@ -33,7 +34,7 @@ MemoryMax=256M
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/bedrock/cluster
+ReadWritePaths=/var/lib/bedrock/cluster /etc/seaweedfs
 
 StandardOutput=journal
 StandardError=journal

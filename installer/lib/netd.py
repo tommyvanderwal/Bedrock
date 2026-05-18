@@ -1270,13 +1270,16 @@ def sweep_hysteresis(d: Daemon) -> None:
             continue
 
         # Up hysteresis: continuously seen for the up threshold AND not
-        # yet logged → emit LINK_UP. Set logged_up only on append
-        # success; transient IPC failures (bedrock-rust restart, etc.)
-        # then retry on the next sweep.
+        # yet logged → emit LINK_UP. Always mark logged_up True for
+        # local routing purposes — the rqlite write is for cluster-wide
+        # observability and must NOT gate local route installation
+        # (that would chicken-and-egg: routes need rqlite leader, leader
+        # needs reachable peer, peer needs routes).
         age_since_first = now - (n.first_seen or 0.0)
         if not n.logged_up and age_since_first >= UP_HYSTERESIS_S:
-            if emit_link_event("up", d, n):
-                n.logged_up = True
+            wrote = emit_link_event("up", d, n)
+            n.logged_up = True   # local-routing flag; emit is best-effort
+            if wrote:
                 n.last_quality_log = now
             continue
 

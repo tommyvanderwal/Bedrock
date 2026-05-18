@@ -374,7 +374,7 @@ def _state_view(v: dict, node_name: str) -> dict:
         "mgmt_ip":      me.get("host", ""),
         "drbd_ip":      me.get("drbd_ip", ""),
         "loopback_ip":  me.get("loopback_ip", ""),
-        "mgmt_url":     f"http://{master_host}:8080" if master_host else "",
+        "mgmt_url":     f"https://{master_host}:8443" if master_host else "",
         "witness_host": master_host,
     }
 

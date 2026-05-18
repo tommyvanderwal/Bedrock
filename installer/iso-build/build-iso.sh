@@ -195,6 +195,7 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
         echo "  downloading Python wheels..."
         pip3 download -q --dest "$PAYLOAD_DIR/wheels" \
             fastapi uvicorn paramiko websockets pydantic python-multipart msgpack \
+            httpx \
             >/dev/null
         echo "    $(ls "$PAYLOAD_DIR/wheels" | wc -l) wheels ($(du -sh "$PAYLOAD_DIR/wheels" | cut -f1))"
     fi

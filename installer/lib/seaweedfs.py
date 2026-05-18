@@ -63,7 +63,7 @@ FILER_HOME        = Path("/var/lib/bedrock/cluster/seaweedfs")
 FILER_DB          = FILER_HOME / "filer.db"
 
 MASTER_TOML       = Path("/etc/bedrock/seaweedfs-master.toml")
-FILER_TOML        = Path("/etc/bedrock/seaweedfs-filer.toml")
+FILER_TOML        = Path("/etc/seaweedfs/filer.toml")
 S3_CONFIG         = Path("/etc/bedrock/seaweedfs-s3.json")
 SEAWEED_ENV       = Path("/etc/bedrock/seaweedfs.env")
 
@@ -185,36 +185,36 @@ def write_master_config() -> None:
 
 
 def write_filer_config() -> None:
-    """Render filer.toml — pins SQLite as the metadata store, points
-    at /var/lib/bedrock/cluster/seaweedfs/filer.db (lives on the
-    tier-cluster DRBD volume per D-07/D-10).
+    """Render filer.toml — pins leveldb3 as the metadata store under
+    /var/lib/bedrock/cluster/seaweedfs/ (lives on the tier-cluster
+    DRBD volume per D-07/D-10).
 
-    Other store backends (postgres, mysql, tikv, dqlite, etcd) are
-    available; switching is bidirectional per the SeaweedFS project's
-    own documented `fs.meta.save` / `fs.meta.load` pattern.
+    Note: SeaweedFS v4.x dropped the SQLite filer store in favour of
+    leveldb3. Other store backends (postgres, mysql, tikv, etcd)
+    remain available; switching is bidirectional via `weed shell` →
+    `fs.meta.save` / `fs.meta.load`.
     """
     FILER_HOME.mkdir(parents=True, exist_ok=True)
     FILER_TOML.parent.mkdir(parents=True, exist_ok=True)
     body = textwrap.dedent(f"""\
         # Bedrock-managed SeaweedFS filer config — DO NOT edit by hand.
         #
-        # Per docs/post-alpha-rewrite-notes.md D-10:
-        # The SQLite metadata DB lives on the tier-cluster DRBD volume
-        # so it moves with the mgmt-master role. Upgrade path to
-        # PostgreSQL is bidirectional via `weed shell` →
-        # `fs.meta.save` / `fs.meta.load` (project-confirmed
-        # bidirectional in the SeaweedFS Filer-Stores wiki).
+        # Per docs/post-alpha-rewrite-notes.md D-10: the metadata store
+        # lives on the tier-cluster DRBD volume so it moves with the
+        # mgmt-master role. SeaweedFS 4.x removed sqlite; we use the
+        # embedded leveldb3 store which is feature-complete for our
+        # POSIX-namespace + S3 use case.
 
-        [sqlite]
+        [leveldb3]
         enabled = true
-        dbFile = "{FILER_DB}"
+        dir = "{FILER_HOME}"
         """)
     FILER_TOML.write_text(body)
-    log.info("seaweedfs: wrote %s (filer db at %s)", FILER_TOML, FILER_DB)
+    log.info("seaweedfs: wrote %s (filer db at %s)", FILER_TOML, FILER_HOME)
 
 
 def write_env_file(*, volume_max: int = 50,
-                   disk_type: str = "ssd") -> None:
+                   disk_type: str = "") -> None:
     """Render /etc/bedrock/seaweedfs.env consumed by all four
     weed systemd units. Variables:
 
@@ -237,13 +237,19 @@ def write_env_file(*, volume_max: int = 50,
         # SeaweedFS 'none' = single-master mode (no peer-list Raft).
         # Documented in `weed master --help`. Avoids the master
         # complaining about "peer list contains only self".
-        peers = "none"
+        master_peers = "none"
     else:
-        peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
+        master_peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
+
+    # Filer/volume need a REAL master endpoint (or comma-list at N>=2).
+    # 'none' is a master-mode-only signal; passing it to the filer
+    # client makes it exit 2/INVALIDARGUMENT.
+    filer_masters = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
 
     env = {
         "SEAWEED_LOOPBACK_IP":      my_lo,
-        "SEAWEED_MASTER_PEERS":     peers,
+        "SEAWEED_MASTER_PEERS":     master_peers,
+        "SEAWEED_FILER_MASTERS":    filer_masters,
         "SEAWEED_VOLUME_DISK_TYPE": disk_type,
         "SEAWEED_VOLUME_MAX":       str(int(volume_max)),
     }
@@ -252,7 +258,7 @@ def write_env_file(*, volume_max: int = 50,
     tmp.write_text("\n".join(f"{k}={v}" for k, v in env.items()) + "\n")
     import os as _os
     _os.replace(tmp, SEAWEED_ENV)
-    log.info("seaweedfs: wrote %s (peers=%s)", SEAWEED_ENV, peers)
+    log.info("seaweedfs: wrote %s (peers=%s)", SEAWEED_ENV, master_peers)
 
 
 def write_s3_config() -> None:

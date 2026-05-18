@@ -202,7 +202,9 @@ WantedBy=multi-user.target
     s["node_name"] = hw.get("hostname", "node1")
     s["witness_host"] = witness_host
     s["mgmt_ip"] = _pick_mgmt_ip(hw)
-    s["mgmt_url"] = f"http://{s['mgmt_ip']}:8080"
+    # Port 8080 is loopback-only (intra-node); HTTPS on 8443 is the
+    # LAN-reachable endpoint and what joiners need to dial.
+    s["mgmt_url"] = f"https://{s['mgmt_ip']}:8443"
     # Mgmt master gets the lowest cluster identity. Joiners get the
     # next free index allocated by the register endpoint. The /24
     # comes from cluster_addr.node_loopback_ip(uuid, N) — derived
@@ -332,19 +334,28 @@ WantedBy=multi-user.target
                 raise
             _sp.run(["systemctl", "restart", "bedrock-rqlited.service"],
                     check=False, timeout=30)
-            # rqlited needs a few seconds to bind HTTP + form its single-
-            # node Raft cluster. Poll quickly until ready.
-            for _attempt in range(30):
+            # Wait for rqlited to be Leader, not just HTTP-up. The
+            # /status endpoint serves 200 the moment HTTP binds, but
+            # /db/execute returns 503 'leader not found' until Raft
+            # elects. Seeding before Leader-up = silent schema-empty
+            # cluster.
+            for _attempt in range(60):
                 _t.sleep(0.5)
                 rc = _sp.run(
                     ["curl", "-fsSL", "--max-time", "1",
                      "http://127.0.0.1:4001/status"],
                     capture_output=True
                 )
-                if rc.returncode == 0:
+                if rc.returncode != 0:
+                    continue
+                try:
+                    state = _json.loads(rc.stdout.decode())["store"]["raft"]["state"]
+                except Exception:
+                    continue
+                if state == "Leader":
                     break
             else:
-                print(f"  WARN: rqlited didn't respond within 15s")
+                print(f"  WARN: rqlited didn't reach Leader within 30s")
             # Master's Bedrock identity Ed25519 (idempotent across runs).
             master_bedrock_pub = _pa.pubkey_hex()
             # Seed the initial operator account so the dashboard is
@@ -406,3 +417,24 @@ WantedBy=multi-user.target
         )
     except Exception as e:
         print(f"  WARN: bedrock-net start failed: {e}")
+
+    # SeaweedFS setup. Master + volume run on every node (peer-of-
+    # everyone HA pattern); filer + s3 follow the mgmt-master via
+    # cluster_arbiter.converge() on the next revision tick.
+    print()
+    print("Setting up SeaweedFS (master + volume on every node)...")
+    try:
+        from . import seaweedfs as _sw
+        _sw.ensure_install()
+        _sw.write_env_file()
+        _sw.write_master_config()
+        _sw.write_filer_config()
+        _sw.write_s3_config()
+        _sw.promote_to_master_volume_host()
+        # Filer + S3 start on N=1 immediately (no DRBD, master IS filer
+        # host). cluster_arbiter.converge() does the same thing but
+        # racing with the orchestrator subscriber's first tick — do
+        # it inline so `bedrock init` returns with everything up.
+        _sw.promote_to_filer_host()
+    except Exception as e:
+        print(f"  WARN: SeaweedFS setup failed: {e}")
