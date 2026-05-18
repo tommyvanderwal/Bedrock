@@ -824,6 +824,35 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # 6. Act on outcome.
     if result.outcome == _election.Outcome.NO_QUORUM:
         _election.write_fence_marker(result.reason)
+        # If we were hosting the cluster singletons (.254 VIP, arbiter
+        # rqlite, filer) at the moment quorum was lost, demote them
+        # directly. cluster_arbiter.converge() can't help here — it
+        # reads state.json["role"], which is only updated by the
+        # rqlite subscriber, and rqlite is by definition unreachable
+        # in NoQuorum. Without this, an isolated master keeps the
+        # singletons up and would serve stale data to a still-attached
+        # peer (the operator's workstation, in the e2e isolation test).
+        if prev_outcome != _election.Outcome.NO_QUORUM.value:
+            try:
+                try:
+                    from . import cluster_arbiter as _ca
+                except ImportError:
+                    from lib import cluster_arbiter as _ca  # type: ignore
+                status = _ca.arbiter_status()
+                hosting = (status.get("service_active")
+                           or status.get("ip_present")
+                           or status.get("mounted"))
+                if hosting:
+                    sys.stderr.write(
+                        "bedrock-net: NoQuorum + currently hosting "
+                        "arbiter — demoting singletons (release .254, "
+                        "stop arbiter rqlite, drbdadm secondary)\n"
+                    )
+                    _ca.demote_arbiter_host()
+            except Exception as e:
+                sys.stderr.write(
+                    f"bedrock-net: NoQuorum self-demote failed: {e!r}\n"
+                )
     elif result.should_set_mgmt_master:
         try:
             try:
