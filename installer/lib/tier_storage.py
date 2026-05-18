@@ -1674,6 +1674,12 @@ def node_reset_local() -> None:
                 "bedrock-fence-watchdog.timer")
     run(f"systemctl stop {' '.join(services)} 2>/dev/null", check=False)
     run(f"systemctl disable {' '.join(services)} 2>/dev/null", check=False)
+    # Clear any cached failure counters from previous start-rate-limit
+    # hits. Otherwise the next `systemctl enable --now` (from
+    # mgmt_install / agent_install) returns success while the unit
+    # silently refuses to start because it's still inside its
+    # StartLimitInterval cooldown.
+    run(f"systemctl reset-failed {' '.join(services)} 2>/dev/null", check=False)
 
     # 2. DRBD resources down + .res cleanup. Best-effort.
     for tier in ("critical",):
