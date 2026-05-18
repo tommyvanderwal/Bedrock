@@ -142,6 +142,27 @@ def compute(
     master_is_alive = bool(current_mgmt_master and liveness.get(current_mgmt_master))
 
     if current_mgmt_master == self_name:
+        # Witness has blessed a different master, and the bless is
+        # fresh: someone else took over (most likely a 2-node-HA
+        # split where the OTHER side promoted via witness vote) — we
+        # MUST demote ourselves to avoid two-primaries-claim-.254
+        # when connectivity returns. The 2-node election math gives
+        # 10+1=11/21 (quorum) to each side simultaneously, so the
+        # quorum check above can't catch this; the witness bless is
+        # what enforces single-master.
+        if witness_blessed_master and witness_blessed_master != self_name:
+            if not now_ms:
+                import time as _t
+                now_ms = int(_t.time() * 1000)
+            age_ms = now_ms - witness_blessed_at_ms if witness_blessed_at_ms else None
+            if age_ms is not None and age_ms < bless_holddown_ms:
+                return Election(
+                    outcome=Outcome.NO_QUORUM, my_votes=my_votes,
+                    total_votes=total_votes, majority=majority,
+                    should_set_mgmt_master=False, reachable_peers=reachable,
+                    reason=(f"witness blessed {witness_blessed_master} "
+                            f"({age_ms}ms ago) — demoting self"),
+                )
         return Election(
             outcome=Outcome.LEADER, my_votes=my_votes,
             total_votes=total_votes, majority=majority,
