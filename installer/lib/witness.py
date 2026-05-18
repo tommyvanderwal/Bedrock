@@ -280,8 +280,20 @@ def needs_reprobe(ws: WitnessState) -> bool:
 def load_cluster_key(path: Path = Path("/etc/bedrock/cluster.key")) -> bytes:
     """Read the shared HMAC key from disk. install.sh + mgmt_install
     write this; agent_install copies it from the master at join time.
-    Empty if unreadable — caller decides whether that's fatal."""
+    Empty if unreadable — caller decides whether that's fatal.
+
+    DO NOT strip(): cluster.key is 32 raw random bytes. ~5% of randomly
+    generated keys start or end with a byte that bytes.strip() treats
+    as whitespace (0x09/0x0A/0x0B/0x0C/0x0D/0x20), in which case
+    strip() silently truncates the key and HMAC verification falls
+    apart for an unlucky cluster."""
     try:
-        return path.read_bytes().strip()
+        data = path.read_bytes()
     except OSError:
         return b""
+    # Tolerate a single trailing newline if a careless tool added one
+    # (e.g. xxd | xxd -r round-trip). But never strip from the front,
+    # and never strip more than one byte.
+    if len(data) == 33 and data[-1:] == b"\n":
+        return data[:32]
+    return data

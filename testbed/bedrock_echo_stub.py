@@ -70,7 +70,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cluster_key_file:
-        key = open(args.cluster_key_file, "rb").read().strip()
+        # Don't strip(): cluster.key is 32 raw random bytes — strip()
+        # eats whitespace-equivalent bytes if they happen to land at
+        # the boundary and silently truncates.
+        key = open(args.cluster_key_file, "rb").read()
+        if len(key) == 33 and key[-1:] == b"\n":
+            key = key[:32]
     elif args.cluster_key_hex:
         key = bytes.fromhex(args.cluster_key_hex)
     else:
