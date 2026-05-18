@@ -725,9 +725,16 @@ def ensure_routing_sysctls() -> None:
 
 
 def ensure_loopback_ip(loopback_ip: str) -> None:
-    """Idempotent. Add the cluster identity IP as a /32 on `lo` if not
-    already there. Survives reboots when state.json is read on
-    daemon start."""
+    """Idempotent. Add the cluster identity IP as a /32 on `lo`, AND
+    drop any stale 100.X.Y.Z/32 from a prior cluster_uuid. Survives
+    reboots when state.json is read on daemon start.
+
+    The 100.64.0.0/10 carrier-grade NAT space is reserved per RFC 6598
+    for cluster loopbacks (`cluster_addr.cluster_loopback_net`). Any
+    /32 in that range on `lo` that isn't our current identity is a
+    residual from a wiped/reinstalled cluster and would confuse mesh
+    routing — drop it.
+    """
     if not loopback_ip:
         return
     cidr = f"{loopback_ip}/32"
@@ -735,10 +742,24 @@ def ensure_loopback_ip(loopback_ip: str) -> None:
         ["ip", "-4", "-o", "addr", "show", "dev", "lo"],
         capture_output=True, text=True,
     ).stdout
-    if cidr in out or f" {loopback_ip}/" in out:
-        return
-    subprocess.run(["ip", "addr", "add", cidr, "dev", "lo"],
-                   capture_output=True, text=True)
+    have_self = False
+    for line in out.splitlines():
+        # Each line is like: "1: lo    inet 100.86.181.1/32 scope global lo \\..."
+        parts = line.split()
+        for i, tok in enumerate(parts):
+            if tok == "inet" and i + 1 < len(parts):
+                addr_cidr = parts[i + 1]
+                if addr_cidr == cidr:
+                    have_self = True
+                elif addr_cidr.startswith("100.") and addr_cidr.endswith("/32"):
+                    # Stale loopback from a prior cluster_uuid.
+                    subprocess.run(
+                        ["ip", "addr", "del", addr_cidr, "dev", "lo"],
+                        capture_output=True, text=True,
+                    )
+    if not have_self:
+        subprocess.run(["ip", "addr", "add", cidr, "dev", "lo"],
+                       capture_output=True, text=True)
 
 
 def run_daemon():

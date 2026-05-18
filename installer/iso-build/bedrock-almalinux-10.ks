@@ -128,6 +128,18 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXS8J+TpzUuO2WDCeSxV9baR5p7p14ZtaXWRvVlZgqp
 PUBKEY_EOF
 chmod 600 /root/.ssh/authorized_keys
 
+# OpenSSH 9.8+ (AlmaLinux 10) ships with PerSourcePenalties enabled
+# by default. A burst of failed auths from one source IP (e.g.
+# paramiko probes from the master during cluster install) locks
+# that source out for up to 10 min. Bedrock's intra-cluster SSH
+# pool can't tolerate this — disable globally on every cluster
+# node. See memory/lesson_persourcepenalty_flap.md.
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-bedrock-no-persource.conf <<'EOF'
+PerSourcePenalties no
+EOF
+chmod 644 /etc/ssh/sshd_config.d/99-bedrock-no-persource.conf
+
 # First-boot one-shot service: runs install.sh against the local
 # payload. Self-disables after success so it never re-runs.
 cat > /etc/systemd/system/bedrock-firstboot.service <<'EOF'
