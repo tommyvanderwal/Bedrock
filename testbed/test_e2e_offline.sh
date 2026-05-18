@@ -502,7 +502,7 @@ fi
 
 # Check sim-1's own fence/services state — it should have self-fenced
 note "--- sim-1 internal view during isolation ---"
-sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rqlited-arbiter bedrock-rust 2>&1 | head -6; echo ---; test -f /run/bedrock-rust.fence && echo "fence marker present" || echo "no fence marker"; ip -4 addr show lo 2>&1 | grep -E "100\\." | head -3' || note "sim-1 introspect failed"
+sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rqlited-arbiter bedrock-net 2>&1 | head -6; echo ---; test -f /run/bedrock-cluster.fence && echo "fence marker present" || echo "no fence marker"; ip -4 addr show lo 2>&1 | grep -E "100\\." | head -3' || note "sim-1 introspect failed"
 
 # .254 must NOT be on sim-1's lo (released as part of self-fence)
 if sssh 1 "ip -4 addr show lo | grep -q '$ARB_IP/' 2>/dev/null"; then
