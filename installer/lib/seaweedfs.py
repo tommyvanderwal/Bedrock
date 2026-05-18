@@ -134,6 +134,14 @@ def _my_loopback() -> str:
     return (_read_state() or {}).get("loopback_ip", "")
 
 
+def _loopback_octet(ip: str) -> int:
+    """Last octet — deterministic sort key for odd-master-subset."""
+    try:
+        return int(ip.rsplit(".", 1)[-1])
+    except (ValueError, IndexError):
+        return 9999
+
+
 def write_master_config() -> None:
     """Render the master.toml — peer list pointing at every other
     node's master grpc, defaultReplication based on cluster size
@@ -151,16 +159,28 @@ def write_master_config() -> None:
             "populated before SeaweedFS install"
         )
 
-    # Master peers list (this node + all peers). Master HA requires
-    # the same peer set on every node.
-    all_masters = sorted([my_lo] + peers)
-    peers_arg = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
-
-    # defaultReplication: at N=1 use "000" (no copies — single node
-    # has no peer). At N>=2 use "001" (one extra copy on a peer
-    # node) as the safer default. Per-collection overrides are still
-    # operator-tunable.
-    n_nodes = len(all_masters)
+    # SeaweedFS master uses Raft; Raft refuses to start with an
+    # even-numbered peer set ("Only odd number of masters are
+    # supported"). Pick a deterministic odd subset of nodes:
+    #   N=1 → 1 master  (self only)
+    #   N=2 → 1 master  (lowest-loopback only)
+    #   N=3 → 3 masters
+    #   N=4 → 3 masters (lowest 3 by loopback octet)
+    #   N=5 → 5 masters
+    # If self is NOT in the elected master subset, this node still
+    # joins as a volume-only server; the master service won't run
+    # here. Volume server addresses ALL masters in mlist anyway.
+    all_lo = sorted([my_lo] + peers, key=_loopback_octet)
+    n_nodes = len(all_lo)
+    if n_nodes <= 1:
+        master_subset = all_lo
+    elif n_nodes == 2:
+        master_subset = all_lo[:1]
+    else:
+        # largest odd ≤ n_nodes
+        odd_n = n_nodes if n_nodes % 2 == 1 else n_nodes - 1
+        master_subset = all_lo[:odd_n]
+    peers_arg = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_subset)
     default_repl = "000" if n_nodes <= 1 else "001"
 
     MASTER_TOML.parent.mkdir(parents=True, exist_ok=True)
@@ -231,19 +251,23 @@ def write_env_file(*, volume_max: int = 50,
         raise RuntimeError(
             "seaweedfs: loopback_ip not in state.json — can't render env"
         )
-    all_masters = sorted([my_lo] + _peer_loopbacks())
-    if len(all_masters) <= 1:
-        # SeaweedFS 'none' = single-master mode (no peer-list Raft).
-        # Documented in `weed master --help`. Avoids the master
-        # complaining about "peer list contains only self".
+    # Master subset: same odd-only rule as write_master_config.
+    all_lo = sorted([my_lo] + _peer_loopbacks(), key=_loopback_octet)
+    n_nodes = len(all_lo)
+    if n_nodes <= 1:
+        master_subset = all_lo
+    elif n_nodes == 2:
+        master_subset = all_lo[:1]
+    else:
+        odd_n = n_nodes if n_nodes % 2 == 1 else n_nodes - 1
+        master_subset = all_lo[:odd_n]
+    if len(master_subset) <= 1:
         master_peers = "none"
     else:
-        master_peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
-
-    # Filer/volume need a REAL master endpoint (or comma-list at N>=2).
-    # 'none' is a master-mode-only signal; passing it to the filer
-    # client makes it exit 2/INVALIDARGUMENT.
-    filer_masters = ",".join(f"{ip}:{MASTER_PORT}" for ip in all_masters)
+        master_peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_subset)
+    # Filer/volume clients dial ALL elected masters (one of them is
+    # the Raft leader, the others are followers — the client picks).
+    filer_masters = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_subset)
 
     env = {
         "SEAWEED_LOOPBACK_IP":      my_lo,
@@ -340,15 +364,50 @@ def reconcile_master_config() -> None:
 
 def promote_to_master_volume_host() -> None:
     """Called by the install / orchestrator path on every node.
-    Master + volume run on EVERY node (peer-of-everyone HA pattern);
-    only filer + s3 follow the mgmt master via cluster_arbiter.
-    Idempotent."""
-    subprocess.run(
-        ["systemctl", "enable", "--now",
-         "bedrock-weed-master.service",
-         "bedrock-weed-volume.service"],
-        check=False, timeout=30,
-    )
+    Volume server runs on EVERY node (peer-of-everyone HA pattern);
+    master ONLY runs on the odd-numbered subset (SeaweedFS Raft
+    refuses even peer counts), recomputed each call from the live
+    cluster.json + state.json so additions/removals re-balance the
+    quorum. Filer + s3 follow the mgmt master via cluster_arbiter.
+
+    If this node was in the master subset before but isn't now, the
+    master unit is stopped + disabled (cluster shrank from N=3 to N=2
+    is the common case — the 3rd master must step down)."""
+    my_lo = _my_loopback()
+    all_lo = sorted([my_lo] + _peer_loopbacks(), key=_loopback_octet)
+    n_nodes = len(all_lo)
+    if n_nodes <= 1:
+        master_subset = all_lo
+    elif n_nodes == 2:
+        master_subset = all_lo[:1]
+    else:
+        odd_n = n_nodes if n_nodes % 2 == 1 else n_nodes - 1
+        master_subset = all_lo[:odd_n]
+    i_run_master = my_lo in master_subset
+
+    if i_run_master:
+        subprocess.run(
+            ["systemctl", "enable", "--now",
+             "bedrock-weed-master.service",
+             "bedrock-weed-volume.service"],
+            check=False, timeout=30,
+        )
+    else:
+        # Stop the master if we were running it before. Volume always
+        # runs (every node serves bytes regardless of master role).
+        log.info("seaweedfs: not in master subset at N=%d "
+                 "(loopback %s, subset %s) — stopping master if active",
+                 n_nodes, my_lo, master_subset)
+        subprocess.run(
+            ["systemctl", "disable", "--now",
+             "bedrock-weed-master.service"],
+            check=False, timeout=30,
+        )
+        subprocess.run(
+            ["systemctl", "enable", "--now",
+             "bedrock-weed-volume.service"],
+            check=False, timeout=30,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
