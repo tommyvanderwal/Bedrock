@@ -91,6 +91,10 @@ def compute(
     witness_alive: bool,
     current_mgmt_master: str | None,
     fence_marker_path: Path = FENCE_MARKER,
+    witness_blessed_master: str = "",
+    witness_blessed_at_ms: int = 0,
+    now_ms: int = 0,
+    bless_holddown_ms: int = 15_000,
 ) -> Election:
     """One-shot election decision. See module docstring for semantics.
 
@@ -165,6 +169,26 @@ def compute(
             should_set_mgmt_master=False, reachable_peers=reachable,
             reason=f"deferring to lower-octet {winner}",
         )
+
+    # Witness-blessed-master gate: if the witness recently blessed a
+    # *different* master (and the bless is still inside the hold-down
+    # window), refuse to promote — the previous master may still be
+    # alive and holding the DRBD primary on a side of the partition
+    # we can't see. Hold-down expires the bless and the election
+    # falls through to normal promotion next tick.
+    if witness_blessed_master and witness_blessed_master != self_name:
+        if not now_ms:
+            import time as _t
+            now_ms = int(_t.time() * 1000)
+        age_ms = now_ms - witness_blessed_at_ms if witness_blessed_at_ms else None
+        if age_ms is not None and age_ms < bless_holddown_ms:
+            return Election(
+                outcome=Outcome.FOLLOWER, my_votes=my_votes,
+                total_votes=total_votes, majority=majority,
+                should_set_mgmt_master=False, reachable_peers=reachable,
+                reason=(f"witness blesses {witness_blessed_master} "
+                        f"({age_ms}ms ago, < {bless_holddown_ms}ms holddown)"),
+            )
 
     return Election(
         outcome=Outcome.LEADER, my_votes=my_votes,

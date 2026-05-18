@@ -811,6 +811,9 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         node_loopbacks=node_loopbacks,
         witness_alive=_witness.is_alive(ws),
         current_mgmt_master=current_master,
+        witness_blessed_master=ws.blessed_master,
+        witness_blessed_at_ms=ws.blessed_at_ms,
+        now_ms=int(time.time() * 1000),
     )
 
     # 5. Log transitions.
@@ -870,7 +873,52 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                 f"(will retry next tick)\n"
             )
 
+    # If we are mgmt_master AND have just finished promoting the
+    # arbiter (drbd primary + mount + .254 + arbiter rqlite up),
+    # publish our tier-critical DRBD current-UUID to the witness so
+    # any zombie ex-master that tries to re-claim with a stale UUID
+    # gets refused (see lib/witness.py "blessed" handling). Cheap
+    # idempotent re-send: the Echo accepts repeat claims from the
+    # same master.
+    if current_master == d.my_node and ws.discovered:
+        try:
+            uuid_hex = _read_tier_critical_uuid()
+            if uuid_hex and ws.blessed_drbd_uuid != uuid_hex:
+                if _witness.send_claim(ws, uuid_hex):
+                    sys.stderr.write(
+                        f"bedrock-net: witness claim sent "
+                        f"(drbd_uuid={uuid_hex[:12]}…)\n"
+                    )
+        except Exception as e:
+            sys.stderr.write(f"bedrock-net: witness claim error: {e!r}\n")
+
     return result.outcome.value
+
+
+def _read_tier_critical_uuid() -> str:
+    """Read the current-UUID of the tier-critical DRBD resource via
+    `drbdadm dump-md`. Returns "" if DRBD isn't up or the resource
+    doesn't exist (N=1 mode). The current-UUID is the field DRBD
+    bumps on every writable transition — it's our generation-marker
+    for "this side has the freshest data"."""
+    rc, out, _ = _run_silent_capture(["drbdadm", "dump-md", "tier-critical"])
+    if rc != 0:
+        return ""
+    # dump-md output has lines like: `current-uuid 0xABCDEF... ;`
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("current-uuid"):
+            parts = s.split()
+            if len(parts) >= 2:
+                tok = parts[1].rstrip(";")
+                return tok.lower().replace("0x", "")
+    return ""
+
+
+def _run_silent_capture(cmd: list[str]) -> tuple[int, str, str]:
+    """Helper: capture stdout/stderr of a subprocess without raising."""
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode, r.stdout or "", r.stderr or ""
 
 
 def run_daemon():

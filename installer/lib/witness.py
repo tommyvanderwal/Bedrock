@@ -94,6 +94,15 @@ class WitnessState:
     last_alive_at: float = 0.0
     # Most recent observed-peers dict from any endpoint (newest wins).
     observed_peers: dict[str, int] = field(default_factory=dict)
+    # Currently-blessed-by-the-witness master for the cluster's arbiter
+    # DRBD volume — set when a node wins the election, completes its
+    # promote, and publishes its tier-critical current-UUID via
+    # send_claim(). Subsequent would-be promoters must check this:
+    # if blessed_master is set and != self and fresh, refuse to
+    # promote (zombie-old-master prevention).
+    blessed_master: str = ""
+    blessed_drbd_uuid: str = ""
+    blessed_at_ms: int = 0
 
 
 def _pack(body: dict, cluster_key: bytes) -> bytes:
@@ -175,9 +184,37 @@ def heartbeat_all(ws: WitnessState) -> None:
             pass
 
 
+def send_claim(ws: WitnessState, drbd_uuid: str) -> bool:
+    """Publish a primacy claim to every discovered Echo: this node is
+    now the cluster's master AND the tier-critical (arbiter-data)
+    DRBD volume's current UUID is `drbd_uuid`. Witness records this
+    and refuses to bless a competing claimant whose UUID doesn't
+    match for a configurable hold-down window.
+
+    Caller-contract: send this AFTER cluster_arbiter.promote_to_arbiter_host
+    succeeds (drbdadm primary + mount + .254 VIP + arbiter rqlite
+    + filer all up). Returns True if at least one Echo accepted the
+    claim (ack came back with accepted=True)."""
+    if ws.sock is None or not ws.discovered:
+        return False
+    pkt = _pack({
+        "v": 1, "t": "claim", "cu": ws.cluster_uuid,
+        "n": ws.my_node, "drbd_uuid": drbd_uuid,
+        "ts": int(time.time() * 1000),
+        "nonce": secrets.token_bytes(8),
+    }, ws.cluster_key)
+    for ep in ws.discovered.values():
+        try:
+            ws.sock.sendto(pkt, ep.addr)
+        except OSError:
+            pass
+    return True
+
+
 def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
-    """Non-blocking drain — call every tick. Updates discovered[] and
-    last_alive_at / observed_peers on every accepted reply."""
+    """Non-blocking drain — call every tick. Updates discovered[],
+    last_alive_at, observed_peers, and the blessed_master / drbd_uuid
+    fields on every accepted reply."""
     if ws.sock is None:
         return
     for _ in range(max_packets):
@@ -191,7 +228,7 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
         if body.get("cu") != ws.cluster_uuid:
             continue
         kind = body.get("t")
-        if kind not in ("pong", "hb_ack"):
+        if kind not in ("pong", "hb_ack", "claim_ack"):
             continue
         echo_id = str(body.get("echo_id") or src[0])
         peers_raw = body.get("peers") or {}
@@ -207,6 +244,18 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
             ep.last_reply_ms = now_ms
         ws.observed_peers = peers
         ws.last_alive_at = time.monotonic()
+        # Witness's view of who currently owns the cluster (set by an
+        # accepted claim). Empty until the first successful failover.
+        bm = body.get("blessed_master") or ""
+        bu = body.get("blessed_drbd_uuid") or ""
+        bat = body.get("blessed_at_ms") or 0
+        if bm:
+            ws.blessed_master = str(bm)
+            ws.blessed_drbd_uuid = str(bu)
+            try:
+                ws.blessed_at_ms = int(bat)
+            except (TypeError, ValueError):
+                ws.blessed_at_ms = now_ms
 
 
 def is_alive(ws: WitnessState) -> bool:

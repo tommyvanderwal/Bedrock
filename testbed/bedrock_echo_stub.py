@@ -95,6 +95,18 @@ def main() -> int:
     # implicitly stale.
     status: dict[str, int] = {}
 
+    # blessed_*: the currently-recognised master + the tier-critical
+    # (arbiter-DRBD-volume) current-UUID it published on its last
+    # successful failover. Set by a claim message. Hold-down window
+    # = CLAIM_HOLDDOWN_MS — a different claimant within this window
+    # is rejected unless it carries the same drbd_uuid (which is the
+    # legitimate case of a re-promote from the same master after a
+    # brief flap).
+    CLAIM_HOLDDOWN_MS = 15_000
+    blessed_master = ""
+    blessed_drbd_uuid = ""
+    blessed_at_ms = 0
+
     while True:
         try:
             data, src = s.recvfrom(1500)
@@ -113,22 +125,61 @@ def main() -> int:
             continue
         now_ms = int(time.time() * 1000)
         status[node] = now_ms
+
+        if kind == "claim":
+            claim_uuid = str(body.get("drbd_uuid") or "")
+            age = now_ms - blessed_at_ms if blessed_at_ms else None
+            accepted = False
+            reason = ""
+            if not blessed_master:
+                accepted = True
+                reason = "no prior master"
+            elif blessed_master == node:
+                accepted = True
+                reason = "same master refreshing"
+            elif age is not None and age >= CLAIM_HOLDDOWN_MS:
+                accepted = True
+                reason = f"prior bless aged {age}ms (>{CLAIM_HOLDDOWN_MS})"
+            elif claim_uuid and claim_uuid == blessed_drbd_uuid:
+                accepted = True
+                reason = "same drbd_uuid (legitimate re-claim)"
+            else:
+                reason = (f"reject: blessed={blessed_master} "
+                          f"drbd={blessed_drbd_uuid[:12]}… "
+                          f"{age}ms < {CLAIM_HOLDDOWN_MS}")
+            if accepted:
+                blessed_master = node
+                blessed_drbd_uuid = claim_uuid
+                blessed_at_ms = now_ms
+            print(f"  claim from {node} drbd_uuid={claim_uuid[:12]}… "
+                  f"→ {'ACCEPTED' if accepted else 'REJECTED'} ({reason})",
+                  file=sys.stderr)
+            reply_t = "claim_ack"
+            reply_extra = {"accepted": bool(accepted), "reason": reason}
+        else:
+            reply_t = "pong" if kind == "probe" else "hb_ack"
+            reply_extra = {}
+
         # Build the relative STATUS_LIST (now − last_seen, ms).
         peers = {n: now_ms - ts for n, ts in status.items()}
         reply = {
             "v": 1,
-            "t": "pong" if kind == "probe" else "hb_ack",
+            "t": reply_t,
             "echo_id": args.echo_id,
             "cu": cu,
             "ts": now_ms,
             "peers": peers,
+            "blessed_master": blessed_master,
+            "blessed_drbd_uuid": blessed_drbd_uuid,
+            "blessed_at_ms": blessed_at_ms,
             "nonce": body.get("nonce") or secrets.token_bytes(8),
+            **reply_extra,
         }
         try:
             s.sendto(_pack(reply, key), src)
         except OSError as e:
             print(f"  send reply to {src}: {e!r}", file=sys.stderr)
-        if args.verbose:
+        if args.verbose and kind != "claim":
             print(f"  {kind} {node} ← {src}; status now {list(peers)}",
                   file=sys.stderr)
 
