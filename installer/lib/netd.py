@@ -490,6 +490,12 @@ class Daemon:
     my_loopback: str
     # Map (peer_node, peer_nic, my_nic) → Neighbour
     neighbours: dict = field(default_factory=dict)
+    # Set of peer node-names ever observed during this run. Survives
+    # `sweep_hysteresis` dropping silent neighbours from `neighbours`,
+    # so the election layer can distinguish "joiner not yet probed
+    # back" (never seen → don't count for quorum) from "known peer
+    # gone silent ≥30 s" (seen → count for quorum at False liveness).
+    ever_seen_peers: set = field(default_factory=set)
     # Map nic → IPv4 address (link-local from NM, or DHCP for the LAN side)
     nic_addrs: dict = field(default_factory=dict)
     # Probe sockets per nic (reused across loop iterations)
@@ -787,8 +793,14 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     except Exception as e:
         sys.stderr.write(f"bedrock-net: witness IO error: {e!r}\n")
 
-    # 2. Peer liveness from netd's own neighbour table.
-    peer_liveness: dict[str, bool] = {}
+    # 2. Peer liveness from netd's own neighbour table. Seed with
+    # every ever-seen peer at False — sweep_hysteresis drops peers
+    # from d.neighbours after 30 s of silence, but the election layer
+    # still needs to count them as cluster members (otherwise an
+    # isolated master sees n_nodes=1 and stays "quorate"). The live
+    # entries below overwrite to True wherever there's a logged-up
+    # link.
+    peer_liveness: dict[str, bool] = {p: False for p in d.ever_seen_peers}
     for n in d.neighbours.values():
         if not n.peer_node:
             continue
@@ -1263,10 +1275,12 @@ def process_probe(d: Daemon, body: dict, sender_link_addr: str,
             rtt_us=0,
         )
         d.neighbours[key] = n
+        d.ever_seen_peers.add(peer_node)
     else:
         n.last_seen = now
         n.peer_link_addr = peer_link_addr
         n.peer_loopback = peer_loopback
+        d.ever_seen_peers.add(peer_node)
 
 
 def nic_for_sender(d: Daemon, sender_addr: str) -> str:
