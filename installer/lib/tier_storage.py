@@ -1697,6 +1697,7 @@ def node_reset_local() -> None:
         "/etc/bedrock/seaweedfs-s3.json "
         "/etc/bedrock/seaweedfs-filer.toml "
         "/etc/bedrock/rqlited.env "
+        "/etc/bedrock/rqlited-arbiter.env "
         "/etc/bedrock/cluster.key "
         "/etc/bedrock/storage.json 2>/dev/null", check=False)
     # rqlite Raft WAL — stale data dir holds the previous cluster's
