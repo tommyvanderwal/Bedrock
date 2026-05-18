@@ -533,6 +533,46 @@ def ensure_vg() -> None:
     _write_storage_json(cfg)
 
 
+def _ensure_vg_headroom(min_mb: int = 1024) -> None:
+    """If the VG has less than `min_mb` MB of free space (typical when
+    kickstart used `--grow` to give the thinpool 100% of disk), attach
+    a sparse loop-backed PV and `vgextend` so thick LVs outside the
+    pool (tier-{critical,bulk}-meta) can be created. Idempotent: if
+    the helper PV is already attached, nothing happens."""
+    out = run(f"vgs {VG} --units m -o vg_free --noheadings",
+              check=False).strip()
+    try:
+        free_mb = float(out.replace("m", "").strip())
+    except (ValueError, AttributeError):
+        free_mb = 0.0
+    if free_mb >= min_mb:
+        return
+    extra_img = Path(f"/var/lib/bedrock-vg-extra.img")
+    # Sparse file — only the bytes we actually write get allocated on
+    # disk. 4 GiB headroom is plenty for every tier-*-meta and any
+    # operator headroom we'd reasonably want at install time.
+    size_mb = max(min_mb * 4, 4096)
+    if not extra_img.exists():
+        print(f"  [tier] VG has {free_mb:.0f}M free (< {min_mb}M); "
+              f"creating sparse loop PV {extra_img} ({size_mb}M)")
+        run(f"truncate -s {size_mb}M {extra_img}")
+    # Find or create the loop device.
+    loop_dev = run(f"losetup -j {extra_img} 2>/dev/null | "
+                   f"head -1 | cut -d: -f1", check=False).strip()
+    if not loop_dev:
+        loop_dev = run(f"losetup -fP --show {extra_img}").strip()
+    # Idempotent pvcreate + vgextend.
+    pv_attached = run(
+        f"pvs --noheadings -o vg_name {loop_dev} 2>/dev/null",
+        check=False).strip()
+    if pv_attached != VG:
+        run(f"pvcreate -y {loop_dev}", check=False)
+        run(f"vgextend {VG} {loop_dev}", check=False)
+    out = run(f"vgs {VG} --units m -o vg_free --noheadings",
+              check=False).strip()
+    print(f"  [tier] VG headroom now: {out.strip()}")
+
+
 def ensure_thinpool() -> None:
     """Create the thin pool if it doesn't exist. Sized to fill the VG.
 
@@ -545,6 +585,12 @@ def ensure_thinpool() -> None:
     """
     ensure_vg()
     if thinpool_exists():
+        # The kickstart-supplied thinpool may have taken 100% of VG
+        # via `logvol --grow` — no room left for the thick meta LVs
+        # (tier-critical-meta etc.) the DRBD promote path needs.
+        # Reduce-thinpool is unsupported on every LVM version we
+        # target, so add a loop-backed PV to grow the VG instead.
+        _ensure_vg_headroom(min_mb=1024)
         return
 
     # 1. Drop the OS-installer's swap LV if present. Frees space and

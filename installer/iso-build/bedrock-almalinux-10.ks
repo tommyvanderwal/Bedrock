@@ -57,10 +57,14 @@ part pv.bedrock --size=1 --grow --asprimary
 
 volgroup bedrock pv.bedrock
 
-# Single thin pool taking ~all VG space. metadatasize=512 MB gives
-# generous headroom for the operations bedrock generates (per-VM
-# thin LVs, snapshots, restores).
-logvol none --thinpool --name=thinpool --vgname=bedrock --size=1 --grow --metadatasize=512
+# Single thin pool taking MOST of the VG space, leaving headroom for
+# thick LVs that live OUTSIDE the pool (DRBD external metadata
+# volumes: tier-critical-meta etc.). Anaconda's `--grow` here would
+# eat 100% of VG → ensure_meta_lv would fail with "VG has insufficient
+# free space" at storage-promote time. Hold back 1 GiB.
+# metadatasize=512 MB gives generous pool-meta headroom for the
+# operations bedrock generates (per-VM thin LVs, snapshots, restores).
+logvol none --thinpool --name=thinpool --vgname=bedrock --size=1 --grow --maxsize=130048 --metadatasize=512
 
 # Root as a thin LV inside the pool. 16 GB virtual covers any
 # reasonable AlmaLinux install footprint; xfs supports online
