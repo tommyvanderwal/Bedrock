@@ -278,7 +278,7 @@ class TestProjections(unittest.TestCase):
         sv = vb._state_view(snap, "sim-1")
         self.assertEqual(sv["role"], "mgmt+compute")
         self.assertEqual(sv["loopback_ip"], "100.42.42.1")
-        self.assertEqual(sv["mgmt_url"], "http://192.168.2.201:8080")
+        self.assertEqual(sv["mgmt_url"], "https://192.168.2.201:8443")
 
     def test_state_view_for_follower(self):
         snap = self._base_snapshot()
@@ -286,7 +286,7 @@ class TestProjections(unittest.TestCase):
         self.assertEqual(sv["role"], "compute")
         self.assertEqual(sv["mgmt_ip"], "192.168.2.202")
         # mgmt_url points at the MASTER (sim-1)
-        self.assertEqual(sv["mgmt_url"], "http://192.168.2.201:8080")
+        self.assertEqual(sv["mgmt_url"], "https://192.168.2.201:8443")
 
 
 if __name__ == "__main__":
