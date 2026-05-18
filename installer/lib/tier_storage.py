@@ -1106,7 +1106,16 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     still contains the same XFS/data — uses external metadata so the on-disk
     filesystem layout is unchanged.
 
-    Requires the LV to be unmounted; remounts the DRBD device in its place.
+    Critical-tier subtlety: at N=1, /var/lib/bedrock/cluster is just a
+    regular directory on the root FS containing filer's leveldb3 +
+    arbiter rqlite data. Mounting the DRBD device over the same path
+    hides those files. Preserve them by:
+      1. Stop services that hold the singleton dir open (filer, s3,
+         arbiter rqlite)
+      2. Snapshot the directory contents to a tmp path
+      3. Mount DRBD over the path
+      4. Restore the snapshot into the DRBD volume
+      5. Restart services
     """
     assert tier == "critical", tier
     minor = DRBD_MINORS[tier]
@@ -1125,20 +1134,45 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     # 2. Write the resource config (mesh of all peers)
     write_drbd_resource(tier, peers)
 
-    # 3. Unmount local — but only if it's currently mounted there
+    # 3. Snapshot the existing /var/lib/bedrock/cluster contents (filer
+    #    leveldb3 + anything else the singletons wrote at N=1) before
+    #    mounting the DRBD device over the same path. Stop the
+    #    singletons first so files are quiescent.
+    singleton_units = ("bedrock-weed-s3", "bedrock-weed-filer",
+                       "bedrock-rqlited-arbiter")
+    for unit in singleton_units:
+        run(f"systemctl stop {unit}.service 2>/dev/null", check=False)
+    snap_dir = Path("/var/lib/bedrock-promote-snapshot")
+    if snap_dir.exists():
+        run(f"rm -rf {snap_dir}", check=False)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    if Path(drbd_mount).exists() and any(Path(drbd_mount).iterdir()):
+        # rsync -aHX preserves perms, ACLs, xattrs; sync afterwards so the
+        # data hits stable storage before the rename window.
+        run(f"rsync -aHX {drbd_mount}/ {snap_dir}/")
+        run("sync", check=False)
+
+    # 4. Unmount local — but only if it's currently mounted there
     if run_ok(f"mountpoint -q {local_mount}"):
         run(f"umount {local_mount}")
 
-    # 4. Initialize DRBD metadata + bring up the resource as primary --force
+    # 5. Initialize DRBD metadata + bring up the resource as primary --force
     run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
     run(f"drbdadm up tier-{tier}")
     run(f"drbdadm primary --force tier-{tier}")
 
-    # 5. Mount the DRBD device — same XFS, same data, just a different /dev
+    # 6. Mount the DRBD device — fresh empty XFS at first promote.
     Path(drbd_mount).mkdir(parents=True, exist_ok=True)
     run(f"mount -t xfs {drbd_dev} {drbd_mount}")
 
-    # 6. Replace fstab line: local mount -> DRBD mount
+    # 7. Restore the singleton-dir snapshot INTO the DRBD volume so the
+    #    filer's leveldb3 and arbiter rqlite data survive the promote.
+    if snap_dir.exists() and any(snap_dir.iterdir()):
+        run(f"rsync -aHX {snap_dir}/ {drbd_mount}/")
+        run("sync", check=False)
+        run(f"rm -rf {snap_dir}", check=False)
+
+    # 8. Replace fstab line: local mount -> DRBD mount
     fstab = Path("/etc/fstab")
     text = fstab.read_text() if fstab.exists() else ""
     new_lines = []
@@ -1149,8 +1183,15 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     new_lines.append(f"{drbd_dev} {drbd_mount} xfs defaults,discard,nofail,_netdev 0 0")
     fstab.write_text("\n".join(new_lines).rstrip() + "\n")
 
-    # 7. Atomic symlink swap: /bedrock/<tier> -> drbd mount
+    # 9. Atomic symlink swap: /bedrock/<tier> -> drbd mount
     atomic_symlink(drbd_mount, PUBLIC_ROOT / tier)
+
+    # 10. Restart the singletons so they pick up the restored data.
+    #     cluster_arbiter.converge() on the next subscriber tick will
+    #     re-apply the full set anyway, but starting them inline keeps
+    #     the test happy without a 5s extra wait.
+    for unit in singleton_units:
+        run(f"systemctl start {unit}.service 2>/dev/null", check=False)
 
 
 def join_drbd_peer(tier: str, peers: list[dict]) -> None:
