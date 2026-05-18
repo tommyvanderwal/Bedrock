@@ -534,6 +534,32 @@ def get_mgmt_ip(i: int) -> str | None:
                 if ip and not ip.startswith(("169.254.", "127.")):
                     return ip
 
+        # Stale ARP cache (e.g. sim's DHCP lease changed after a
+        # restart). Force a quick parallel ping-sweep of the bedrock
+        # bridge's /24 to populate the host's neighbour table, then
+        # re-check. Without this, an unreachable virsh-reported IP
+        # gets returned by the fallback below and every sssh fails
+        # silently against the stale address.
+        import subprocess as _sp
+        sweep = _sp.Popen(
+            "for o in $(seq 30 230); do "
+            "ping -c1 -W1 192.168.2.$o >/dev/null 2>&1 & done; wait",
+            shell=True,
+        )
+        try:
+            sweep.wait(timeout=8)
+        except _sp.TimeoutExpired:
+            sweep.kill()
+        arp_out, _ = run(["ip", "neigh"], capture=True)
+        for line in (arp_out or "").splitlines():
+            cols = line.split()
+            if len(cols) >= 5 and cols[4].lower() == mgmt_mac:
+                ip = cols[0]
+                if ip and not ip.startswith(("169.254.", "127.")):
+                    return ip
+
+    # Last-resort fallback: convention .201+i. Often wrong post-test
+    # (DHCP renumbers); only correct on the very first install.
     return mgmt_ip(i)
 
     # Try virsh domifaddr (works for NAT)
