@@ -109,9 +109,20 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
                   "will need the driver ISO attached manually.")
     run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
     Path("/etc/exports.d").mkdir(exist_ok=True)
+    # The ISO library is exported to the operator LAN (mgmt-bridge
+    # CIDR) and to the cluster's own CGNAT /24 so peers can mount
+    # via their loopback /32.
+    try:
+        from . import cluster_addr as _ca
+        _cluster_uuid = s.get("cluster_uuid", "")
+        _cl_net = _ca.cluster_loopback_net(_cluster_uuid) if _cluster_uuid else ""
+    except Exception:
+        _cl_net = ""
+    _exports = ["192.168.2.0/24(ro,sync,no_subtree_check)"]
+    if _cl_net:
+        _exports.append(f"{_cl_net}(ro,sync,no_subtree_check)")
     Path("/etc/exports.d/bedrock-iso.exports").write_text(
-        "/opt/bedrock/iso  192.168.2.0/24(ro,sync,no_subtree_check) "
-        "10.99.0.0/24(ro,sync,no_subtree_check)\n"
+        "/opt/bedrock/iso  " + " ".join(_exports) + "\n"
     )
     run("systemctl enable --now nfs-server >/dev/null 2>&1", check=False)
     run("exportfs -ra 2>&1 || true", check=False)
@@ -214,21 +225,16 @@ WantedBy=multi-user.target
     s["loopback_ip"] = _ca.node_loopback_ip(s["cluster_uuid"], 1)
     state.save(s)
 
-    # Initialise /etc/bedrock/cluster.json with this node registered
+    # Initialise /etc/bedrock/cluster.json with this node registered.
+    # No drbd_ip/tb_ip/eno_ip keys: every intra-cluster bind/target
+    # is loopback_ip (the /32 on `lo`) and the mesh layer routes it.
     import json as _json
-    drbd_ip = ""
-    for n in hw.get("nics", []):
-        if n.get("ip", "").startswith("10.99."):
-            drbd_ip = n["ip"]
     cluster = {
         "cluster_name": cluster_name,
         "cluster_uuid": s["cluster_uuid"],
         "nodes": {
             s["node_name"]: {
                 "host": s["mgmt_ip"],
-                "drbd_ip": drbd_ip,
-                "tb_ip": drbd_ip,
-                "eno_ip": drbd_ip,
                 "role": "mgmt+compute",
                 "loopback_ip": s["loopback_ip"],
                 "cockpit": f"https://{s['mgmt_ip']}:9090",

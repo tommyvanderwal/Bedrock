@@ -24,12 +24,11 @@ That's 64 × 256 = 16,384 distinct /24s available; the chance of two
 Bedrock clusters in the same operator network deriving the same /24
 is 1/16,384 ≈ 0.006%.
 
-Backwards-compat: old clusters that pre-date this scheme have
-loopback IPs already recorded in cluster.json (typically in the old
-10.99.0.0/24 prefix). Those addresses keep working — bedrock-net
-reads loopback_ip per-node from state.json/cluster.json directly
-rather than re-deriving — so this scheme only governs newly-allocated
-identities."""
+ALL intra-cluster traffic — DRBD endpoints, SeaweedFS volume/filer
+peering, libvirt migration, SSH between nodes, the dashboard's inter-
+node calls — binds to and targets the loopback /32 inside this /24.
+The mesh layer (bedrock-net) routes those packets over whichever
+physical NIC has the best path."""
 
 from __future__ import annotations
 
@@ -41,10 +40,10 @@ def cluster_loopback_prefix(cluster_uuid: str) -> str:
     of the per-cluster /24. `node_loopback_ip(uuid, N)` appends the
     fourth octet (N = node_index)."""
     if not cluster_uuid:
-        # Safe fallback — should never trigger in practice because
-        # bootstrap creates a uuid before anyone calls this. Use the
-        # legacy prefix so an old cluster.json on disk still resolves.
-        return "10.99.0"
+        # Caller bug — bootstrap must create the uuid before any
+        # cluster-addressing decision. Surface it rather than silently
+        # falling back to a colliding placeholder.
+        raise ValueError("cluster_loopback_prefix: cluster_uuid is empty")
     h = hashlib.sha256(cluster_uuid.encode()).digest()
     second = 64 + (h[0] % 64)
     third  = h[1]

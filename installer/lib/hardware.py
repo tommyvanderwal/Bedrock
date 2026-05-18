@@ -55,14 +55,26 @@ def detect() -> dict:
         mac = parts[2] if len(parts) > 2 else ""
         if name == "lo" or name.startswith(("virbr", "veth", "docker", "br-", "tap", "vnet")):
             continue
-        # Get IP if present
-        ip = ""
+        # Collect all IPv4 addresses on this NIC; report the first
+        # non-link-local as the primary `ip` and keep the full list
+        # for callers that need to be specific (e.g. cluster_addr
+        # consumers picking the loopback /32).
+        ips = []
         ip_line = run(f"ip -o -br addr show {name}")
         if ip_line:
-            ip_parts = ip_line.split()
-            if len(ip_parts) >= 3 and "/" in ip_parts[2]:
-                ip = ip_parts[2].split("/")[0]
-        hw["nics"].append({"name": name, "state": state, "mac": mac, "ip": ip})
+            for tok in ip_line.split():
+                if "/" in tok and tok.count(".") == 3:
+                    ips.append(tok.split("/")[0])
+        ip = ""
+        for cand in ips:
+            if not cand.startswith("169.254."):
+                ip = cand; break
+        if not ip and ips:
+            ip = ips[0]
+        hw["nics"].append({
+            "name": name, "state": state, "mac": mac,
+            "ip": ip, "ips": ips,
+        })
 
     # Root disk size (primary block device)
     out = run("df -BG --output=size / | tail -1").replace("G", "").strip()

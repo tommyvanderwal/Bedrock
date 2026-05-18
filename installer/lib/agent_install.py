@@ -97,16 +97,20 @@ def install(witness: str, cluster_info: dict, repo: str):
     hw = s.get("hardware", {})
 
     # Pick local IPs
+    # mgmt_ip = the LAN/bridge address joiners reach the master on.
+    # Per cluster_addr.py: there is no separate "drbd_ip" — every
+    # intra-cluster bind/target uses the node's loopback /32 (set on
+    # `lo` by bedrock-net once the cluster identity is allocated).
+    # We still track drbd_ip here as a legacy state.json key for any
+    # caller that hasn't migrated, but leave it empty.
     mgmt_ip = ""
     drbd_ip = ""
     for n in hw.get("nics", []):
         if n["state"] == "UP" and n["name"] == "br0" and n["ip"]:
-            mgmt_ip = n["ip"]
-        elif n["state"] == "UP" and n.get("ip", "").startswith("10.99."):
-            drbd_ip = n["ip"]
+            mgmt_ip = n["ip"]; break
     if not mgmt_ip:
         for n in hw.get("nics", []):
-            if n["state"] == "UP" and n["ip"] and not n["ip"].startswith("10."):
+            if n["state"] == "UP" and n["ip"] and not n["ip"].startswith("169.254."):
                 mgmt_ip = n["ip"]; break
 
     existing = cluster_info.get("nodes", [])

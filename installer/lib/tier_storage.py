@@ -1661,8 +1661,19 @@ def transition_to_n2_master(self_drbd_ip: str, peer: dict,
         set_tier_state(tier, mode="drbd-nfs", master=self_name,
                        peers=[p["name"] for p in peers])
 
-    # 4. NFS export the DRBD-backed mounts
-    nfs_export_drbd_tiers(["192.168.2.0/24", "10.99.0.0/24"])
+    # 4. NFS export the DRBD-backed mounts. NFS clients are peers'
+    # loopback /32s — all sit inside the cluster's CGNAT /24 (per
+    # cluster_addr.cluster_loopback_net). The historical
+    # "10.99.0.0/24" entry is kept as a legacy fallback for
+    # pre-rewrite clusters that haven't been re-bootstrapped.
+    try:
+        from . import cluster_addr as _ca
+        from . import state as _st
+        _cluster_uuid = (_st.load() or {}).get("cluster_uuid", "")
+        _allowed = [_ca.cluster_loopback_net(_cluster_uuid)] if _cluster_uuid else []
+    except Exception:
+        _allowed = []
+    nfs_export_drbd_tiers(_allowed + ["192.168.2.0/24", "10.99.0.0/24"])
 
     # 5. Garage cluster formation will happen after the peer's daemon is up;
     #    that's the peer's responsibility to call back.

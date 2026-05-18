@@ -477,17 +477,18 @@ def cmd_storage(args):
         nodes = cluster.get("nodes", {})
         state_local = load_state()
         self_name = state_local.get("node_name")
-        self_drbd = state_local.get("drbd_ip", "")
-        if not self_drbd:
-            for n in state_local.get("hardware", {}).get("nics", []):
-                if n.get("ip", "").startswith("10.99."):
-                    self_drbd = n["ip"]; break
+        # Per cluster_addr.py: the cluster's CGNAT /24 (100.X.Y.0/24)
+        # is the ONE address space for all intra-cluster traffic.
+        # DRBD endpoints, Garage, NFS — everything binds to / targets
+        # the node's loopback /32; the mesh layer routes those packets
+        # over whichever physical NIC has the best path.
+        self_drbd = state_local.get("loopback_ip", "")
         peers = [(n, info) for n, info in nodes.items() if n != self_name]
         if len(peers) != 1:
             print(f"promote requires exactly 1 peer; have {len(peers)}.")
             return 1
         peer_name, peer_info = peers[0]
-        peer_drbd = peer_info.get("drbd_ip", "")
+        peer_drbd = peer_info.get("loopback_ip", "")
         peer_mgmt = peer_info.get("host", "")
         print(f"Promoting cluster to N=2:")
         print(f"  master: {self_name} (drbd {self_drbd})")
@@ -541,10 +542,7 @@ def cmd_storage(args):
         # Internal: called from master to drive the peer's side
         peers = json.loads(args.peers)
         state_local = load_state()
-        self_drbd = ""
-        for n in state_local.get("hardware", {}).get("nics", []):
-            if n.get("ip", "").startswith("10.99."):
-                self_drbd = n["ip"]; break
+        self_drbd = state_local.get("loopback_ip", "")
         master = {"name": "<master>", "drbd_ip": args.master_drbd}
         tier_storage.transition_to_n2_peer(
             self_drbd, master, args.rpc_secret, args.admin_token, peers)
