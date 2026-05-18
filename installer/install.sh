@@ -240,6 +240,9 @@ LIB_FILES=(
     observability.py
     rqlite_client.py
     rqlite_setup.py
+    election.py
+    witness.py
+    s3backer_compactor.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \
