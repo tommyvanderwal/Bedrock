@@ -28,12 +28,17 @@ ExecStartPre=/usr/bin/python3 -c "import sys; sys.path.insert(0, '/usr/local/lib
 
 # /bin/sh -c so multi-word env values get word-split. rqlite v10:
 # on-disk is the only mode; no -on-disk flag needed.
+#
+# Ports: the arbiter uses 4011/4012 so it can coexist with the
+# per-node rqlited (which binds 0.0.0.0:4001/4002) on the same host.
+# The .254/32 advertised address keeps peers routing to whichever
+# node currently holds the master role.
 ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -node-id "$BEDROCK_ARBITER_NODE_ID" \
-    -http-addr "$BEDROCK_ARBITER_BIND_IP:4001" \
-    -raft-addr "$BEDROCK_ARBITER_BIND_IP:4002" \
-    -http-adv-addr "$BEDROCK_ARBITER_BIND_IP:4001" \
-    -raft-adv-addr "$BEDROCK_ARBITER_BIND_IP:4002" \
+    -http-addr "$BEDROCK_ARBITER_BIND_IP:4011" \
+    -raft-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
+    -http-adv-addr "$BEDROCK_ARBITER_BIND_IP:4011" \
+    -raft-adv-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
     $BEDROCK_ARBITER_JOIN_FLAG \
     $BEDROCK_ARBITER_BOOTSTRAP_FLAG \
     "$BEDROCK_ARBITER_DATA_DIR"'
