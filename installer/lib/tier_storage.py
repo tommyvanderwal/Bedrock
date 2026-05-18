@@ -1147,9 +1147,10 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
         run(f"rm -rf {snap_dir}", check=False)
     snap_dir.mkdir(parents=True, exist_ok=True)
     if Path(drbd_mount).exists() and any(Path(drbd_mount).iterdir()):
-        # rsync -aHX preserves perms, ACLs, xattrs; sync afterwards so the
-        # data hits stable storage before the rename window.
-        run(f"rsync -aHX {drbd_mount}/ {snap_dir}/")
+        # cp -a preserves perms, ownership, timestamps, symlinks — adequate
+        # for filer leveldb3 + arbiter rqlite data. rsync isn't in the base
+        # AlmaLinux 10.1 install, but cp is in coreutils.
+        run(f"cp -a {drbd_mount}/. {snap_dir}/")
         run("sync", check=False)
 
     # 4. Unmount local — but only if it's currently mounted there
@@ -1168,7 +1169,7 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     # 7. Restore the singleton-dir snapshot INTO the DRBD volume so the
     #    filer's leveldb3 and arbiter rqlite data survive the promote.
     if snap_dir.exists() and any(snap_dir.iterdir()):
-        run(f"rsync -aHX {snap_dir}/ {drbd_mount}/")
+        run(f"cp -a {snap_dir}/. {drbd_mount}/")
         run("sync", check=False)
         run(f"rm -rf {snap_dir}", check=False)
 
