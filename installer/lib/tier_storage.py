@@ -554,13 +554,13 @@ def _ensure_vg_headroom(min_mb: int = 1024) -> None:
     # If the VG still reports a missing PV (e.g. someone manually
     # `rm`'d the .img while the loop was attached), vgreduce it out
     # so subsequent lvcreate / vgextend operations don't fail.
-    vg_pvs = run(
-        f"vgs --noheadings -o pv_count,pv_missing_count {VG} 2>/dev/null",
+    missing_pvs = run(
+        f"vgs --noheadings -o vg_missing_pv_count {VG} 2>/dev/null",
         check=False,
-    ).strip().split()
-    if len(vg_pvs) == 2 and vg_pvs[1] != "0":
+    ).strip()
+    if missing_pvs and missing_pvs != "0":
         print(f"  [tier] vgreduce --removemissing {VG} "
-              f"(missing PV count={vg_pvs[1]})")
+              f"(missing PV count={missing_pvs})")
         run(f"vgreduce --removemissing --force {VG} 2>&1 | tail -3",
             check=False)
     out = run(f"vgs {VG} --units m -o vg_free --noheadings",
