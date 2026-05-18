@@ -886,7 +886,13 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                         "stop arbiter rqlite, drbdadm secondary)\n"
                     )
                     _ca.demote_arbiter_host()
-                d.demoted_in_cycle = True
+                    # Only set the once-per-cycle latch AFTER we
+                    # actually demoted. Otherwise an early NoQuorum at
+                    # daemon startup (neighbours=0 → no quorum, but
+                    # hosting=False because singletons haven't started
+                    # yet) latches the flag and a later real isolation
+                    # skips the demote.
+                    d.demoted_in_cycle = True
             except Exception as e:
                 sys.stderr.write(
                     f"bedrock-net: NoQuorum self-demote failed: {e!r}\n"
@@ -908,9 +914,14 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                 f"(will retry next tick)\n"
             )
 
-    # Reset NoQuorum streak when we leave the NoQuorum state.
+    # Reset NoQuorum streak + demote-once flag when we leave the
+    # NoQuorum state. Without the demote_in_cycle reset, an isolated
+    # master that briefly recovers and then re-isolates would skip the
+    # second demote, leaving .254 + arbiter rqlite live on a node that
+    # no longer has quorum.
     if result.outcome != _election.Outcome.NO_QUORUM:
         d.noquorum_streak = 0
+        d.demoted_in_cycle = False
 
     # If we are mgmt_master AND have just finished promoting the
     # arbiter (drbd primary + mount + .254 + arbiter rqlite up),

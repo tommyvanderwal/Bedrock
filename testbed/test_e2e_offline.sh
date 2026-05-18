@@ -219,12 +219,30 @@ s3_put_marker() {
 }
 
 s3_get_marker() {
+    # Retry up to 6 × 5s: SeaweedFS filer/master are briefly
+    # unavailable right after a join (master peer-list ring update +
+    # volume server registration), so a get fired immediately can
+    # return 404/503 even though the object is persistent. The
+    # in-progress filer recovers within ~10-20s. Retry semantics keep
+    # the test honest about real data loss while not flagging
+    # transient unavailability.
     local node=$1 phase=$2
     local master_ip
     master_ip=$(s3_endpoint_for "$node")
     [ -z "$master_ip" ] && return 1
-    sssh "$node" "curl -sS --fail \
-        http://${master_ip}:8333/bedrock-test/marker-${phase}.txt 2>/dev/null"
+    local got
+    for attempt in 1 2 3 4 5 6; do
+        got=$(sssh "$node" "curl -sS --fail \
+            http://${master_ip}:8333/bedrock-test/marker-${phase}.txt 2>/dev/null")
+        if echo "$got" | grep -q "phase=$phase"; then
+            echo "$got"
+            return 0
+        fi
+        sleep 5
+    done
+    # final attempt — also returns body even if grep didn't match
+    echo "$got"
+    return 1
 }
 
 s3_round_trip() {
