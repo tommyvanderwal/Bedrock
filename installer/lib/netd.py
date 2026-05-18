@@ -6,7 +6,7 @@ See `docs/06-mesh-network.md` for the high-level design rationale
 and operational verification.
 
 Single Python daemon that runs on every node and owns the layer
-between L2-cable-up and "DRBD/libvirt/NFS can talk to a peer's
+between L2-cable-up and "DRBD/libvirt/SeaweedFS can talk to a peer's
 loopback IP." The short version:
 
   * Every node has ONE cluster identity = a /32 loopback IP recorded

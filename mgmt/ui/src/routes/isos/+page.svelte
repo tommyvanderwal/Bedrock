@@ -82,7 +82,7 @@
 			<span>Choose .iso file</span>
 		</label>
 		<p class="hint">Files land in <code>/opt/bedrock/iso/</code> on the mgmt node and
-			are NFS-exported read-only to the cluster LAN + DRBD ring.</p>
+			are served read-only at /mnt/isos on every cluster node via SeaweedFS.</p>
 	{/if}
 	{#if error}
 		<div class="error">{error}</div>

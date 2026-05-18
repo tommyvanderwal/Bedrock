@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS witnesses (
     addr                    TEXT NOT NULL,
     witness_pubkey          TEXT NOT NULL,    -- hex
     encrypted_witness_key   TEXT NOT NULL,    -- hex (AEAD-wrapped per-witness key)
-    backend                 TEXT NOT NULL DEFAULT 'echo',  -- 'echo' | 'smb' | 'nfs' | 's3' (D-17)
+    backend                 TEXT NOT NULL DEFAULT 'echo',  -- 'echo' | 'smb' | 's3' (D-17)
     updated_at              INTEGER NOT NULL
 );
 

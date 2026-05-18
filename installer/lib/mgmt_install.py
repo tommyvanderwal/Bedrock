@@ -73,8 +73,9 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         _download(f"{repo}/binaries/victoria-logs", BINARIES / "victoria-logs")
         os.chmod(BINARIES / "victoria-logs", 0o755)
 
-    # 3. ISO library + NFS export (mgmt-node-only; compute nodes can mount it
-    #    on demand. Read-only export on mgmt LAN + DRBD ring.)
+    # 3. ISO library: master holds the canonical /opt/bedrock/iso tree,
+    #    SeaweedFS filer serves it cluster-wide; every node FUSE-mounts
+    #    /mnt/isos via seaweedfs.ensure_iso_library_mount().
     iso_dir = BEDROCK_BASE / "iso"
     iso_dir.mkdir(parents=True, exist_ok=True)
     (iso_dir / "README.md").write_text(
@@ -107,13 +108,12 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         if not ok:
             print("  WARN: virtio-win.iso download failed; Windows installs "
                   "will need the driver ISO attached manually.")
-    # ISO library now lives in the SeaweedFS filer namespace; see
+    # ISO library lives in the SeaweedFS filer namespace; see
     # seaweedfs.ensure_iso_library() — every node FUSE-mounts the
     # filer at /mnt/isos so libvirt's --cdrom path works unchanged.
-    # No NFS export from the master; SeaweedFS handles distribution
-    # across the cluster. Seed any virtio-win.iso staged here into
-    # the filer namespace once master+volume+filer+s3 are up
-    # (handled by promote_to_filer_host's first-time setup).
+    # Seed any virtio-win.iso staged here into the filer namespace
+    # once master+volume+filer+s3 are up (handled by
+    # promote_to_filer_host's first-time setup).
 
     # 4. FastAPI + Svelte dashboard files. Same helper runs on
     # followers too — the dashboard is reachable from ANY node.

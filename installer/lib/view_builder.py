@@ -158,7 +158,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "encrypted_witness_key": row["encrypted_witness_key"],
             }
             # D-17: backend column added so multi-backend (Echo /
-            # SMB / NFS / S3) is operator-visible. Default 'echo'
+            # SMB / S3) is operator-visible. Default 'echo'
             # for back-compat with consumers expecting just the key.
             if row.get("backend"):
                 entry["backend"] = row["backend"]

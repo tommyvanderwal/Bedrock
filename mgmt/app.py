@@ -4181,7 +4181,7 @@ _VALID_PRIORITIES = ("low", "normal", "high")
 # Maps priority → libvirt cpu_shares (cgroup weight; default is 1024).
 # Powers of 2 on either side so the relative weights are clearly visible.
 PRIORITY_CPU_SHARES = {"low": 256, "normal": 1024, "high": 4096}
-ISO_MOUNT_DIR = "/mnt/isos"  # identical on every cluster node (bind/NFS)
+ISO_MOUNT_DIR = "/mnt/isos"  # identical on every cluster node (SeaweedFS FUSE)
 
 
 def _mgmt_node_name() -> str:

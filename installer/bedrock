@@ -14,7 +14,6 @@ Cluster-wide commands (run on the mgmt master unless noted):
   bedrock storage status   — show tier modes + mountpoints
   bedrock storage promote                       — N=1 → N=2 promotion
   bedrock storage promote-critical-3way <peer>  — N=2 → N=3 (critical tier)
-  bedrock storage transfer-mgmt <new-master>    — move mgmt role
   bedrock storage remove-peer <name>            — drain + remove peer
   bedrock storage collapse-to-n1                — last-node back to standalone
 """

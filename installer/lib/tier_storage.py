@@ -41,8 +41,6 @@ Entry points (growth path):
 Entry points (shrink / role-move path):
   drbd_remove_peer(...)               — online DRBD peer removal
                                         (LINBIT-blessed adjust flow)
-  transfer_mgmt_role(...)             — move mgmt + DRBD primary
-                                        from one node to another
 
 Entry points (final-collapse to single-node path):
   drbd_demote_to_local(tier)          — turn a stand-alone DRBD resource
@@ -157,7 +155,7 @@ DRBD_META_SIZE_MB = 32   # external metadata is tiny; per-resource
 
 # Mountpoint trees
 LOCAL_ROOT  = Path("/var/lib/bedrock/local")    # /var/lib/bedrock/local/<tier>
-MOUNTS_ROOT = Path("/var/lib/bedrock/mounts")   # /var/lib/bedrock/mounts/<tier>-{drbd,nfs,s3fs}
+MOUNTS_ROOT = Path("/var/lib/bedrock/mounts")   # /var/lib/bedrock/mounts/<tier>-drbd
 PUBLIC_ROOT = Path("/bedrock")                  # /bedrock/<tier>  (the stable abstraction)
 
 TIERS = ("scratch", "bulk", "critical")
@@ -992,8 +990,8 @@ def render_drbd_res_mesh(resource: str, minor: int,
 
 def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
     """Regenerate /etc/drbd.d/tier-*.res files for every tier whose
-    cluster.json mode is currently DRBD-backed (i.e. 'drbd' / 'drbd-
-    nfs' / 'drbd-3way') AND a resource file already exists. Idempotent
+    cluster.json mode is currently DRBD-backed (i.e. 'drbd' /
+    'drbd-3way') AND a resource file already exists. Idempotent
     — silently no-ops in N=1 (no DRBD configured) or for tiers that
     don't have an existing .res file. After a successful rewrite,
     runs `drbdadm adjust tier-<resource>` so the running daemon picks
@@ -1021,7 +1019,7 @@ def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
             "loopback_ip": n.get("loopback_ip", ""),
         })
 
-    DRBD_MODES = {"drbd", "drbd-nfs", "drbd-3way"}
+    DRBD_MODES = {"drbd", "drbd-3way"}
     rewritten = False
     for resource, minor in DRBD_MINORS.items():
         res_path = drbd_dir / f"tier-{resource}.res"
@@ -1125,7 +1123,7 @@ def join_drbd_peer(tier: str, peers: list[dict]) -> None:
     # Don't promote — the master is primary. Initial sync starts automatically.
 
 
-# ── NFS export (master) and NFS mount (peers) ──────────────────────────────
+# ── N=1 → N=2 critical-tier promotion ──────────────────────────────────────
 
 def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
     """Master-side N=1 -> N=2 transition.
@@ -1221,16 +1219,13 @@ def promote_critical_to_3way(third_peer: dict) -> None:
             f"echo {b} | base64 -d > /etc/drbd.d/tier-critical.res")
         ssh(peer_host, "drbdadm adjust tier-critical", check=False)
 
-    set_tier_state("critical", mode="drbd-nfs",
+    set_tier_state("critical", mode="drbd",
                     peers=[p["name"] for p in peers])
 
 
 # ── Decommissioning helpers ────────────────────────────────────────────────
 #
-# These two helpers implement the "shrink the cluster cleanly" path:
-#
 #   drbd_remove_peer    — remove a peer from a running DRBD resource (config-first)
-#   transfer_mgmt_role  — move mgmt + DRBD primary to a new node
 #
 # Detailed contracts, invariants, command sequences, and source citations
 # live in tier_storage.md.
@@ -1378,411 +1373,12 @@ def drbd_remove_peer(
 
     # 6. Persist updated peer list in cluster.json (tier resources only)
     if bedrock_resource and surviving_peers is not None:
-        set_tier_state(resource, mode="drbd-nfs",
+        set_tier_state(resource, mode="drbd",
                        peers=[p["name"] for p in surviving_peers])
         print(f"  [tier] drbd_remove_peer({full_res}): done. "
               f"{len(surviving_peers)} peers remain.")
     else:
         print(f"  [tier] drbd_remove_peer({full_res}): done.")
-
-
-def _transfer_mgmt_role_n1(
-    old_master_host: str,
-    new_master_host: str,
-    other_peer_hosts: list[str],
-) -> None:
-    """N=1 mgmt-role transfer (no DRBD, no NFS-of-tiers).
-
-    The N≥2 ten-step playbook in transfer_mgmt_role assumes DRBD
-    primary/secondary swap + tier-NFS re-export, neither of which
-    exists in N=1. The actual moves needed are smaller:
-
-      1. Stop bedrock-{mgmt,vm,vl} + nfs-server on the old master
-      2. rsync /opt/bedrock/{mgmt,iso,data,bin} + scrape.yml
-      3. rsync /etc/bedrock/cluster.json + the bedrock-rust log dir
-      4. Copy systemd unit files; daemon-reload on new
-      5. Re-export the ISO library (the only NFS export in N=1) on new
-      6. Start bedrock-{vm,vl,mgmt} + mnt-isos.mount on new
-      7. Re-point ISO-library mount-units on every other peer
-      8. Append MGMT_MASTER → propagation flips daemon.toml on every
-         peer, restarts bedrock-rust, and joiners now dial the new
-         master automatically.
-    """
-    print(f"  [mgmt] N=1 transfer mgmt role: {old_master_host} → {new_master_host}")
-
-    # 1. Stop services on old master (best-effort: may already be down).
-    ssh(old_master_host,
-        "systemctl stop bedrock-mgmt bedrock-vm bedrock-vl "
-        "nfs-server mnt-isos.mount 2>/dev/null", check=False)
-
-    # 2. rsync /opt/bedrock data subtrees old → new (pull from new).
-    for sub in ("mgmt", "iso", "data", "bin"):
-        ssh(new_master_host,
-            f"mkdir -p /opt/bedrock/{sub} && "
-            f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
-            f"root@{old_master_host}:/opt/bedrock/{sub}/ "
-            f"/opt/bedrock/{sub}/", check=False, timeout=600)
-    ssh(new_master_host,
-        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-        f"root@{old_master_host}:/opt/bedrock/scrape.yml "
-        f"/opt/bedrock/ 2>/dev/null", check=False)
-
-    # 3. Cluster state — cluster.json is the canonical view; the log
-    #    directory is bedrock-rust's append-only source-of-truth that
-    #    drives both view_builder and replication. Seeding both lets
-    #    the new master serve correct status the moment it comes up,
-    #    rather than waiting for a fresh replication round-trip.
-    ssh(new_master_host,
-        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-        f"root@{old_master_host}:/etc/bedrock/cluster.json "
-        f"/etc/bedrock/cluster.json", check=False)
-    ssh(new_master_host,
-        f"mkdir -p /var/lib/bedrock/log && "
-        f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
-        f"root@{old_master_host}:/var/lib/bedrock/log/ "
-        f"/var/lib/bedrock/log/", check=False)
-
-    # 4. Systemd units (in case the new master never had them — e.g.
-    #    a peer that joined a single-node cluster).
-    for unit in ("bedrock-mgmt.service", "bedrock-vm.service",
-                 "bedrock-vl.service", "mnt-isos.mount"):
-        ssh(new_master_host,
-            f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-            f"root@{old_master_host}:/etc/systemd/system/{unit} "
-            f"/etc/systemd/system/{unit} 2>/dev/null", check=False)
-    ssh(new_master_host, "systemctl daemon-reload")
-
-    # 5. Re-export the ISO library on the new master. (The only NFS
-    #    export in N=1; tier-bulk/tier-critical are local LVs, not
-    #    exported.)
-    ssh(new_master_host,
-        "mkdir -p /etc/exports.d && "
-        "echo '/opt/bedrock/iso 192.168.2.0/24(ro,sync,no_subtree_check)' "
-        "> /etc/exports.d/bedrock-iso.exports && "
-        "systemctl enable --now nfs-server >/dev/null 2>&1 && "
-        "exportfs -ra", check=False)
-
-    # 6. Start mgmt + observability + ISO-library automount on new.
-    ssh(new_master_host,
-        "systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt "
-        "mnt-isos.mount", check=False)
-
-    # 7. Re-point peers' ISO-library NFS mount unit. Lazy umount — the
-    #    automount remounts on next access against the new server.
-    for peer in other_peer_hosts:
-        ssh(peer,
-            f"sed -i 's|{old_master_host}:/opt/bedrock/iso|"
-            f"{new_master_host}:/opt/bedrock/iso|g' "
-            f"/etc/systemd/system/mnt-isos.mount", check=False)
-        ssh(peer, "systemctl daemon-reload", check=False)
-        ssh(peer, "umount -l /mnt/isos 2>/dev/null", check=False)
-
-    # 8. Update cluster_info.mgmt_master from the new master so
-    #    rqlite replicates the change. The orchestrator's revision-
-    #    watcher on every node sees the diff, regenerates daemon.toml,
-    #    and restarts bedrock-rust pointing at the new master.
-    new_master_name = ssh(new_master_host,
-                          "hostname --fqdn 2>/dev/null || hostname",
-                          check=False).strip()
-    if new_master_name:
-        ssh(new_master_host,
-            f"python3 -c \"import sys; sys.path.insert(0, "
-            f"'/usr/local/lib/bedrock'); from lib import bedrock_state as bs; "
-            f"rev = bs.set_mgmt_master('{new_master_name}'); "
-            f"print('mgmt_master rev=' + str(rev))\"",
-            check=False, timeout=30)
-
-    print(f"  [mgmt] N=1 transfer complete. New master: "
-          f"{new_master_host} ({new_master_name or '?'})")
-
-
-def transfer_mgmt_role(
-    old_master_host: str,
-    new_master_host: str,
-    new_master_loopback: str,
-    other_peer_hosts: list[str],
-    old_master_loopback: str | None = None,
-) -> None:
-    """Move the mgmt + NFS-server + DRBD-primary role to a new node.
-
-    Ten-step playbook (see tier_storage.md "transfer_mgmt_role"):
-
-      1. Verify new master's DRBD secondaries are UpToDate (won't
-         promote stale data)
-      2. Stop bedrock-{mgmt,vm,vl} + nfs-server on old master
-      3. Unmount + drbdadm secondary on old master
-      4. drbdadm primary + mount on new master
-      5. rsync /opt/bedrock/{mgmt,iso,data,bin} from old → new
-      6. Copy systemd unit files; daemon-reload on new
-      7. Configure NFS exports + start nfs-server on new
-      8. Start bedrock-vl, bedrock-vm, bedrock-mgmt on new
-      9. SSH-fanout to other peers: replace NFS server IP in fstab,
-         remount NFS clients
-     10. Update /bedrock/<tier> symlinks; update cluster.json on every
-         node to reflect new master
-
-    Crash-safety: each on-disk write (fstab, exports, systemd units,
-    cluster.json) is committed before the kernel-side step that
-    depends on it. A power loss mid-flight leaves persistent state
-    consistent with whichever step had committed by then; running this
-    function again is idempotent and resumes correctly.
-
-    Args:
-        old_master_host:    current master mgmt-LAN address (must be
-                            ssh-reachable for the rsync; can be skipped
-                            if old master is already down — see special
-                            case below)
-        new_master_host:    new master mgmt-LAN address
-        new_master_loopback: new master's loopback /32 in the cluster CGNAT /24
-        other_peer_hosts:   mgmt-LAN addresses of every OTHER cluster
-                            node (not old master, not new master) — they
-                            need their NFS clients re-pointed
-        old_master_loopback: old master's loopback /32; if None,
-                            looked up from cluster.json
-    """
-    # N=1 fast path: when no tier is in DRBD mode there's no DRBD
-    # plumbing or NFS-of-DRBD to swap, so the ten-step playbook below
-    # collapses to a much smaller set of moves: stop services on old,
-    # rsync /opt/bedrock + cluster state, start services on new,
-    # re-point peers' ISO-library mount, append MGMT_MASTER. We dispatch
-    # to a separate helper here both because the steps are different
-    # AND because the original code would have raised "could not
-    # resolve drbd ip" on the very next line in N=1, since loopback_ip is
-    # always empty when there's no DRBD ring.
-    cluster = load_cluster()
-    tiers = cluster.get("tiers") or {}
-    is_n1 = all(
-        (tiers.get(t) or {}).get("mode") in (None, "local", "local-thin")
-        for t in ("critical",)
-    )
-    if is_n1:
-        return _transfer_mgmt_role_n1(
-            old_master_host, new_master_host, other_peer_hosts)
-
-    print(f"  [mgmt] transfer mgmt+NFS role: {old_master_host} → {new_master_host}")
-
-    # 0. Resolve old master's DRBD ip if not given (needed for fstab sed)
-    if old_master_loopback is None:
-        c = load_cluster()
-        for node in c.get("nodes", {}).values():
-            if node.get("host") == old_master_host:
-                old_master_loopback = node.get("loopback_ip", "")
-                break
-        if not old_master_loopback:
-            raise RuntimeError(
-                f"could not resolve drbd ip for old master {old_master_host}")
-
-    # 1. Verify new master's DRBD secondaries are UpToDate
-    for tier in ("critical",):
-        out = ssh(new_master_host, f"drbdadm status tier-{tier}",
-                  check=False)
-        if "disk:UpToDate" not in out:
-            raise RuntimeError(
-                f"new master {new_master_host}'s tier-{tier} is not "
-                f"UpToDate; refusing to promote.\n{out}")
-
-    # 2. Stop services on old master (best-effort: may already be down)
-    ssh(old_master_host,
-        "systemctl stop bedrock-mgmt bedrock-vm bedrock-vl "
-        "mnt-isos.mount nfs-server",
-        check=False)
-
-    # 3. Unmount + secondary on old master
-    for tier in ("critical",):
-        ssh(old_master_host,
-            f"umount /var/lib/bedrock/mounts/{tier}-drbd",
-            check=False)
-        ssh(old_master_host, f"drbdadm secondary tier-{tier}", check=False)
-
-    # 4. Promote new master + mount the DRBD-backed XFS
-    for tier in ("critical",):
-        ssh(new_master_host, f"drbdadm primary tier-{tier}")
-        minor = DRBD_MINORS[tier]
-        mount = f"/var/lib/bedrock/mounts/{tier}-drbd"
-        ssh(new_master_host, f"mkdir -p {mount}")
-        ssh(new_master_host, f"mount /dev/drbd{minor} {mount}",
-            check=False)
-        # Idempotent fstab line on new master (DRBD device, not NFS)
-        device = f"/dev/drbd{minor}"
-        ssh(new_master_host,
-            f"grep -q '{mount}' /etc/fstab || echo "
-            f"'{device} {mount} xfs defaults,discard,nofail,_netdev 0 0' "
-            f">> /etc/fstab")
-
-    # 5. rsync /opt/bedrock/{mgmt,iso,data,bin} from old → new (via
-    #    new master pulling from old; consistent with our other
-    #    rsync-pull patterns).
-    for sub in ("mgmt", "iso", "data", "bin"):
-        ssh(new_master_host,
-            f"mkdir -p /opt/bedrock/{sub} && "
-            f"rsync -aHX --delete -e 'ssh -o StrictHostKeyChecking=no' "
-            f"root@{old_master_host}:/opt/bedrock/{sub}/ "
-            f"/opt/bedrock/{sub}/", check=False)
-    # scrape.yml + any top-level singletons
-    ssh(new_master_host,
-        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-        f"root@{old_master_host}:/opt/bedrock/scrape.yml "
-        f"/opt/bedrock/ 2>/dev/null", check=False)
-
-    # 5b. Pull /etc/bedrock/cluster.json from the old master. Peers'
-    #     cluster.json only ever held tier state (the canonical
-    #     cluster_name + cluster_uuid + nodes map lives only on the
-    #     master). Without this rsync the new master's `bedrock storage
-    #     status` shows "Cluster: <none>" and downstream verbs
-    #     (remove-peer, collapse-to-n1) can't resolve peer hostnames
-    #     to loopback_ips. (Lessons-log L28.)
-    ssh(new_master_host,
-        f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-        f"root@{old_master_host}:/etc/bedrock/cluster.json "
-        f"/etc/bedrock/cluster.json", check=False)
-
-    # 6. Copy systemd unit files. mnt-isos.mount and the bedrock-*
-    #    units are idempotent if pre-existing (rsync overwrites).
-    for unit in ("bedrock-mgmt.service", "bedrock-vm.service",
-                 "bedrock-vl.service", "mnt-isos.mount"):
-        ssh(new_master_host,
-            f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
-            f"root@{old_master_host}:/etc/systemd/system/{unit} "
-            f"/etc/systemd/system/{unit}", check=False)
-    ssh(new_master_host, "systemctl daemon-reload")
-
-    # 6b. Install mgmt-app Python deps on the new master. agent_install
-    #     doesn't install these (only mgmt_install.install_full does),
-    #     so a peer becoming the new master needs them now.
-    #     (See lessons-log L17.)
-    ssh(new_master_host,
-        "pip3 install -q fastapi uvicorn paramiko websockets pydantic "
-        "python-multipart 2>&1 | tail -2",
-        check=False, timeout=300)
-
-    # 7. NFS exports on new master
-    nfs_export_drbd_tiers_remote(new_master_host)
-
-    # 8. Start mgmt + metrics services on new master
-    ssh(new_master_host,
-        "systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt "
-        "mnt-isos.mount", check=False)
-
-    # 9. Re-point NFS clients on every other peer
-    for peer in other_peer_hosts:
-        ssh(peer,
-            f"sed -i 's|{old_master_loopback}:/var/lib/bedrock/mounts/|"
-            f"{new_master_loopback}:/var/lib/bedrock/mounts/|g' /etc/fstab")
-        # Also update the ISO library NFS mount unit if present
-        ssh(peer,
-            f"sed -i 's|{old_master_host}:/opt/bedrock/iso|"
-            f"{new_master_host}:/opt/bedrock/iso|g' "
-            f"/etc/systemd/system/mnt-isos.mount", check=False)
-        ssh(peer, "systemctl daemon-reload", check=False)
-        for tier in ("critical",):
-            # Use lazy umount: when the old NFS server has just been
-            # demoted, regular umount can return success without
-            # actually unmounting — leaving the kernel state pointing
-            # at the dead server. -l detaches the mount immediately
-            # and the next mount picks up fresh config from fstab.
-            # (See lessons-log L16.)
-            ssh(peer,
-                f"umount -l /var/lib/bedrock/mounts/{tier}-nfs", check=False)
-            ssh(peer,
-                f"mount /var/lib/bedrock/mounts/{tier}-nfs", check=False)
-
-    # 10. Symlink swaps: new master goes to local DRBD mount; old
-    #     master (if reachable) goes to NFS-from-new-master.
-    for tier in ("critical",):
-        ssh(new_master_host,
-            f"ln -sfn /var/lib/bedrock/mounts/{tier}-drbd /bedrock/{tier}.tmp && "
-            f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
-            check=False)
-        # Old master, if reachable, becomes a peer; symlink to NFS mount
-        ssh(old_master_host,
-            f"mkdir -p /var/lib/bedrock/mounts/{tier}-nfs && "
-            f"grep -q '{tier}-nfs' /etc/fstab || echo "
-            f"'{new_master_loopback}:/var/lib/bedrock/mounts/{tier}-drbd "
-            f"/var/lib/bedrock/mounts/{tier}-nfs nfs "
-            f"rw,nolock,soft,timeo=50,retrans=3,_netdev,nofail 0 0' "
-            f">> /etc/fstab && "
-            f"mount /var/lib/bedrock/mounts/{tier}-nfs && "
-            f"ln -sfn /var/lib/bedrock/mounts/{tier}-nfs /bedrock/{tier}.tmp && "
-            f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
-            check=False)
-
-    # 11. Update cluster.json on the new master + propagate.
-    #     Two updates per node:
-    #       a) tier.master       — critical → new_master_name
-    #       b) nodes[*].role     — old master demoted to "compute";
-    #                              new master upgraded to "mgmt+compute".
-    #     Without (b), `bedrock storage remove-peer` would refuse to
-    #     remove the OLD master on the (now-correct) ground that it
-    #     still has the "mgmt" role. (Lessons-log L28.)
-    new_master_name = ssh(new_master_host,
-                          "hostname --fqdn 2>/dev/null || hostname",
-                          check=False).strip()
-    old_master_name = ssh(old_master_host,
-                          "hostname --fqdn 2>/dev/null || hostname",
-                          check=False).strip()
-    all_hosts = [new_master_host] + other_peer_hosts
-    if old_master_host not in all_hosts:
-        all_hosts.append(old_master_host)
-    for host in all_hosts:
-        ssh(host,
-            f"python3 -c 'import json; from pathlib import Path; "
-            f"p=Path(\"/etc/bedrock/cluster.json\"); "
-            f"c=json.loads(p.read_text()) if p.exists() else {{}}; "
-            f"c.setdefault(\"tiers\",{{}}); "
-            f"[c[\"tiers\"].setdefault(t,{{}}).update("
-            f"{{\"master\":\"{new_master_name}\"}}) for t in (\"critical\",)]; "
-            f"nodes=c.setdefault(\"nodes\",{{}}); "
-            f"nodes.setdefault(\"{new_master_name}\",{{}})[\"role\"]=\"mgmt+compute\"; "
-            f"old=nodes.get(\"{old_master_name}\"); "
-            f"old and old.update({{\"role\":\"compute\"}}); "
-            f"p.write_text(json.dumps(c, indent=2))'",
-            check=False)
-
-    # 12. Update state.json on every node so each one's mgmt_url +
-    #     witness_host point at the new master, and `role` matches the
-    #     new layout. Without this:
-    #       - new master's `bedrock-mgmt` keeps reporting its OLD
-    #         (peer-era) mgmt_url in /cluster-info,
-    #       - peers' `bedrock storage status` shows stale mgmt_ip,
-    #       - subsequent `bedrock join --witness <new>` queries
-    #         /cluster-info, gets back the OLD master's mgmt_url, and
-    #         tries to register against a dead service.
-    #     (Lessons-log L28 follow-up.)
-    new_master_url = f"http://{new_master_host}:8080"
-    for host in all_hosts:
-        is_new_master = (host == new_master_host)
-        new_role = "mgmt+compute" if is_new_master else "compute"
-        # witness_host on the new master is "self" (same convention as
-        # mgmt_install.install_full); on every other node it's the new
-        # master's mgmt-LAN host.
-        new_witness = "self" if is_new_master else new_master_host
-        ssh(host,
-            f"python3 -c 'import json; from pathlib import Path; "
-            f"p=Path(\"/etc/bedrock/state.json\"); "
-            f"s=json.loads(p.read_text()) if p.exists() else {{}}; "
-            f"s[\"mgmt_url\"]={json.dumps(new_master_url)}; "
-            f"s[\"witness_host\"]={json.dumps(new_witness)}; "
-            f"s[\"role\"]={json.dumps(new_role)}; "
-            f"p.write_text(json.dumps(s, indent=2))'",
-            check=False)
-    # bedrock-mgmt caches the cluster info from state.json at startup,
-    # so a restart on the new master picks up the new mgmt_url.
-    ssh(new_master_host, "systemctl restart bedrock-mgmt", check=False)
-
-    # Update cluster_info.mgmt_master in rqlite. Raft replicates to
-    # every peer; each peer's orchestrator revision-watcher then
-    # regenerates daemon.toml and restarts bedrock-rust pointing at
-    # the new master. This is what makes L28's manual rsync of
-    # cluster.json + role rewrite unnecessary — rqlite IS the
-    # propagation.
-    if _is_mgmt_master():
-        try:
-            from . import bedrock_state as _bs
-            _bs.set_mgmt_master(new_master_name)
-        except Exception as e:
-            print(f"  [state] set_mgmt_master write skipped: {e}")
-
-    print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
 
 
 def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
@@ -1794,14 +1390,13 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
     (external metadata never touched it).
 
     Effects:
-      1. Stop NFS export of <tier>-drbd (if applicable)
-      2. Remove /etc/drbd.d/tier-<tier>.res so boot won't auto-up
-      3. Update /etc/fstab: replace DRBD-mount line with local-LV line
-      4. drbdsetup down tier-<tier> (resource leaves kernel state)
-      5. mount /dev/<vg>/tier-<tier> at /var/lib/bedrock/local/<tier>
-      6. atomic_symlink /bedrock/<tier> → /var/lib/bedrock/local/<tier>
-      7. set_tier_state(<tier>, mode="local")
-      8. (optional) lvremove tier-<tier>-meta
+      1. Remove /etc/drbd.d/tier-<tier>.res so boot won't auto-up
+      2. Update /etc/fstab: replace DRBD-mount line with local-LV line
+      3. drbdsetup down tier-<tier> (resource leaves kernel state)
+      4. mount /dev/<vg>/tier-<tier> at /var/lib/bedrock/local/<tier>
+      5. atomic_symlink /bedrock/<tier> → /var/lib/bedrock/local/<tier>
+      6. set_tier_state(<tier>, mode="local")
+      7. (optional) lvremove tier-<tier>-meta
 
     Crash-safety: persistent state is mutated *before* the kernel-side
     drbdadm down. A reboot mid-flight finds .res gone + fstab pointing
@@ -1839,16 +1434,7 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
                   f"drbd_demote_to_local can succeed.")
             return False
 
-    # 1. Stop NFS export (best-effort — if it was being exported)
-    exports_file = Path("/etc/exports.d/bedrock-tiers.exports")
-    if exports_file.exists():
-        text = exports_file.read_text()
-        new = "\n".join(l for l in text.splitlines()
-                        if str(drbd_mount) not in l)
-        exports_file.write_text(new + "\n" if new else "")
-        run("exportfs -ra", check=False)
-
-    # 2. drbdadm down with .res still in place. drbdadm orchestrates
+    # 1. drbdadm down with .res still in place. drbdadm orchestrates
     #    the full teardown (umount→secondary→detach→disconnect→
     #    del-minor→del-resource) using the .res file. Skipping this
     #    and using drbdsetup directly leaves the LV chained to a

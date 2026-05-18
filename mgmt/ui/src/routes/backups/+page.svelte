@@ -361,7 +361,7 @@
 		<label>Kind
 			<select bind:value={kind}>
 				<option value="kopia-s3">S3 (or S3-compatible)</option>
-				<option value="kopia-fs">Filesystem / NFS path</option>
+				<option value="kopia-fs">Filesystem path</option>
 			</select>
 		</label>
 	</div>
@@ -397,8 +397,8 @@
 		<div class="row">
 			<label class="grow">Filesystem path
 				<input type="text" bind:value={filesystem_path}
-					placeholder="/mnt/nas/bedrock-backups" />
-				<span class="hint">Must be reachable on every node (NFS mount, shared FS, etc.).</span>
+					placeholder="/mnt/shared/bedrock-backups" />
+				<span class="hint">Must be reachable on every node (shared FS).</span>
 			</label>
 		</div>
 	{/if}

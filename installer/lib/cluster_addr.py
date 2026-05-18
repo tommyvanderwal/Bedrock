@@ -2,7 +2,7 @@
 
 Every Bedrock node has a stable cluster-identity IPv4 — a /32 on `lo`
 that everything cluster-internal binds to (DRBD, libvirt migration,
-NFS, SSH, dashboard inter-node calls). This module owns the question
+SeaweedFS, SSH, dashboard inter-node calls). This module owns the question
 "what /24 does this cluster use, and what /32 does node N get?"
 
 Lives in RFC 6598 Shared Address Space (100.64.0.0/10):
@@ -62,8 +62,8 @@ def node_loopback_ip(cluster_uuid: str, node_index: int) -> str:
     Indices are assigned by registration order — the node that runs
     `bedrock init` gets 1, subsequent joiners get the lowest free
     index per `mgmt /api/nodes/register`. The mgmt-master role can
-    transfer between nodes later via `bedrock node transfer-mgmt`,
-    so don't assume `node_index == 1` means current leader."""
+    move between nodes on failover, so don't assume
+    `node_index == 1` means current leader."""
     if node_index < 1 or node_index > 254:
         raise ValueError(f"node_index out of range (1..254): {node_index}")
     return f"{cluster_loopback_prefix(cluster_uuid)}.{node_index}"

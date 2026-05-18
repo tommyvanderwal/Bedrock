@@ -7,7 +7,7 @@ exits. mgmt never runs a long-lived kopia daemon.
 Per cluster-protocol-overview.md and snapshots-and-backup.md §9c-bis:
 
   - One Kopia repository per cluster (operator-chosen — S3 / S3-
-    compatible / NFS / FS path). Encryption password lives in
+    compatible / FS path). Encryption password lives in
     /etc/bedrock/backup.key (mode 0600), out-of-band, never in the
     log.
   - Each Bedrock node has the kopia binary; runs `kopia repository

@@ -136,7 +136,7 @@
 			</select>
 			<span class="hint">
 				{#if isos.length === 0}No ISOs yet — click <strong>Upload new ISO</strong> above.
-				{:else}NFS-mounted at <code>/mnt/isos/</code> on every cluster node.
+				{:else}Served at <code>/mnt/isos/</code> on every cluster node via SeaweedFS.
 				{/if}
 				<br />The virtio-win driver ISO is attached automatically so Windows
 				Setup can find the disk — you don't need to pick it.

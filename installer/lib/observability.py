@@ -366,10 +366,9 @@ def seed_backend(source_host: str, target_host: str,
         `vmbackup` snapshots the source VM via its `/snapshot/create`
         API, then writes the data to fs://<stage>. `vmrestore` reads
         that stage on the other host and lays the data out into the
-        target's storage dir. We can't use s3:// here without standing
-        up Garage, and a shared NFS would add a dependency the
-        observability path shouldn't have — so we ship the stage dir
-        between hosts with one tar-over-ssh.
+        target's storage dir. We ship the stage dir between hosts
+        with one tar-over-ssh — keeps the observability path free of
+        a shared-filesystem dependency.
 
         Bypasses the symlink-in-snapshot issue that plain
         `tar` on the raw snapshot directory hit: vmbackup writes real

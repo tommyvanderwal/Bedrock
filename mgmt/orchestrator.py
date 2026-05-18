@@ -12,11 +12,12 @@ hosting:
                           the snapshot-diff reactor.
   ② boot_orchestrator    on startup: wait for clear cluster role,
                           then start DRBD / promote-or-secondary per
-                          cluster.json + NFS export (master) or mount
-                          (follower) + libvirtd + VMs that belong
-                          here.
-  ③ fence_responder      on fence marker: pause running VMs +
-                          exportfs -au (cleanup is FAST — seconds).
+                          cluster.json + libvirtd + VMs that belong
+                          here. Critical-tier DRBD primary/mount/.254
+                          VIP/arbiter rqlite/filer are owned by
+                          cluster_arbiter.converge().
+  ③ fence_responder      on fence marker: pause running VMs
+                          (cleanup is FAST — seconds).
                           Then unfence (interfaces up, marker
                           cleared), wait for role to settle,
                           reconcile paused VMs against the now-
@@ -27,13 +28,8 @@ hosting:
                           re-run start_local_services for
                           re-promotion.
   ④ reactor              snapshot-diff-driven side-effects —
-                          vm-host changed, tier_state.master changed
-                          (NFS remount), backup_target appeared,
+                          vm-host changed, backup_target appeared,
                           etc., once services are up.
-
-Single source of role truth: /run/bedrock-rust.role, written by the
-Rust daemon on every election change ("leader" / "follower" /
-"noquorum" / "fenced").
 
 The 5-min fence-to-reboot watchdog lives outside this process, in
 /usr/local/bin/bedrock-fence-watchdog (a systemd timer). Its job is
@@ -66,7 +62,7 @@ DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
 FENCE_MARKER = Path("/tmp/bedrock-rust.fence")
 ROLE_FILE = Path("/run/bedrock-rust.role")
 
-# Cleanup itself is fast — virsh suspend + exportfs -au are seconds.
+# Cleanup itself is fast — virsh suspend on local VMs is seconds.
 # This is the cap on the cleanup procedure only; the broader 5-min
 # fence-to-reboot cap is the independent watchdog timer.
 FENCE_CLEANUP_TIMEOUT_S = 30.0
@@ -175,20 +171,6 @@ def _drbd_role(resource: str) -> str:
     if r.returncode != 0:
         return "Unknown"
     return (r.stdout or "").strip().split("/")[0] or "Unknown"
-
-
-def _find_drbd_nfs_master_drbd_ip(tiers: dict, nodes: dict) -> str | None:
-    """The drbd_ip of the current tier-master. All drbd-nfs tiers share
-    the same master in our model; we pick whichever is set."""
-    for tier in tiers.values():
-        if tier.get("mode") != "drbd-nfs":
-            continue
-        master_name = tier.get("master")
-        if master_name and master_name in nodes:
-            ip = nodes[master_name].get("drbd_ip")
-            if ip:
-                return ip
-    return None
 
 
 def get_snapshot() -> dict:
@@ -389,60 +371,13 @@ async def _start_local_services():
     says they should be in. Idempotent — safe at boot, after a fence
     cycle, or when re-running because the log changed."""
     cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
-    tiers = cluster.get("tiers", {}) or {}
     nodes = cluster.get("nodes", {}) or {}
     vms = cluster.get("vms", {}) or {}
     self_name = _self_node_name()
-    drbd_tiers = {n: t for n, t in tiers.items() if t.get("mode") == "drbd-nfs"}
 
-    if drbd_tiers:
-        # Make sure the drbd kernel module + resources are up. If
-        # already up, this is a no-op.
-        log.info("services: starting drbd")
-        subprocess.run(["systemctl", "start", "drbd"], check=False)
-        for tier_name in drbd_tiers:
-            subprocess.run(
-                ["drbdadm", "wait-connect-resource", f"tier-{tier_name}"],
-                timeout=20, check=False
-            )
-
-        # Be the role cluster.json says we are. drbdadm is idempotent
-        # for already-correct state (primary→primary, secondary→secondary
-        # are no-ops). The dangerous case — secondary while we have an
-        # open qemu FD — is handled in _reconcile_paused_vms before we
-        # ever land here.
-        i_am_master_of_anything = False
-        for tier_name, tier in drbd_tiers.items():
-            res = f"tier-{tier_name}"
-            if tier.get("master") == self_name:
-                log.info("services: drbdadm primary %s", res)
-                subprocess.run(["drbdadm", "primary", res], check=False)
-                i_am_master_of_anything = True
-            else:
-                log.info("services: drbdadm secondary %s", res)
-                subprocess.run(["drbdadm", "secondary", res], check=False)
-
-        # NFS export side. The master serves /var/lib/bedrock/mounts/*
-        # to peers; followers mount whatever the current master serves.
-        if i_am_master_of_anything:
-            try:
-                from lib import tier_storage
-                tier_storage.nfs_export_drbd_tiers(
-                    ["192.168.2.0/24", "10.99.0.0/24"]
-                )
-                log.info("services: NFS exports applied")
-            except Exception as e:
-                log.warning("services: NFS export failed: %s", e)
-        else:
-            master_drbd_ip = _find_drbd_nfs_master_drbd_ip(drbd_tiers, nodes)
-            if master_drbd_ip:
-                try:
-                    from lib import tier_storage
-                    tier_storage.nfs_mount_drbd_tiers(master_drbd_ip)
-                    log.info("services: NFS mounts targeting master at %s",
-                             master_drbd_ip)
-                except Exception as e:
-                    log.warning("services: NFS mount failed: %s", e)
+    # DRBD primary/secondary + mount + arbiter rqlite + .254 VIP for the
+    # critical tier is owned by cluster_arbiter.converge(), driven from
+    # the rqlite subscriber on every revision tick. Nothing to do here.
 
     log.info("services: starting libvirtd")
     subprocess.run(["systemctl", "start", "libvirtd"], check=False)
@@ -488,7 +423,7 @@ async def _start_local_services():
 
 async def fence_responder():
     """Watch /tmp/bedrock-rust.fence. On appearance, run cleanup
-    (pause VMs + drop NFS exports) within FENCE_CLEANUP_TIMEOUT_S,
+    (pause VMs) within FENCE_CLEANUP_TIMEOUT_S,
     bring interfaces back up + clear the marker, wait for cluster
     membership to re-establish, reconcile paused VMs against the
     now-current log, and (re-)start local services.
@@ -545,8 +480,7 @@ async def fence_responder():
 
 async def _run_fence_cleanup():
     """The minimum required to make this node not-dangerous to peers:
-       1. virsh suspend every running VM (preserve state).
-       2. exportfs -au (drop NFS so peers stop hammering our dead server).
+    virsh suspend every running VM (preserve state).
 
     We do NOT demote DRBD here — qemu's open file descriptors on the
     DRBD device would EBUSY. The demote-when-needed happens in
@@ -559,9 +493,6 @@ async def _run_fence_cleanup():
     for vm in running:
         log.info("fence: virsh suspend %s", vm)
         subprocess.run(["virsh", "suspend", vm], check=False)
-
-    log.info("fence: exportfs -au (drop all NFS exports)")
-    subprocess.run(["exportfs", "-au"], check=False)
 
     log.info("fence: cleanup complete (paused %d VMs)", len(running))
 
@@ -623,7 +554,6 @@ async def _reactor_diff(prev: dict, cur: dict, self_name: str):
 
       - VMs that disappeared from cur.vms → virsh destroy + undefine
       - VMs whose host changed → start/destroy locally as appropriate
-      - tiers whose master changed (drbd-nfs mode) → promote / remount
       - backup_targets that appeared → kopia repository connect
 
     Only active after boot_orchestrator has started services; the
@@ -656,17 +586,9 @@ async def _reactor_diff(prev: dict, cur: dict, self_name: str):
                      "destroying local copy", name, cur_host)
             subprocess.run(["virsh", "destroy", name], check=False)
 
-    # Tiers whose master changed (drbd-nfs only).
-    prev_tiers = prev.get("tiers") or {}
-    cur_tiers = cur.get("tiers") or {}
-    for tier_name, cur_t in cur_tiers.items():
-        if cur_t.get("mode") != "drbd-nfs":
-            continue
-        prev_t = prev_tiers.get(tier_name, {})
-        if prev_t.get("master") == cur_t.get("master"):
-            continue
-        await _react_tier_master_change(
-            tier_name, cur_t.get("master"), self_name)
+    # Critical-tier DRBD master transitions are owned by
+    # cluster_arbiter.converge(), called from the rqlite subscriber
+    # every revision tick. Nothing to do here.
 
     # backup_targets that appeared (or had their config refreshed).
     prev_targets = prev.get("backup_targets") or {}
@@ -675,47 +597,6 @@ async def _reactor_diff(prev: dict, cur: dict, self_name: str):
         if prev_targets.get(tid) == target:
             continue
         await _react_backup_target_set(tid, target)
-
-
-async def _react_tier_master_change(tier_name: str, new_master: str | None,
-                                    self_name: str):
-    """A drbd-nfs tier's master changed. If we're the new master:
-    drbdadm primary + NFS export. Otherwise: remount NFS from the
-    new master's drbd_ip.
-
-    Idempotent — running with the role we already have is a no-op
-    at the drbdadm / nfs level.
-    """
-    res = f"tier-{tier_name}"
-    cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
-    nodes = cluster.get("nodes", {}) or {}
-
-    if new_master == self_name:
-        log.info("reactor: tier %s master=us; drbdadm primary + re-export",
-                 tier_name)
-        subprocess.run(["drbdadm", "primary", res], check=False)
-        try:
-            from lib import tier_storage
-            tier_storage.nfs_export_drbd_tiers(
-                ["192.168.2.0/24", "10.99.0.0/24"]
-            )
-        except Exception as e:
-            log.warning("reactor: NFS export failed: %s", e)
-    else:
-        master_node = nodes.get(new_master or "", {})
-        master_drbd_ip = (master_node or {}).get("drbd_ip")
-        if not master_drbd_ip:
-            return
-        log.info("reactor: tier %s master=%s; remount NFS from %s",
-                 tier_name, new_master, master_drbd_ip)
-        for t in ("bulk", "critical"):
-            mp = f"/var/lib/bedrock/mounts/{t}-drbd"
-            subprocess.run(["umount", "-l", mp], check=False)
-        try:
-            from lib import tier_storage
-            tier_storage.nfs_mount_drbd_tiers(master_drbd_ip)
-        except Exception as e:
-            log.warning("reactor: NFS remount failed: %s", e)
 
 
 async def _react_backup_target_set(target_id: str, target: dict):

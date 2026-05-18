@@ -7,9 +7,8 @@ Every Bedrock node — whether it's the initial mgmt master or a peer
 that joined via `bedrock join` — gets the FULL package set installed
 here. This includes the Python deps the mgmt FastAPI app needs
 (paramiko, fastapi, uvicorn, websockets, pydantic, python-multipart),
-because any node may take over the mgmt role via
-`tier_storage.transfer_mgmt_role()` and must be ready to start
-`bedrock-mgmt.service` immediately. (See lessons-log L17.)
+because any node may take over the mgmt role on failover and must be
+ready to start `bedrock-mgmt.service` immediately. (See lessons-log L17.)
 
 OS base: **AlmaLinux 10.1**. The previous "NOT 10" caveat in
 BEDROCK.md was tied to early 10.0 / kernel 6.12 DRBD-kmod gaps; ELRepo
@@ -44,7 +43,6 @@ BASE_PACKAGES = [
     "iputils",
     "cockpit",
     "cockpit-machines",
-    "nfs-utils",          # NFS server + client; any node may export tier-bulk/critical
 ]
 
 DRBD_PACKAGES = [
@@ -143,8 +141,8 @@ def install_base():
     run("sed -i '/^root$/d' /etc/cockpit/disallowed-users 2>/dev/null", check=False)
 
     # Install mgmt-app Python deps on EVERY node so any node can take
-    # over the mgmt role via transfer_mgmt_role() without a runtime
-    # pip install. (Lessons-log L17.)
+    # over the mgmt role on failover without a runtime pip install.
+    # (Lessons-log L17.)
     print(f"  Installing mgmt-app Python deps "
           f"({', '.join(MGMT_PYTHON_PACKAGES)})...")
     run(f"pip3 install -q {' '.join(MGMT_PYTHON_PACKAGES)} "
