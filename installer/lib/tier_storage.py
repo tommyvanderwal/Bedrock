@@ -672,7 +672,7 @@ def ensure_xfs(device: str, label: str) -> None:
 
 
 def ensure_fstab(device: str, mount: str, fstype: str = "xfs",
-                  options: str = "defaults,discard") -> None:
+                  options: str = "defaults,discard,nofail,x-systemd.device-timeout=10s") -> None:
     """Idempotent fstab line."""
     fstab = Path("/etc/fstab")
     line = f"{device} {mount} {fstype} {options} 0 0"
@@ -683,7 +683,7 @@ def ensure_fstab(device: str, mount: str, fstype: str = "xfs",
 
 
 def ensure_mounted(device: str, mount: str, fstype: str = "xfs",
-                    options: str = "defaults,discard") -> None:
+                    options: str = "defaults,discard,nofail,x-systemd.device-timeout=10s") -> None:
     Path(mount).mkdir(parents=True, exist_ok=True)
     ensure_fstab(device, mount, fstype, options)
     if not run_ok(f"mountpoint -q {mount}"):
@@ -1569,7 +1569,8 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
             continue   # drop any pre-existing local-LV line for this tier
         new_lines.append(line)
     new_lines.append(
-        f"{data_lv} {local_mount} xfs defaults,discard 0 0"
+        f"{data_lv} {local_mount} xfs "
+        "defaults,discard,nofail,x-systemd.device-timeout=10s 0 0"
     )
     fstab.write_text("\n".join(new_lines).rstrip() + "\n")
 
