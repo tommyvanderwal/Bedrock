@@ -16,12 +16,24 @@ This documentation exists so any engineer picking up the project can answer:
 
 ## Start here
 
+- [`state-flow.md`](state-flow.md) — **what each node does in each
+  cluster state, what triggers transitions, and what failure modes
+  look like.** Covers N=1 init → join → critical-tier promote →
+  healthy N≥2 → isolation+failover → master rejoin → 2-node HA →
+  scale-down → boot recovery, plus a what-can-go-wrong matrix.
+  ~20 minutes to read; the single best place to start after the
+  May-2026 Rust-removal rewrite.
 - [`architecture.md`](architecture.md) — the whole stack on one page, with a
-  component map, port list, and data-flow diagram. Read this first.
+  component map, port list, and data-flow diagram.
 - [`network-walkthrough.md`](network-walkthrough.md) — a friendly,
   ASCII-art-heavy tour of how the cluster's networking actually works
   (every step, every decision). Aimed at non-network engineers; use as
   the gentle introduction before diving into `06-mesh-network.md`.
+
+Per-module Python source companion notes live next to the code
+under [`installer/lib/*.md`](../installer/lib/) and
+[`mgmt/*.md`](../mgmt/). Each has a module-purpose paragraph at
+the top + a one-sentence description per function.
 
 ## Actions (what engineers trigger)
 
