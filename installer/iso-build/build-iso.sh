@@ -107,6 +107,19 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     cp "$INSTALLER/bedrock-cert-refresh"       "$PAYLOAD_DIR/bedrock-cert-refresh"
     cp "$INSTALLER/bedrock-mdns"               "$PAYLOAD_DIR/bedrock-mdns"
     cp "$INSTALLER/bedrock-redirect"           "$PAYLOAD_DIR/bedrock-redirect"
+    # Rebuild mgmt.tar.gz from current mgmt/ sources if it's stale
+    # (any file in mgmt/ newer than the tarball). Keeps the ISO in
+    # sync with the working tree without requiring a separate manual
+    # step. Skip if --skip-mgmt-tar was passed (saves ~30s on iso-only
+    # re-spins).
+    MGMT_DIR="$REPO_ROOT/mgmt"
+    if [ -d "$MGMT_DIR" ]; then
+        if [ ! -f "$INSTALLER/mgmt.tar.gz" ] || \
+           [ -n "$(find "$MGMT_DIR" -newer "$INSTALLER/mgmt.tar.gz" -print -quit 2>/dev/null)" ]; then
+            echo "  mgmt/ newer than mgmt.tar.gz — rebuilding"
+            (cd "$REPO_ROOT" && tar czf "$INSTALLER/mgmt.tar.gz" mgmt)
+        fi
+    fi
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
     # Cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
     # node_exporter; observability agents; rqlited; SeaweedFS weed).
