@@ -426,6 +426,20 @@ WantedBy=multi-user.target
         # racing with the orchestrator subscriber's first tick — do
         # it inline so `bedrock init` returns with everything up.
         _sw.promote_to_filer_host()
+        # Wait for the S3 gateway to actually bind 0.0.0.0:8333 before
+        # returning. Without this, `bedrock init` returns while weed-s3
+        # is still spinning up and any test or operator script that
+        # immediately PUTs to the S3 endpoint gets ECONNREFUSED.
+        import socket as _sock, time as _t
+        for _attempt in range(30):
+            try:
+                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                _s.settimeout(0.5)
+                _s.connect(("127.0.0.1", 8333))
+                _s.close()
+                break
+            except Exception:
+                _t.sleep(0.5)
         # ISO library FUSE mount + seed any pre-staged ISOs (e.g.
         # virtio-win.iso shipped in the install ISO).
         _sw.ensure_iso_library_mount()

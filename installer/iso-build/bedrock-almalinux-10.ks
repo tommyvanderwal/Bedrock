@@ -137,6 +137,14 @@ chmod 600 /root/.ssh/authorized_keys
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-bedrock-no-persource.conf <<'EOF'
 PerSourcePenalties no
+# Bedrock's intra-cluster tooling fans out many short-lived SSH
+# sessions from the same source (test harness, mgmt master driving
+# storage promote, paramiko-based status probes). The OpenSSH
+# default of MaxStartups 10:30:100 randomly rejects connections
+# at 10 concurrent unauthenticated sockets, which manifests as
+# "kex_exchange_identification: read: Connection reset by peer"
+# in the test logs. Bump it well past the worst expected burst.
+MaxStartups 100:30:200
 EOF
 chmod 644 /etc/ssh/sshd_config.d/99-bedrock-no-persource.conf
 
