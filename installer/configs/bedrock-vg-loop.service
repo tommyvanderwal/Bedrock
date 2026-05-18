@@ -1,0 +1,23 @@
+[Unit]
+Description=Bedrock VG loop-back PV attach (boot recovery)
+DefaultDependencies=no
+Before=lvm2-monitor.service local-fs-pre.target
+After=systemd-tmpfiles-setup.service
+ConditionPathExists=/var/lib/bedrock-vg-extra.img
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Reattach the sparse loop PV used by tier-*-meta thick LVs. Idempotent:
+# losetup -j returns the existing assignment if already attached;
+# losetup -fP is a no-op in that case (well, actually returns success
+# without doing anything if the file is already attached — close enough).
+ExecStart=/bin/bash -c '\
+    if ! /sbin/losetup -j /var/lib/bedrock-vg-extra.img | grep -q ":"; then \
+        /sbin/losetup -fP /var/lib/bedrock-vg-extra.img; \
+    fi; \
+    /sbin/vgchange -ay bedrock 2>/dev/null || true \
+'
+
+[Install]
+WantedBy=local-fs-pre.target

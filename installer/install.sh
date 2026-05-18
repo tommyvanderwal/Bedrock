@@ -150,6 +150,20 @@ systemctl enable bedrock-rqlited.service >/dev/null 2>&1 || true
 systemctl disable drbd >/dev/null 2>&1 || true
 systemctl disable libvirtd >/dev/null 2>&1 || true
 
+# VG loop-back PV reattach at boot. The DRBD promote path adds a
+# sparse loop-backed PV to the bedrock VG so tier-*-meta (thick LVs
+# outside the thin pool) can be created. losetup associations don't
+# survive reboot — without this unit, the VG would come up missing
+# its loop PV and bedrock would have to handle that on every command.
+log "Installing bedrock-vg-loop boot helper..."
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-vg-loop.service" \
+    -o /etc/systemd/system/bedrock-vg-loop.service 2>/dev/null || \
+    warn "bedrock-vg-loop.service not in payload (older ISO?); skipping"
+if [ -f /etc/systemd/system/bedrock-vg-loop.service ]; then
+    systemctl daemon-reload
+    systemctl enable bedrock-vg-loop.service >/dev/null 2>&1 || true
+fi
+
 # Independent fence watchdog: reboots the node if /run/bedrock-cluster.fence
 # stays present for > 5 min, indicating mgmt's fence cleanup hung or
 # crashed. Runs as a systemd timer every 30s; survives mgmt crashes
