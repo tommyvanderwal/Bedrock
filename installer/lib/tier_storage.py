@@ -1198,6 +1198,11 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
 def join_drbd_peer(tier: str, peers: list[dict]) -> None:
     """On a peer (not the source of data): create the LV (if needed), write
     DRBD config, bring up as Secondary so it can resync from the primary.
+
+    Idempotent: drbdadm up on an already-up resource emits
+    "Minor or volume exists already" — that's success for our purposes
+    (the attach + peer-connect did succeed; the redundant
+    drbdsetup new-minor is the noisy fail).
     """
     minor = DRBD_MINORS[tier]
     lv = f"tier-{tier}"
@@ -1206,8 +1211,22 @@ def join_drbd_peer(tier: str, peers: list[dict]) -> None:
     ensure_thin_lv(lv, size)
     ensure_meta_lv(f"tier-{tier}-meta")
     write_drbd_resource(tier, peers)
+    # create-md can fail if metadata already exists from a previous
+    # attempt; --force overwrites. Either succeeds.
     run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
-    run(f"drbdadm up tier-{tier}")
+    # drbdadm up: if already up, swallow the "exists already" error.
+    r = subprocess.run(
+        f"drbdadm up tier-{tier}",
+        shell=True, capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        # Already-up is fine; anything else re-raise.
+        combined = (r.stdout or "") + (r.stderr or "")
+        if "exists already" not in combined and "in use" not in combined:
+            raise RuntimeError(
+                f"command failed (rc={r.returncode}): drbdadm up tier-{tier}\n"
+                f"  stdout: {r.stdout}\n  stderr: {r.stderr}"
+            )
     # Don't promote — the master is primary. Initial sync starts automatically.
 
 
