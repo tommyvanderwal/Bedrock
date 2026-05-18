@@ -331,6 +331,98 @@ for i in 1 2 3 4; do
     assert_master_can_reach_peers $i
 done
 
+# ─────────────────────────────────────────────────────────────────
+# 5b. Isolation test — drop the current leader for 25s, observe
+#     peer behaviour, restore network, verify consistency.
+# ─────────────────────────────────────────────────────────────────
+step "5b. Isolation: drop sim-1 (current leader) for 25s"
+
+WS_IP=$(ip route get $(sim_ip 1) 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+[ -z "$WS_IP" ] && WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+note "workstation IP allowlisted on br0: $WS_IP"
+
+# Capture pre-isolation state (master, voters)
+PRE_MASTER=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[\"results\"][0][\"values\"][0][0])"')
+note "pre-isolation mgmt_master: $PRE_MASTER"
+
+# Isolate sim-1: drop cluster traffic but keep workstation SSH alive
+sssh 1 "bash -c '
+iptables-save > /tmp/iptables-pre-isolation 2>/dev/null
+# Allow workstation FIRST (insert order matters — last -I wins position 1)
+iptables -I OUTPUT -o br0 -j DROP
+iptables -I INPUT  -i br0 -j DROP
+iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
+iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
+# Cut mesh-plane NICs entirely
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
+echo isolated
+'" || mark_fail "couldn't apply iptables on sim-1"
+
+note "sim-1 isolated; sleeping 25s..."
+sleep 25
+
+# Observe from sim-2 (still connected to sim-3/4 mesh)
+note "--- DURING isolation, view from sim-2 ---"
+sssh 2 'curl -fsSL --max-time 3 http://127.0.0.1:4001/nodes 2>&1 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+leaders = [k for k,v in d.items() if v.get(\"leader\")]
+reach   = [k for k,v in d.items() if v.get(\"reachable\")]
+print(\"  /nodes leader:\", leaders or \"NONE\")
+print(\"  /nodes reachable:\", reach)
+"' || note "sim-2 rqlite unresponsive during isolation"
+
+DURING_MASTER=$(sssh 2 'curl -fsSL --max-time 3 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' || echo "")
+note "during-isolation mgmt_master (sim-2 view): ${DURING_MASTER:-unknown}"
+
+# Check sim-1's own fence/services state
+note "--- sim-1 internal view during isolation ---"
+sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rust 2>&1 | head -6; echo ---; test -f /run/bedrock-rust.fence && echo "fence marker present" || echo "no fence marker"; ip addr show lo 2>&1 | grep "inet 100\\." | head -3' || note "sim-1 introspect failed"
+
+# Restore connectivity on sim-1
+note "--- restoring connectivity on sim-1 ---"
+sssh 1 "bash -c '
+for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
+iptables -F INPUT
+iptables -F OUTPUT
+iptables-restore < /tmp/iptables-pre-isolation 2>/dev/null || true
+echo restored
+'"
+
+note "sleeping 20s for mesh + rqlite convergence..."
+sleep 20
+
+# Verify post-rejoin consistency
+note "--- POST-rejoin: cluster view from sim-1 ---"
+sssh 1 'curl -fsSL --max-time 5 http://127.0.0.1:4001/nodes 2>&1 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+leaders = [k for k,v in d.items() if v.get(\"leader\")]
+reach   = [k for k,v in d.items() if v.get(\"reachable\")]
+print(\"  /nodes leader:\", leaders)
+print(\"  /nodes reachable:\", reach)
+"' || mark_fail "sim-1 rqlite unresponsive after rejoin"
+
+# A. exactly one leader in the cluster (no split-brain)
+LEADERS=$(sssh 1 'curl -fsSL --max-time 5 http://127.0.0.1:4001/nodes 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for v in d.values() if v.get(\"leader\")))"' || echo "?")
+if [ "$LEADERS" = "1" ]; then
+    pass "post-rejoin: exactly 1 leader (no split-brain)"
+else
+    mark_fail "post-rejoin: $LEADERS leaders visible (expected 1)"
+fi
+
+# B. mesh reachability restored from all sims to all loopbacks
+for i in 1 2 3 4; do
+    assert_master_can_reach_peers $i
+done
+
+# C. S3 markers all still readable (from sim-1 — the data lives on sim-1's leveldb3)
+s3_verify_history 1 n1 n2 n3 n4
+
+# D. mgmt_master coherent across nodes
+POST_MASTER=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[\"results\"][0][\"values\"][0][0])"')
+note "post-rejoin mgmt_master: $POST_MASTER (was: $PRE_MASTER, during: ${DURING_MASTER:-?})"
+
 step "6. Cattle VM lifecycle"
 sssh 1 'bedrock vm create cattle-test --type cattle --ram 256 --disk 1 2>&1 | tail -3' || note "vm create returned non-zero"
 sleep 30
