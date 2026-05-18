@@ -111,13 +111,14 @@ def install(witness: str, cluster_info: dict, repo: str):
 
     existing = cluster_info.get("nodes", [])
     node_name = hw.get("hostname", f"node{len(existing)+1}")
-    # Always HTTPS 8443. Master binds 8080 to loopback (for its own CLI),
-    # so off-host calls must go through 8443. cluster.key + bedrock_pubkey
-    # therefore ride encrypted on the wire. Cert verification is off
-    # (the cert is for `<dashed-ip>.my.local-ip.co`, not the bare IP we
-    # dial) — peer trust comes from operator-approved fingerprint check
-    # at the popup, not from TLS PKI.
-    mgmt_url = f"https://{witness}:8443"
+    # Prefer the mgmt_url from cluster_info (returned by discovery.
+    # query_cluster) — that reflects what the master actually serves
+    # (HTTPS once cert-refresh has fetched a cert, HTTP fallback
+    # before). Fall back to the historical HTTPS-on-8443 hardcoding
+    # only if cluster_info didn't provide one. Cert verification
+    # stays off; peer trust comes from the operator-approved
+    # Ed25519 fingerprint check at the popup, not from TLS PKI.
+    mgmt_url = cluster_info.get("mgmt_url") or f"https://{witness}:8443"
 
     # Deploy exporters first — register makes mgmt rewrite scrape.yml to include us
     print("  Installing exporters...")
@@ -163,9 +164,11 @@ def install(witness: str, cluster_info: dict, repo: str):
     # so the rest of install() can run unchanged.
     result = {
         "nodes": approval.get("nodes", []),
+        "node_map": approval.get("node_map", {}),
         "peer_pubkeys": approval.get("peer_pubkeys", []),
         "peer_ips": approval.get("peer_ips", []),
         "master_drbd_ip": approval.get("master_drbd_ip", ""),
+        "mgmt_master": approval.get("mgmt_master", ""),
         "loopback_ip": approval.get("loopback_ip", ""),
         "cluster_key_hex": cluster_key.hex(),
     }
@@ -189,6 +192,53 @@ def install(witness: str, cluster_info: dict, repo: str):
         "loopback_ip": result.get("loopback_ip", ""),
     })
     state.save(s)
+
+    # Bootstrap cluster.json on the joiner — without it, rqlite_setup
+    # can't render the env-file (it needs the nodes dict for peer
+    # loopbacks + sorted-name node-id). bedrock-mgmt's snapshot watcher
+    # will overwrite this with the canonical fold output once rqlited
+    # is joined and the SQLite DB has replicated.
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        node_map = dict(result.get("node_map") or {})
+        # Ensure self entry is present (master may not have folded our
+        # node_register into cluster.json yet at /api/join/status time).
+        node_map[node_name] = {
+            "host":          mgmt_ip,
+            "drbd_ip":       drbd_ip,
+            "loopback_ip":   result.get("loopback_ip", ""),
+            "role":          "compute",
+            "pubkey":        my_pubkey,
+            "bedrock_pubkey": bedrock_pub_hex,
+        }
+        _cluster_json = _Path("/etc/bedrock/cluster.json")
+        existing_cj = {}
+        if _cluster_json.exists():
+            try:
+                existing_cj = _json.loads(_cluster_json.read_text()) or {}
+            except Exception:
+                existing_cj = {}
+        existing_cj.update({
+            "cluster_uuid": s["cluster_uuid"],
+            "cluster_name": s["cluster_name"],
+            "mgmt_master":  result.get("mgmt_master", ""),
+            "nodes":        node_map,
+        })
+        existing_cj.setdefault("tiers", {})
+        existing_cj.setdefault("witnesses", {})
+        existing_cj.setdefault("params", {})
+        existing_cj.setdefault("vms", {})
+        existing_cj.setdefault("backup_targets", {})
+        existing_cj.setdefault("paths", {})
+        existing_cj.setdefault("operators", {})
+        existing_cj.setdefault("join_requests", {})
+        existing_cj.setdefault("obs_backends", {"metrics": [], "logs": []})
+        existing_cj.setdefault("log_index", 0)
+        _cluster_json.write_text(_json.dumps(existing_cj, indent=2))
+        print(f"  cluster.json bootstrapped with {len(node_map)} nodes")
+    except Exception as e:
+        print(f"  WARN: bootstrap cluster.json failed: {e}")
 
     # Install every peer's pubkey locally so mgmt + peers can SSH to this node.
     _install_peer_pubkeys(result.get("peer_pubkeys", []))
@@ -305,6 +355,51 @@ def install(witness: str, cluster_info: dict, repo: str):
         )
     except Exception as e:
         print(f"  WARN: bedrock-net start failed: {e}")
+
+    # Start the joiner's own rqlited and -join the leader's Raft so
+    # this node becomes a full rqlite voter. Required for bedrock-mgmt
+    # on this node to read/write the cluster store locally — without
+    # this, the only rqlite voter in the cluster is the master and
+    # the joiner's local mgmt API can't query state.
+    print("  Starting rqlited (joining leader's Raft)...")
+    try:
+        from . import rqlite_setup as _rqs
+        import time as _t
+        # Wait for the master's loopback to be reachable via the mesh
+        # before rendering env — rqlited will -join 100.X.Y.1:4002.
+        master_loopback = ""
+        for n_name, n in (result.get("node_map") or {}).items():
+            if n_name == result.get("mgmt_master"):
+                master_loopback = n.get("loopback_ip", "")
+                break
+        if master_loopback:
+            for _attempt in range(30):
+                rc = subprocess.run(
+                    ["ping", "-c", "1", "-W", "1", master_loopback],
+                    capture_output=True,
+                )
+                if rc.returncode == 0:
+                    break
+                _t.sleep(0.5)
+        _rqs.render_env_file()
+        subprocess.run(
+            ["systemctl", "restart", "bedrock-rqlited.service"],
+            check=False, timeout=30,
+        )
+        for _attempt in range(30):
+            _t.sleep(0.5)
+            rc = subprocess.run(
+                ["curl", "-fsSL", "--max-time", "1",
+                 "http://127.0.0.1:4001/status"],
+                capture_output=True,
+            )
+            if rc.returncode == 0:
+                print(f"  rqlited up and joined")
+                break
+        else:
+            print(f"  WARN: rqlited didn't respond within 15s on joiner")
+    except Exception as e:
+        print(f"  WARN: rqlited start failed: {e}")
 
     # Install + start the dashboard (FastAPI + Svelte UI). Reachable
     # at http://<this-node>:8080. The follower's mgmt API serves the

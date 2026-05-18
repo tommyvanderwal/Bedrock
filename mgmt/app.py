@@ -1112,6 +1112,19 @@ def join_status(id: str):
                        .get("loopback_ip")
                        or (cluster.get("nodes") or {}).get(master_name, {})
                        .get("host", "")) if master_name else ""
+        # Full per-node map so the joiner can write a bootstrap
+        # cluster.json — required for rqlite_setup.render_env_file()
+        # to compute peer loopbacks and the sorted-name node-id.
+        node_map = {}
+        for n_name, n in (cluster.get("nodes") or {}).items():
+            node_map[n_name] = {
+                "host":          n.get("host", ""),
+                "drbd_ip":       n.get("drbd_ip", ""),
+                "loopback_ip":   n.get("loopback_ip", ""),
+                "role":          n.get("role", "compute"),
+                "pubkey":        n.get("pubkey", ""),
+                "bedrock_pubkey": n.get("bedrock_pubkey", ""),
+            }
         out.update({
             "cluster_name": cluster.get("cluster_name", "bedrock"),
             "cluster_uuid": cluster.get("cluster_uuid", ""),
@@ -1119,7 +1132,9 @@ def join_status(id: str):
             "peer_pubkeys": peer_pubkeys,
             "peer_ips":     sorted(set(peer_ips)),
             "master_drbd_ip": master_addr,
+            "mgmt_master":  master_name or "",
             "nodes":        list((cluster.get("nodes") or {}).keys()),
+            "node_map":     node_map,
         })
     elif out["state"] == "rejected":
         out["reason"] = req.get("reason", "")

@@ -140,8 +140,20 @@ def render_env_file(
             f"Run after state.json is populated (post-init/join)."
         )
 
-    node_idx = _sorted_node_index(cluster, my_node)
-    if node_idx is None:
+    # rqlite node-id MUST be stable across the cluster's lifetime —
+    # once a node-id is in the Raft store, you can't change it without
+    # snapshot wipe. Sorted-name index breaks this: a new node whose
+    # name sorts before an existing one would shift everyone's index.
+    # The loopback's last octet is permanent (cluster_uuid-derived,
+    # allocated sequentially on join) and unique per node, so use it.
+    try:
+        node_idx = int(my_loopback.rsplit(".", 1)[1])
+    except (ValueError, IndexError):
+        raise RuntimeError(
+            f"rqlite_setup: cannot derive node-id from "
+            f"loopback_ip={my_loopback!r}"
+        )
+    if my_node not in (cluster.get("nodes") or {}):
         raise RuntimeError(
             f"rqlite_setup: node {my_node!r} not in cluster.json yet. "
             f"Run after the node has been registered."
