@@ -170,8 +170,19 @@ def _drbd_secondary() -> None:
 
 
 def _is_mounted(path: Path) -> bool:
-    rc, out, _ = _run(["findmnt", "-n", "-T", str(path)])
-    return rc == 0 and out.strip() != ""
+    """True iff `path` itself is a mount point (not just on a mounted FS).
+
+    findmnt -T <path> returns the containing filesystem, which for a
+    not-yet-mounted /var/lib/bedrock/cluster returns the root mount
+    ("/" on xfs) — so _is_mounted would return True even though
+    the DRBD device isn't mounted there. That made promote_to_arbiter_host
+    skip the mount step and the filer happily wrote leveldb3 to the
+    root FS, which is invisible to peers and disappears at failover.
+
+    Use `mountpoint -q` (or equivalently findmnt without -T) which
+    returns 0 ONLY if the path is a true mount point."""
+    rc, _, _ = _run(["mountpoint", "-q", str(path)])
+    return rc == 0
 
 
 def _mount() -> None:
