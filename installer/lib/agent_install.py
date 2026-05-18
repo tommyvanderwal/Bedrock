@@ -297,48 +297,19 @@ def install(witness: str, cluster_info: dict, repo: str):
     except Exception as e:
         print(f"  WARN: tier setup failed: {e}")
 
-    # bedrock-rust daemon setup. The master's cluster_key + cluster_uuid
-    # come down via the register response (see _register additions). We
-    # write our local copy, init the log with the same uuid (so the
-    # bootstrap entry's hash matches), then daemon-dial the master so
-    # log replication catches us up.
-    print("  Starting bedrock-rust daemon...")
+    # Cluster HMAC key (used by lib/witness.py to sign Echo heartbeats).
+    # The master's key comes down in the register response so every
+    # node shares the same secret for witness auth.
     try:
         master_key_hex = result.get("cluster_key_hex")
         if master_key_hex:
             daemon_setup.write_cluster_key(bytes.fromhex(master_key_hex))
         else:
-            print("  WARN: master did not send cluster_key_hex; daemon will start without witness auth")
-            daemon_setup.write_cluster_key()  # fresh, won't match master
-        daemon_setup.init_log_if_needed(s["cluster_uuid"])
-        # `or witness` (not `.get(..., witness)`) so an empty-string
-        # value from mgmt also falls through. mgmt sends "" when the
-        # Master's address for bedrock-rust to dial. Prefer the loopback
-        # /32 (mesh-routed); fall back to the discovery witness host.
-        master_drbd = result.get("master_loopback_ip") or witness
-        daemon_setup.render_daemon_toml(
-            # Initial daemon.toml gets bedrock-rust talking to the master.
-            # The watcher overwrites this from the replicated snapshot
-            # within ~1s of the first node_register entry arriving, so
-            # don't sweat exact sender_id assignment here — sorted-name
-            # ordering happens in render_from_snapshot.
-            sender_id=int(s["node_id"]) + 1,
-            # Empty during bootstrap — we don't yet know peer sender_ids
-            # (sorted-name ordering happens after the snapshot folds).
-            # The watcher overwrites this within ~1s of NODE_REGISTER
-            # replicating, so the empty list never matters in practice;
-            # using [] here just keeps us honest about what we know now.
-            peer_sender_ids=[],
-            peer_listen=["0.0.0.0:8200"],
-            peer=[f"{master_drbd}:8200"],
-            fence_interfaces=[],
-            witnesses=[],
-            role="follower",
-        )
-        daemon_setup.restart()
-        print(f"  bedrock-rust running as follower, dialing {master_drbd}:8200")
+            print("  WARN: master did not send cluster_key_hex; "
+                  "witness heartbeats won't match")
+            daemon_setup.write_cluster_key()
     except Exception as e:
-        print(f"  WARN: bedrock-rust setup failed: {e}")
+        print(f"  WARN: cluster_key setup failed: {e}")
 
     # bedrock-net mesh discovery + routing daemon. Picks up the
     # loopback_ip we just wrote to state.json, claims it as /32 on

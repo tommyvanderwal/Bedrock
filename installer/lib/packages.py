@@ -61,7 +61,7 @@ MGMT_PYTHON_PACKAGES = [
     "websockets",
     "pydantic",
     "python-multipart",
-    # bedrock-rust IPC + log_entries / view_builder typed payloads
+    # lib/witness.py uses msgpack for the Echo wire format
     "msgpack",
 ]
 

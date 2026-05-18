@@ -217,16 +217,15 @@ def _cmd_node_list():
 def _cmd_node_leave(target: str, reason: str):
     """Cleanly remove `target` from the cluster. Run on the master.
 
-    The master appends node_unregister to the log; replication carries
-    it to every peer; each peer's view_builder folds the entry → the
-    target's row disappears from cluster.json on every node and from
-    every node's daemon.toml peer_sender_ids list. Followers regen +
-    restart their bedrock-rust automatically.
+    The master writes node_unregister to rqlite; Raft replicates it
+    to every peer; each peer's view_builder folds the row out of
+    cluster.json on next subscriber tick. The election layer in
+    bedrock-net picks up the new membership automatically.
 
     The TARGET node is then asked (via SSH) to shut down its own
     bedrock services so it stops heartbeating to the witness — the
-    witness's STATUS_LIST entry for that sender_id ages out within
-    the takeover threshold and the cluster never sees it again.
+    witness's STATUS_LIST entry for that node ages out within the
+    takeover threshold and the cluster never sees it again.
 
     Idempotent: removing a node that's already gone is a no-op append
     plus a no-op SSH (best-effort).
@@ -286,8 +285,8 @@ def _cmd_node_leave(target: str, reason: str):
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             f"root@{target_host}",
-            "systemctl stop bedrock-rust bedrock-mgmt 2>/dev/null; "
-            "rm -f /tmp/bedrock-rust.fence; "
+            "systemctl stop bedrock-net bedrock-mgmt 2>/dev/null; "
+            "rm -f /run/bedrock-cluster.fence; "
             "true",
         ]).returncode
         if rc != 0:
@@ -333,16 +332,10 @@ def cmd_vm(args):
 
 
 def cmd_witness(args):
-    """Manage cluster witnesses. add/rm/list. Each add/rm:
-       1) writes a row to the rqlite witnesses table on this node
-          (master), 2) Raft replicates to all rqlite peers,
-       3) each node's orchestrator regenerates /etc/bedrock/daemon.toml
-       on rqlite-revision change, 4) restarts bedrock-rust on every node.
-
-    The daemon is restart-safe by design — rqlite is canonical, so
-    nothing in RAM is load-bearing. Peer connections + witness
-    sessions reconnect within seconds of the restart.
-    """
+    """Manage cluster witnesses. add/rm/list. Each add/rm writes a
+    row to the rqlite witnesses table on this node (master); Raft
+    replicates to all rqlite peers; each node's bedrock-net election
+    tick picks up the new witness list on its next 1-Hz pass."""
     from lib import bedrock_state as bs, view_builder
 
     if args.action == "list":
@@ -419,26 +412,16 @@ def _wait_replicated(target_revision: int, timeout_s: float = 10.0) -> bool:
 
 
 def _propagate_daemon_config(reason: str) -> None:
-    """Master appends the log entry; every node (including this one)
-    runs an independent watcher that polls the local log, rebuilds
-    its snapshot on change, regenerates daemon.toml, and restarts
-    bedrock-rust. We only need to (a) regenerate locally for instant
-    feedback, (b) wait briefly for replication so the operator can
-    eyeball the cluster as converged.
-
-    No SSH between nodes. The log IS the propagation channel; each
-    peer's mgmt orchestrator handles its side independently.
-    """
-    from lib import daemon_setup, view_builder, state as _state
+    """The master writes the mutation to rqlite (witness add/rm,
+    node_unregister, etc.). Raft replicates to every peer; each
+    peer's bedrock-net election tick picks up the change on the next
+    pass. We only wait briefly so a follow-up status command sees
+    the propagated state."""
+    from lib import view_builder, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
     snapshot = view_builder.rebuild(this_node=self_name)
-    daemon_setup.render_from_snapshot(snapshot, self_name)
-    daemon_setup.restart()
-    print(f"  [{reason}] {self_name}: daemon.toml regenerated from snapshot, daemon restarted")
-    print(f"  [{reason}] peers will pick up the change via their local watchers (no SSH needed)")
-    # Brief pause for replication so a follow-up status command sees
-    # the propagated state.
+    print(f"  [{reason}] {self_name}: rqlite write replicated; peers converge on next tick")
     _wait_replicated(snapshot.get("log_index", 0))
 
 

@@ -88,29 +88,17 @@ log "Downloading bedrock CLI..."
 curl -fsSL "${BEDROCK_REPO}/bedrock" -o "${INSTALL_DIR}/bedrock"
 chmod +x "${INSTALL_DIR}/bedrock"
 
-log "Downloading bedrock-rust daemon..."
-curl -fsSL "${BEDROCK_REPO}/binaries/bedrock-rust" -o "${INSTALL_DIR}/bedrock-rust"
-chmod +x "${INSTALL_DIR}/bedrock-rust"
-
-log "Downloading bedrock-net (mesh discovery + routing daemon)..."
+log "Downloading bedrock-net (mesh discovery + routing + election daemon)..."
 curl -fsSL "${BEDROCK_REPO}/bedrock-net" -o "${INSTALL_DIR}/bedrock-net"
 chmod +x "${INSTALL_DIR}/bedrock-net"
+mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-net.service" \
     -o /etc/systemd/system/bedrock-net.service
+systemctl daemon-reload
 # Service unit is enabled by `bedrock init` / `bedrock join` once
 # loopback_ip is allocated, not now (the daemon needs cluster state
 # to do anything useful, and starting it pre-init would just no-op
 # in a tight retry loop).
-
-log "Installing bedrock-rust systemd unit..."
-mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock/log
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rust.service" \
-    -o /etc/systemd/system/bedrock-rust.service
-systemctl daemon-reload
-# Enabled but NOT started — `bedrock init` / `bedrock join` writes
-# /etc/bedrock/daemon.toml first, then starts the service. Starting
-# it without a config file would just fail-loop.
-systemctl enable bedrock-rust.service >/dev/null 2>&1 || true
 
 # rqlite — the cluster-state store (post-alpha-rewrite-notes.md D-01).
 # Per-node Raft voter, on-disk SQLite mode, bound to this node's
@@ -162,7 +150,7 @@ systemctl enable bedrock-rqlited.service >/dev/null 2>&1 || true
 systemctl disable drbd >/dev/null 2>&1 || true
 systemctl disable libvirtd >/dev/null 2>&1 || true
 
-# Independent fence watchdog: reboots the node if /tmp/bedrock-rust.fence
+# Independent fence watchdog: reboots the node if /run/bedrock-cluster.fence
 # stays present for > 5 min, indicating mgmt's fence cleanup hung or
 # crashed. Runs as a systemd timer every 30s; survives mgmt crashes
 # because it doesn't depend on mgmt at all.

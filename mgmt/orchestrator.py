@@ -7,21 +7,19 @@ hosting:
 
   ① rqlite_subscriber    poll bedrock_meta.revision; on advance,
                           rebuild snapshot from rqlite, project to
-                          cluster.json + state.json + daemon.toml,
-                          bounce bedrock-rust on toml change, run
-                          the snapshot-diff reactor.
+                          cluster.json + state.json, run the
+                          snapshot-diff reactor.
   ② boot_orchestrator    on startup: wait for clear cluster role,
-                          then start DRBD / promote-or-secondary per
-                          cluster.json + libvirtd + VMs that belong
-                          here. Critical-tier DRBD primary/mount/.254
-                          VIP/arbiter rqlite/filer are owned by
+                          then start libvirtd + VMs that belong here.
+                          Critical-tier DRBD primary/mount/.254 VIP/
+                          arbiter rqlite/filer are owned by
                           cluster_arbiter.converge().
-  ③ fence_responder      on fence marker: pause running VMs
-                          (cleanup is FAST — seconds).
-                          Then unfence (interfaces up, marker
-                          cleared), wait for role to settle,
-                          reconcile paused VMs against the now-
-                          current cluster state:
+  ③ fence_responder      on fence marker (dropped by bedrock-net's
+                          election when this node loses quorum):
+                          pause running VMs, then clear the marker
+                          when election regains quorum + reconcile
+                          paused VMs against the now-current cluster
+                          state:
                               moved/destroyed → virsh destroy +
                                                 drbdadm secondary
                               still ours      → virsh resume
@@ -41,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import re
@@ -52,13 +49,12 @@ from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/bedrock")
 
-from lib import view_builder, daemon_setup, rqlite_client
+from lib import view_builder, rqlite_client
 
 log = logging.getLogger("bedrock.orchestrator")
 
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON = Path("/etc/bedrock/state.json")
-DAEMON_TOML = Path("/etc/bedrock/daemon.toml")
 FENCE_MARKER = Path("/run/bedrock-cluster.fence")
 
 # Cleanup itself is fast — virsh suspend on local VMs is seconds.
@@ -89,22 +85,6 @@ def _self_node_name() -> str:
         return json.loads(STATE_JSON.read_text()).get("node_name", "") or ""
     except Exception:
         return ""
-
-
-def _fence_interfaces() -> list[str]:
-    """Read fence_interfaces from daemon.toml (the daemon's own list)."""
-    if not DAEMON_TOML.exists():
-        return []
-    m = re.search(r'fence_interfaces\s*=\s*\[([^\]]*)\]', DAEMON_TOML.read_text())
-    if not m:
-        return []
-    return [s.strip().strip('"') for s in m.group(1).split(",") if s.strip().strip('"')]
-
-
-def _daemon_toml_hash() -> bytes:
-    if not DAEMON_TOML.exists():
-        return b""
-    return hashlib.sha256(DAEMON_TOML.read_bytes()).digest()
 
 
 def _running_vm_names() -> list[str]:
@@ -173,13 +153,11 @@ def get_snapshot() -> dict:
 async def rqlite_subscriber():
     """Watch the rqlite cluster-state store's revision counter; on
     every advance, rebuild the snapshot, project to cluster.json +
-    state.json + daemon.toml, run the reactor on the snapshot diff,
-    and bounce bedrock-rust if daemon.toml changed.
+    state.json, run the reactor on the snapshot diff.
 
-    Replaces the old bedrock-rust IPC log subscriber. Poll-based
-    (per rqlite's HTTP semantics) at ~500ms cadence; the reactor
-    sees one consolidated revision-advance per tick even if many
-    mutations landed within it.
+    Poll-based (per rqlite's HTTP semantics) at ~500ms cadence; the
+    reactor sees one consolidated revision-advance per tick even if
+    many mutations landed within it.
     """
     self_name = _self_node_name()
     log.info("rqlite_subscriber: starting (node=%r)", self_name)
@@ -197,17 +175,15 @@ def _subscriber_pass(self_name: str) -> None:
     each advance, refresh state. Called from a thread executor (the
     rqlite client is sync)."""
     global _LAST_LOG_IDX
-    last_toml_hash = _daemon_toml_hash()
     with rqlite_client.RqliteClient() as rc:
         for rev in rc.watch(since_revision=_LAST_LOG_IDX, interval_s=0.5):
-            last_toml_hash = _apply_revision(rc, rev, self_name, last_toml_hash)
+            _apply_revision(rc, rev, self_name)
 
 
 def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
-                    self_name: str, last_toml_hash: bytes) -> bytes:
+                    self_name: str) -> None:
     """Refresh the in-memory snapshot from rqlite, project to disk,
-    restart bedrock-rust if its config changed, queue a reactor task.
-    Returns the post-apply daemon.toml hash."""
+    queue a reactor task."""
     global _LAST_LOG_IDX, _PREV_SNAPSHOT
     prev = copy.deepcopy(_SNAPSHOT)
     new = view_builder.build_snapshot(client=rc)
@@ -232,14 +208,6 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
         log.warning("rqlite_subscriber: projection write at rev %d: %s",
                     revision, e)
 
-    try:
-        daemon_setup.render_from_snapshot(_SNAPSHOT, self_name)
-    except Exception as e:
-        log.warning("rqlite_subscriber: render_from_snapshot at rev %d: %s",
-                    revision, e)
-        _PREV_SNAPSHOT = prev
-        return last_toml_hash
-
     # Observability reconciler — converge local vmagent/vlagent and
     # (conditionally) bedrock-vm / bedrock-vl to whatever the snapshot's
     # obs_backends list says. Idempotent.
@@ -249,18 +217,6 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     except Exception as e:
         log.warning("rqlite_subscriber: obs.reconcile at rev %d: %s",
                     revision, e)
-
-    new_hash = _daemon_toml_hash()
-    if new_hash != last_toml_hash:
-        log.info("rqlite_subscriber: rev %d changed daemon.toml; "
-                 "restarting bedrock-rust", revision)
-        try:
-            daemon_setup.restart()
-        except Exception as e:
-            log.warning("rqlite_subscriber: restart bedrock-rust: %s", e)
-            _PREV_SNAPSHOT = prev
-            return last_toml_hash
-        last_toml_hash = new_hash
 
     # DRBD multi-path config regen on mesh path-table change.
     try:
@@ -321,8 +277,6 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     except Exception:
         pass
     _PREV_SNAPSHOT = prev
-
-    return last_toml_hash
 
 
 # ── ② boot_orchestrator ──────────────────────────────────────────────────
@@ -451,12 +405,9 @@ async def fence_responder():
                       "the watchdog", e)
             return
 
-        for iface in _fence_interfaces():
-            log.info("fence: ip link set %s up (unfence)", iface)
-            subprocess.run(["ip", "link", "set", iface, "up"], check=False)
         try:
             FENCE_MARKER.unlink()
-            log.info("fence: marker cleared — bedrock-rust will resume election")
+            log.info("fence: marker cleared — election will resume on next tick")
         except FileNotFoundError:
             pass
 

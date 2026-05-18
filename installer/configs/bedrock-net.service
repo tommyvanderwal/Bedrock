@@ -1,8 +1,7 @@
 [Unit]
-Description=Bedrock mesh network daemon (path discovery + routing)
+Description=Bedrock cluster daemon (mesh routing + witness + election)
 Documentation=man:bedrock-net(8) https://github.com/bedrockcluster/bedrock
-After=network.target bedrock-rust.service
-Wants=bedrock-rust.service
+After=network.target
 # We don't fail the unit if state.json isn't ready yet — the daemon
 # polls cluster.json on each tick and picks up loopback_ip when it
 # appears (post init/join). That makes restart loops self-healing.

@@ -232,35 +232,13 @@ WantedBy=multi-user.target
         print(f"  WARN: tier setup failed: {e}")
         print(f"  You can re-run with: bedrock storage init")
 
-    # bedrock-rust daemon setup. Generates the cluster's 32-byte AEAD
-    # key (saved at /etc/bedrock/cluster.key), initialises the log with
-    # the cluster_uuid as bootstrap entry, writes daemon.toml, and
-    # starts the systemd service. Standalone mode at init — peer +
-    # witness entries are added via cluster transitions later.
-    print()
-    print("Starting bedrock-rust daemon...")
+    # Cluster HMAC key — shared with every joiner via the register
+    # response so witness heartbeats from every node verify against
+    # the same secret.
     try:
         daemon_setup.write_cluster_key()
-        daemon_setup.init_log_if_needed(s["cluster_uuid"])
-        daemon_setup.render_daemon_toml(
-            sender_id=1,
-            # No peers yet — empty list. When a node joins, the master
-            # appends node_register; replication's no-op on the master
-            # but the watcher's fold + render_from_snapshot will fill
-            # peer_sender_ids and bounce the daemon.
-            peer_sender_ids=[],
-            peer_listen=["0.0.0.0:8200"],
-            peer=[],
-            fence_interfaces=[],
-            witnesses=[],           # added later; see `bedrock witness add`
-            # Master at init advertises Leader so a future joiner
-            # attaches as Follower without a manual reconfigure step.
-            # The lease loop's witness-based election still has the
-            # final say once the peer + witness are both up.
-            role="leader",
-        )
-        daemon_setup.restart()
-        print(f"  bedrock-rust running, IPC at /run/bedrock-rust.sock")
+    except Exception as e:
+        print(f"  WARN: cluster_key write failed: {e}")
 
         # Bootstrap the rqlite cluster-state store: apply schema,
         # then seed cluster_info, master node_register, initial
@@ -387,7 +365,7 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"  WARN: rqlite seed failed: {e}")
     except Exception as e:
-        print(f"  WARN: bedrock-rust setup failed: {e}")
+        print(f"  WARN: cluster-state seed failed: {e}")
 
     # bedrock-net mesh discovery + routing daemon. Picks up the
     # loopback_ip from state.json, claims it on `lo`, starts probing
