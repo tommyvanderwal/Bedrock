@@ -112,12 +112,17 @@ def compute(
     liveness = dict(peer_liveness)
     liveness[self_name] = True
 
-    # Cluster size = every node we know about (from rqlite snapshot).
-    # Use node_loopbacks's keys as the authoritative member set; that's
-    # the rqlite `nodes` table after view_builder. Anything in
-    # peer_liveness but not in node_loopbacks is ignored (a fresh
-    # joiner not yet committed to rqlite).
-    members = set(node_loopbacks)
+    # Cluster membership for quorum math: only count nodes we've
+    # actually heard from at least once (i.e. present in
+    # peer_liveness — whether True or False), plus ourselves. The
+    # cluster.json membership (`node_loopbacks`) includes freshly
+    # registered joiners whose bedrock-net hasn't probed back yet;
+    # counting those would push the master into NoQuorum during
+    # every join and tear down its singletons mid-join. Once we've
+    # seen a peer at least once, the entry stays in peer_liveness
+    # (set False on link loss but never deleted), so this rule
+    # correctly recognises a partitioned-but-known peer.
+    members = {n for n in node_loopbacks if n in peer_liveness}
     members.add(self_name)
     n_nodes = max(len(members), 1)
     reachable = tuple(sorted(n for n in members if liveness.get(n)))
