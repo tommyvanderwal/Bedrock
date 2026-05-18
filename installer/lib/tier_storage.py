@@ -539,6 +539,30 @@ def _ensure_vg_headroom(min_mb: int = 1024) -> None:
     a sparse loop-backed PV and `vgextend` so thick LVs outside the
     pool (tier-{critical,bulk}-meta) can be created. Idempotent: if
     the helper PV is already attached, nothing happens."""
+    # Pre-flight: if we previously created a loop-backed PV but the
+    # loopback association is gone (reboot wipes losetup), reattach
+    # it so vgs/vgreduce/lvcreate don't choke on the missing PV.
+    extra_img = Path(f"/var/lib/bedrock-vg-extra.img")
+    if extra_img.exists():
+        attached = run(
+            f"losetup -j {extra_img} 2>/dev/null | head -1 | cut -d: -f1",
+            check=False,
+        ).strip()
+        if not attached:
+            print(f"  [tier] reattaching loop PV from {extra_img}")
+            run(f"losetup -fP {extra_img}", check=False)
+    # If the VG still reports a missing PV (e.g. someone manually
+    # `rm`'d the .img while the loop was attached), vgreduce it out
+    # so subsequent lvcreate / vgextend operations don't fail.
+    vg_pvs = run(
+        f"vgs --noheadings -o pv_count,pv_missing_count {VG} 2>/dev/null",
+        check=False,
+    ).strip().split()
+    if len(vg_pvs) == 2 and vg_pvs[1] != "0":
+        print(f"  [tier] vgreduce --removemissing {VG} "
+              f"(missing PV count={vg_pvs[1]})")
+        run(f"vgreduce --removemissing --force {VG} 2>&1 | tail -3",
+            check=False)
     out = run(f"vgs {VG} --units m -o vg_free --noheadings",
               check=False).strip()
     try:
