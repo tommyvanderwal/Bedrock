@@ -249,6 +249,39 @@ for f in "${LIB_FILES[@]}"; do
         || die "Failed to fetch lib/${f}"
 done
 
+# Sanity-check: list every .py in the payload's lib/ dir and refuse
+# to continue if anything is missing locally. Catches the "developer
+# added a new module under installer/lib/ but forgot LIB_FILES" gap
+# (see memory/lesson_iso_payload_drift.md). file:// + http:// both
+# work.
+log "Verifying lib/ payload completeness..."
+PAYLOAD_LIB="${BEDROCK_REPO}/lib/"
+if [[ "$BEDROCK_REPO" == file://* ]]; then
+    # Walk the dir directly.
+    payload_dir="${BEDROCK_REPO#file://}/lib"
+    payload_files=$(cd "$payload_dir" && ls *.py 2>/dev/null || true)
+else
+    # HTTP repo — Apache/nginx autoindex would let us, but our serve.py
+    # serves only known paths. Skip the check in HTTP mode.
+    payload_files=""
+fi
+if [ -n "$payload_files" ]; then
+    missing=""
+    for f in $payload_files; do
+        if [ ! -f "${LIB_DIR}/${f}" ]; then
+            missing="$missing $f"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        warn "lib/ files in payload but not installed locally:$missing"
+        warn "Adding them now."
+        for f in $missing; do
+            curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \
+                || warn "  failed to fetch lib/${f} (continuing)"
+        done
+    fi
+fi
+
 # ── Record repo location for future subcommands ────────────────────────────
 
 mkdir -p /etc/bedrock
