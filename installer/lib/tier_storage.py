@@ -1616,10 +1616,18 @@ def node_reset_local() -> None:
     print("  [reset] clearing local cluster state")
 
     # 1. Stop services. Best-effort — the service might not exist on this node.
+    #    Include bedrock-rqlited + bedrock-rqlited-arbiter + bedrock-net:
+    #    leaving them up means stale Raft state keeps probing for the
+    #    previous cluster's voters and the next `bedrock init` can't
+    #    elect a leader.
     services = ("bedrock-mgmt", "bedrock-vm", "bedrock-vl",
+                "bedrock-vmagent", "bedrock-vlagent",
+                "bedrock-net",
+                "bedrock-rqlited", "bedrock-rqlited-arbiter",
                 "bedrock-weed-master", "bedrock-weed-volume",
                 "bedrock-weed-filer", "bedrock-weed-s3",
-                "bedrock-weed-isos-mount.service")
+                "bedrock-weed-isos-mount.service",
+                "bedrock-fence-watchdog.timer")
     run(f"systemctl stop {' '.join(services)} 2>/dev/null", check=False)
     run(f"systemctl disable {' '.join(services)} 2>/dev/null", check=False)
 
@@ -1656,8 +1664,28 @@ def node_reset_local() -> None:
     # 5. SeaweedFS state — config files (filer.toml + master/volume
     #    runtime data) are reset on every fresh setup, but tear down
     #    here so a `node_reset_local` truly takes us back to bootstrap.
+    #    Includes the generated /etc/bedrock/seaweedfs* + rqlited.env +
+    #    storage.json files — these get re-rendered by mgmt_install /
+    #    agent_install on the next `bedrock init`/`join`. Leaving stale
+    #    copies bricks weed-master when the new cluster picks a
+    #    different /24 (e.g. testbed loops): the env file's old
+    #    loopback IP doesn't exist on `lo` and the bind fails.
     run("rm -rf /etc/seaweedfs /var/lib/bedrock/seaweedfs "
         "/var/lib/bedrock/cluster/seaweedfs 2>/dev/null", check=False)
+    run("rm -f /etc/bedrock/seaweedfs.env "
+        "/etc/bedrock/seaweedfs-master.toml "
+        "/etc/bedrock/seaweedfs-s3.json "
+        "/etc/bedrock/seaweedfs-filer.toml "
+        "/etc/bedrock/rqlited.env "
+        "/etc/bedrock/cluster.key "
+        "/etc/bedrock/storage.json 2>/dev/null", check=False)
+    # rqlite Raft WAL — stale data dir holds the previous cluster's
+    # voter set and election state, which deadlocks a fresh `bedrock
+    # init` waiting for ghost peers.
+    run("rm -rf /var/lib/bedrock/rqlite /var/lib/bedrock-rqlited-arbiter "
+        "2>/dev/null", check=False)
+    # Mesh daemon runtime state — peer list, witness state.
+    run("rm -rf /run/bedrock 2>/dev/null", check=False)
 
     # 6. Tier LVs. Lvremove fails harmlessly if the LV is already gone.
     for lv in ("tier-scratch", "tier-bulk", "tier-critical",

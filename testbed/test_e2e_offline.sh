@@ -601,7 +601,7 @@ FOLLOWER_NAME=$(sssh "$FOLLOWER_SIM" 'python3 -c "import json; print(json.load(o
 note "current master: sim-$MASTER_SIM ($MASTER_NAME); follower: sim-$FOLLOWER_SIM ($FOLLOWER_NAME)"
 # Pull cluster key from the current master (any node would work — the
 # key is cluster-wide — but the master is guaranteed to have it).
-CLUSTER_KEY_HEX=$(sssh "$MASTER_SIM" 'xxd -p /etc/bedrock/cluster.key | tr -d "\n"' 2>/dev/null || echo "")
+CLUSTER_KEY_HEX=$(sssh "$MASTER_SIM" 'python3 -c "print(open(\"/etc/bedrock/cluster.key\",\"rb\").read().hex())"' 2>/dev/null || echo "")
 if [ -z "$CLUSTER_KEY_HEX" ] || [ ${#CLUSTER_KEY_HEX} -ne 64 ]; then
     mark_fail "8a: could not pull /etc/bedrock/cluster.key from sim-$MASTER_SIM (got ${#CLUSTER_KEY_HEX} hex chars)"
 else
