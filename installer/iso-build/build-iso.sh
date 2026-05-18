@@ -98,10 +98,8 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
 
     # 2a. Bedrock files. Layout mirrors what install.sh expects from
     #     a BEDROCK_REPO-style HTTP server — same paths whether the
-    #     operator's BEDROCK_REPO is a URL or `file:///…`. So
-    #     bedrock-rust goes under binaries/ (install.sh fetches
-    #     ${BEDROCK_REPO}/binaries/bedrock-rust), lib modules under
-    #     lib/, configs/ holds the systemd units.
+    #     operator's BEDROCK_REPO is a URL or `file:///…`. lib/
+    #     modules under lib/, configs/ holds the systemd units.
     cp "$INSTALLER/install.sh"                 "$PAYLOAD_DIR/install.sh"
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
     cp "$INSTALLER/bedrock-net"                "$PAYLOAD_DIR/bedrock-net"
@@ -110,12 +108,11 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     cp "$INSTALLER/bedrock-mdns"               "$PAYLOAD_DIR/bedrock-mdns"
     cp "$INSTALLER/bedrock-redirect"           "$PAYLOAD_DIR/bedrock-redirect"
     cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
-    # All cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
-    # node_exporter; rust daemon: bedrock-rust). install.sh copies the
-    # rust daemon to /usr/local/bin; mgmt_install + agent_install pull
-    # the rest from $BEDROCK_REPO/binaries/ when `bedrock init` /
-    # `bedrock join` runs.
-    for b in bedrock-rust victoria-metrics victoria-logs node_exporter \
+    # Cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
+    # node_exporter; observability agents; rqlited; SeaweedFS weed).
+    # mgmt_install + agent_install pull these from $BEDROCK_REPO/binaries/
+    # when `bedrock init` / `bedrock join` runs.
+    for b in victoria-metrics victoria-logs node_exporter \
              vmagent vlagent vmbackup vmrestore rqlited weed; do
         if [ -f "$INSTALLER/binaries/$b" ]; then
             cp "$INSTALLER/binaries/$b" "$PAYLOAD_DIR/binaries/$b"

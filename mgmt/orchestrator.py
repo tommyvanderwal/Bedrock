@@ -754,6 +754,35 @@ async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
 
 # ── public registration ──────────────────────────────────────────────────
 
+async def converge_retry():
+    """Periodically re-run cluster_arbiter.converge(). The rqlite
+    subscriber already runs converge on every revision advance, but
+    a failed promote during failover (e.g. DRBD primary refused
+    because the isolated old master hasn't self-demoted yet) needs a
+    timer-based retry: nothing in rqlite advances when we're just
+    waiting for the OLD master to drop its DRBD-primary."""
+    self_name = _self_node_name()
+    # Wait until cluster.json has settled enough to have a role.
+    while not _self_node_name():
+        await asyncio.sleep(1)
+    self_name = _self_node_name()
+    try:
+        try:
+            from installer.lib import cluster_arbiter as _ca  # type: ignore
+        except ImportError:
+            sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import cluster_arbiter as _ca  # type: ignore
+    except Exception as e:
+        log.warning("converge_retry: import cluster_arbiter failed: %s", e)
+        return
+    while True:
+        try:
+            await asyncio.to_thread(_ca.converge)
+        except Exception as e:
+            log.warning("converge_retry: tick failed: %s", e)
+        await asyncio.sleep(5)
+
+
 def start_all():
     """Spawn the orchestrator's tasks on the running event loop. Called
     from FastAPI's startup hook in mgmt/app.py."""
@@ -761,5 +790,6 @@ def start_all():
     asyncio.create_task(fence_responder())
     asyncio.create_task(boot_orchestrator())
     asyncio.create_task(backup_scheduler())
+    asyncio.create_task(converge_retry())
     log.info("orchestrator: tasks started (subscriber, fence_responder, "
-             "boot, backup_scheduler)")
+             "boot, backup_scheduler, converge_retry)")
