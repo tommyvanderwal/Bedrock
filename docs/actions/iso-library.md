@@ -21,7 +21,7 @@ the VM is being built.
 
   NFS server: :2049  →  exports /opt/bedrock/iso to
                           192.168.2.0/24 (ro)
-                          10.99.0.0/24 (ro)
+                          100.X.Y.0/24 (ro)
 
   compute nodes (bedrock-sim-2, bedrock-sim-3, …)
   ──────────────────────────────────────────────

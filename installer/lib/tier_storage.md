@@ -526,7 +526,7 @@ abstraction works at any cluster size with the same client code.
   │ /bedrock/bulk    ─── symlink ──┼─→ NFS mount │      ↓                           │
   │ /bedrock/critical── symlink ──┼─→ NFS mount  │   /dev/drbd1100 (tier-bulk)      │
   │                                │   from      │   /dev/drbd1101 (tier-critical)  │
-  │ Garage daemon  :3900 :3901 :3903│   master    │      ↓ (sync over 10.99.0.x)     │
+  │ Garage daemon  :3900 :3901 :3903│   master    │      ↓ (sync over 100.X.Y.Z)     │
   └─────────┬──────────────────────┘             └──────────────────────────────────┘
             │
             │ Garage internal RPC (per-partition routing)

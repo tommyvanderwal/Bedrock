@@ -52,7 +52,7 @@ independent of kernel routing.
     to the next on path-level TCP failure.
 
   ┌──────────┐         Path 2: direct cable          ┌──────────┐
-  │  NODE 1  │═══════ 10.99.0.1 ←──────→ 10.99.0.2 ═══│  NODE 2  │
+  │  NODE 1  │═══════ 100.86.181.1 ←──────→ 100.86.181.2 ═══│  NODE 2  │
   │          │                                        │          │
   │          │         Path 2: via MikroTik switch    │          │
   │          │─────── 192.168.2.141 ←──→ .142 ────────│          │
@@ -94,7 +94,7 @@ independent of kernel routing.
                │
                ├──► Write to local thin LV
                │
-               ├──► Send over 10.99.0.x ──────► DRBD Secondary
+               ├──► Send over 100.X.Y.Z ──────► DRBD Secondary
                │         (direct cable)              │
                │                                     ├──► Write to local thin LV
                │                                     │
@@ -192,6 +192,6 @@ independent of kernel routing.
   Each resource config defines:
   - device minor number (1, 2, ...)
   - backing disk (thin LV path)
-  - replication address (10.99.0.x:port)
+  - replication address (100.X.Y.Z:port)
   - split-brain recovery policy
 ```

@@ -70,7 +70,7 @@ class TestClusterIdentity(unittest.TestCase):
 class TestMembership(unittest.TestCase):
     def test_node_register_upserts(self):
         c = _fake_client()
-        bs.node_register("sim-1", "192.168.2.201", "10.99.0.1",
+        bs.node_register("sim-1", "192.168.2.201",
                          role="mgmt+compute",
                          pubkey="ssh-key", bedrock_pubkey="bk",
                          client=c)
@@ -83,7 +83,6 @@ class TestMembership(unittest.TestCase):
         params = c.execute.call_args_list[0].kwargs.get("params") or []
         self.assertIn("sim-1", params)
         self.assertIn("192.168.2.201", params)
-        self.assertIn("10.99.0.1", params)
         self.assertIn("mgmt+compute", params)
 
     def test_node_unregister_drops_node_and_drbd_ids(self):

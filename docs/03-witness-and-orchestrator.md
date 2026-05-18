@@ -161,7 +161,7 @@ on each node. It is the decision maker.
   │     POST /heartbeat/{my-node}/{res}              │
   │                                                  │
   │  2. TCP ping peer on BOTH paths                  │
-  │     10.99.0.x:22  (direct cable)                 │
+  │     100.X.Y.Z:22  (direct cable)                 │
   │     192.168.2.x:22 (via switch)                  │
   │                                                  │
   │  3. Query witness: GET /status                   │

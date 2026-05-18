@@ -1,10 +1,9 @@
-"""SeaweedFS lifecycle helpers — Bedrock's unified S3 stack (D-09).
+"""SeaweedFS lifecycle helpers — Bedrock's unified S3 stack.
 
-Per docs/post-alpha-rewrite-notes.md D-09..D-12: SeaweedFS replaces
-both Garage (scratch) and RustFS (bulk/critical). One S3 daemon
-stack instead of two. Filer metadata in SQLite on the tier-cluster
-DRBD volume (D-10); upgrade path to PostgreSQL via fs.meta.save /
-fs.meta.load is bidirectional and project-confirmed.
+Filer metadata in leveldb3 on the critical-tier DRBD volume at N≥2
+(local LV at N=1); upgrade path to PostgreSQL via
+`weed shell` → fs.meta.save / fs.meta.load is bidirectional and
+documented in the SeaweedFS project wiki.
 
 Components SeaweedFS-side:
 
@@ -350,6 +349,94 @@ def promote_to_master_volume_host() -> None:
          "bedrock-weed-volume.service"],
         check=False, timeout=30,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ISO library — `weed mount` (FUSE) of the filer's /isos subtree on
+# every node. libvirt sees /mnt/isos/<name>.iso as a regular local
+# path; SeaweedFS replicates the bytes via volume servers. ISOs are
+# uploaded once into the filer (via S3 or via /mnt/isos from any node)
+# and become visible cluster-wide.
+# ─────────────────────────────────────────────────────────────────────
+
+ISO_MOUNTPOINT  = Path("/mnt/isos")
+ISO_FILER_PATH  = "/isos"
+ISO_MOUNT_UNIT  = "bedrock-isos-mount.service"
+
+
+def ensure_iso_library_mount() -> None:
+    """Install a systemd unit that FUSE-mounts the filer's /isos
+    subtree at /mnt/isos, and start it. Idempotent.
+
+    The filer endpoint is the cluster's loopback master VIP (.254/32)
+    when present, otherwise the local filer at this node's loopback.
+    Mesh routing makes either choice see the live filer.
+    """
+    from . import cluster_arbiter as _ca
+
+    ISO_MOUNTPOINT.mkdir(parents=True, exist_ok=True)
+    my_lo = _my_loopback()
+    arb_lo = _ca.arbiter_loopback_ip()
+    # Filer always reachable on its local loopback; .254 follows the
+    # mgmt master so peers can dial the active filer from anywhere.
+    filer_target = f"{arb_lo or my_lo}:8888"
+
+    unit = (
+        "[Unit]\n"
+        "Description=Bedrock ISO library (SeaweedFS FUSE mount)\n"
+        "After=network-online.target bedrock-net.service\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=notify\n"
+        f"ExecStartPre=/usr/bin/mkdir -p {ISO_MOUNTPOINT}\n"
+        f"ExecStart=/usr/local/bin/weed mount -filer={filer_target} "
+        f"-dir={ISO_MOUNTPOINT} -filer.path={ISO_FILER_PATH} "
+        "-allowOthers -dirAutoCreate\n"
+        f"ExecStopPost=/bin/sh -c 'fusermount -u {ISO_MOUNTPOINT} 2>/dev/null || true'\n"
+        "Restart=on-failure\n"
+        "RestartSec=3s\n"
+        "TimeoutStopSec=10\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    unit_path = Path(f"/etc/systemd/system/{ISO_MOUNT_UNIT}")
+    existing = unit_path.read_text() if unit_path.exists() else ""
+    if existing != unit:
+        unit_path.write_text(unit)
+        subprocess.run(["systemctl", "daemon-reload"], check=False, timeout=10)
+    subprocess.run(
+        ["systemctl", "enable", "--now", ISO_MOUNT_UNIT],
+        check=False, timeout=30,
+    )
+    log.info("seaweedfs: ISO library mounted at %s via filer=%s",
+             ISO_MOUNTPOINT, filer_target)
+
+
+def seed_iso_library(source_dir: Path = Path("/opt/bedrock/iso")) -> None:
+    """Copy any ISOs staged in `source_dir` (e.g. virtio-win.iso baked
+    into the install ISO) into the filer's /isos subtree. Runs once
+    on the mgmt-master after the filer is up. Idempotent — `cp -n`
+    skips files that already exist in the namespace.
+    """
+    if not source_dir.exists() or not source_dir.is_dir():
+        return
+    target = ISO_MOUNTPOINT
+    if not target.is_mount():
+        # Mount isn't up yet — ensure it.
+        ensure_iso_library_mount()
+    isos = list(source_dir.glob("*.iso"))
+    if not isos:
+        return
+    for src in isos:
+        dst = target / src.name
+        if dst.exists():
+            continue
+        subprocess.run(["cp", "-n", str(src), str(dst)],
+                       check=False, timeout=300)
+        log.info("seaweedfs: seeded ISO %s -> /isos/%s",
+                 src.name, src.name)
 
 
 # ─────────────────────────────────────────────────────────────────────

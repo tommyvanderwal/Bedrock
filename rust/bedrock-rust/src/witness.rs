@@ -695,7 +695,8 @@ fn count_distinct_peer_hosts(reg: &crate::peer::PeerRegistry) -> usize {
     let hosts: HashSet<String> = snap
         .iter()
         .filter_map(|l| {
-            // address looks like "10.99.0.11:8200" or "10.99.0.11:38656".
+            // address looks like "100.86.181.2:8200" — peer's loopback /32 from
+            // the cluster's CGNAT /24 (see installer/lib/cluster_addr.py).
             l.address.rsplit_once(':').map(|(h, _)| h.to_string())
         })
         .collect();

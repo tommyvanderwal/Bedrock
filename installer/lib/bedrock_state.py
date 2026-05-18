@@ -8,13 +8,13 @@ rqlite — and bumps the revision counter so watchers see the change.
 API surface deliberately mirrors log_entries.py so the call-site
 migration is mechanical: every place that used to do
 
-    payload = le.node_register("sim-1", "1.2.3.4", "10.99.0.1")
+    payload = le.node_register("sim-1", "192.168.2.18")
     with rust_ipc.Daemon() as d:
         d.append(payload)
 
 becomes
 
-    bedrock_state.node_register("sim-1", "1.2.3.4", "10.99.0.1")
+    bedrock_state.node_register("sim-1", "192.168.2.18")
 
 Each function takes the same arguments as the old encoder, opens a
 short-lived rqlite client by default (or accepts one for batch
@@ -119,24 +119,25 @@ def set_mgmt_master(node_name: str,
 # ─────────────────────────────────────────────────────────────────────
 
 
-def node_register(node_name: str, host: str, drbd_ip: str,
+def node_register(node_name: str, host: str,
                   role: str = "compute", pubkey: str = "",
                   bedrock_pubkey: str = "",
                   client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """Upsert a node. Same semantics as the old le.node_register —
-    keeps existing rows' loopback_ip if a re-register lands."""
+    """Upsert a node. Keeps the existing row's loopback_ip across
+    re-registers (loopback is allocated separately by mgmt at join
+    approval; this helper is for keeping host/role/pubkey current)."""
     c, owns = _client(client)
     try:
         c.execute(
-            "INSERT INTO nodes(node_name, host, drbd_ip, role, pubkey, "
+            "INSERT INTO nodes(node_name, host, role, pubkey, "
             "bedrock_pubkey, loopback_ip, maintenance, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, '', 0, ?) "
+            "VALUES(?, ?, ?, ?, ?, '', 0, ?) "
             "ON CONFLICT(node_name) DO UPDATE SET "
-            "host = excluded.host, drbd_ip = excluded.drbd_ip, "
-            "role = excluded.role, pubkey = excluded.pubkey, "
+            "host = excluded.host, role = excluded.role, "
+            "pubkey = excluded.pubkey, "
             "bedrock_pubkey = excluded.bedrock_pubkey, "
             "updated_at = excluded.updated_at",
-            params=[node_name, host, drbd_ip, role, pubkey,
+            params=[node_name, host, role, pubkey,
                     bedrock_pubkey, _now()],
         )
         return _bump_and_close(c, owns)
@@ -220,7 +221,6 @@ def node_maintenance(node_name: str, on: bool,
 def tier_state(tier: str, mode: str, master: str | None = None,
                peers: list[str] | None = None,
                backend_path: str | None = None,
-               garage_endpoint: str | None = None,
                client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Upsert a tier row. version is auto-incremented on every
     update so consumers can use it as an optimistic-concurrency
@@ -230,15 +230,14 @@ def tier_state(tier: str, mode: str, master: str | None = None,
         peers_json = json.dumps(peers or [])
         c.execute(
             "INSERT INTO tiers(tier_name, mode, master, peers, "
-            "backend_path, garage_endpoint, version, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, 1, ?) "
+            "backend_path, version, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, 1, ?) "
             "ON CONFLICT(tier_name) DO UPDATE SET "
             "mode = excluded.mode, master = excluded.master, "
             "peers = excluded.peers, backend_path = excluded.backend_path, "
-            "garage_endpoint = excluded.garage_endpoint, "
             "version = version + 1, updated_at = excluded.updated_at",
             params=[tier, mode, master, peers_json,
-                    backend_path, garage_endpoint, _now()],
+                    backend_path, _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:

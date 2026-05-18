@@ -59,10 +59,9 @@ CREATE TABLE IF NOT EXISTS cluster_info (
 
 CREATE TABLE IF NOT EXISTS nodes (
     node_name        TEXT PRIMARY KEY,
-    host             TEXT NOT NULL,
-    drbd_ip          TEXT NOT NULL,
-    loopback_ip      TEXT NOT NULL DEFAULT '',
-    role             TEXT NOT NULL DEFAULT 'compute',  -- 'compute' | 'mgmt+compute'
+    host             TEXT NOT NULL,                     -- mgmt-LAN IP for SSH/HTTPS
+    loopback_ip      TEXT NOT NULL DEFAULT '',          -- cluster /32 on `lo`
+    role             TEXT NOT NULL DEFAULT 'compute',   -- 'compute' | 'mgmt+compute'
     pubkey           TEXT NOT NULL DEFAULT '',          -- SSH ed25519
     bedrock_pubkey   TEXT NOT NULL DEFAULT '',          -- inter-node API signing
     maintenance      INTEGER NOT NULL DEFAULT 0,        -- bool 0/1
@@ -79,7 +78,6 @@ CREATE TABLE IF NOT EXISTS tiers (
     master           TEXT,
     peers            TEXT NOT NULL DEFAULT '[]',        -- JSON array of node names
     backend_path     TEXT,
-    garage_endpoint  TEXT,
     version          INTEGER NOT NULL DEFAULT 0,
     updated_at       INTEGER NOT NULL
 );

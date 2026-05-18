@@ -61,7 +61,6 @@ DRBD_NET = "bedrock-drbd"
 # to exercise multi-path discovery, prio ordering, and chaos failover
 # without making the libvirt domain XML unreasonable.
 MESH_NETS = ["bedrock-mesh-1", "bedrock-mesh-2", "bedrock-mesh-3"]
-DRBD_PREFIX = "10.99.0"  # node i gets DRBD_PREFIX + .{10+i-1}
 
 # Static LAN IPs for the sims (br0). The home router's DHCP pool ends
 # at .200, so .201-.210 is collision-safe. Sims do NOT request DHCP
@@ -95,10 +94,6 @@ def virsh(*args, capture=True):
 
 def node_name(i: int) -> str:
     return f"bedrock-sim-{i}"
-
-
-def drbd_ip(i: int) -> str:
-    return f"{DRBD_PREFIX}.{10 + i - 1}"
 
 
 def ssh_key_exists() -> bool:
@@ -164,8 +159,14 @@ def make_cloud_init(node_idx: int, all_indices: list[int]) -> Path:
     hostname = node_name(node_idx)
     pubkey = SSH_PUBKEY.read_text().strip()
 
+    # Legacy cloud-init path (the bedrock-install ISO path is the
+    # primary one). DRBD now rides the cluster loopback /32 (mesh-
+    # routed), so we no longer pre-seed per-node DRBD-NIC hosts —
+    # entries below are placeholders for the now-unused template
+    # field.
     hosts_entries = "\n".join(
-        f"      {drbd_ip(j)} {node_name(j)}-drbd" for j in all_indices
+        f"      # {node_name(j)} mesh loopback assigned at join time"
+        for j in all_indices
     )
 
     # Password-hash for sim-node root. Set BEDROCK_SIM_PASSWD_HASH to override;
@@ -178,7 +179,7 @@ def make_cloud_init(node_idx: int, all_indices: list[int]) -> Path:
                  .replace("{HOSTNAME}", hostname)
                  .replace("{ROOT_PASSWD_HASH}", passwd_hash)
                  .replace("{SSH_PUBKEY}", pubkey)
-                 .replace("{DRBD_IP}", drbd_ip(node_idx))
+                 .replace("{DRBD_IP}", "")
                  .replace("{MGMT_IP}", mgmt_ip(node_idx))
                  .replace("{MGMT_GATEWAY}", MGMT_GATEWAY)
                  .replace("{MGMT_DNS}", MGMT_DNS)
@@ -508,7 +509,7 @@ def get_mgmt_ip(i: int) -> str | None:
             last_mac = cols[1].lower()
         if len(cols) >= 4 and "/" in cols[-1]:
             ip = cols[-1].split("/")[0]
-            if (ip and not ip.startswith(("169.254.", "127.", "10.99."))
+            if (ip and not ip.startswith(("169.254.", "127.", "100."))
                 and "." in ip):
                 if mgmt_mac and last_mac and last_mac != mgmt_mac:
                     continue

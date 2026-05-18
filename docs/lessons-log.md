@@ -152,7 +152,7 @@ cluster handles cross-node lookup internally.
 
 **What we found:** that's *true* only if the specific endpoint host
 stays alive. When sim-1 went down, every other node's s3fs hung trying
-to reach `url=http://10.99.0.10:3900`, returning empty bytes for
+to reach `url=http://100.86.181.10:3900`, returning empty bytes for
 unreachable blocks — masquerading as Garage data loss when actually it
 was client-side. Garage cluster (sim-2/3/4) had the data the whole
 time.
@@ -1007,8 +1007,8 @@ swap is one line and protects every existing and future SSH'd cmd.
 `installer/lib/netd.py`, `mgmt/app.py`
 
 We originally carved cluster loopback `/32` identities from
-`10.99.0.0/24`. That's RFC 1918 private space, which means an
-operator using `10.99` internally (Hetzner default networks, AWS
+`100.X.Y.0/24`. That's RFC 1918 private space, which means an
+operator using `100.X.Y` internally (Hetzner default networks, AWS
 VPC defaults, plenty of homelabs) silently collides with us. Our
 "throwaway" `/32`s end up on real LAN hosts; routes fight each
 other.

@@ -103,13 +103,12 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
 
         # nodes
         for row in client.query(
-            "SELECT node_name, host, drbd_ip, loopback_ip, role, "
+            "SELECT node_name, host, loopback_ip, role, "
             "pubkey, bedrock_pubkey, maintenance FROM nodes",
             level=level,
         ):
             entry = {
                 "host": row["host"],
-                "drbd_ip": row["drbd_ip"],
                 "loopback_ip": row.get("loopback_ip", ""),
                 "role": row.get("role", "compute"),
                 "pubkey": row.get("pubkey", ""),
@@ -122,7 +121,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         # tiers (+ drbd_node_ids per tier)
         tier_rows = client.query(
             "SELECT tier_name, mode, master, peers, backend_path, "
-            "garage_endpoint, version FROM tiers",
+            "version FROM tiers",
             level=level,
         )
         for row in tier_rows:
@@ -138,8 +137,6 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 tier_obj["peers"] = []
             if row.get("backend_path") is not None:
                 tier_obj["backend_path"] = row["backend_path"]
-            if row.get("garage_endpoint") is not None:
-                tier_obj["garage_endpoint"] = row["garage_endpoint"]
             out["tiers"][row["tier_name"]] = tier_obj
 
         for row in client.query(
@@ -372,7 +369,6 @@ def _state_view(v: dict, node_name: str) -> dict:
         "cluster_uuid": v["cluster_uuid"],
         "role":         me.get("role", "compute"),
         "mgmt_ip":      me.get("host", ""),
-        "drbd_ip":      me.get("drbd_ip", ""),
         "loopback_ip":  me.get("loopback_ip", ""),
         "mgmt_url":     f"https://{master_host}:8443" if master_host else "",
         "witness_host": master_host,

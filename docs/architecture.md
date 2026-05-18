@@ -260,5 +260,5 @@ files on compute-only nodes.
    and pushes log events the instant they happen.
 4. Operator actions (convert, migrate, etc.) are orchestrated by the mgmt
    node fanning out via SSH. Compute nodes carry no orchestration logic.
-5. Data lives in DRBD, which replicates synchronously over the 10.99
+5. Data lives in DRBD, which replicates synchronously over the 100.X.Y
    ring. VMs pivot between nodes via `virsh migrate` without touching disk.

@@ -129,7 +129,7 @@ This is database-admin territory, not DRBD's problem to solve.
 - Convert paths in Bedrock already set `allow-two-primaries=no` after
   a successful migrate (see [`../actions/vm-migrate.md`](../actions/vm-migrate.md))
   — if you customise the migrate flow, preserve this.
-- Stable network is worth the investment: the DRBD ring (10.99.0.x) on
+- Stable network is worth the investment: the DRBD ring (100.X.Y.Z) on
   a dedicated physical link (direct-cable or VLAN) makes partitions
   rare.
 

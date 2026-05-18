@@ -2210,7 +2210,7 @@ def compute_routes(d: Daemon) -> list[str]:
       2. **Loopback /32 per peer with monotonic metrics + panic /24
          catch-all.** Drives general cluster traffic to the right
          physical NIC for protocols that talk to peer.loopback_ip
-         (libvirt migration, NFS, SSH, garage, the bedrock dashboard).
+         (libvirt migration, SeaweedFS, SSH, the bedrock dashboard).
     """
     routes: list[str] = []
 

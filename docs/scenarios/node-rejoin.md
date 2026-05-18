@@ -25,7 +25,7 @@ come up from systemd, DRBD re-converges, exporters start being scraped.
          │   Parallel starts:
          │     libvirtd         (no VMs auto-start because disks are DRBD)
          │     kmod-drbd9x      (loaded via /etc/modules-load.d/drbd.conf)
-         │     NetworkManager   bedrock-drbd connection up → eth1 = 10.99.0.X
+         │     NetworkManager   bedrock-drbd connection up → eth1 = 100.X.Y.Z
          │     chronyd          time sync
          │     node-exporter    :9100
          │     vm-exporter      :9177
@@ -39,7 +39,7 @@ come up from systemd, DRBD re-converges, exporters start being scraped.
          │
          │    Each resource:
          │      - reads its external meta-disk for last generation UUID
-         │      - opens TCP connection to each peer over 10.99.0.x
+         │      - opens TCP connection to each peer over 100.X.Y.Z
          │      - DRBD handshake: compares generations
          │      - if self is older → resync as SyncTarget
          │      - if equal      → no resync, peer-disk=UpToDate

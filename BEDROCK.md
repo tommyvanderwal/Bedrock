@@ -72,7 +72,7 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 
 ## Build phases for 0.1
 1. **Base OS** — AlmaLinux 9 minimal on both nodes. Root SSH, static management IP, NTP, SELinux permissive, firewall off.
-2. **Networking** — Direct cable between second NICs for DRBD (10.99.0.x). First NIC through MikroTik with br0 bridge for management/VM traffic.
+2. **Networking** — Mgmt LAN over br0 (bridge over the first NIC, via MikroTik). All intra-cluster traffic (DRBD, SeaweedFS, libvirt migration) targets the per-node loopback /32 in the cluster's CGNAT /24 (100.X.Y.0/24, derived from `cluster_uuid` — see `installer/lib/cluster_addr.py`); the mesh layer (`bedrock-net`) routes those packets over whichever physical NIC has the best path.
 3. **Hypervisor** — Install KVM/QEMU/libvirt on both nodes. Verify libvirtd running.
 4. **Storage foundation** — LVM thin pool on NVMe. DRBD from ELRepo. Load kernel module.
 5. **First replicated volume** — Thin LV on both nodes, DRBD resource config, initialize and sync over direct link.

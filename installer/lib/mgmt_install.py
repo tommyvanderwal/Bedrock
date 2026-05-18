@@ -107,37 +107,13 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         if not ok:
             print("  WARN: virtio-win.iso download failed; Windows installs "
                   "will need the driver ISO attached manually.")
-    run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
-    Path("/etc/exports.d").mkdir(exist_ok=True)
-    # The ISO library is exported to the operator LAN (mgmt-bridge
-    # CIDR) and to the cluster's own CGNAT /24 so peers can mount
-    # via their loopback /32.
-    try:
-        from . import cluster_addr as _ca
-        _cluster_uuid = s.get("cluster_uuid", "")
-        _cl_net = _ca.cluster_loopback_net(_cluster_uuid) if _cluster_uuid else ""
-    except Exception:
-        _cl_net = ""
-    _exports = ["192.168.2.0/24(ro,sync,no_subtree_check)"]
-    if _cl_net:
-        _exports.append(f"{_cl_net}(ro,sync,no_subtree_check)")
-    Path("/etc/exports.d/bedrock-iso.exports").write_text(
-        "/opt/bedrock/iso  " + " ".join(_exports) + "\n"
-    )
-    run("systemctl enable --now nfs-server >/dev/null 2>&1", check=False)
-    run("exportfs -ra 2>&1 || true", check=False)
-
-    # Bind-mount /opt/bedrock/iso → /mnt/isos so the mgmt node references
-    # ISOs via the same path as compute nodes (which NFS-mount there).
-    Path("/mnt/isos").mkdir(exist_ok=True)
-    Path("/etc/systemd/system/mnt-isos.mount").write_text(
-        "[Unit]\nDescription=Bedrock ISO library (bind mount)\n\n"
-        "[Mount]\nWhat=/opt/bedrock/iso\nWhere=/mnt/isos\n"
-        "Type=none\nOptions=bind,ro\n\n"
-        "[Install]\nWantedBy=multi-user.target\n"
-    )
-    run("systemctl daemon-reload", check=False)
-    run("systemctl enable --now mnt-isos.mount >/dev/null 2>&1", check=False)
+    # ISO library now lives in the SeaweedFS filer namespace; see
+    # seaweedfs.ensure_iso_library() — every node FUSE-mounts the
+    # filer at /mnt/isos so libvirt's --cdrom path works unchanged.
+    # No NFS export from the master; SeaweedFS handles distribution
+    # across the cluster. Seed any virtio-win.iso staged here into
+    # the filer namespace once master+volume+filer+s3 are up
+    # (handled by promote_to_filer_host's first-time setup).
 
     # 4. FastAPI + Svelte dashboard files. Same helper runs on
     # followers too — the dashboard is reachable from ANY node.
@@ -226,7 +202,7 @@ WantedBy=multi-user.target
     state.save(s)
 
     # Initialise /etc/bedrock/cluster.json with this node registered.
-    # No drbd_ip/tb_ip/eno_ip keys: every intra-cluster bind/target
+    # No drbd_ip / tb_ip / eno_ip keys: every intra-cluster bind/target
     # is loopback_ip (the /32 on `lo`) and the mesh layer routes it.
     import json as _json
     cluster = {
@@ -317,7 +293,6 @@ WantedBy=multi-user.target
                 "nodes": {
                     s["node_name"]: {
                         "host":          s["mgmt_ip"],
-                        "drbd_ip":       drbd_ip,
                         "loopback_ip":   s["loopback_ip"],
                         "role":          "mgmt+compute",
                         "pubkey":        "",
@@ -380,7 +355,6 @@ WantedBy=multi-user.target
                 _bs.node_register(
                     node_name=s["node_name"],
                     host=s["mgmt_ip"],
-                    drbd_ip=drbd_ip,
                     role="mgmt+compute",
                     pubkey="",   # filled in on key rotation
                     bedrock_pubkey=master_bedrock_pub,
@@ -442,5 +416,9 @@ WantedBy=multi-user.target
         # racing with the orchestrator subscriber's first tick — do
         # it inline so `bedrock init` returns with everything up.
         _sw.promote_to_filer_host()
+        # ISO library FUSE mount + seed any pre-staged ISOs (e.g.
+        # virtio-win.iso shipped in the install ISO).
+        _sw.ensure_iso_library_mount()
+        _sw.seed_iso_library(Path("/opt/bedrock/iso"))
     except Exception as e:
         print(f"  WARN: SeaweedFS setup failed: {e}")

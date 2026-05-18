@@ -1108,11 +1108,9 @@ def join_status(id: str):
                 peer_pubkeys.append(n["pubkey"])
             if n.get("host"):
                 peer_ips.append(n["host"])
-            if n.get("drbd_ip"):
-                peer_ips.append(n["drbd_ip"])
-        # mgmt-master's address — that's where the joiner's bedrock-rust
-        # dials to start log replication. Falls back to first node with
-        # "mgmt" in role if mgmt_master isn't set yet.
+        # mgmt-master's loopback /32 — that's where the joiner's
+        # bedrock-rust dials. Falls back to first node with "mgmt"
+        # in role if mgmt_master isn't set yet.
         master_name = None
         for n_name, n in (cluster.get("nodes") or {}).items():
             if "mgmt" in (n.get("role", "") or ""):
@@ -1128,7 +1126,6 @@ def join_status(id: str):
         for n_name, n in (cluster.get("nodes") or {}).items():
             node_map[n_name] = {
                 "host":          n.get("host", ""),
-                "drbd_ip":       n.get("drbd_ip", ""),
                 "loopback_ip":   n.get("loopback_ip", ""),
                 "role":          n.get("role", "compute"),
                 "pubkey":        n.get("pubkey", ""),
@@ -1140,7 +1137,7 @@ def join_status(id: str):
             "loopback_ip":  node_info.get("loopback_ip", ""),
             "peer_pubkeys": peer_pubkeys,
             "peer_ips":     sorted(set(peer_ips)),
-            "master_drbd_ip": master_addr,
+            "master_loopback_ip": master_addr,
             "mgmt_master":  master_name or "",
             "nodes":        list((cluster.get("nodes") or {}).keys()),
             "node_map":     node_map,
@@ -1261,7 +1258,6 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
             _bs.node_register(
                 node_name=pending["node_name"],
                 host=pending["host"],
-                drbd_ip="",
                 role="compute",
                 pubkey=joiner_ssh_pubkey,
                 bedrock_pubkey=pending["bedrock_pubkey"],
@@ -1637,7 +1633,6 @@ def cluster_info():
 class NodeRegister(BaseModel):
     name: str
     host: str
-    drbd_ip: Optional[str] = None
     role: str = "compute"
     pubkey: Optional[str] = None          # SSH ed25519 — paramiko mesh
     bedrock_pubkey: Optional[str] = None  # Ed25519 identity — inter-node API auth
@@ -3448,8 +3443,9 @@ def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
     if not dst_name or dst_name == src_name: raise HTTPException(400, "No valid target")
     src, dst = nodes_cfg[src_name], nodes_cfg[dst_name]
 
-    # For migration URI, prefer USB4 IP, fall back to DRBD IP, fall back to LAN
-    dst_migrate_ip = dst.get("tb_ip") or dst.get("drbd_ip") or dst.get("eno_ip") or dst.get("host")
+    # Migration URI = peer's loopback /32 (mesh-routed over whatever
+    # physical path bedrock-net picked best); falls back to mgmt host.
+    dst_migrate_ip = dst.get("loopback_ip") or dst.get("host")
 
     for r in resources:
         ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=yes {r}")
@@ -3592,7 +3588,7 @@ def _lv_bytes(host: str, lv_path: str) -> int:
 
 
 def _gen_drbd_res(resource: str, minor: int, peers: list) -> str:
-    """peers: list of (node_name, drbd_ip, lv_path, meta_lv_path). 2 or 3 entries.
+    """peers: list of (node_name, loopback_ip, lv_path, meta_lv_path). 2 or 3 entries.
     External meta-disk keeps the DRBD device the same size as the data LV,
     so virsh blockcopy can pivot 1:1 without size mismatch.
     """
@@ -3792,7 +3788,7 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                         f"-n {meta_lv_name} -y 2>&1 || true", timeout=30)
 
                 # 2. Create matching data + meta LV on each peer
-                peers_info = [(src_name, src.get("drbd_ip") or src["host"],
+                peers_info = [(src_name, src.get("loopback_ip") or src["host"],
                                src_lv, meta_path)]
                 for pname in chosen:
                     p = nodes_cfg[pname]
@@ -3803,7 +3799,7 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                     ssh_cmd(p["host"],
                             f"lvcreate -V {meta_mb}M -T {vg_name}/thinpool "
                             f"-n {meta_lv_name} -y", timeout=30)
-                    peers_info.append((pname, p.get("drbd_ip") or p["host"],
+                    peers_info.append((pname, p.get("loopback_ip") or p["host"],
                                        f"/dev/{vg_name}/{lv_name}",
                                        f"/dev/{vg_name}/{meta_lv_name}"))
                 all_hosts = [nodes_cfg[n]["host"] for n, _, _, _ in peers_info]
@@ -3982,10 +3978,10 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                                f"-n {meta_lv_name} -y", timeout=30)
             if task: task.step_done(f"{step_prefix}: LVs on new peer {new_peer}")
 
-            peers_info = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
+            peers_info = [(n, nodes_cfg[n].get("loopback_ip") or nodes_cfg[n]["host"],
                            existing["lv_path"], existing["meta_path"])
                           for n in existing["peers"]]
-            peers_info.append((new_peer, p.get("drbd_ip") or p["host"],
+            peers_info.append((new_peer, p.get("loopback_ip") or p["host"],
                                f"/dev/{vg_name}/{lv_name}",
                                f"/dev/{vg_name}/{meta_lv_name}"))
             minor = existing["minor"]
@@ -4056,7 +4052,7 @@ def _vm_convert_downgrade(vm_name: str, cur: str, tgt: str, src_name: str,
             ssh_cmd(drop["host"], f"drbdadm down {resource} 2>&1 || true", timeout=30)
             ssh_cmd(drop["host"], f"drbdadm wipe-md --force {resource} 2>&1 || true", timeout=30)
 
-            remaining = [(n, nodes_cfg[n].get("drbd_ip") or nodes_cfg[n]["host"],
+            remaining = [(n, nodes_cfg[n].get("loopback_ip") or nodes_cfg[n]["host"],
                           existing["lv_path"], existing["meta_path"])
                          for n in existing["peers"] if n != drop_name]
             minor = existing["minor"]
@@ -5057,10 +5053,10 @@ def api_support_checks():
                         "the affected node."),
     })
 
-    # 2. ≥1 direct DRBD cable on a 2-node cluster.
-    #    Heuristic: every node has a `drbd_ip` reachable from peers via
-    #    the DRBD network without going through the LAN router. We
-    #    test by ping from each node to each other node's drbd_ip.
+    # 2. Mesh reachability — every peer's loopback /32 pings.
+    #    Heuristic: every peer has a loopback_ip reachable from every other
+    #    node via the mesh (any path is fine; bedrock-net routes).
+    #    ping each peer's loopback_ip from every node.
     if len(nodes_cfg) >= 2:
         names = list(nodes_cfg)
         unreachable = []
@@ -5068,18 +5064,18 @@ def api_support_checks():
             src_host = nodes_cfg[src].get("host")
             for dst in names:
                 if dst == src: continue
-                dst_drbd = nodes_cfg[dst].get("drbd_ip")
-                if not dst_drbd:
-                    unreachable.append(f"{src}→{dst}(no drbd_ip)")
+                dst_lo = nodes_cfg[dst].get("loopback_ip")
+                if not dst_lo:
+                    unreachable.append(f"{src}→{dst}(no loopback_ip)")
                     continue
                 try:
                     _o, rc = ssh_cmd_rc(src_host,
-                        f"ping -c1 -W2 -q {dst_drbd} >/dev/null 2>&1",
+                        f"ping -c1 -W2 -q {dst_lo} >/dev/null 2>&1",
                         timeout=8)
                     if rc != 0:
-                        unreachable.append(f"{src}→{dst}({dst_drbd})")
+                        unreachable.append(f"{src}→{dst}({dst_lo})")
                 except Exception:
-                    unreachable.append(f"{src}→{dst}({dst_drbd})")
+                    unreachable.append(f"{src}→{dst}({dst_lo})")
         if not unreachable:
             checks.append({
                 "id": "drbd_cable", "label": "Dedicated DRBD path between nodes",

@@ -140,27 +140,18 @@ def render_from_snapshot(snapshot: dict, this_node: str,
     # weighted-vote election counts these (10 votes per node + 1 for
     # witness) to decide quorum at N≥3. Empty for standalone.
     #
-    # Peer dial address — preference order:
-    #   1. loopback_ip — the mesh cluster identity. The kernel route
-    #      to this /32 picks the best physical NIC via bedrock-net's
-    #      metric-ordered routing, so bedrock-rust gets multi-path
-    #      failover for free without knowing about it.
-    #   2. drbd_ip — the dedicated peer-link at N≥2 in legacy
-    #      deployments (separate cable, redundant). Kept for clusters
-    #      that pre-date the mesh layer.
-    #   3. host — the mgmt LAN. The always-true fallback.
-    # Without these fallbacks (especially loopback_ip when present),
-    # bedrock-rust would dial a single fixed address and lose
-    # multi-path resilience entirely.
+    # Peer dial address: the loopback /32. The kernel route to that
+    # /32 picks the best physical NIC via bedrock-net's metric-ordered
+    # routing, so bedrock-rust gets multi-path failover for free.
+    # `host` (mgmt LAN) is the always-true fallback for clusters that
+    # haven't fully allocated loopbacks yet (bootstrap window).
     peer_addrs: list[str] = []
     peer_sender_ids: list[int] = []
     for nm in name_list:
         if nm == this_node:
             continue
         n = nodes[nm]
-        addr = (n.get("loopback_ip")
-                or n.get("drbd_ip")
-                or n.get("host", ""))
+        addr = n.get("loopback_ip") or n.get("host", "")
         if addr:
             peer_addrs.append(f"{addr}:8200")
         peer_sender_ids.append(name_list.index(nm) + 1)

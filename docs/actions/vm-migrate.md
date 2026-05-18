@@ -105,7 +105,7 @@ HTTP response: 500 with `detail: "Migration failed: ..."`.
 3. **`--unsafe`**: acknowledges we're intentionally migrating between
    DRBD Primaries (a config libvirt flags as risky by default).
 4. **`--migrateuri tcp://<drbd_ip>`**: forces the QEMU memory copy over
-   the DRBD ring (10.99.0.x) instead of the LAN. Saves LAN bandwidth
+   the DRBD ring (100.X.Y.Z) instead of the LAN. Saves LAN bandwidth
    and, on the physical lab with USB4 / 2.5 G direct ethernet, uses the
    fast link.
 5. **Secondary-demote + disallow-two-primaries only after migrate

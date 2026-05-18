@@ -207,10 +207,11 @@ def _cmd_node_list():
     if not nodes:
         print("(no nodes registered yet)")
         return
-    print(f"{'NAME':<35} {'HOST':<18} {'DRBD':<14} {'ROLE':<14} MAINTENANCE")
+    print(f"{'NAME':<35} {'HOST':<18} {'LOOPBACK':<16} {'ROLE':<14} MAINTENANCE")
     for nm, n in nodes.items():
         m = "yes" if n.get("maintenance") else ""
-        print(f"{nm:<35} {n.get('host',''):<18} {n.get('drbd_ip',''):<14} "
+        print(f"{nm:<35} {n.get('host',''):<18} "
+              f"{n.get('loopback_ip',''):<16} "
               f"{n.get('role',''):<14} {m}")
 
 
@@ -458,7 +459,8 @@ def cmd_storage(args):
         print(f"Cluster: {cluster.get('cluster_name', '<none>')}")
         print(f"Nodes:   {len(nodes)}")
         for name, info in nodes.items():
-            print(f"  {name:<12} mgmt={info.get('host','-'):<16} drbd={info.get('drbd_ip','-')}")
+            print(f"  {name:<12} mgmt={info.get('host','-'):<16} "
+                  f"loopback={info.get('loopback_ip','-')}")
         print()
         print("Tiers (mountpoint /bedrock/<tier>):")
         for tier in ("scratch", "bulk", "critical"):
@@ -472,45 +474,39 @@ def cmd_storage(args):
         return
 
     if args.action == "promote":
-        # Promote from N=1 to N=2: requires exactly one peer registered.
+        # Promote the critical tier from local-LV to DRBD-replicated.
+        # Requires N>=2 (at least one peer in the cluster). Idempotent
+        # on the critical tier; bulk stays SeaweedFS, scratch stays
+        # local LV.
         cluster = tier_storage.load_cluster()
         nodes = cluster.get("nodes", {})
         state_local = load_state()
         self_name = state_local.get("node_name")
-        # Per cluster_addr.py: the cluster's CGNAT /24 (100.X.Y.0/24)
-        # is the ONE address space for all intra-cluster traffic.
-        # DRBD endpoints, Garage, NFS — everything binds to / targets
-        # the node's loopback /32; the mesh layer routes those packets
-        # over whichever physical NIC has the best path.
-        self_drbd = state_local.get("loopback_ip", "")
+        self_lo = state_local.get("loopback_ip", "")
         peers = [(n, info) for n, info in nodes.items() if n != self_name]
-        if len(peers) != 1:
-            print(f"promote requires exactly 1 peer; have {len(peers)}.")
+        if not peers:
+            print("promote needs at least one peer. Have a peer "
+                  "`bedrock join` first.")
             return 1
+        # First promote: pick the first peer to seed the DRBD pair.
+        # Additional peers can be added later via `bedrock storage
+        # add-peer` (TBD) once two-peer DRBD is verified.
         peer_name, peer_info = peers[0]
-        peer_drbd = peer_info.get("loopback_ip", "")
+        peer_lo = peer_info.get("loopback_ip", "")
         peer_mgmt = peer_info.get("host", "")
-        print(f"Promoting cluster to N=2:")
-        print(f"  master: {self_name} (drbd {self_drbd})")
-        print(f"  peer:   {peer_name} (drbd {peer_drbd})")
+        print("Promoting critical tier to DRBD:")
+        print(f"  master: {self_name} ({self_lo})")
+        print(f"  peer:   {peer_name} ({peer_lo})")
 
-        rpc_secret  = secrets.token_hex(32)
-        admin_token = secrets.token_hex(32)
-        peer = {"name": peer_name, "drbd_ip": peer_drbd}
-
-        # 1. Master side
-        result = tier_storage.transition_to_n2_master(
-            self_drbd, peer, rpc_secret, admin_token)
+        peer_dict = {"name": peer_name, "loopback_ip": peer_lo}
+        result = tier_storage.transition_to_n2_master(self_lo, peer_dict)
         peers_full = result["peers"]
 
-        # 2. Peer side via SSH (encode the call to bedrock storage helper)
-        master = {"name": self_name, "drbd_ip": self_drbd}
+        # Drive the peer side via SSH.
         peer_cmd = (
             f"bedrock storage _peer-promote "
-            f"--master-drbd {self_drbd} "
-            f"--rpc-secret {rpc_secret} "
-            f"--admin-token {admin_token} "
-            f"--peers '{json.dumps(peers_full)}' "
+            f"--master-loopback {self_lo} "
+            f"--peers '{json.dumps(peers_full)}'"
         )
         print(f"Running peer transition on {peer_name} ({peer_mgmt})...")
         import subprocess as _sp
@@ -519,357 +515,42 @@ def cmd_storage(args):
              f"root@{peer_mgmt}", peer_cmd]).returncode
         if rc != 0:
             print(f"  peer transition returned {rc}")
-
-        # 3. Garage cluster formation (master-side; peer's daemon is up now)
-        print("Forming Garage cluster + creating scratch bucket...")
-        creds = tier_storage.finalize_n2_garage(
-            self_drbd, [self_drbd, peer_drbd])
-
-        # 4. Both sides s3fs-mount scratch
-        tier_storage.s3fs_mount_scratch(
-            creds["access_key"], creds["secret_key"], self_drbd)
-        s3fs_cmd = (
-            f"bedrock storage _peer-s3fs "
-            f"--ak {creds['access_key']} --sk {creds['secret_key']} "
-            f"--endpoint-drbd {self_drbd}"
-        )
-        _sp.run(["ssh", "-o", "StrictHostKeyChecking=no",
-                 f"root@{peer_mgmt}", s3fs_cmd])
-        print("N=2 promotion complete. Run `bedrock storage status` to verify.")
+            return 1
+        print("Critical-tier promotion complete. Initial DRBD sync runs "
+              "in background — check `drbdadm status tier-critical`.")
         return
 
     if args.action == "_peer-promote":
-        # Internal: called from master to drive the peer's side
+        # Internal: called from master to drive the peer's side.
         peers = json.loads(args.peers)
         state_local = load_state()
-        self_drbd = state_local.get("loopback_ip", "")
-        master = {"name": "<master>", "drbd_ip": args.master_drbd}
-        tier_storage.transition_to_n2_peer(
-            self_drbd, master, args.rpc_secret, args.admin_token, peers)
+        self_lo = state_local.get("loopback_ip", "")
+        master = {"name": "<master>", "loopback_ip": args.master_loopback}
+        tier_storage.transition_to_n2_peer(self_lo, master, peers)
         return
 
-    if args.action == "_peer-s3fs":
-        # Joining peer: master's scratch is canonical and was already
-        # migrated into Garage on the master side. The peer's local
-        # scratch is empty/setup_n1-only — never carry it across.
-        # Without `migrate_local_data=False` the peer-side rsync runs
-        # against an empty source while the bucket already has the
-        # master's data, and migrate_scratch_into_garage's MD5 verify
-        # fails (src=empty manifest, dst=master's). (Lessons-log L29.)
-        from lib import tier_storage as ts
-        ts.s3fs_mount_scratch(args.ak, args.sk, args.endpoint_drbd,
-                              migrate_local_data=False)
-        return
-
-    if args.action == "promote-critical-3way":
-        # N=2 → N=3 for the critical tier. Run on the mgmt master.
-        # Looks up <peer-name> in cluster.json; the new peer must already
-        # have run `bedrock join` and `bedrock storage init` so its
-        # local thin-pool is ready for the DRBD initial sync.
+    if args.action == "demote":
+        # Demote critical tier from DRBD-replicated back to local LV.
+        # Run on the last surviving node, or on a master that is about
+        # to leave a multi-node cluster behind. Safe to call when the
+        # tier is already local — it's a no-op.
         cluster = tier_storage.load_cluster()
-        nodes = cluster.get("nodes", {})
-        peer_name = args.peer
-        peer_info = nodes.get(peer_name)
-        if not peer_info:
-            print(f"ERROR: peer '{peer_name}' not found in cluster.json")
-            return 1
-        peer_drbd = peer_info.get("drbd_ip", "")
-        if not peer_drbd:
-            print(f"ERROR: peer '{peer_name}' has no drbd_ip in cluster.json")
-            return 1
-        peer_host = peer_info.get("host", "")
-        if not peer_host:
-            print(f"ERROR: peer '{peer_name}' has no host in cluster.json")
-            return 1
-        print(f"Extending tier-critical to 3-way with peer "
-              f"{peer_name} ({peer_drbd})...")
-        tier_storage.promote_critical_to_3way(
-            {"name": peer_name, "drbd_ip": peer_drbd})
-        # The new peer needs to:
-        #   1. Unmount its local /var/lib/bedrock/local/critical (DRBD
-        #      can't open the LV as backing while it's mounted).
-        #   2. Drop the fstab line for that mount.
-        #   3. write_drbd_resource + create-md + drbdadm up (== join_drbd_peer).
-        # Drive it via SSH.
-        full_peers = []
-        for n_name in (
-                tier_storage.load_cluster().get("tiers", {})
-                .get("critical", {}).get("peers", [])):
-            n_info = nodes.get(n_name, {})
-            full_peers.append(
-                {"name": n_name, "drbd_ip": n_info.get("drbd_ip", "")})
-        peer_cmd = (
-            f"bedrock storage _peer-join-tier "
-            f"--tier critical "
-            f"--peers '{json.dumps(full_peers)}'"
-        )
-        print(f"Joining tier-critical on {peer_name} ({peer_host})...")
-        import subprocess as _sp
-        rc = _sp.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             f"root@{peer_host}", peer_cmd]).returncode
-        if rc != 0:
-            print(f"  peer-side join returned {rc}")
-            return 1
-        print("3-way promotion staged. Sync will continue in the "
-              "background; check `drbdadm status tier-critical`.")
-        return
-
-    if args.action == "_peer-join-tier":
-        # Internal: called from master to drive peer-side tier join.
-        # Idempotent: unmount is best-effort; create-md is --force.
-        from lib import tier_storage as ts
-        from pathlib import Path as _Path
-        tier = args.tier
-        peers = json.loads(args.peers)
-        local_mount = _Path(f"/var/lib/bedrock/local/{tier}")
-        # 1. Unmount + drop fstab line
-        import subprocess as _sp
-        _sp.run(["umount", str(local_mount)], check=False,
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        fstab = _Path("/etc/fstab")
-        if fstab.exists():
-            new = []
-            for line in fstab.read_text().splitlines():
-                if str(local_mount) in line and "tier-" in line:
-                    continue
-                new.append(line)
-            fstab.write_text("\n".join(new).rstrip() + "\n")
-        # 2. Run join (writes .res, create-md, drbdadm up)
-        ts.join_drbd_peer(tier, peers)
-        return
-
-    if args.action == "transfer-mgmt":
-        # Move the mgmt + NFS + DRBD-primary role from the current
-        # master to <new-master-name>. Run on the current master (or
-        # any node with SSH access to both).
-        cluster = tier_storage.load_cluster()
-        nodes = cluster.get("nodes", {})
-        new_name = args.new_master
-        new_info = nodes.get(new_name)
-        if not new_info:
-            print(f"ERROR: '{new_name}' not in cluster.json")
-            return 1
-        # Find current master via state.json or by role label.
-        st = load_state()
-        old_host = st.get("mgmt_ip", "")
-        old_name = st.get("node_name", "")
-        if not old_host:
-            for n_name, n in nodes.items():
-                if "mgmt" in n.get("role", ""):
-                    old_host = n.get("host", "")
-                    old_name = n_name
-                    break
-        if old_name == new_name:
-            print(f"'{new_name}' is already the mgmt master.")
+        t = cluster.get("tiers", {}).get("critical", {})
+        if t.get("mode") != "drbd":
+            print(f"critical tier mode={t.get('mode','?')} — nothing to demote.")
             return 0
-        new_host = new_info.get("host", "")
-        new_drbd = new_info.get("drbd_ip", "")
-        other_hosts = [n.get("host", "") for nm, n in nodes.items()
-                        if nm not in (old_name, new_name) and n.get("host")]
-        print(f"Transferring mgmt role: {old_name} ({old_host}) → "
-              f"{new_name} ({new_host})")
-        if other_hosts:
-            print(f"  Will also re-point NFS clients on: {', '.join(other_hosts)}")
-        tier_storage.transfer_mgmt_role(
-            old_master_host=old_host,
-            new_master_host=new_host,
-            new_master_drbd_ip=new_drbd,
-            other_peer_hosts=other_hosts,
-        )
-        print(f"Mgmt role now on {new_name}. Run "
-              f"`bedrock storage status` from there to verify.")
-        return
-
-    if args.action == "remove-peer":
-        # Cleanly remove <peer-name> from the cluster:
-        #   1. Drain Garage on that node onto the survivors.
-        #   2. drbd_remove_peer for each tier the peer participates in.
-        #   3. Update cluster.json (drop the node entry).
-        # Run on the mgmt master. Refuses to remove the current master
-        # — operator must `transfer-mgmt` first.
-        cluster = tier_storage.load_cluster()
-        nodes = cluster.get("nodes", {})
-        peer_name = args.peer
-        peer_info = nodes.get(peer_name)
-        if not peer_info:
-            print(f"ERROR: peer '{peer_name}' not found in cluster.json")
+        print("Demoting critical tier: DRBD → local LV...")
+        ok = tier_storage.drbd_demote_to_local("critical")
+        if not ok:
+            print("  drbd_demote_to_local returned False (preconditions not met).")
             return 1
-        if "mgmt" in peer_info.get("role", ""):
-            print(f"ERROR: '{peer_name}' is the mgmt master. Run "
-                  f"`bedrock storage transfer-mgmt <other-node>` first.")
-            return 1
-        peer_host = peer_info.get("host", "")
-        peer_drbd = peer_info.get("drbd_ip", "")
-        survivors = [(nm, n) for nm, n in nodes.items() if nm != peer_name]
-        if not survivors:
-            print(f"ERROR: removing the only node would leave the cluster empty. "
-                  f"Use `bedrock storage collapse-to-n1` on the last node "
-                  f"if you mean to fully collapse.")
-            return 1
-        survivor_hosts = [n.get("host", "") for _, n in survivors if n.get("host")]
-        survivor_peers = [{"name": nm, "drbd_ip": n.get("drbd_ip", "")}
-                           for nm, n in survivors]
-        st = load_state()
-        self_host = st.get("mgmt_ip", "")
-        # Pick a surviving admin host that is reachable. Prefer self, fall
-        # back to any survivor.
-        surv_admin = self_host if self_host in survivor_hosts \
-            else (survivor_hosts[0] if survivor_hosts else "")
-
-        print(f"Removing peer {peer_name} ({peer_host}, drbd {peer_drbd})")
-        print(f"  Survivors: {[nm for nm, _ in survivors]}")
-
-        # 1. Drain Garage (only if scratch is on Garage, i.e. cluster N>=2).
-        scratch = cluster.get("tiers", {}).get("scratch", {})
-        if scratch.get("mode") == "garage":
-            # Find the leaving node's short Garage id from /v2/GetClusterStatus.
-            # Handle: node may not be in Garage at all (peer joined post-promote
-            # without an extend-garage step), in which case addr can be null
-            # or the node's drbd_ip may simply not match any layout entry.
-            short_id = ""
-            try:
-                token = tier_storage._garage_admin_token()
-                status = tier_storage._garage_api(
-                    "GET", "/v2/GetClusterStatus", token=token) or {}
-                for n in status.get("nodes", []):
-                    addr = n.get("addr") or ""
-                    if addr.startswith(peer_drbd + ":"):
-                        short_id = (n.get("id") or "")[:16]
-                        break
-            except Exception as e:
-                print(f"  [1/4] WARN: could not query Garage layout: {e}")
-                print(f"        Skipping Garage drain. If {peer_name} was a "
-                      f"Garage member, sharded data may be lost; otherwise "
-                      f"this is harmless.")
-                short_id = ""
-
-            if short_id:
-                try:
-                    print(f"  [1/4] Draining Garage data from {peer_name} "
-                          f"(id {short_id})...")
-                    tier_storage.garage_drain_node(
-                        departing_node_id_short=short_id,
-                        surviving_admin_host=surv_admin,
-                        departing_node_admin_host=peer_host,
-                    )
-                except Exception as e:
-                    print(f"  [1/4] WARN: Garage drain failed: {e}")
-                    print(f"        Continuing with DRBD removal. Investigate "
-                          f"the Garage state on the survivors before "
-                          f"running {peer_name} again as a peer.")
-            else:
-                print(f"  [1/4] Garage: {peer_name} not in cluster layout "
-                      f"(addr-match miss) — skipping drain.")
-
-        # 2. DRBD: remove from each tier the peer participates in.
-        tiers = cluster.get("tiers", {})
-        for tier in ("bulk", "critical"):
-            t = tiers.get(tier, {})
-            if peer_name not in t.get("peers", []):
-                continue
-            survivors_for_tier = [p for p in survivor_peers
-                                   if p["name"] in t.get("peers", [])]
-            if not survivors_for_tier:
-                continue
-            # Survivor hosts that participate in THIS tier.
-            host_for_tier = [nodes[p["name"]].get("host", "")
-                              for p in survivors_for_tier
-                              if nodes.get(p["name"], {}).get("host")]
-            print(f"  [2/4] DRBD remove peer from tier-{tier}...")
-            tier_storage.drbd_remove_peer(
-                resource=tier,
-                leaving_peer_name=peer_name,
-                surviving_hosts=host_for_tier,
-                surviving_peers=survivors_for_tier,
-            )
-
-        # 3. Drop the node from cluster.json on the master. Peers are
-        #    expected to re-fetch via the mgmt API (or get pushed); for
-        #    v1.0 cluster.json on peers may briefly be stale and is
-        #    self-healing on next mgmt refresh.
-        cluster = tier_storage.load_cluster()  # re-read after helpers wrote
-        if peer_name in cluster.get("nodes", {}):
-            del cluster["nodes"][peer_name]
-            tier_storage.save_cluster(cluster)
-            print(f"  [3/4] cluster.json: dropped {peer_name}")
-
-        # 4. Reset the leaving node's local state — back to post-bootstrap
-        #    so it can `bedrock init` a new cluster or `bedrock join`
-        #    another. SSH'd over because we're cluster-side; the leaving
-        #    node should not be expected to clean itself up.
-        if peer_host:
-            print(f"  [4/4] resetting {peer_name} to clean state via SSH...")
-            import subprocess as _sp
-            rc = _sp.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no",
-                 f"root@{peer_host}",
-                 "bedrock storage _local-reset"],
-                stdout=_sp.PIPE, stderr=_sp.STDOUT).returncode
-            if rc != 0:
-                print(f"        WARN: remote reset returned {rc}; the "
-                      f"node may have stale state. Re-run "
-                      f"`bedrock storage _local-reset` on it manually.")
-
-        print(f"Done. {peer_name} is no longer part of the cluster and "
-              f"is back to post-bootstrap state — ready to "
-              f"`bedrock init` or `bedrock join`.")
         return
 
     if args.action == "_local-reset":
-        # Internal: called over SSH from a master running `remove-peer`,
+        # Internal: called over SSH from a master running `node leave`,
         # or manually by an operator who wants to take this node out.
         # Brings local state back to post-`bedrock bootstrap`.
         tier_storage.node_reset_local()
-        return
-
-    if args.action == "collapse-to-n1":
-        # Last-node collapse to standalone N=1: demote all DRBD tiers
-        # back to plain local LVs and migrate scratch out of Garage.
-        # Run ON the last surviving node — refuses to run if cluster.json
-        # still shows other nodes.
-        cluster = tier_storage.load_cluster()
-        nodes = cluster.get("nodes", {})
-        if len(nodes) > 1:
-            print(f"ERROR: cluster still has {len(nodes)} nodes "
-                  f"({', '.join(nodes)}).")
-            print(f"Run `bedrock storage remove-peer <name>` for each "
-                  f"other node first, then re-run this on the last one.")
-            return 1
-        st = load_state()
-        if st.get("node_name") not in nodes and nodes:
-            print(f"ERROR: this node ({st.get('node_name')}) is not the "
-                  f"one in cluster.json ({list(nodes)}). Run on the "
-                  f"last surviving node.")
-            return 1
-
-        print("Collapsing to N=1 (standalone local mode)...")
-
-        # 1. Demote DRBD tiers back to local LVs.
-        for tier in ("bulk", "critical"):
-            t = cluster.get("tiers", {}).get(tier, {})
-            if t.get("mode") == "drbd-nfs":
-                print(f"  [1/2] drbd_demote_to_local({tier})...")
-                ok = tier_storage.drbd_demote_to_local(tier)
-                if not ok:
-                    print(f"        skipped (preconditions not met).")
-            else:
-                print(f"  [1/2] tier {tier} mode={t.get('mode','?')} — "
-                      f"nothing to demote.")
-
-        # 2. Migrate scratch out of Garage (if it's on Garage).
-        scratch = cluster.get("tiers", {}).get("scratch", {})
-        if scratch.get("mode") == "garage":
-            print(f"  [2/2] migrate_scratch_out_of_garage()...")
-            tier_storage.migrate_scratch_out_of_garage(
-                verify_md5=not args.skip_md5,
-                keep_garage=args.keep_garage,
-            )
-        else:
-            print(f"  [2/2] scratch mode={scratch.get('mode','?')} — "
-                  f"nothing to migrate.")
-
-        print("Collapse complete. Run `bedrock storage status` to verify.")
         return
 
 
@@ -1106,43 +787,21 @@ def main():
 
     p_st = sub.add_parser("storage", help="Storage tier operations")
     p_st_sub = p_st.add_subparsers(dest="action", required=True)
-    p_st_sub.add_parser("init", help="Idempotent local-LV tier setup (N=1)")
-    p_st_sub.add_parser("status", help="Show tier modes + mountpoints")
-    p_st_sub.add_parser("promote", help="Promote N=1 cluster to N=2 (Garage + DRBD-NFS)")
-    p_p3 = p_st_sub.add_parser("promote-critical-3way",
-        help="Extend tier-critical to a third peer (run on mgmt master)")
-    p_p3.add_argument("peer", help="cluster.json node name to add as the 3rd peer")
-    p_tm = p_st_sub.add_parser("transfer-mgmt",
-        help="Move mgmt + NFS + DRBD primary to another node "
-             "(run from any node)")
-    p_tm.add_argument("new_master", metavar="new-master",
-        help="cluster.json node name to receive the mgmt role")
-    p_rp = p_st_sub.add_parser("remove-peer",
-        help="Drain Garage + DRBD-remove a peer cleanly "
-             "(run on mgmt master)")
-    p_rp.add_argument("peer", help="cluster.json node name of the peer to remove")
-    p_cn = p_st_sub.add_parser("collapse-to-n1",
-        help="Last-node collapse: demote DRBD tiers + migrate scratch "
-             "out of Garage (run ON the last surviving node)")
-    p_cn.add_argument("--skip-md5", action="store_true",
-        help="Skip MD5 verification of the scratch migration "
-             "(faster on large datasets)")
-    p_cn.add_argument("--keep-garage", action="store_true",
-        help="Don't stop/remove Garage after migrating scratch out "
-             "(useful if other things use the Garage cluster)")
+    p_st_sub.add_parser("init",
+        help="Idempotent local-LV tier setup (N=1)")
+    p_st_sub.add_parser("status",
+        help="Show tier modes + mountpoints")
+    p_st_sub.add_parser("promote",
+        help="Promote critical tier to DRBD replication (run on mgmt "
+             "master when cluster has N>=2 nodes). Bulk stays on "
+             "SeaweedFS volumes; scratch stays local LV.")
+    p_st_sub.add_parser("demote",
+        help="Demote critical tier back to a plain local LV "
+             "(reverse of `promote` — run on the last surviving node)")
     p_pp = p_st_sub.add_parser("_peer-promote", help=argparse.SUPPRESS)
-    p_pp.add_argument("--master-drbd", required=True)
-    p_pp.add_argument("--rpc-secret", required=True)
-    p_pp.add_argument("--admin-token", required=True)
+    p_pp.add_argument("--master-loopback", required=True)
     p_pp.add_argument("--peers", required=True)
-    p_pjt = p_st_sub.add_parser("_peer-join-tier", help=argparse.SUPPRESS)
-    p_pjt.add_argument("--tier", required=True)
-    p_pjt.add_argument("--peers", required=True)
     p_st_sub.add_parser("_local-reset", help=argparse.SUPPRESS)
-    p_ps = p_st_sub.add_parser("_peer-s3fs", help=argparse.SUPPRESS)
-    p_ps.add_argument("--ak", required=True)
-    p_ps.add_argument("--sk", required=True)
-    p_ps.add_argument("--endpoint-drbd", required=True)
     p_st.set_defaults(func=cmd_storage)
 
     p_op = sub.add_parser("operator",

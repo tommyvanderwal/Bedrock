@@ -96,15 +96,11 @@ def install(witness: str, cluster_info: dict, repo: str):
     s = state.load()
     hw = s.get("hardware", {})
 
-    # Pick local IPs
     # mgmt_ip = the LAN/bridge address joiners reach the master on.
-    # Per cluster_addr.py: there is no separate "drbd_ip" — every
-    # intra-cluster bind/target uses the node's loopback /32 (set on
-    # `lo` by bedrock-net once the cluster identity is allocated).
-    # We still track drbd_ip here as a legacy state.json key for any
-    # caller that hasn't migrated, but leave it empty.
+    # Per cluster_addr.py every intra-cluster bind/target uses the
+    # node's loopback /32 (set on `lo` by bedrock-net once the cluster
+    # identity is allocated by the master at join approval).
     mgmt_ip = ""
-    drbd_ip = ""
     for n in hw.get("nics", []):
         if n["state"] == "UP" and n["name"] == "br0" and n["ip"]:
             mgmt_ip = n["ip"]; break
@@ -171,7 +167,7 @@ def install(witness: str, cluster_info: dict, repo: str):
         "node_map": approval.get("node_map", {}),
         "peer_pubkeys": approval.get("peer_pubkeys", []),
         "peer_ips": approval.get("peer_ips", []),
-        "master_drbd_ip": approval.get("master_drbd_ip", ""),
+        "master_loopback_ip": approval.get("master_loopback_ip", ""),
         "mgmt_master": approval.get("mgmt_master", ""),
         "loopback_ip": approval.get("loopback_ip", ""),
         "cluster_key_hex": cluster_key.hex(),
@@ -188,7 +184,6 @@ def install(witness: str, cluster_info: dict, repo: str):
         "witness_host": witness,
         "mgmt_url": mgmt_url,
         "mgmt_ip": mgmt_ip,
-        "drbd_ip": drbd_ip,
         # Cluster identity for the mesh layer. mgmt allocated this in
         # the register response; bedrock-net.service reads it from
         # state.json on next start to pin the /32 on `lo`. Empty if
@@ -210,7 +205,6 @@ def install(witness: str, cluster_info: dict, repo: str):
         # node_register into cluster.json yet at /api/join/status time).
         node_map[node_name] = {
             "host":          mgmt_ip,
-            "drbd_ip":       drbd_ip,
             "loopback_ip":   result.get("loopback_ip", ""),
             "role":          "compute",
             "pubkey":        my_pubkey,
@@ -260,34 +254,16 @@ def install(witness: str, cluster_info: dict, repo: str):
             shell=True, check=False)
         print(f"  Pre-scanned {len(peer_ips)} peer host keys.")
 
-    # NFS mount the ISO library at /mnt/isos so --cdrom paths work identically
-    # on every node in the cluster. Source is the mgmt node's host IP (parsed
-    # from mgmt_url), NOT this node's own IP.
-    print("  Installing NFS client + mounting ISO library...")
-    subprocess.run("dnf install -y -q nfs-utils >/dev/null 2>&1",
-                   shell=True, check=False)
-    from urllib.parse import urlparse as _urlparse
-    mgmt_host = _urlparse(s["mgmt_url"]).hostname or witness
+    # ISO library: SeaweedFS FUSE mount at /mnt/isos. Set up later
+    # (after bedrock-weed-filer is reachable on the cluster) by
+    # seaweedfs.ensure_iso_library_mount(). At install time we just
+    # ensure the mountpoint exists.
     Path("/mnt/isos").mkdir(exist_ok=True)
-    Path("/etc/systemd/system/mnt-isos.mount").write_text(
-        "[Unit]\nDescription=Bedrock ISO library (NFS)\nAfter=network-online.target\n"
-        "Wants=network-online.target\n\n"
-        f"[Mount]\nWhat={mgmt_host}:/opt/bedrock/iso\nWhere=/mnt/isos\n"
-        "Type=nfs\nOptions=ro,nolock,soft,_netdev\n\n"
-        "[Install]\nWantedBy=multi-user.target\n"
-    )
-    Path("/etc/systemd/system/mnt-isos.automount").write_text(
-        "[Unit]\nDescription=Bedrock ISO library (automount)\n\n"
-        "[Automount]\nWhere=/mnt/isos\nTimeoutIdleSec=300\n\n"
-        "[Install]\nWantedBy=multi-user.target\n"
-    )
-    subprocess.run("systemctl daemon-reload", shell=True, check=False)
-    subprocess.run("systemctl enable --now mnt-isos.automount >/dev/null 2>&1",
-                   shell=True, check=False)
 
-    # Storage tiers — N=1 setup on this node first (creates local LVs and
-    # /bedrock/<tier> symlinks). Cluster-wide transition to N>=2 (Garage +
-    # DRBD-NFS) is triggered separately via `bedrock storage promote`.
+    # Storage tiers — N=1 setup on this node first (creates local LVs
+    # and /bedrock/<tier> symlinks). Cluster-wide transition to N>=2
+    # (DRBD on the critical tier) is triggered separately via
+    # `bedrock storage promote`.
     print("  Setting up storage tiers (local LVs)...")
     try:
         tier_storage.setup_n1()
@@ -310,8 +286,9 @@ def install(witness: str, cluster_info: dict, repo: str):
         daemon_setup.init_log_if_needed(s["cluster_uuid"])
         # `or witness` (not `.get(..., witness)`) so an empty-string
         # value from mgmt also falls through. mgmt sends "" when the
-        # current master has no drbd_ip — the always-true case in N=1.
-        master_drbd = result.get("master_drbd_ip") or witness
+        # Master's address for bedrock-rust to dial. Prefer the loopback
+        # /32 (mesh-routed); fall back to the discovery witness host.
+        master_drbd = result.get("master_loopback_ip") or witness
         daemon_setup.render_daemon_toml(
             # Initial daemon.toml gets bedrock-rust talking to the master.
             # The watcher overwrites this from the replicated snapshot
@@ -418,6 +395,10 @@ def install(witness: str, cluster_info: dict, repo: str):
         _sw.write_filer_config()
         _sw.write_s3_config()
         _sw.promote_to_master_volume_host()
+        # ISO library: FUSE-mount the filer's /isos subtree so
+        # libvirt's --cdrom /mnt/isos/<name>.iso just works on this
+        # node like on every other.
+        _sw.ensure_iso_library_mount()
     except Exception as e:
         print(f"  WARN: SeaweedFS setup failed: {e}")
 

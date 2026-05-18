@@ -102,7 +102,7 @@ through. Configured via the systemd template
 ## Multi-network resilience
 
 The cluster runs on two networks: `bedrock-mgmt` (192.168.x) and
-`bedrock-drbd` (10.99.x — used for both DRBD replication and RustFS /
+`bedrock-drbd` (100.X.Y — used for both DRBD replication and RustFS /
 Garage inter-node traffic). Per-peer host routes via the mgmt LAN at
 metric 200 provide outbound failover when the drbd link drops on a
 node — kernel switches transparently and TCP reconnect logic handles

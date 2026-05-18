@@ -248,10 +248,10 @@ Final cleaned 4-node testbed:
 
 ```
 === Per-node view (post chaos) ===
-  bedrock-c51a36 (192.168.2.60, master): loopback=10.99.0.1/32
-  bedrock-4807f4 (192.168.2.62)        : loopback=10.99.0.2/32
-  bedrock-606941 (192.168.2.61)        : loopback=10.99.0.3/32
-  bedrock-0acd31 (192.168.2.63)        : loopback=10.99.0.4/32
+  bedrock-c51a36 (192.168.2.60, master): loopback=100.86.181.1/32
+  bedrock-4807f4 (192.168.2.62)        : loopback=100.86.181.2/32
+  bedrock-606941 (192.168.2.61)        : loopback=100.86.181.3/32
+  bedrock-0acd31 (192.168.2.63)        : loopback=100.86.181.4/32
 
 === Path-table on master ===
   paths: 15            (5 NIC types × 3 peers)
@@ -263,12 +263,12 @@ Final cleaned 4-node testbed:
     (enp5s0, enp5s0): 3   ← bedrock-mesh-3 plane
 
 === Routes on master (per-peer multipath) ===
-  10.99.0.0/24 via 10.42.65.232 dev enp5s0 metric 999  (panic catchall)
-  10.99.0.2 via 192.168.2.62 dev br0    metric 10
-  10.99.0.2 via 10.42.209.61 dev enp2s0 metric 11
-  10.99.0.2 via 10.42.44.253 dev enp3s0 metric 12
-  10.99.0.2 via 10.42.63.196 dev enp4s0 metric 13
-  10.99.0.2 via 10.42.65.232 dev enp5s0 metric 14
+  100.X.Y.0/24 via 10.42.65.232 dev enp5s0 metric 999  (panic catchall)
+  100.86.181.2 via 192.168.2.62 dev br0    metric 10
+  100.86.181.2 via 10.42.209.61 dev enp2s0 metric 11
+  100.86.181.2 via 10.42.44.253 dev enp3s0 metric 12
+  100.86.181.2 via 10.42.63.196 dev enp4s0 metric 13
+  100.86.181.2 via 10.42.65.232 dev enp5s0 metric 14
   ... (same metric-ordered chain for .3, .4)
 
 === Cross-loopback ping (post-chaos) ===

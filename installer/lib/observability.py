@@ -95,10 +95,10 @@ def _systemd_want(unit: str, want_running: bool, restart_if_running: bool = Fals
 
 def _backend_url(snapshot: dict, node_name: str, port: int) -> str:
     """Resolve a node name to its reachable URL. Prefer loopback_ip
-    (the cluster mesh /32, multi-path failover via bedrock-net) then
-    drbd_ip then mgmt host."""
+    (the cluster mesh /32, multi-path failover via bedrock-net); fall
+    back to the mgmt host during the bootstrap window."""
     n = (snapshot.get("nodes") or {}).get(node_name) or {}
-    addr = (n.get("loopback_ip") or n.get("drbd_ip") or n.get("host", ""))
+    addr = n.get("loopback_ip") or n.get("host", "")
     return f"http://{addr}:{port}" if addr else ""
 
 

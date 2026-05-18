@@ -81,7 +81,6 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$SIM1_IP '
   cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
   sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
   ssh-keyscan -H $(hostname -I | awk "{print \$1}") >> /root/.ssh/known_hosts 2>/dev/null
-  ssh-keyscan -H 10.99.0.10 >> /root/.ssh/known_hosts 2>/dev/null
   systemctl restart bedrock-mgmt
 ' > /dev/null
 
@@ -114,7 +113,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$SIM2_IP \
 # SSH key mesh for 2 nodes (needed for DRBD + virsh migrate)
 note "Setting up SSH key mesh"
 for SRC in $SIM1_IP $SIM2_IP; do
-  for DST in $SIM1_IP $SIM2_IP 10.99.0.10 10.99.0.11; do
+  for DST in $SIM1_IP $SIM2_IP; do
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$SRC \
       "ssh-keyscan -H $DST >> /root/.ssh/known_hosts 2>/dev/null; sort -u /root/.ssh/known_hosts -o /root/.ssh/known_hosts" 2>/dev/null
   done

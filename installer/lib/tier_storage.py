@@ -16,14 +16,16 @@ misdiagnoses, lessons learned), see ../../docs/lessons-log.md.
 
 Quick model:
   /bedrock/<tier> is the stable mountpoint on every node, always valid.
-  Backend behind the symlink swaps as the cluster grows or shrinks.
+  Backend behind the symlink only changes on the **critical** tier as
+  the cluster grows; scratch and bulk stay where they are.
 
-  N=1: /bedrock/<tier>    -> /var/lib/bedrock/local/<tier>        (local thin LV)
-  N=2: /bedrock/scratch   -> Garage S3 via local s3fs FUSE
-       /bedrock/bulk      -> DRBD 2-way XFS, NFS-served by master
-       /bedrock/critical  -> DRBD 2-way XFS, NFS-served by master
-  N=3: /bedrock/critical  -> DRBD 3-way XFS  (bulk stays 2-way)
-  N=4: same shape; new node = Garage volume + NFS client
+  scratch  : per-node ephemeral, always local thin LV
+  bulk     : SeaweedFS volumes (master+volume on every node, RF
+             managed by SeaweedFS itself); /bedrock/bulk points at
+             the FUSE-mounted filer subtree
+  critical : N=1 → local thin LV; N≥2 → DRBD-replicated XFS, mounted
+             only on the mgmt-master (filer's leveldb3 metadata DB
+             and other cluster singletons live here)
 
 External DRBD metadata is essential: it makes local-LV → DRBD-replicated
 promotion zero-copy (the data LV's XFS is preserved byte-for-byte).
@@ -31,25 +33,27 @@ promotion zero-copy (the data LV's XFS is preserved byte-for-byte).
 Entry points (growth path):
   setup_n1()                          — single-node setup; idempotent
   transition_to_n2_master(...)        — N=1 -> N=2 master side
+                                        (DRBD primary on critical tier)
   transition_to_n2_peer(...)          — N=1 -> N=2 peer side
-  finalize_n2_garage(...)             — Garage cluster formation
+                                        (DRBD secondary on critical tier)
   promote_critical_to_3way(...)       — N=2 -> N=3 critical promote
-  s3fs_mount_scratch(...)             — FUSE mount Garage scratch bucket
 
 Entry points (shrink / role-move path):
   drbd_remove_peer(...)               — online DRBD peer removal
                                         (LINBIT-blessed adjust flow)
-  garage_drain_node(...)              — graceful Garage node decommission
-                                        (RF=1 safe, per-partition resync)
-  transfer_mgmt_role(...)             — move mgmt + NFS + DRBD primary
+  transfer_mgmt_role(...)             — move mgmt + DRBD primary
                                         from one node to another
 
 Entry points (final-collapse to single-node path):
   drbd_demote_to_local(tier)          — turn a stand-alone DRBD resource
                                         back into a plain local LV
                                         (XFS preserved by external meta)
-  migrate_scratch_out_of_garage()     — copy scratch data out of Garage
-                                        into a local LV; stop Garage
+
+The scratch tier is always local LVM (per-node ephemeral). The bulk
+tier is SeaweedFS-distributed (volume server on every node, no DRBD).
+Only the critical tier follows the mgmt-master via DRBD — that's
+where the filer's leveldb3 metadata DB and other cluster singletons
+live (per docs/post-alpha-rewrite-notes.md D-07/D-10).
 
 Called from:
   mgmt_install.install_full() -> setup_n1()
@@ -161,22 +165,8 @@ TIERS = ("scratch", "bulk", "critical")
 # DRBD resource minor numbers — kept above VM minors (which start at 1000).
 # Tier resources start at 1100 to leave a comfortable gap.
 DRBD_MINORS = {
-    "bulk":     1100,
     "critical": 1101,
 }
-
-# Garage (only at N>=2; serves the scratch tier)
-GARAGE_VERSION  = "v2.3.0"
-GARAGE_URL      = (f"https://garagehq.deuxfleurs.fr/_releases/{GARAGE_VERSION}/"
-                   "x86_64-unknown-linux-musl/garage")
-GARAGE_S3_PORT      = 3900
-GARAGE_RPC_PORT     = 3901
-GARAGE_ADMIN_PORT   = 3903
-GARAGE_DATA_LV_GB   = 18   # backs Garage's data dir; replaces local scratch LV
-GARAGE_DATA_DIR     = "/var/lib/garage/data"
-GARAGE_META_DIR     = "/var/lib/garage/meta"
-GARAGE_BLOCK_BYTES  = 10 * 1024 * 1024
-
 
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON   = Path("/etc/bedrock/state.json")
@@ -318,7 +308,6 @@ def set_tier_state(tier: str, **kv) -> None:
             master=cur.get("master"),
             peers=cur.get("peers"),
             backend_path=cur.get("backend_path"),
-            garage_endpoint=cur.get("garage_endpoint"),
         )
     except Exception as e:
         print(f"  [state] tier_state write skipped: {e}")
@@ -767,7 +756,7 @@ def free_drbd_node_id(resource: str, peer_name: str,
 
 def render_drbd_res(resource: str, minor: int,
                     peers: list[dict]) -> str:
-    """Render a DRBD resource file. peers = [{name, drbd_ip}, ...].
+    """Render a DRBD resource file. peers = [{name, loopback_ip}, ...].
 
     Node-ids are PERSISTED (not renumbered): each peer gets its sticky
     id from cluster.json, allocated on first sight of that peer.
@@ -783,7 +772,7 @@ def render_drbd_res(resource: str, minor: int,
             f'    device    /dev/drbd{minor};\n'
             f'    disk      /dev/{VG}/tier-{resource};\n'
             f'    meta-disk /dev/{VG}/tier-{resource}-meta;\n'
-            f'    address   {p["drbd_ip"]}:{7000 + minor};\n'
+            f'    address   {p["loopback_ip"]}:{7000 + minor};\n'
             f'  }}\n'
         )
 
@@ -793,8 +782,8 @@ def render_drbd_res(resource: str, minor: int,
         for j in range(i + 1, len(peers)):
             conn_blocks.append(
                 f'  connection {{\n'
-                f'    host {peers[i]["name"]} address {peers[i]["drbd_ip"]}:{7000+minor};\n'
-                f'    host {peers[j]["name"]} address {peers[j]["drbd_ip"]}:{7000+minor};\n'
+                f'    host {peers[i]["name"]} address {peers[i]["loopback_ip"]}:{7000+minor};\n'
+                f'    host {peers[j]["name"]} address {peers[j]["loopback_ip"]}:{7000+minor};\n'
                 f'  }}\n'
             )
 
@@ -891,7 +880,7 @@ def render_drbd_res_mesh(resource: str, minor: int,
         topologies and arbitrary NIC layouts
 
     Inputs:
-      peers — [{name, drbd_ip, loopback_ip}, ...]
+      peers — [{name, loopback_ip}, ...]
       snapshot — view_builder.fold output, must include `paths`
     """
     on_blocks = []
@@ -903,7 +892,7 @@ def render_drbd_res_mesh(resource: str, minor: int,
         # use loopback so the address is stable across NIC churn —
         # peers that need to dial this node use whichever path is
         # best per the kernel routing layer.
-        anchor_addr = p.get("loopback_ip", "") or p.get("drbd_ip", "")
+        anchor_addr = p.get("loopback_ip", "")
         on_blocks.append(
             f'  on {p["name"]} {{\n'
             f'    node-id   {nid};\n'
@@ -960,8 +949,8 @@ def render_drbd_res_mesh(resource: str, minor: int,
             # ensures DRBD can still establish the connection even
             # when every direct mesh path is down or hasn't been
             # observed yet (fresh cluster, mid-rejoin, etc.).
-            lb_a = a.get("loopback_ip", "") or a.get("drbd_ip", "")
-            lb_b = b.get("loopback_ip", "") or b.get("drbd_ip", "")
+            lb_a = a.get("loopback_ip", "")
+            lb_b = b.get("loopback_ip", "")
             if lb_a and lb_b:
                 path_blocks.append(
                     f'    path {{\n'
@@ -1017,12 +1006,12 @@ def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
     nodes = (snapshot.get("nodes") or {})
 
     # Build the canonical peers list once: every node currently in the
-    # cluster snapshot, with name + drbd_ip + loopback_ip.
+    # cluster snapshot, with name + loopback_ip.
     peers: list[dict] = []
     for name, n in sorted(nodes.items()):
         peers.append({
             "name": name,
-            "drbd_ip": n.get("drbd_ip", ""),
+            "loopback_ip": n.get("loopback_ip", ""),
             "loopback_ip": n.get("loopback_ip", ""),
         })
 
@@ -1069,7 +1058,7 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
 
     Requires the LV to be unmounted; remounts the DRBD device in its place.
     """
-    assert tier in ("bulk", "critical"), tier
+    assert tier == "critical", tier
     minor = DRBD_MINORS[tier]
     local_mount = str(LOCAL_ROOT / tier)
     drbd_mount = str(MOUNTS_ROOT / f"{tier}-drbd")
@@ -1128,616 +1117,56 @@ def join_drbd_peer(tier: str, peers: list[dict]) -> None:
 
 # ── NFS export (master) and NFS mount (peers) ──────────────────────────────
 
-def nfs_export_drbd_tiers(allowed_subnets: list[str]) -> None:
-    """Export /var/lib/bedrock/mounts/<tier>-drbd to peers."""
-    Path("/etc/exports.d").mkdir(parents=True, exist_ok=True)
-    lines = []
-    for tier in ("bulk", "critical"):
-        path = MOUNTS_ROOT / f"{tier}-drbd"
-        if not path.exists():
-            continue
-        opts = "rw,sync,no_root_squash,no_subtree_check"
-        clauses = " ".join(f"{net}({opts})" for net in allowed_subnets)
-        lines.append(f"{path} {clauses}")
-    Path("/etc/exports.d/bedrock-tiers.exports").write_text("\n".join(lines) + "\n")
-    # ensure nfs-server running
-    run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
-    run("systemctl enable --now nfs-server", check=False)
-    run("exportfs -ra", check=False)
+def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
+    """Master-side N=1 -> N=2 transition.
 
+    Only the **critical** tier gets DRBD-replicated — it hosts the
+    filer's leveldb3 + any other cluster singleton metadata, and
+    the mgmt-master role moves it via cluster_arbiter. Bulk is
+    served by SeaweedFS volumes (one per node, RF managed by
+    SeaweedFS); scratch is per-node local LVM.
 
-def nfs_mount_drbd_tiers(master_drbd_ip: str) -> None:
-    """On a peer: mount each DRBD-backed tier from master via NFS, point
-    /bedrock/<tier> at it.
-
-    Uses fstab + mount (not a systemd .mount unit) — avoids systemd-escape
-    pain with hyphens in mount paths.
+    peer = {"name": "...", "loopback_ip": "..."}
     """
-    run("dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
-    fstab_path = Path("/etc/fstab")
-    text = fstab_path.read_text() if fstab_path.exists() else ""
-    new_lines = text.splitlines()
+    print("  [tier] N=2 master transition: promote critical tier to DRBD primary")
 
-    for tier in ("bulk", "critical"):
-        nfs_mount = MOUNTS_ROOT / f"{tier}-nfs"
-        nfs_mount.mkdir(parents=True, exist_ok=True)
-        remote = f"{master_drbd_ip}:/var/lib/bedrock/mounts/{tier}-drbd"
-        line = (f"{remote} {nfs_mount} nfs "
-                f"rw,nolock,soft,timeo=50,retrans=3,_netdev,nofail 0 0")
-        # Drop any existing line for this mount (idempotent re-runs)
-        new_lines = [ln for ln in new_lines if str(nfs_mount) not in ln]
-        new_lines.append(line)
-
-    fstab_path.write_text("\n".join(new_lines).rstrip() + "\n")
-    run("systemctl daemon-reload", check=False)
-
-    # Mount each tier
-    for tier in ("bulk", "critical"):
-        nfs_mount = MOUNTS_ROOT / f"{tier}-nfs"
-        if not run_ok(f"mountpoint -q {nfs_mount}"):
-            run(f"mount {nfs_mount}", check=False)
-        # Symlink: /bedrock/<tier> -> NFS mountpoint
-        atomic_symlink(str(nfs_mount), PUBLIC_ROOT / tier)
-
-
-# ── Garage admin API helpers ──────────────────────────────────────────────
-#
-# We talk to Garage via the v2 admin API (http://127.0.0.1:3903) rather than
-# parsing `garage` CLI text tables. Rationale: CLI labels and column layouts
-# drift across releases and a parse miss is silent (we read the wrong value).
-# The admin API returns structured JSON whose schema is in OpenAPI v2 and
-# evolves under semver.
-#
-# See `tier_storage.md` § "Garage admin API" and lessons-log L18 / L24.
-
-GARAGE_ADMIN_BASE = f"http://127.0.0.1:{GARAGE_ADMIN_PORT}"
-
-
-def _garage_admin_token(host: str | None = None) -> str:
-    """Read admin_token from /etc/garage.toml on `host` (None = local).
-
-    Garage has a single shared admin token cluster-wide (written by
-    `install_garage_local` from the value passed to `init`/`join`). Reading
-    it from the same config Garage itself reads keeps caller and server
-    in lockstep — no separate secret to plumb.
-    """
-    cmd = r"""awk -F'"' '/^admin_token/{print $2}' /etc/garage.toml"""
-    out = (run(cmd, check=False) if host is None
-           else ssh(host, cmd, check=False)).strip()
-    if not out:
-        where = host or "local"
-        raise RuntimeError(
-            f"admin_token not found in /etc/garage.toml on {where} — "
-            f"Garage admin API needs it.")
-    return out
-
-
-def _garage_api(method: str, path: str, body=None, *,
-                host: str | None = None,
-                token: str | None = None,
-                check: bool = True,
-                timeout: int = 10):
-    """Call the Garage v2 admin API. Returns parsed JSON (or None when
-    `check=False` and the call fails / response is empty).
-
-    `path` includes leading slash and any query string,
-        e.g. "/v2/GetClusterLayout" or "/v2/ListWorkers?node=self".
-    `body` is a Python value JSON-encoded into the request body, or None.
-    `host` selects which node's admin API to call (None = local).
-
-    Local calls go through stdlib urllib (no shell). Remote calls use
-    `curl` over our `ssh()` helper because the admin port may not be
-    routable cluster-wide and the token lives on each node.
-    """
-    if token is None:
-        token = _garage_admin_token(host)
-    payload = "" if body is None else json.dumps(body)
-    url = f"{GARAGE_ADMIN_BASE}{path}"
-
-    if host is None:
-        try:
-            req = urllib.request.Request(
-                url, method=method,
-                data=payload.encode() if body is not None else None,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    **({"Content-Type": "application/json"}
-                       if body is not None else {}),
-                },
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read().decode()
-            return json.loads(raw) if raw else None
-        except (urllib.error.URLError, urllib.error.HTTPError,
-                json.JSONDecodeError) as e:
-            if check:
-                raise RuntimeError(
-                    f"Garage API {method} {path} failed: {e}") from e
-            return None
-
-    # Remote: curl over ssh. Bodies we send never contain single quotes
-    # (we control them: bucket names, hex node ids, integers, "tables"/
-    # "blocks"). If that ever changes, switch to a heredoc here.
-    parts = ["curl -fsS", f"-X {method}",
-             f"-H 'Authorization: Bearer {token}'"]
-    if body is not None:
-        parts.append("-H 'Content-Type: application/json'")
-        parts.append(f"-d '{payload}'")
-    parts.append(f"'{url}'")
-    out = ssh(host, " ".join(parts), check=check)
-    if not out:
-        return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError as e:
-        if check:
-            raise RuntimeError(
-                f"Garage API {method} {path} on {host} returned non-JSON: "
-                f"{out!r}") from e
-        return None
-
-
-# ── Garage installation + cluster formation ───────────────────────────────
-
-def install_garage_local(drbd_ip: str, rpc_secret: str,
-                          admin_token: str) -> None:
-    """Install + start Garage on this node. Idempotent."""
-    # Garage user
-    if not run_ok("id garage &>/dev/null"):
-        run("useradd -r -s /sbin/nologin -d /var/lib/garage garage")
-
-    # Garage data LV (replaces the local scratch LV at N>=2 — but for now we
-    # provision a separate LV so the local scratch data stays accessible
-    # during migration if needed).
-    ensure_thin_lv("garage-data", GARAGE_DATA_LV_GB)
-    ensure_xfs(f"/dev/{VG}/garage-data", "garage-data")
-    ensure_mounted(f"/dev/{VG}/garage-data", GARAGE_DATA_DIR)
-    Path(GARAGE_META_DIR).mkdir(parents=True, exist_ok=True)
-    run(f"chown -R garage:garage /var/lib/garage")
-
-    # Binary
-    if not Path("/usr/local/bin/garage").exists():
-        run(f"curl -fsSL -o /usr/local/bin/garage {GARAGE_URL}", timeout=300)
-        run("chmod +x /usr/local/bin/garage")
-
-    # Config
-    Path("/etc/garage.toml").write_text(
-        f'metadata_dir = "{GARAGE_META_DIR}"\n'
-        f'data_dir     = "{GARAGE_DATA_DIR}"\n'
-        f'db_engine    = "lmdb"\n'
-        f'replication_factor = 1\n'
-        f'rpc_secret      = "{rpc_secret}"\n'
-        f'rpc_bind_addr   = "[::]:{GARAGE_RPC_PORT}"\n'
-        f'rpc_public_addr = "{drbd_ip}:{GARAGE_RPC_PORT}"\n'
-        f'block_size = {GARAGE_BLOCK_BYTES}\n'
-        f'\n'
-        f'[s3_api]\n'
-        f'api_bind_addr = "[::]:{GARAGE_S3_PORT}"\n'
-        f's3_region     = "garage"\n'
-        f'root_domain   = ".s3.scratch.local"\n'
-        f'\n'
-        f'[admin]\n'
-        f'api_bind_addr = "[::]:{GARAGE_ADMIN_PORT}"\n'
-        f'admin_token   = "{admin_token}"\n'
-    )
-    run("chown root:garage /etc/garage.toml && chmod 640 /etc/garage.toml")
-
-    # systemd unit
-    Path("/etc/systemd/system/garage.service").write_text(
-        "[Unit]\n"
-        "Description=Garage S3 (scratch tier)\n"
-        "After=network-online.target\n"
-        "Wants=network-online.target\n"
-        f"RequiresMountsFor={GARAGE_DATA_DIR}\n\n"
-        "[Service]\n"
-        "User=garage\n"
-        "Group=garage\n"
-        "Environment=RUST_LOG=garage=info\n"
-        "ExecStart=/usr/local/bin/garage server\n"
-        "Restart=on-failure\n"
-        "RestartSec=5\n\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
-    run("systemctl daemon-reload")
-    run("systemctl enable --now garage.service", check=False)
-    time.sleep(2)
-
-
-def _self_drbd_ip() -> str:
-    """Pick this node's DRBD IP from /etc/bedrock/state.json."""
-    s = load_state()
-    if s.get("drbd_ip"):
-        return s["drbd_ip"]
-    for n in s.get("hardware", {}).get("nics", []):
-        ip = n.get("ip", "")
-        if ip.startswith("10.99."):
-            return ip
-    return ""
-
-
-def garage_form_cluster(peers_drbd_ips: list[str],
-                         capacity_gb: int = GARAGE_DATA_LV_GB - 2) -> None:
-    """Connect peers + apply cluster layout. Idempotent — re-running just
-    bumps the layout version.
-
-    Talks to each peer's admin API directly (read its node id, stage roles,
-    apply layout). Replaces the prior CLI-fanout shape that parsed
-    `garage layout show` text — see lessons-log L24.
-    """
-    self_ip = _self_drbd_ip()
-    token = _garage_admin_token()  # admin_token is shared cluster-wide
-
-    # Discover each peer's full hex node id and its RPC listen address.
-    ids: dict[str, str] = {}  # drbd_ip -> "<hex>@<addr>"
-    for ip in peers_drbd_ips:
-        host = None if ip == self_ip else ip
-        info = _garage_api("GET", "/v2/GetNodeInfo?node=self",
-                           host=host, token=token, check=False)
-        succ = (info or {}).get("success", {})
-        if not succ:
-            continue
-        my_hex = next(iter(succ.values())).get("nodeId", "")
-        if not my_hex:
-            continue
-        # Cold-start fallback: if the peer hasn't yet learned its addr from
-        # other nodes, GetClusterStatus may not return an addr. Use the DRBD
-        # IP we were called with — Garage's gossip will replace it.
-        addr = f"{ip}:{GARAGE_RPC_PORT}"
-        status = _garage_api("GET", "/v2/GetClusterStatus",
-                             host=host, token=token, check=False) or {}
-        for n in status.get("nodes", []):
-            if n.get("id") == my_hex and n.get("addr"):
-                addr = n["addr"]
-                break
-        ids[ip] = f"{my_hex}@{addr}"
-
-    # Connect from this node to each remote peer (skip self).
-    remote = [v for ip, v in ids.items() if ip != self_ip]
-    if remote:
-        _garage_api("POST", "/v2/ConnectClusterNodes",
-                    body=remote, token=token, check=False)
-
-    time.sleep(2)
-
-    # Stage one role per node — same zone, equal capacity (in BYTES; the
-    # API takes int64, not the CLI's "12G" suffix).
-    capacity_bytes = capacity_gb * (1024 ** 3)
-    roles = [
-        {"id": v.split("@")[0], "zone": "dc1",
-         "capacity": capacity_bytes, "tags": []}
-        for v in ids.values()
-    ]
-    if roles:
-        _garage_api("POST", "/v2/UpdateClusterLayout",
-                    body={"roles": roles}, token=token, check=False)
-
-    # Apply: read the current version from the structured response and
-    # bump by 1. Replaces `parsing "Current cluster layout version: N"`.
-    cur = _garage_api("GET", "/v2/GetClusterLayout",
-                      token=token, check=False) or {}
-    next_version = int(cur.get("version", 0)) + 1
-    _garage_api("POST", "/v2/ApplyClusterLayout",
-                body={"version": next_version}, token=token, check=False)
-
-
-def garage_create_scratch_bucket() -> dict:
-    """Create the 'scratch' bucket + key. Returns {access_key, secret_key}.
-
-    Uses CreateBucket / CreateKey / AllowBucketKey directly and reads
-    `accessKeyId` + `secretAccessKey` from the structured CreateKey
-    response — no more regexing 'Key ID:' / 'Secret key:' labels that
-    drift across Garage versions (lessons-log L24).
-    """
-    token = _garage_admin_token()
-
-    # Bucket: create or recover via global-alias lookup if it already exists.
-    bucket = _garage_api("POST", "/v2/CreateBucket",
-                         body={"globalAlias": "scratch"},
-                         token=token, check=False)
-    if not bucket:
-        bucket = _garage_api(
-            "GET", "/v2/GetBucketInfo?globalAlias=scratch", token=token)
-    bucket_id = bucket["id"]
-
-    # Key: create or recover via name search. Fresh CreateKey returns the
-    # secret in the response; GetKeyInfo only does so with showSecretKey=true.
-    key = _garage_api("POST", "/v2/CreateKey",
-                      body={"name": "scratch-key"},
-                      token=token, check=False)
-    if not key or not key.get("secretAccessKey"):
-        key = _garage_api(
-            "GET", "/v2/GetKeyInfo?search=scratch-key&showSecretKey=true",
-            token=token)
-    ak = key["accessKeyId"]
-    sk = key.get("secretAccessKey") or ""
-
-    # Grant the key full perms on the bucket. Idempotent — repeated calls
-    # just re-set the same flags.
-    _garage_api("POST", "/v2/AllowBucketKey", body={
-        "bucketId": bucket_id,
-        "accessKeyId": ak,
-        "permissions": {"read": True, "write": True, "owner": True},
-    }, token=token, check=False)
-
-    return {"access_key": ak, "secret_key": sk}
-
-
-def s3fs_mount_scratch(access_key: str, secret_key: str,
-                        endpoint_drbd_ip: str | None = None,
-                        migrate_local_data: bool = True) -> None:
-    """Mount Garage's 'scratch' bucket via s3fs at /var/lib/bedrock/mounts/scratch-s3fs
-    and point /bedrock/scratch at it.
-
-    Always uses the LOCAL Garage daemon at 127.0.0.1:3900 (invariant #6
-    in tier_storage.md). The endpoint_drbd_ip arg is accepted for
-    backward compat with older callers but ignored — Garage handles
-    cross-node block lookup internally via its own RPC.
-
-    If `migrate_local_data` is True (default) and the local scratch LV
-    is currently mounted with content, that content is rsync'd into the
-    Garage bucket BEFORE the symlink swap. This preserves data across
-    the N=1 → N=2 promote (lessons-log L15: data may be lost only on
-    node loss, never on a default migration).
-
-    Set migrate_local_data=False on a freshly-joined peer that doesn't
-    have its own local scratch data to migrate (the local LV exists
-    from setup_n1 but is empty; nothing to copy).
-    """
-    # s3fs-fuse is in EPEL on AlmaLinux 9
-    if not run_ok("rpm -q s3fs-fuse >/dev/null 2>&1"):
-        if not run_ok("rpm -q epel-release >/dev/null 2>&1"):
-            run("dnf install -y -q epel-release", timeout=180)
-        run("dnf install -y -q s3fs-fuse", timeout=180)
-    Path("/etc/passwd-s3fs").write_text(f"{access_key}:{secret_key}\n")
-    os.chmod("/etc/passwd-s3fs", 0o600)
-
-    s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
-    s3fs_mount.mkdir(parents=True, exist_ok=True)
-
-    fstab = Path("/etc/fstab")
-    # Always target the LOCAL Garage daemon (invariant #6 in
-    # tier_storage.md, lessons-log L6).
-    line = (f"scratch {s3fs_mount} fuse.s3fs "
-            f"_netdev,allow_other,umask=0022,sigv4,endpoint=garage,"
-            f"use_path_request_style,"
-            f"url=http://127.0.0.1:{GARAGE_S3_PORT},"
-            f"passwd_file=/etc/passwd-s3fs 0 0")
-    text = fstab.read_text() if fstab.exists() else ""
-    if str(s3fs_mount) not in text:
-        fstab.write_text(text.rstrip() + "\n" + line + "\n")
-
-    # Mount s3fs FIRST (before unmounting local) so the migration
-    # has a destination.
-    if not run_ok(f"mountpoint -q {s3fs_mount}"):
-        run(f"mount {s3fs_mount}", check=False)
-
-    # Migrate any local scratch data into the Garage bucket BEFORE
-    # the symlink swap. (L15: scratch data must be preserved on
-    # default N=1 → N=2 promote.)
-    local_scratch = LOCAL_ROOT / "scratch"
-    if migrate_local_data and run_ok(f"mountpoint -q {local_scratch}"):
-        migrate_scratch_into_garage(verify_md5=True)
-    elif run_ok(f"mountpoint -q {local_scratch}"):
-        # Caller said skip migration — just unmount and swap symlink.
-        run(f"umount {local_scratch}", check=False)
-
-    atomic_symlink(str(s3fs_mount), PUBLIC_ROOT / "scratch")
-
-
-def migrate_scratch_into_garage(verify_md5: bool = True) -> None:
-    """Copy any data from the local scratch LV into the Garage scratch
-    bucket via s3fs, atomically swap /bedrock/scratch to point at the
-    Garage mount, then unmount the local LV.
-
-    Symmetric counterpart to `migrate_scratch_out_of_garage()`. Called
-    from `s3fs_mount_scratch()` during N=1 → N=2 promote so the
-    operator's local scratch data is preserved.
-
-    Pre:
-      - local scratch LV is mounted at /var/lib/bedrock/local/scratch
-      - s3fs already mounted at /var/lib/bedrock/mounts/scratch-s3fs
-        (Garage cluster up, scratch bucket created, s3fs operational)
-
-    Post:
-      - all files from local scratch are now objects in the scratch bucket
-      - /bedrock/scratch symlink points at the s3fs mount
-      - local scratch LV is unmounted (LV preserved; operator can
-        lvremove later if disk space is needed)
-      - if verify_md5=True, every file's MD5 was checksummed on both
-        sides before the symlink swap
-
-    Crash-safety:
-      - The rsync runs while /bedrock/scratch still points at the local
-        LV. A crash mid-rsync leaves persistent state at "local mode";
-        re-running converges (rsync skips already-copied files).
-      - The atomic symlink swap is the commit point. After it, new
-        opens go to s3fs; existing fds on the local mount keep
-        working until they close.
-      - The umount happens AFTER the swap, so a crash between commit
-        and umount just leaves the local LV mounted but unused; next
-        boot's fstab won't remount it (we drop the line at the end)
-        and a re-run picks up where it left off.
-    """
-    print(f"  [garage] migrate_scratch_into_garage()")
-
-    s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
-    local_scratch = LOCAL_ROOT / "scratch"
-
-    if not run_ok(f"mountpoint -q {local_scratch}"):
-        # Nothing to migrate
-        return
-    if not run_ok(f"mountpoint -q {s3fs_mount}"):
-        raise RuntimeError(
-            f"s3fs not mounted at {s3fs_mount} — caller must mount "
-            f"the Garage scratch bucket first.")
-
-    # 1. rsync local → s3fs.
-    #    - no -X: xattrs incompatible per L22.
-    #    - --omit-dir-times: s3fs returns EIO when rsync sets the
-    #      destination root dir's mtime (S3 has no notion of directory
-    #      mtime; FUSE bridge surfaces EIO). File mtimes still preserved
-    #      so re-runs remain idempotent on size+mtime. (L26.)
-    print(f"  [garage] rsync pass 1 (local -> Garage)")
-    run(f"rsync -aH --inplace --omit-dir-times "
-        f"{local_scratch}/ {s3fs_mount}/",
-        timeout=24 * 3600)
-
-    # 2. Optional MD5 verification
-    if verify_md5:
-        print(f"  [garage] md5 verify")
-        src_md5 = run(
-            f"cd {local_scratch} && find . -type f -print0 | sort -z | "
-            f"xargs -0 md5sum 2>/dev/null", check=False)
-        dst_md5 = run(
-            f"cd {s3fs_mount} && find . -type f -print0 | sort -z | "
-            f"xargs -0 md5sum 2>/dev/null", check=False)
-        if src_md5 != dst_md5:
-            Path("/tmp/scratch-into-md5-src.log").write_text(src_md5)
-            Path("/tmp/scratch-into-md5-dst.log").write_text(dst_md5)
-            raise RuntimeError(
-                "MD5 verification failed: local and Garage differ. "
-                "Manifests at /tmp/scratch-into-md5-{src,dst}.log. "
-                "Re-run rsync with --checksum, or investigate the diff.")
-
-    # 3. Atomic symlink swap — commit point
-    atomic_symlink(str(s3fs_mount), PUBLIC_ROOT / "scratch")
-    print(f"  [garage] /bedrock/scratch now points at Garage "
-          f"(via local s3fs)")
-
-    # 4. Wait for any open fds on the local mount to drain so we can
-    #    cleanly umount.
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        out = run(f"lsof +D {local_scratch} 2>/dev/null | wc -l",
-                  check=False)
-        try:
-            count = int(out.strip().splitlines()[0])
-        except (ValueError, IndexError):
-            count = 0
-        if count <= 1:
-            break
-        time.sleep(2)
-
-    # 5. Unmount local scratch + drop fstab line
-    run(f"umount {local_scratch} 2>/dev/null", check=False)
-    if run_ok(f"mountpoint -q {local_scratch}"):
-        run(f"umount -l {local_scratch}", check=False)
-
-    fstab = Path("/etc/fstab")
-    if fstab.exists():
-        text = fstab.read_text()
-        new = "\n".join(l for l in text.splitlines()
-                        if str(local_scratch) not in l)
-        fstab.write_text(new + "\n" if new else "")
-
-    print(f"  [garage] local scratch LV unmounted; data now lives in Garage.")
-
-
-# ── Top-level transition orchestration ─────────────────────────────────────
-
-def transition_to_n2_master(self_drbd_ip: str, peer: dict,
-                              rpc_secret: str, admin_token: str) -> dict:
-    """Master-side N=1 -> N=2 transition. Returns garage credentials.
-
-    peer = {"name": "...", "drbd_ip": "..."}
-    """
-    print("  [tier] N=2 master transition: install Garage, promote DRBD bulk+critical, NFS-export")
-
-    # 1. Install Garage locally (master)
-    install_garage_local(self_drbd_ip, rpc_secret, admin_token)
-
-    # 2. Build peer list including self
     self_state = load_state()
     self_name = self_state.get("node_name", "node1")
     peers = [
-        {"name": self_name, "drbd_ip": self_drbd_ip},
+        {"name": self_name, "loopback_ip": self_loopback_ip},
         peer,
     ]
 
-    # 3. Promote bulk + critical to DRBD primary on master
-    for tier in ("bulk", "critical"):
-        promote_local_to_drbd_master(tier, peers)
-        set_tier_state(tier, mode="drbd-nfs", master=self_name,
-                       peers=[p["name"] for p in peers])
+    promote_local_to_drbd_master("critical", peers)
+    set_tier_state("critical", mode="drbd", master=self_name,
+                   peers=[p["name"] for p in peers])
 
-    # 4. NFS export the DRBD-backed mounts. NFS clients are peers'
-    # loopback /32s — all sit inside the cluster's CGNAT /24 (per
-    # cluster_addr.cluster_loopback_net). The historical
-    # "10.99.0.0/24" entry is kept as a legacy fallback for
-    # pre-rewrite clusters that haven't been re-bootstrapped.
-    try:
-        from . import cluster_addr as _ca
-        from . import state as _st
-        _cluster_uuid = (_st.load() or {}).get("cluster_uuid", "")
-        _allowed = [_ca.cluster_loopback_net(_cluster_uuid)] if _cluster_uuid else []
-    except Exception:
-        _allowed = []
-    nfs_export_drbd_tiers(_allowed + ["192.168.2.0/24", "10.99.0.0/24"])
-
-    # 5. Garage cluster formation will happen after the peer's daemon is up;
-    #    that's the peer's responsibility to call back.
-
-    set_tier_state("scratch", mode="garage-pending", master=self_name)
-
-    return {"rpc_secret": rpc_secret, "admin_token": admin_token,
-             "peers": peers}
+    return {"peers": peers}
 
 
-def transition_to_n2_peer(self_drbd_ip: str, master: dict,
-                            rpc_secret: str, admin_token: str,
+def transition_to_n2_peer(self_loopback_ip: str, master: dict,
                             peers: list[dict]) -> None:
-    """Peer-side N=1 -> N=2 transition. Called on the joining node after
-    setup_n1() and after master has set up the export.
+    """Peer-side N=1 -> N=2 transition: unmount local critical LV, join
+    DRBD as Secondary so the initial sync from master overwrites our
+    XFS. Called after setup_n1() on the joiner.
     """
-    print("  [tier] N=2 peer transition: unmount local LVs, join DRBD, NFS-mount, install Garage")
+    print("  [tier] N=2 peer transition: unmount local critical, join DRBD secondary")
+    local_mount = LOCAL_ROOT / "critical"
+    if run_ok(f"mountpoint -q {local_mount}"):
+        run(f"umount {local_mount}", check=False)
+    fstab = Path("/etc/fstab")
+    if fstab.exists():
+        new = []
+        for line in fstab.read_text().splitlines():
+            if str(local_mount) in line and "tier-" in line:
+                continue
+            new.append(line)
+        fstab.write_text("\n".join(new).rstrip() + "\n")
+    join_drbd_peer("critical", peers)
 
-    # 1. Unmount peer's local bulk/critical mounts FIRST. The peer's local
-    #    XFS will be overwritten by the DRBD initial sync from master.
-    #    DRBD `attach` requires the backing LV to be unowned, so this MUST
-    #    happen before drbdadm up.
-    for tier in ("bulk", "critical"):
-        local_mount = LOCAL_ROOT / tier
-        if run_ok(f"mountpoint -q {local_mount}"):
-            run(f"umount {local_mount}", check=False)
-        # Remove the old fstab line (peer no longer mounts the raw LV)
-        fstab = Path("/etc/fstab")
-        if fstab.exists():
-            new = []
-            for line in fstab.read_text().splitlines():
-                if str(local_mount) in line and "tier-" in line:
-                    continue
-                new.append(line)
-            fstab.write_text("\n".join(new).rstrip() + "\n")
-
-    # 2. Join DRBD as Secondary for bulk + critical (initial sync starts auto)
-    for tier in ("bulk", "critical"):
-        join_drbd_peer(tier, peers)
-
-    # 3. NFS-mount bulk + critical from master
-    nfs_mount_drbd_tiers(master["drbd_ip"])
-
-    # 4. Install Garage locally
-    install_garage_local(self_drbd_ip, rpc_secret, admin_token)
-
-
-def finalize_n2_garage(garage_endpoint_drbd_ip: str,
-                        peers_drbd_ips: list[str]) -> dict:
-    """Called on master once all Garage daemons are up. Forms cluster,
-    creates scratch bucket + key, returns credentials. Then both nodes run
-    s3fs_mount_scratch() with these credentials.
-    """
-    garage_form_cluster(peers_drbd_ips)
-    creds = garage_create_scratch_bucket()
-    set_tier_state("scratch", mode="garage", master=None,
-                   garage_endpoint=f"http://{garage_endpoint_drbd_ip}:{GARAGE_S3_PORT}")
-    return creds
-
-
-# ── 3-way critical promotion (N=2 -> N=3) ──────────────────────────────────
 
 def promote_critical_to_3way(third_peer: dict) -> None:
-    """Add a third peer to the critical DRBD resource. bulk stays 2-way.
+    """Add a third peer to the critical DRBD resource.
 
     Run on the master. Assumes the resource was created with --max-peers=7
     so adding a peer is just a config update + drbdadm adjust + new node
@@ -1759,7 +1188,7 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     peers = []
     for name in existing_peer_names + [third_peer["name"]]:
         node = nodes.get(name, {})
-        peers.append({"name": name, "drbd_ip": node.get("drbd_ip", "")})
+        peers.append({"name": name, "loopback_ip": node.get("loopback_ip", "")})
 
     # Local: write new config + adjust kernel.
     write_drbd_resource("critical", peers)
@@ -1788,15 +1217,13 @@ def promote_critical_to_3way(third_peer: dict) -> None:
 
 # ── Decommissioning helpers ────────────────────────────────────────────────
 #
-# These three helpers implement the "shrink the cluster cleanly" path:
+# These two helpers implement the "shrink the cluster cleanly" path:
 #
 #   drbd_remove_peer    — remove a peer from a running DRBD resource (config-first)
-#   garage_drain_node   — drain a Garage node's data to surviving nodes (RF=1 safe)
-#   transfer_mgmt_role  — move mgmt + NFS server + DRBD primary to a new node
+#   transfer_mgmt_role  — move mgmt + DRBD primary to a new node
 #
 # Detailed contracts, invariants, command sequences, and source citations
-# live in tier_storage.md (sections "drbd_remove_peer", "garage_drain_node",
-# "transfer_mgmt_role"). Read those before changing this code.
+# live in tier_storage.md.
 
 
 def drbd_remove_peer(
@@ -1824,7 +1251,7 @@ def drbd_remove_peer(
         leaving_peer_name: peer's hostname as it appears in the .res
         surviving_hosts:  list of mgmt-LAN hosts (or any reachable IP)
                           to SSH into for the per-node operations
-        surviving_peers:  list of {"name": ..., "drbd_ip": ...} for the
+        surviving_peers:  list of {"name": ..., "loopback_ip": ...} for the
                           peers that REMAIN. Required if
                           `bedrock_resource=True` so we can render the
                           new tier config. Optional otherwise.
@@ -1949,156 +1376,6 @@ def drbd_remove_peer(
         print(f"  [tier] drbd_remove_peer({full_res}): done.")
 
 
-def garage_drain_node(
-    departing_node_id_short: str,
-    surviving_admin_host: str,
-    departing_node_admin_host: str,
-    poll_seconds: int = 5,
-    max_wait_seconds: int = 7200,
-) -> None:
-    """Garage-blessed online node decommission.
-
-    Drains a Garage node's data to its peers via Garage's own per-
-    partition block-resync worker. Works at any replication factor
-    INCLUDING RF=1 — Garage's resync mechanism is offload-then-delete:
-    blocks are copied to their new owner BEFORE being deleted from
-    the source, so reads stay correct throughout the transition (the
-    multi-version layout history continues to direct reads to the
-    departing node until each block has been copied).
-
-    Args:
-        departing_node_id_short: 16-char short node id of the leaving Garage daemon
-        surviving_admin_host:    mgmt-LAN host of any surviving node
-                                 (used to issue layout commands; Garage
-                                 propagates them)
-        departing_node_admin_host: mgmt-LAN host of the departing node
-                                 (where we observe + speed up the resync
-                                 worker, and ultimately stop the daemon)
-        poll_seconds:           how often to poll worker state
-        max_wait_seconds:       safety timeout
-
-    Pre: surviving_admin_host can ssh to departing_node_admin_host.
-
-    See tier_storage.md "garage_drain_node" for the command-by-command
-    breakdown and source citations to Garage's block_resync worker.
-    """
-    print(f"  [garage] drain {departing_node_id_short}")
-
-    # All Garage interactions go through the v2 admin API (see
-    # `_garage_api`). The token is shared cluster-wide so we can read it
-    # from any node — survivor + departing both work.
-    surv_token = _garage_admin_token(surviving_admin_host)
-    dep_token  = _garage_admin_token(departing_node_admin_host)
-
-    # The API takes the FULL hex node id, not the short id the CLI
-    # accepts. Resolve via the survivor's GetClusterStatus.
-    status = _garage_api("GET", "/v2/GetClusterStatus",
-                         host=surviving_admin_host, token=surv_token)
-    departing_full = ""
-    for n in status.get("nodes", []):
-        if n.get("id", "").startswith(departing_node_id_short):
-            departing_full = n["id"]
-            break
-    if not departing_full:
-        raise RuntimeError(
-            f"node {departing_node_id_short} not found in cluster status — "
-            f"already removed from layout?")
-
-    # 1. Stage the layout removal + apply. Garage assigns this node's
-    #    partitions to surviving nodes in the new layout version.
-    _garage_api("POST", "/v2/UpdateClusterLayout",
-                body={"roles": [{"id": departing_full, "remove": True}]},
-                host=surviving_admin_host, token=surv_token)
-
-    # Bump the version monotonically (read structured `version`, no parse).
-    cur = _garage_api("GET", "/v2/GetClusterLayout",
-                      host=surviving_admin_host, token=surv_token) or {}
-    next_version = int(cur.get("version", 0)) + 1
-    _garage_api("POST", "/v2/ApplyClusterLayout",
-                body={"version": next_version},
-                host=surviving_admin_host, token=surv_token)
-
-    # 2. Speed up the resync workers on the DEPARTING node (where the
-    #    blocks live). Default tranquility throttles for impact-friendly
-    #    operation; for a controlled drain we want it to drain fast.
-    for var, val in (("resync-tranquility", "0"),
-                     ("resync-worker-count", "8")):
-        _garage_api("POST", "/v2/SetWorkerVariable?node=self",
-                    body={"variable": var, "value": val},
-                    host=departing_node_admin_host, token=dep_token,
-                    check=False)
-
-    # 3. Wait for all "Block resync" workers on the departing node to
-    #    show idle with queueLength in (0, null). The block_resync worker
-    #    is offload-then-delete, so this is exactly the "data is fully
-    #    re-homed" signal we need before stopping the daemon.
-    #
-    # Source: src/block/resync.rs L537 (worker name) + L551 (queueLength)
-    # at https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main-v2/
-    # See lessons-log L18 for the original CLI-table-parsing miss.
-    deadline = time.time() + max_wait_seconds
-    while time.time() < deadline:
-        body = _garage_api("POST", "/v2/ListWorkers?node=self",
-                           body={}, host=departing_node_admin_host,
-                           token=dep_token, check=False)
-        if not body or body.get("error") or not body.get("success"):
-            time.sleep(poll_seconds)
-            continue
-        # success is {<this-node-id-hex>: [worker, worker, ...]}
-        workers = next(iter(body["success"].values()))
-        all_idle = True
-        any_resync = False
-        for w in workers:
-            if not w.get("name", "").startswith("Block resync worker"):
-                continue
-            any_resync = True
-            if w.get("state") != "idle":
-                all_idle = False
-                break
-            if (w.get("queueLength") or 0) > 0:
-                all_idle = False
-                break
-        if any_resync and all_idle:
-            break
-        time.sleep(poll_seconds)
-    else:
-        raise RuntimeError(
-            f"garage drain timeout after {max_wait_seconds}s — "
-            f"workers still not Idle. Investigate before stopping the node.")
-
-    # 4. Verify no errored blocks. ListBlockErrors returns a structured
-    #    array per node — len == 0 is the safety gate. Replaces text-line
-    #    counting that miscounts on header-format changes.
-    errs = _garage_api("GET", "/v2/ListBlockErrors?node=self",
-                       host=departing_node_admin_host, token=dep_token,
-                       check=False) or {}
-    succ = (errs.get("success") or {}) if isinstance(errs, dict) else {}
-    err_list = next(iter(succ.values()), []) if succ else []
-    if err_list:
-        # Show the first few hashes so the operator can investigate.
-        sample = ", ".join(b.get("blockHash", "?") for b in err_list[:3])
-        raise RuntimeError(
-            f"garage block errors on {departing_node_admin_host}: "
-            f"{len(err_list)} entries (e.g. {sample}). "
-            f"NOT safe to remove node yet.")
-
-    # 5. Run repair on the whole cluster to ensure metadata tables and
-    #    block references are consistent. Garage docs recommend this
-    #    after layout changes. Idempotent.
-    for repair_type in ("tables", "blocks"):
-        _garage_api("POST", "/v2/LaunchRepairOperation?node=*",
-                    body={"repairType": repair_type},
-                    host=surviving_admin_host, token=surv_token,
-                    check=False)
-
-    # 6. NOW it is safe to stop Garage on the departing node.
-    ssh(departing_node_admin_host, "systemctl stop garage", check=False)
-    ssh(departing_node_admin_host, "systemctl disable garage",
-        check=False)
-
-    print(f"  [garage] drain complete. Surviving cluster has all data.")
-
-
 def _transfer_mgmt_role_n1(
     old_master_host: str,
     new_master_host: str,
@@ -2212,9 +1489,9 @@ def _transfer_mgmt_role_n1(
 def transfer_mgmt_role(
     old_master_host: str,
     new_master_host: str,
-    new_master_drbd_ip: str,
+    new_master_loopback: str,
     other_peer_hosts: list[str],
-    old_master_drbd_ip: str | None = None,
+    old_master_loopback: str | None = None,
 ) -> None:
     """Move the mgmt + NFS-server + DRBD-primary role to a new node.
 
@@ -2246,11 +1523,11 @@ def transfer_mgmt_role(
                             if old master is already down — see special
                             case below)
         new_master_host:    new master mgmt-LAN address
-        new_master_drbd_ip: new master's IP on the DRBD ring (10.99.0.x)
+        new_master_loopback: new master's loopback /32 in the cluster CGNAT /24
         other_peer_hosts:   mgmt-LAN addresses of every OTHER cluster
                             node (not old master, not new master) — they
                             need their NFS clients re-pointed
-        old_master_drbd_ip: old master's IP on the DRBD ring; if None,
+        old_master_loopback: old master's loopback /32; if None,
                             looked up from cluster.json
     """
     # N=1 fast path: when no tier is in DRBD mode there's no DRBD
@@ -2260,13 +1537,13 @@ def transfer_mgmt_role(
     # re-point peers' ISO-library mount, append MGMT_MASTER. We dispatch
     # to a separate helper here both because the steps are different
     # AND because the original code would have raised "could not
-    # resolve drbd ip" on the very next line in N=1, since drbd_ip is
+    # resolve drbd ip" on the very next line in N=1, since loopback_ip is
     # always empty when there's no DRBD ring.
     cluster = load_cluster()
     tiers = cluster.get("tiers") or {}
     is_n1 = all(
         (tiers.get(t) or {}).get("mode") in (None, "local", "local-thin")
-        for t in ("bulk", "critical")
+        for t in ("critical",)
     )
     if is_n1:
         return _transfer_mgmt_role_n1(
@@ -2275,18 +1552,18 @@ def transfer_mgmt_role(
     print(f"  [mgmt] transfer mgmt+NFS role: {old_master_host} → {new_master_host}")
 
     # 0. Resolve old master's DRBD ip if not given (needed for fstab sed)
-    if old_master_drbd_ip is None:
+    if old_master_loopback is None:
         c = load_cluster()
         for node in c.get("nodes", {}).values():
             if node.get("host") == old_master_host:
-                old_master_drbd_ip = node.get("drbd_ip", "")
+                old_master_loopback = node.get("loopback_ip", "")
                 break
-        if not old_master_drbd_ip:
+        if not old_master_loopback:
             raise RuntimeError(
                 f"could not resolve drbd ip for old master {old_master_host}")
 
     # 1. Verify new master's DRBD secondaries are UpToDate
-    for tier in ("bulk", "critical"):
+    for tier in ("critical",):
         out = ssh(new_master_host, f"drbdadm status tier-{tier}",
                   check=False)
         if "disk:UpToDate" not in out:
@@ -2301,14 +1578,14 @@ def transfer_mgmt_role(
         check=False)
 
     # 3. Unmount + secondary on old master
-    for tier in ("bulk", "critical"):
+    for tier in ("critical",):
         ssh(old_master_host,
             f"umount /var/lib/bedrock/mounts/{tier}-drbd",
             check=False)
         ssh(old_master_host, f"drbdadm secondary tier-{tier}", check=False)
 
     # 4. Promote new master + mount the DRBD-backed XFS
-    for tier in ("bulk", "critical"):
+    for tier in ("critical",):
         ssh(new_master_host, f"drbdadm primary tier-{tier}")
         minor = DRBD_MINORS[tier]
         mount = f"/var/lib/bedrock/mounts/{tier}-drbd"
@@ -2343,7 +1620,7 @@ def transfer_mgmt_role(
     #     master). Without this rsync the new master's `bedrock storage
     #     status` shows "Cluster: <none>" and downstream verbs
     #     (remove-peer, collapse-to-n1) can't resolve peer hostnames
-    #     to drbd_ips. (Lessons-log L28.)
+    #     to loopback_ips. (Lessons-log L28.)
     ssh(new_master_host,
         f"rsync -aHX -e 'ssh -o StrictHostKeyChecking=no' "
         f"root@{old_master_host}:/etc/bedrock/cluster.json "
@@ -2379,15 +1656,15 @@ def transfer_mgmt_role(
     # 9. Re-point NFS clients on every other peer
     for peer in other_peer_hosts:
         ssh(peer,
-            f"sed -i 's|{old_master_drbd_ip}:/var/lib/bedrock/mounts/|"
-            f"{new_master_drbd_ip}:/var/lib/bedrock/mounts/|g' /etc/fstab")
+            f"sed -i 's|{old_master_loopback}:/var/lib/bedrock/mounts/|"
+            f"{new_master_loopback}:/var/lib/bedrock/mounts/|g' /etc/fstab")
         # Also update the ISO library NFS mount unit if present
         ssh(peer,
             f"sed -i 's|{old_master_host}:/opt/bedrock/iso|"
             f"{new_master_host}:/opt/bedrock/iso|g' "
             f"/etc/systemd/system/mnt-isos.mount", check=False)
         ssh(peer, "systemctl daemon-reload", check=False)
-        for tier in ("bulk", "critical"):
+        for tier in ("critical",):
             # Use lazy umount: when the old NFS server has just been
             # demoted, regular umount can return success without
             # actually unmounting — leaving the kernel state pointing
@@ -2401,7 +1678,7 @@ def transfer_mgmt_role(
 
     # 10. Symlink swaps: new master goes to local DRBD mount; old
     #     master (if reachable) goes to NFS-from-new-master.
-    for tier in ("bulk", "critical"):
+    for tier in ("critical",):
         ssh(new_master_host,
             f"ln -sfn /var/lib/bedrock/mounts/{tier}-drbd /bedrock/{tier}.tmp && "
             f"mv -T /bedrock/{tier}.tmp /bedrock/{tier}",
@@ -2410,7 +1687,7 @@ def transfer_mgmt_role(
         ssh(old_master_host,
             f"mkdir -p /var/lib/bedrock/mounts/{tier}-nfs && "
             f"grep -q '{tier}-nfs' /etc/fstab || echo "
-            f"'{new_master_drbd_ip}:/var/lib/bedrock/mounts/{tier}-drbd "
+            f"'{new_master_loopback}:/var/lib/bedrock/mounts/{tier}-drbd "
             f"/var/lib/bedrock/mounts/{tier}-nfs nfs "
             f"rw,nolock,soft,timeo=50,retrans=3,_netdev,nofail 0 0' "
             f">> /etc/fstab && "
@@ -2421,7 +1698,7 @@ def transfer_mgmt_role(
 
     # 11. Update cluster.json on the new master + propagate.
     #     Two updates per node:
-    #       a) tier.master       — bulk + critical → new_master_name
+    #       a) tier.master       — critical → new_master_name
     #       b) nodes[*].role     — old master demoted to "compute";
     #                              new master upgraded to "mgmt+compute".
     #     Without (b), `bedrock storage remove-peer` would refuse to
@@ -2443,7 +1720,7 @@ def transfer_mgmt_role(
             f"c=json.loads(p.read_text()) if p.exists() else {{}}; "
             f"c.setdefault(\"tiers\",{{}}); "
             f"[c[\"tiers\"].setdefault(t,{{}}).update("
-            f"{{\"master\":\"{new_master_name}\"}}) for t in (\"bulk\",\"critical\")]; "
+            f"{{\"master\":\"{new_master_name}\"}}) for t in (\"critical\",)]; "
             f"nodes=c.setdefault(\"nodes\",{{}}); "
             f"nodes.setdefault(\"{new_master_name}\",{{}})[\"role\"]=\"mgmt+compute\"; "
             f"old=nodes.get(\"{old_master_name}\"); "
@@ -2496,42 +1773,6 @@ def transfer_mgmt_role(
             print(f"  [state] set_mgmt_master write skipped: {e}")
 
     print(f"  [mgmt] transfer complete. New master: {new_master_host} ({new_master_name})")
-
-
-def nfs_export_drbd_tiers_remote(host: str) -> None:
-    """Set up NFS exports for tier-bulk/critical on a remote host.
-
-    The remote variant of nfs_export_drbd_tiers — used by
-    transfer_mgmt_role. Idempotent.
-    """
-    exports = (
-        "/var/lib/bedrock/mounts/bulk-drbd     "
-        "192.168.2.0/24(rw,sync,no_root_squash,no_subtree_check) "
-        "10.99.0.0/24(rw,sync,no_root_squash,no_subtree_check)\n"
-        "/var/lib/bedrock/mounts/critical-drbd "
-        "192.168.2.0/24(rw,sync,no_root_squash,no_subtree_check) "
-        "10.99.0.0/24(rw,sync,no_root_squash,no_subtree_check)\n"
-    )
-    import base64
-    b = base64.b64encode(exports.encode()).decode()
-    ssh(host, "mkdir -p /etc/exports.d")
-    ssh(host, f"echo {b} | base64 -d > /etc/exports.d/bedrock-tiers.exports")
-    ssh(host, "dnf install -y -q nfs-utils >/dev/null 2>&1", check=False)
-    ssh(host, "systemctl enable --now nfs-server", check=False)
-    ssh(host, "exportfs -ra", check=False)
-
-
-# ── Final-collapse helpers (N=2 → N=1, last surviving node) ───────────────
-#
-#   drbd_demote_to_local           — turn a single-peer DRBD into a local LV
-#   migrate_scratch_out_of_garage  — migrate scratch data out of Garage into
-#                                    a local LV; stop Garage cleanly
-#
-# These run on the LAST surviving node when collapsing the cluster back to
-# single-node operation. They pair with drbd_remove_peer and
-# garage_drain_node, which are what get you DOWN to a single peer / single
-# Garage node first. See tier_storage.md sections "drbd_demote_to_local"
-# and "migrate_scratch_out_of_garage" for full operational specs.
 
 
 def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
@@ -2657,198 +1898,6 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
     return True
 
 
-def migrate_scratch_out_of_garage(
-    verify_md5: bool = True,
-    keep_garage: bool = False,
-) -> None:
-    """Migrate all scratch data out of Garage into a local LV; then
-    decommission Garage on this node.
-
-    Used at the end of cluster collapse (N=1, last node) to return the
-    scratch tier to a plain local-LV mount and stop Garage entirely.
-
-    Pre:
-      - This node is the only Garage cluster member (after
-        garage_drain_node has drained every other node).
-      - /var/lib/bedrock/local/scratch's underlying LV exists (created
-        in setup_n1; may currently be unmounted because s3fs is using
-        the public symlink).
-      - There is enough free space in the local thin pool to hold the
-        current Garage scratch dataset.
-
-    Effects (in order, with crash-safety annotations):
-      1. Mount the local scratch LV at /var/lib/bedrock/local/scratch.
-      2. rsync from /bedrock/scratch (s3fs view) to local mount, twice
-         (first pass while in-flight, second pass to catch deltas).
-      3. (optional) MD5 verification that every file in local matches
-         the s3fs source.
-      4. atomic_symlink /bedrock/scratch → local mount  (commit point)
-      5. Wait for any process still using the s3fs mount via the OLD
-         symlink target to release file handles (lsof poll).
-      6. umount s3fs; remove fstab entry.
-      7. Update set_tier_state(scratch, mode="local").
-      8. systemctl stop garage; systemctl disable garage.
-      9. (optional) lvremove garage-data; rm /etc/garage.toml +
-         /var/lib/garage/meta directory.
-
-    The crash-window is between step 4 (symlink swap) and step 6
-    (umount): if power is lost there, on next boot fstab still has
-    the s3fs line, garage.service starts, scratch returns to s3fs.
-    Operator re-runs the function and it picks up where it left off
-    (idempotent: rsync sees "no changes," symlink already correct,
-    umount + stop garage proceed).
-
-    Args:
-      verify_md5:  if True, hash every file in local + s3fs and
-                   compare. Default True. Set False for very large
-                   datasets where hashing time is prohibitive.
-      keep_garage: if True, do NOT stop/disable garage at step 8.
-                   Useful if other things use the Garage cluster.
-                   Default False — this is the "last node, full
-                   collapse" case.
-    """
-    print(f"  [garage] migrate_scratch_out_of_garage()")
-
-    s3fs_mount = MOUNTS_ROOT / "scratch-s3fs"
-    local_mount = LOCAL_ROOT / "scratch"
-    data_lv = f"/dev/{VG}/tier-scratch"
-
-    # 0. Pre-flight — local LV exists?
-    if not lv_exists("tier-scratch"):
-        raise RuntimeError(
-            "tier-scratch LV missing — was setup_n1 ever run on this node? "
-            "Cannot migrate without a destination.")
-
-    # 1. Mount local scratch LV (might already be mounted; idempotent)
-    Path(local_mount).mkdir(parents=True, exist_ok=True)
-    fstype = run(f"blkid -s TYPE -o value {data_lv} 2>/dev/null",
-                 check=False)
-    if fstype != "xfs":
-        run(f"mkfs.xfs -f -L scratch {data_lv}")
-    if not run_ok(f"mountpoint -q {local_mount}"):
-        run(f"mount {data_lv} {local_mount}")
-
-    # 1b. Pre-flight — enough free space in thin pool for the data?
-    src_bytes = run(f"du -sb {s3fs_mount} 2>/dev/null | awk '{{print $1}}'",
-                    check=False)
-    try:
-        src_bytes = int(src_bytes)
-    except ValueError:
-        src_bytes = 0
-    pool_free_mb = run(
-        f"lvs --noheadings --units m -o lv_size,data_percent "
-        f"{VG}/{THINPOOL} | awk '{{size=$1; pct=$2+0; "
-        f"gsub(/m/,\"\",size); print size*(100-pct)/100}}'",
-        check=False)
-    try:
-        free_bytes = int(float(pool_free_mb)) * 1024 * 1024
-    except ValueError:
-        free_bytes = 0
-    if free_bytes < src_bytes * 1.1:    # 10% headroom
-        raise RuntimeError(
-            f"thin pool free space {free_bytes/1e9:.1f} GB insufficient "
-            f"for scratch dataset {src_bytes/1e9:.1f} GB + 10% headroom. "
-            f"Free up the pool or extend it before retrying.")
-
-    # 2. rsync, twice. The first pass copies most data while the
-    #    cluster may still be writing; the second pass catches deltas
-    #    after we have the symlink-swap commit point ready.
-    print(f"  [garage] rsync pass 1 (bulk copy)")
-    # NOTE: rsync -X (extended attrs) deliberately omitted here.
-    # s3fs reports SELinux/xattr contexts inconsistently with the
-    # destination XFS, causing "lremovexattr: Permission denied"
-    # mid-copy. Plain -aH preserves what we actually need
-    # (perms, times, hardlinks). See lessons-log L22.
-    run(f"rsync -aH --inplace {s3fs_mount}/ {local_mount}/",
-        timeout=24 * 3600)
-
-    # 3. (Optional) MD5 verify before the commit
-    if verify_md5:
-        print(f"  [garage] md5 verify")
-        # Generate manifests and compare. We use sorted output for
-        # deterministic diff.
-        src_md5 = run(
-            f"cd {s3fs_mount} && find . -type f -print0 | sort -z | "
-            f"xargs -0 md5sum 2>/dev/null", check=False)
-        dst_md5 = run(
-            f"cd {local_mount} && find . -type f -print0 | sort -z | "
-            f"xargs -0 md5sum 2>/dev/null", check=False)
-        if src_md5 != dst_md5:
-            # Save both manifests for debugging
-            Path("/tmp/scratch-md5-src.log").write_text(src_md5)
-            Path("/tmp/scratch-md5-dst.log").write_text(dst_md5)
-            raise RuntimeError(
-                "MD5 verification failed: src and local differ. "
-                "Manifests saved to /tmp/scratch-md5-{src,dst}.log. "
-                "Re-run rsync with --checksum, or investigate the diff.")
-
-    # 4. Commit point — symlink swap. New opens of /bedrock/scratch
-    #    now go to local LV. Any process that already had a file open
-    #    via the s3fs mount keeps reading from the old inode.
-    atomic_symlink(str(local_mount), PUBLIC_ROOT / "scratch")
-    print(f"  [garage] /bedrock/scratch now points at local LV "
-          f"{local_mount}")
-
-    # 5. Wait for s3fs to be unused so we can cleanly umount.
-    #    lsof returns 0 entries when nothing has files open inside.
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        out = run(f"lsof +D {s3fs_mount} 2>/dev/null | wc -l",
-                  check=False)
-        try:
-            count = int(out.strip().splitlines()[0])
-        except (ValueError, IndexError):
-            count = 0
-        if count <= 1:   # 1 = header line; 0 = totally empty
-            break
-        time.sleep(2)
-
-    # 6. umount s3fs; drop the fstab line
-    run(f"umount {s3fs_mount} 2>/dev/null", check=False)
-    if run_ok(f"mountpoint -q {s3fs_mount}"):
-        # lazy fallback if normal umount failed
-        run(f"umount -l {s3fs_mount}", check=False)
-    fstab = Path("/etc/fstab")
-    if fstab.exists():
-        text = fstab.read_text()
-        new = "\n".join(l for l in text.splitlines()
-                        if "fuse.s3fs" not in l)
-        fstab.write_text(new + "\n" if new else "")
-
-    # 7. Persist in cluster.json
-    set_tier_state("scratch", mode="local",
-                   master=None,
-                   backend_path=str(local_mount),
-                   garage_endpoint=None)
-
-    # 8. Stop + disable Garage (unless caller said keep)
-    if not keep_garage:
-        run("systemctl stop garage", check=False)
-        run("systemctl disable garage", check=False)
-
-        # 9. Optional disk-space reclaim. Garage's data LV and its
-        #    metadata directory are no longer needed.
-        run(f"umount /var/lib/garage/data 2>/dev/null", check=False)
-        run(f"lvremove -f {VG}/garage-data 2>/dev/null", check=False)
-        # Remove fstab line for garage-data
-        if fstab.exists():
-            text = fstab.read_text()
-            new = "\n".join(l for l in text.splitlines()
-                            if "garage-data" not in l)
-            fstab.write_text(new + "\n" if new else "")
-        run("rm -rf /var/lib/garage", check=False)
-        run("rm -f /etc/garage.toml /etc/systemd/system/garage.service "
-            "/etc/passwd-s3fs", check=False)
-        run("systemctl daemon-reload", check=False)
-
-    print(f"  [garage] scratch migrated to local LV; "
-          f"Garage decommissioned." if not keep_garage else
-          f"  [garage] scratch migrated to local LV; "
-          f"Garage left running per keep_garage=True.")
-
-
-# ── Clean-leave: node reset to post-bootstrap / pre-init state ────────────
-
 def node_reset_local() -> None:
     """Bring this node back to its post-`bedrock bootstrap` state.
 
@@ -2857,11 +1906,10 @@ def node_reset_local() -> None:
     when an operator manually wants to take this node out of service.
 
     What this clears:
-      - Stops bedrock services (mgmt/vm/vl/garage/nfs-server/mnt-isos)
+      - Stops bedrock services (mgmt/vm/vl/weed-*)
       - Tears down DRBD resources + removes /etc/drbd.d/tier-*.res
-      - Unmounts everything bedrock-related (NFS, s3fs, DRBD, local LVs)
+      - Unmounts everything bedrock-related (FUSE mounts, DRBD, local LVs)
       - Drops fstab entries for bedrock mounts
-      - Removes NFS exports + garage config + s3fs creds + units
       - Removes tier LVs from the bedrock VG (data goes away — operator
         already accepted this by running remove-peer)
       - Removes /bedrock/* symlinks and /opt/bedrock/{mgmt,iso,data}
@@ -2885,13 +1933,14 @@ def node_reset_local() -> None:
 
     # 1. Stop services. Best-effort — the service might not exist on this node.
     services = ("bedrock-mgmt", "bedrock-vm", "bedrock-vl",
-                "mnt-isos.mount", "mnt-isos.automount",
-                "nfs-server", "garage")
+                "bedrock-weed-master", "bedrock-weed-volume",
+                "bedrock-weed-filer", "bedrock-weed-s3",
+                "bedrock-weed-isos-mount.service")
     run(f"systemctl stop {' '.join(services)} 2>/dev/null", check=False)
     run(f"systemctl disable {' '.join(services)} 2>/dev/null", check=False)
 
     # 2. DRBD resources down + .res cleanup. Best-effort.
-    for tier in ("bulk", "critical"):
+    for tier in ("critical",):
         run(f"drbdadm down tier-{tier} 2>/dev/null", check=False)
         run(f"drbdsetup down tier-{tier} 2>/dev/null", check=False)
     run("rm -f /etc/drbd.d/tier-*.res /etc/drbd.d/tier-*.res.removed-* "
@@ -2900,15 +1949,11 @@ def node_reset_local() -> None:
     # 3. Unmount anything bedrock-touched. Two passes (normal then lazy)
     #    to handle any stuck handles per L16.
     mounts = (
-        "/var/lib/bedrock/mounts/scratch-s3fs",
-        "/var/lib/bedrock/mounts/bulk-nfs",
-        "/var/lib/bedrock/mounts/critical-nfs",
-        "/var/lib/bedrock/mounts/bulk-drbd",
         "/var/lib/bedrock/mounts/critical-drbd",
         "/var/lib/bedrock/local/scratch",
         "/var/lib/bedrock/local/bulk",
         "/var/lib/bedrock/local/critical",
-        "/var/lib/garage/data",
+        "/var/lib/bedrock/seaweedfs",
         "/mnt/isos",
     )
     for mp in mounts:
@@ -2916,29 +1961,23 @@ def node_reset_local() -> None:
             run(f"umount {mp} 2>/dev/null || umount -l {mp} 2>/dev/null",
                 check=False)
 
-    # 4. Drop fstab lines for anything bedrock-related. Use a token list
-    #    that matches every kind of mount we've ever installed.
+    # 4. Drop fstab lines for anything bedrock-related.
     fstab = Path("/etc/fstab")
     if fstab.exists():
-        tokens = ("/var/lib/bedrock", "/var/lib/garage",
-                  "scratch-s3fs", "tier-", "garage-data",
-                  "/mnt/isos", " /bedrock/")
+        tokens = ("/var/lib/bedrock", "tier-", "/mnt/isos", " /bedrock/")
         new = [l for l in fstab.read_text().splitlines()
                if not any(t in l for t in tokens)]
         fstab.write_text("\n".join(new).rstrip() + "\n")
 
-    # 5. NFS exports
-    run("rm -f /etc/exports.d/bedrock-*.exports 2>/dev/null", check=False)
-    run("exportfs -ra 2>/dev/null", check=False)
+    # 5. SeaweedFS state — config files (filer.toml + master/volume
+    #    runtime data) are reset on every fresh setup, but tear down
+    #    here so a `node_reset_local` truly takes us back to bootstrap.
+    run("rm -rf /etc/seaweedfs /var/lib/bedrock/seaweedfs "
+        "/var/lib/bedrock/cluster/seaweedfs 2>/dev/null", check=False)
 
-    # 6. Garage config + creds + unit
-    run("rm -f /etc/garage.toml /etc/passwd-s3fs "
-        "/etc/systemd/system/garage.service 2>/dev/null", check=False)
-    run("rm -rf /var/lib/garage 2>/dev/null", check=False)
-
-    # 7. Tier LVs. Lvremove fails harmlessly if the LV is already gone.
+    # 6. Tier LVs. Lvremove fails harmlessly if the LV is already gone.
     for lv in ("tier-scratch", "tier-bulk", "tier-critical",
-               "tier-bulk-meta", "tier-critical-meta", "garage-data"):
+               "tier-critical-meta"):
         run(f"lvremove -fy bedrock/{lv} 2>/dev/null", check=False)
 
     # 8. /bedrock/* symlinks

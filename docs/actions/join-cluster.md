@@ -17,7 +17,7 @@ bedrock join --witness <mgmt-host> [--yes]
 
 - `bedrock bootstrap` completed on this node.
 - The target cluster's mgmt node is reachable on port 8080.
-- This node's DRBD NIC (eth1 / `bedrock-drbd`) has a 10.99.0.X address
+- This node's DRBD NIC (eth1 / `bedrock-drbd`) has a 100.X.Y.Z address
   (done by cloud-init in the testbed, by the operator on physical hw).
 
 ## Sequence
