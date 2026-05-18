@@ -138,12 +138,25 @@ def _cluster_size() -> int:
 def _drbd_promote() -> None:
     log.info("arbiter: drbdadm primary %s", TIER_RESOURCE)
     rc, _, err = _run(["drbdadm", "primary", TIER_RESOURCE], timeout=30)
-    if rc != 0:
-        # `--force` shouldn't be needed if the cluster is healthy;
-        # the witness-aware election path is what authorises us to
-        # take over. Leave forcing to operators / Phase D's
-        # generation-guarded promote path.
-        raise RuntimeError(f"drbdadm primary {TIER_RESOURCE} failed: {err.strip()}")
+    if rc == 0:
+        return
+    # Failover case: the previous primary is unreachable (we got here
+    # via cluster election → set_mgmt_master → converge), so DRBD's
+    # "Need access to UpToDate data" check refuses without --force.
+    # The election (lib/election.py) + witness DRBD-UUID blessing
+    # (lib/witness.py) are the single source of authority for who
+    # owns the data — if they say we're master, we are. --force here
+    # is correct.
+    if "uptodate" in err.lower() or "need access" in err.lower():
+        log.warning("arbiter: drbdadm primary refused (peer unreachable); "
+                    "retrying with --force per election authority")
+        rc, _, err = _run(
+            ["drbdadm", "--", "--force", "primary", TIER_RESOURCE],
+            timeout=30,
+        )
+        if rc == 0:
+            return
+    raise RuntimeError(f"drbdadm primary {TIER_RESOURCE} failed: {err.strip()}")
 
 
 def _drbd_secondary() -> None:
