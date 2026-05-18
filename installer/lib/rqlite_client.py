@@ -52,7 +52,27 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("bedrock.rqlite_client")
 
-DEFAULT_HOST = "127.0.0.1"
+def _default_host() -> str:
+    """The per-node rqlited binds to the node's loopback /32 in the
+    cluster CGNAT range — not 127.0.0.1 — so two rqlite instances
+    (per-node + arbiter at .254/32) can coexist on the same host
+    using the same ports but distinct bind addresses. Look the IP up
+    from state.json; fall back to 127.0.0.1 for tests and any caller
+    before state.json exists.
+    """
+    try:
+        import json
+        from pathlib import Path
+        s = json.loads(Path("/etc/bedrock/state.json").read_text())
+        lo = s.get("loopback_ip", "")
+        if lo:
+            return lo
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+DEFAULT_HOST = _default_host()
 DEFAULT_PORT = 4001  # rqlite's HTTP API port; Raft itself is on 4002
 DEFAULT_TIMEOUT_S = 10.0
 
