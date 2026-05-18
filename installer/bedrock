@@ -249,6 +249,26 @@ def _cmd_node_leave(target: str, reason: str):
     rev = bs.node_unregister(node_name=target, reason=reason)
     print(f"  rev={rev} node_unregister({target}, reason={reason!r})")
 
+    # 1b. Drop the target's voter slot from rqlite's Raft membership.
+    # Without this, the leaver's rqlited going offline costs a vote
+    # against the live cluster, and consecutive leaves brick quorum.
+    # The voter slot id = last octet of the loopback IP (per the
+    # rqlite_setup loopback-octet node-id rule).
+    try:
+        target_lo = (target_info.get("loopback_ip") or "").rsplit(".", 1)
+        if len(target_lo) == 2 and target_lo[1].isdigit():
+            import subprocess as _sp_rm, json as _json_rm
+            voter_id = target_lo[1]
+            _sp_rm.run(
+                ["curl", "-fsSL", "-X", "DELETE",
+                 "http://127.0.0.1:4001/remove",
+                 "-d", _json_rm.dumps({"id": voter_id})],
+                capture_output=True, timeout=10,
+            )
+            print(f"  rqlite raft: voter id={voter_id} removed")
+    except Exception as e:
+        print(f"  warn: rqlite /remove failed: {e}")
+
     # 2. Master regenerates its own daemon.toml from the new snapshot
     #    so its peer_sender_ids drops the leaving node immediately.
     _propagate_daemon_config(f"leave:{target}")

@@ -175,8 +175,17 @@ def write_scrape_config(cluster: dict):
     # drops zero scrapes. Best-effort: if the unit isn't here yet (early
     # init), the reconciler will start vmagent on the next log fold with
     # the fresh scrape.yml already on disk.
-    subprocess.run("systemctl restart bedrock-vmagent.service",
-                   shell=True, check=False, capture_output=True, timeout=5)
+    # Fire-and-forget so a slow `systemctl restart` doesn't block the
+    # FastAPI startup lifespan. Mgmt would otherwise loop-crash if the
+    # vmagent unit takes >5s to settle (which it does when other
+    # services are racing for the same systemd lock at install time).
+    try:
+        subprocess.Popen(
+            ["systemctl", "restart", "--no-block", "bedrock-vmagent.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def get_nodes() -> dict:

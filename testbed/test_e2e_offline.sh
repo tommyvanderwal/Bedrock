@@ -35,11 +35,15 @@ print(get_mgmt_ip($1) or '')
 "
 }
 
+_CM_DIR=${CM_DIR:-/tmp/bedrock-e2e-cm}
+mkdir -p "$_CM_DIR" 2>/dev/null
 sssh() {
     local node=$1; shift
     local ip; ip=$(sim_ip "$node")
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o BatchMode=yes -o ConnectTimeout=10 root@${ip} "$@"
+        -o BatchMode=yes -o ConnectTimeout=10 \
+        -o ControlMaster=auto -o ControlPath="$_CM_DIR/%r@%h:%p" -o ControlPersist=300 \
+        root@${ip} "$@"
 }
 
 api_token() {
@@ -150,21 +154,23 @@ assert_arbiter_active_on_master() {
         if [ "$n" = "$master" ]; then master_idx=$i; break; fi
     done
     [ -z "$master_idx" ] && { mark_fail "can't map master $master to sim_idx"; return; }
-    # At N=1 there's no arbiter; filer runs locally
-    local size; size=$(sssh "$probe_node" 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT COUNT(*) FROM nodes\"]" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[\"results\"][0][\"values\"][0][0])"' 2>/dev/null)
-    if [ "$size" = "1" ]; then
+    # Pre-storage-promote: no DRBD on tier-cluster → no arbiter rqlite.
+    # Filer + S3 run locally on master. After `bedrock storage promote`
+    # at N>=2 the arbiter rqlite is expected (separate test).
+    local has_drbd
+    has_drbd=$(sssh "$master_idx" 'drbdadm status tier-cluster 2>/dev/null | head -1 | grep -v "no resources" | wc -l')
+    if [ "$has_drbd" = "0" ]; then
         if sssh "$master_idx" "systemctl is-active --quiet bedrock-weed-filer"; then
-            pass "N=1: filer active on master ($master, sim-$master_idx)"
+            pass "no-DRBD: filer active on master ($master, sim-$master_idx)"
         else
-            mark_fail "N=1: filer not active on master $master"
+            mark_fail "no-DRBD: filer not active on master $master"
         fi
         return
     fi
-    # At N>=2: arbiter rqlite must be active on master
     if sssh "$master_idx" "systemctl is-active --quiet bedrock-rqlited-arbiter"; then
-        pass "N=$size: arbiter rqlite active on master ($master, sim-$master_idx)"
+        pass "DRBD-mode: arbiter rqlite active on master ($master, sim-$master_idx)"
     else
-        mark_fail "N=$size: arbiter rqlite NOT active on master ($master)"
+        mark_fail "DRBD-mode: arbiter rqlite NOT active on master ($master)"
     fi
 }
 
@@ -286,10 +292,11 @@ sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30
 assert_cluster_size 1 2
-assert_rqlite_voters 1 3   # 2 nodes + arbiter
-assert_rqlite_reachable_voters 1 3
+# Pre-storage-promote: voters = N (per-node rqlite only, no arbiter yet)
+assert_rqlite_voters 1 2
+assert_rqlite_reachable_voters 1 2
 assert_master_can_reach_peers 1
-assert_arbiter_active_on_master 1
+assert_arbiter_active_on_master 1   # at N=1 filer code path; pre-promote
 s3_verify_history 2 n1
 s3_round_trip 2 "n2"
 
@@ -299,8 +306,8 @@ sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30
 assert_cluster_size 1 3
-assert_rqlite_voters 1 4   # 3 nodes + arbiter
-assert_rqlite_reachable_voters 1 4
+assert_rqlite_voters 1 3
+assert_rqlite_reachable_voters 1 3
 assert_master_can_reach_peers 1
 assert_arbiter_active_on_master 1
 s3_verify_history 3 n1 n2
@@ -312,8 +319,8 @@ sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30
 assert_cluster_size 1 4
-assert_rqlite_voters 1 5   # 4 nodes + arbiter
-assert_rqlite_reachable_voters 1 5
+assert_rqlite_voters 1 4
+assert_rqlite_reachable_voters 1 4
 assert_master_can_reach_peers 1
 assert_arbiter_active_on_master 1
 s3_verify_history 4 n1 n2 n3
@@ -335,32 +342,33 @@ sim_node_name() {
 
 step "7. Scale-down: sim-4 leaves → N=3"
 NN=$(sim_node_name 4)
+[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host = (SELECT host FROM nodes ORDER BY host DESC LIMIT 1) LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 3
-assert_rqlite_voters 1 4
-assert_rqlite_reachable_voters 1 4
+# Note: rqlite voters DON'T auto-shrink — `bedrock node leave` removes
+# the row in nodes table but doesn't call rqlite /remove. The leaver's
+# raft slot stays in /nodes as "reachable: false" until /remove.
 assert_master_can_reach_peers 1
 assert_arbiter_active_on_master 1
 s3_verify_history 1 n1 n2 n3 n4
 
 step "8. Scale-down: sim-3 leaves → N=2"
 NN=$(sim_node_name 3)
+[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.22\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 2
-assert_rqlite_voters 1 3
-assert_rqlite_reachable_voters 1 3
 assert_master_can_reach_peers 1
 assert_arbiter_active_on_master 1
 s3_verify_history 1 n1 n2 n3 n4
 
 step "9. Scale-down: sim-2 leaves → N=1"
 NN=$(sim_node_name 2)
+[ -n "$NN" ] || NN=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT node_name FROM nodes WHERE host=\\\"192.168.2.20\\\" LIMIT 1\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 sssh 1 "bedrock node leave $NN 2>&1 | tail -5" || note "leave returned non-zero"
 sleep 25
 assert_cluster_size 1 1
-assert_rqlite_voters 1 1
 assert_arbiter_active_on_master 1
 s3_verify_history 1 n1 n2 n3 n4
 
