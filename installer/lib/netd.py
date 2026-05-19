@@ -809,7 +809,16 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         if not n.peer_node:
             continue
         # ANY logged-up link to a peer = the peer is reachable.
-        peer_liveness[n.peer_node] = peer_liveness.get(n.peer_node, False) or n.logged_up
+        # Do NOT use setdefault here: a not-yet-logged_up neighbour
+        # must remain absent from peer_liveness (and therefore from
+        # the members set) so n_nodes stays small at startup. The
+        # ever_seen_peers gate ensures that once a peer has reached
+        # logged_up at least once, it persists in peer_liveness even
+        # if its link later goes silent.
+        if n.peer_node in peer_liveness:
+            peer_liveness[n.peer_node] = peer_liveness[n.peer_node] or n.logged_up
+        elif n.logged_up:
+            peer_liveness[n.peer_node] = True
 
     # 3. Cluster snapshot from cluster.json (lightweight read each tick).
     try:
