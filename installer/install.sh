@@ -140,7 +140,13 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited-arbiter.service" \
 mkdir -p /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
 chmod 700 /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
 systemctl daemon-reload
-systemctl enable bedrock-rqlited.service >/dev/null 2>&1 || true
+# Do NOT enable bedrock-rqlited here. Its EnvironmentFile=/etc/bedrock/
+# rqlited.env doesn't exist until `bedrock init`/`join` writes it.
+# Auto-starting at multi-user.target would crash-loop rqlited AND
+# (via Requires=bedrock-net.service) drag bedrock-net into the same
+# crash-loop — both hitting StartLimitBurst before the operator
+# even has a chance to run init. `bedrock init`/`join` enables +
+# starts it once the prereqs are in place.
 
 # DRBD + libvirtd are NOT auto-started at boot. The mgmt service's
 # orchestrator decides when it's safe (cluster contact established,
