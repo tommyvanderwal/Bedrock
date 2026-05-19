@@ -395,21 +395,7 @@ def arbiter_status() -> dict:
 def i_should_host_arbiter() -> bool:
     """Decide from state.json: does this node currently hold the
     mgmt master role? Returns False if state.json is missing or
-    role isn't mgmt+compute.
-
-    Also returns False if the fence marker is present: netd has just
-    self-demoted us because we lost quorum, and the role bit in
-    state.json hasn't caught up (rqlite is unreachable in NoQuorum
-    so the subscriber can't project the new role). Without this
-    check, converge() would promote-back-to-host within seconds of
-    netd's demote, putting .254 back on lo and re-claiming DRBD
-    primary on an isolated node — exactly what the demote was
-    avoiding."""
-    try:
-        if Path("/run/bedrock-cluster.fence").exists():
-            return False
-    except Exception:
-        pass
+    role isn't mgmt+compute."""
     try:
         s = json.loads(STATE_JSON.read_text())
         return "mgmt" in (s.get("role") or "")
