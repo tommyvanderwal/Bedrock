@@ -63,6 +63,22 @@ ARBITER_OCTET   = 254
 CLUSTER_JSON    = Path("/etc/bedrock/cluster.json")
 STATE_JSON      = Path("/etc/bedrock/state.json")
 
+# Under the unified bedrock-d daemon: bedrock-d.main() wires its
+# BedrockState here so cluster_arbiter can read netd's live election
+# outcome directly instead of state.json["role"] (which lags behind
+# netd by an rqlite round-trip, and at N=2 may never settle because
+# rqlite can't form quorum until the arbiter we're deciding about is
+# running). This makes netd the single source of truth for "am I
+# the cluster's mgmt master right now".
+SHARED_STATE = None
+
+
+def attach_state(state) -> None:
+    """Called once from bedrock-d main() with the shared BedrockState
+    so i_should_host_arbiter() can consult netd's election outcome."""
+    global SHARED_STATE
+    SHARED_STATE = state
+
 
 def _run(cmd: list[str], check: bool = False, timeout: int = 30) -> tuple[int, str, str]:
     """Shell out + capture. Never raises; caller decides on rc."""
@@ -393,9 +409,34 @@ def arbiter_status() -> dict:
 
 
 def i_should_host_arbiter() -> bool:
-    """Decide from state.json: does this node currently hold the
-    mgmt master role? Returns False if state.json is missing or
-    role isn't mgmt+compute."""
+    """Decide whether this node should currently host the cluster
+    singletons (arbiter rqlite + .254 + DRBD primary + filer + s3).
+
+    Authority (in order):
+      1. netd's live election outcome via SHARED_STATE — this is the
+         real-time decision based on peer_liveness + witness vote.
+         Used by the unified bedrock-d daemon.
+            "leader"   → True  (host)
+            "fenced"   → False (we're isolated; do not promote)
+            "noquorum" → False (we lost quorum; demote in progress)
+            "follower" → False (peer is master)
+      2. Fallback to state.json["role"] for standalone / pre-
+         unification installs. Returns False if missing.
+
+    Why netd wins: at N=2 (no rqlite arbiter yet), rqlite can't form
+    quorum until the arbiter we're deciding about is started. Reading
+    state.json["role"] (projected from rqlite) deadlocks. netd's
+    election + witness vote is the only path that doesn't need
+    rqlite quorum to decide.
+    """
+    if SHARED_STATE is not None:
+        outcome = (SHARED_STATE.last_election_outcome or "").lower()
+        if outcome == "leader":
+            return True
+        if outcome in ("fenced", "noquorum", "follower"):
+            return False
+        # outcome == "" / "init" → fall through to legacy path while
+        # the daemon is still warming up.
     try:
         s = json.loads(STATE_JSON.read_text())
         return "mgmt" in (s.get("role") or "")

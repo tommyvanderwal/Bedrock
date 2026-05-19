@@ -96,9 +96,12 @@ def main() -> int:
     # BEFORE uvicorn.run takes over the main thread. The orchestrator
     # tasks attach via FastAPI's startup hook (already in mgmt/app.py).
     from mgmt import app as mgmt_app, orchestrator
+    from lib import cluster_arbiter  # type: ignore
     orchestrator.attach_state(state)
+    cluster_arbiter.attach_state(state)
     mgmt_app.app.state.bedrock = state
-    log.info("bedrock-d: FastAPI + orchestrator attached; starting uvicorn")
+    log.info("bedrock-d: FastAPI + orchestrator + cluster_arbiter "
+             "attached; starting uvicorn")
 
     # mgmt/app.py's existing __main__ block handles cert detection +
     # dual 8080/8443 listeners. We call its same logic here.
