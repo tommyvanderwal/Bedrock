@@ -38,7 +38,12 @@ def main() -> int:
     # Path setup — must come before any bedrock imports so the unified
     # daemon finds the lib/ tree shipped under /usr/local/lib/bedrock.
     sys.path.insert(0, "/usr/local/lib/bedrock")
-    sys.path.insert(0, "/opt/bedrock")  # for mgmt/
+    sys.path.insert(0, "/opt/bedrock")        # for `import mgmt.app`
+    sys.path.insert(0, "/opt/bedrock/mgmt")   # mgmt/app.py does
+                                              # `from ws import hub`
+                                              # (works for it under
+                                              # standalone WorkingDirectory
+                                              # but not under bedrock-d)
 
     logging.basicConfig(
         level=logging.INFO,
