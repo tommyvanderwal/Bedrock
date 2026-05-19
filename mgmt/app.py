@@ -5322,7 +5322,11 @@ if ui_build.exists():
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def serve_main():
+    """Bind uvicorn to 8443+8080 (or 8080-only if no cert yet) and
+    block until SIGTERM. Extracted from the __main__ block so the
+    unified bedrock-d entrypoint can call it after wiring shared
+    state + starting netd thread."""
     import threading
     import uvicorn
     # Two listeners:
@@ -5358,3 +5362,7 @@ if __name__ == "__main__":
         # next restart (triggered by cert install) flips to the safe
         # loopback-bound layout above.
         uvicorn.run(app, host="0.0.0.0", port=8080)
+
+
+if __name__ == "__main__":
+    serve_main()

@@ -102,11 +102,11 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
     #     modules under lib/, configs/ holds the systemd units.
     cp "$INSTALLER/install.sh"                 "$PAYLOAD_DIR/install.sh"
     cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
-    cp "$INSTALLER/bedrock-net"                "$PAYLOAD_DIR/bedrock-net"
-    cp "$INSTALLER/bedrock-fence-watchdog"     "$PAYLOAD_DIR/bedrock-fence-watchdog"
-    cp "$INSTALLER/bedrock-cert-refresh"       "$PAYLOAD_DIR/bedrock-cert-refresh"
-    cp "$INSTALLER/bedrock-mdns"               "$PAYLOAD_DIR/bedrock-mdns"
-    cp "$INSTALLER/bedrock-redirect"           "$PAYLOAD_DIR/bedrock-redirect"
+    cp "$INSTALLER/bedrock-d"                  "$PAYLOAD_DIR/bedrock-d"
+    # The five per-feature daemons (bedrock-net, bedrock-fence-watchdog,
+    # bedrock-cert-refresh, bedrock-mdns, bedrock-redirect) are folded
+    # into bedrock-d as threads / asyncio tasks. See
+    # docs/daemon-unification.md.
     # Rebuild mgmt.tar.gz from current mgmt/ sources if it's stale
     # (any file in mgmt/ newer than the tarball). Keeps the ISO in
     # sync with the working tree without requiring a separate manual

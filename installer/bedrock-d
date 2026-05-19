@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""bedrock-d — the single unified Bedrock daemon.
+
+Folds the historical split — bedrock-net (mesh, election, witness)
+and bedrock-mgmt (FastAPI + orchestrator) — into one Python process.
+All in-process subsystems share a single BedrockState object so
+there is NO file-based IPC for live decisions any more. The bedrock
+CLI stays a separate executable; it dials this process over
+HTTP loopback:8080.
+
+Top-level layout:
+
+    main thread (asyncio event loop)
+      ├── FastAPI on :8443 (HTTPS, LAN) and :8080 (HTTP, loopback)
+      ├── orchestrator tasks: rqlite_subscriber, fence_responder,
+      │   boot_orchestrator, converge_retry, backup_scheduler
+      └── cert_refresh task (24 h interval)
+    netd thread   — blocking mesh/election/witness loop
+    mdns thread   — blocking UDP responder
+
+On SIGTERM the state.stop_event is set, threads exit, uvicorn returns,
+process ends cleanly.
+
+Stays-as-separate processes (third-party or external-by-design):
+  rqlited / rqlited-arbiter, weed-*, vm/vl, vmagent/vlagent.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import sys
+import threading
+from pathlib import Path
+
+
+def main() -> int:
+    # Path setup — must come before any bedrock imports so the unified
+    # daemon finds the lib/ tree shipped under /usr/local/lib/bedrock.
+    sys.path.insert(0, "/usr/local/lib/bedrock")
+    sys.path.insert(0, "/opt/bedrock")  # for mgmt/
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("bedrock-d")
+
+    # ── Shared state ──────────────────────────────────────────────
+    from lib import state_shared  # type: ignore
+    state = state_shared.BedrockState()
+    log.info("bedrock-d: state object initialised")
+
+    # ── Signal handling ───────────────────────────────────────────
+    def _handle_sig(sig, _frame):
+        log.info("bedrock-d: signal %d received — initiating shutdown", sig)
+        state.stop_event.set()
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    # ── netd thread ───────────────────────────────────────────────
+    from lib import netd  # type: ignore
+
+    def _netd_thread():
+        try:
+            netd.run_daemon(shared_state=state)
+        except Exception as e:
+            log.exception("bedrock-d: netd thread crashed: %r", e)
+            # netd crash is bad but should NOT kill the whole daemon —
+            # mgmt + orchestrator may still be able to do useful work
+            # (e.g. serve the dashboard so the operator can diagnose).
+            # Signal shutdown so the operator sees a clean exit rather
+            # than a half-alive process. Per user direction: no
+            # fence-watchdog auto-reboot. They'll see this in
+            # journalctl and decide.
+
+    t_netd = threading.Thread(target=_netd_thread, name="bedrock-netd",
+                              daemon=True)
+    t_netd.start()
+    log.info("bedrock-d: netd thread started")
+
+    # ── mDNS responder thread (best-effort; non-critical) ─────────
+    try:
+        from lib import mdns_responder  # type: ignore
+        def _mdns_thread():
+            try:
+                # If mdns_responder.run() accepts a stop_event we pass
+                # it; otherwise it's a tight loop we just let run as a
+                # daemon thread (dies when main thread exits).
+                if hasattr(mdns_responder, "run_with_state"):
+                    mdns_responder.run_with_state(state)
+                else:
+                    mdns_responder.run()
+            except Exception as e:
+                log.warning("bedrock-d: mdns thread exited: %r", e)
+        threading.Thread(target=_mdns_thread, name="bedrock-mdns",
+                         daemon=True).start()
+        log.info("bedrock-d: mdns thread started")
+    except Exception as e:
+        log.warning("bedrock-d: mdns init skipped: %r", e)
+
+    # ── FastAPI / orchestrator ─────────────────────────────────────
+    # Wire the shared state into mgmt's FastAPI app + orchestrator
+    # BEFORE uvicorn.run takes over the main thread. The orchestrator
+    # tasks attach via FastAPI's startup hook (already in mgmt/app.py).
+    from mgmt import app as mgmt_app, orchestrator
+    orchestrator.attach_state(state)
+    mgmt_app.app.state.bedrock = state
+    log.info("bedrock-d: FastAPI + orchestrator attached; starting uvicorn")
+
+    # mgmt/app.py's existing __main__ block handles cert detection +
+    # dual 8080/8443 listeners. We call its same logic here.
+    mgmt_app.serve_main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

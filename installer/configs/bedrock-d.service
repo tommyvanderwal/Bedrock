@@ -1,0 +1,45 @@
+[Unit]
+Description=Bedrock unified daemon (netd + mgmt + orchestrator + dashboard)
+Documentation=file:///home/tommy/projects/Bedrock/docs/daemon-unification.md
+After=network-online.target
+Wants=network-online.target
+# bedrock-rqlited is a hard requirement for the orchestrator's
+# rqlite_subscriber to be useful, but we DO NOT mark it as
+# Requires= here — we want bedrock-d up early so the dashboard is
+# serviceable on a fresh box (and so joiners can dial /api/join even
+# before rqlited finishes Raft formation). The subscriber retries on
+# its own.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bedrock-d
+# Restart policy: come back fast on crash. No StartLimit since we
+# want the operator to see crashes via journalctl, not have systemd
+# silently give up. fence-watchdog is intentionally absent (single-
+# process design; operator troubleshoots a stuck bedrock-d directly).
+Restart=on-failure
+RestartSec=3s
+# Stop semantics: SIGTERM → daemon sets stop_event → threads exit,
+# uvicorn returns, process ends. Give it 20s before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# Logging direct to journal so `journalctl -u bedrock-d` shows
+# everything in one place.
+StandardOutput=journal
+StandardError=journal
+
+# Resources: dashboard rendering can briefly spike on `bedrock storage
+# status` and similar; orchestrator tasks are tiny. 1 GB ceiling
+# catches a runaway leak before it kills the node.
+MemoryHigh=512M
+MemoryMax=1G
+
+# Capabilities: bedrock-d needs CAP_NET_ADMIN (for `ip addr add` from
+# cluster_arbiter), CAP_NET_BIND_SERVICE (port 80 redirector), and
+# CAP_NET_RAW (mesh probes use raw sockets / ICMP). Easiest: run as
+# root. The dashboard's UI gates everything else by operator token.
+User=root
+
+[Install]
+WantedBy=multi-user.target

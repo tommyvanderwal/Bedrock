@@ -1664,14 +1664,22 @@ def node_reset_local() -> None:
     #    leaving them up means stale Raft state keeps probing for the
     #    previous cluster's voters and the next `bedrock init` can't
     #    elect a leader.
-    services = ("bedrock-mgmt", "bedrock-vm", "bedrock-vl",
+    # Single unified daemon: bedrock-d (was bedrock-net + bedrock-mgmt).
+    # Older units (bedrock-mgmt, bedrock-net, bedrock-fence-watchdog,
+    # bedrock-mdns, bedrock-redirect, bedrock-cert-refresh) are kept
+    # in the stop list so a node installed from a pre-unification ISO
+    # still gets cleanly torn down on reset.
+    services = ("bedrock-d",
+                "bedrock-mgmt", "bedrock-net",
+                "bedrock-mdns", "bedrock-redirect",
+                "bedrock-cert-refresh.timer",
+                "bedrock-fence-watchdog.timer",
+                "bedrock-vm", "bedrock-vl",
                 "bedrock-vmagent", "bedrock-vlagent",
-                "bedrock-net",
                 "bedrock-rqlited", "bedrock-rqlited-arbiter",
                 "bedrock-weed-master", "bedrock-weed-volume",
                 "bedrock-weed-filer", "bedrock-weed-s3",
-                "bedrock-weed-isos-mount.service",
-                "bedrock-fence-watchdog.timer")
+                "bedrock-weed-isos-mount.service")
     run(f"systemctl stop {' '.join(services)} 2>/dev/null", check=False)
     run(f"systemctl disable {' '.join(services)} 2>/dev/null", check=False)
     # Clear any cached failure counters from previous start-rate-limit

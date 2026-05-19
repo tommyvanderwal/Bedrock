@@ -971,7 +971,16 @@ def _run_silent_capture(cmd: list[str]) -> tuple[int, str, str]:
     return r.returncode, r.stdout or "", r.stderr or ""
 
 
-def run_daemon():
+def run_daemon(shared_state=None):
+    """Main netd loop. If `shared_state` is a state_shared.BedrockState
+    instance, the constructed Daemon is also attached as `shared_state.netd`
+    so other in-process readers (FastAPI handlers) can see live netd state
+    without going through /run/bedrock/*.json files.
+
+    Also honors `shared_state.stop_event` for clean shutdown when running
+    inside the unified `bedrock-d` process. Without a shared_state arg the
+    function behaves exactly as before — used by the legacy `bedrock-net`
+    standalone systemd unit (kept during the transition)."""
     cluster_key, cluster_uuid, my_node, my_loopback = load_state()
     if not my_loopback:
         # Try cluster.json as fallback (post-init/join, before state.json refresh).
@@ -995,6 +1004,17 @@ def run_daemon():
         my_node=my_node,
         my_loopback=my_loopback,
     )
+
+    # Publish the Daemon onto the shared state object so the unified
+    # bedrock-d process can answer dashboard queries without re-reading
+    # /run/bedrock/*.json files. Standalone-mode (shared_state=None)
+    # keeps the original behaviour: state lives in this stack frame.
+    if shared_state is not None:
+        with shared_state.netd_lock:
+            shared_state.netd = d
+            shared_state.self_node_name = my_node
+            shared_state.self_loopback_ip = my_loopback
+            shared_state.cluster_uuid = cluster_uuid
 
     d.recv_sock = open_recv_socket()
     d.recv_sock.settimeout(0.05)
@@ -1050,7 +1070,14 @@ def run_daemon():
     last_status = 0.0
     last_switch_state = 0.0
 
-    while not d.stopped:
+    def _should_stop() -> bool:
+        if d.stopped:
+            return True
+        if shared_state is not None and shared_state.stop_event.is_set():
+            return True
+        return False
+
+    while not _should_stop():
         try:
             tick(d, last_probe, last_route_emit)
             now = time.time()
@@ -1089,6 +1116,16 @@ def run_daemon():
                 last_election_outcome = _election_tick(
                     d, ws, _witness, _election, last_election_outcome)
                 last_election_at = now
+                # Publish outcome onto shared state for the dashboard
+                # + orchestrator (saves them re-reading /run files).
+                if shared_state is not None and last_election_outcome:
+                    shared_state.last_election_outcome = last_election_outcome
+                    # Mirror fence-marker file existence into shared
+                    # state so cluster_arbiter.converge can read it
+                    # without a stat() per tick.
+                    shared_state.fence_marker_present = (
+                        last_election_outcome == "fenced"
+                    )
             if now - last_status >= 30.0:
                 logged = sum(1 for n in d.neighbours.values() if n.logged_up)
                 advs = [

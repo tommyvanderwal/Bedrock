@@ -64,6 +64,12 @@ FENCE_CLEANUP_TIMEOUT_S = 30.0
 
 # Live in-memory snapshot, updated by rqlite_subscriber and read by
 # other tasks (and by the FastAPI handlers that want fresh state).
+#
+# Unification status: when running under bedrock-d (the unified
+# daemon), these globals are bound to fields on the shared
+# state_shared.BedrockState object by orchestrator.attach_state().
+# Backwards-compat: standalone bedrock-mgmt still uses the module
+# globals directly. The accessor helpers below abstract over both.
 _SNAPSHOT: dict = view_builder.empty_snapshot()
 # bedrock_meta.revision of the last snapshot we observed.
 # Field name retained as _LAST_LOG_IDX for back-compat with existing
@@ -75,8 +81,21 @@ _LAST_LOG_IDX: int = 0
 _PREV_SNAPSHOT: dict = view_builder.empty_snapshot()
 _SERVICES_STARTED: bool = False
 
+# When non-None, all snapshot/last_log_idx/services_started reads + writes
+# go through this object instead of the module globals above. Set by
+# `attach_state(state)` from the unified bedrock-d entrypoint.
+_STATE = None
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+def attach_state(state) -> None:
+    """Hook the unified daemon's shared state object so subscriber +
+    fence_responder + boot + converge_retry + backup all read/write
+    through it. Called once at bedrock-d startup."""
+    global _STATE
+    _STATE = state
+
 
 def _self_node_name() -> str:
     if not STATE_JSON.exists():
@@ -145,6 +164,9 @@ def _drbd_role(resource: str) -> str:
 
 def get_snapshot() -> dict:
     """Read-only access to the live snapshot for FastAPI handlers."""
+    if _STATE is not None:
+        with _STATE.snapshot_lock:
+            return _STATE.snapshot
     return _SNAPSHOT
 
 
@@ -175,8 +197,9 @@ def _subscriber_pass(self_name: str) -> None:
     each advance, refresh state. Called from a thread executor (the
     rqlite client is sync)."""
     global _LAST_LOG_IDX
+    since = _STATE.last_log_idx if _STATE is not None else _LAST_LOG_IDX
     with rqlite_client.RqliteClient() as rc:
-        for rev in rc.watch(since_revision=_LAST_LOG_IDX, interval_s=0.5):
+        for rev in rc.watch(since_revision=since, interval_s=0.5):
             _apply_revision(rc, rev, self_name)
 
 
@@ -184,12 +207,26 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
                     self_name: str) -> None:
     """Refresh the in-memory snapshot from rqlite, project to disk,
     queue a reactor task."""
-    global _LAST_LOG_IDX, _PREV_SNAPSHOT
-    prev = copy.deepcopy(_SNAPSHOT)
-    new = view_builder.build_snapshot(client=rc)
-    _SNAPSHOT.clear()
-    _SNAPSHOT.update(new)
-    _LAST_LOG_IDX = int(new.get("log_index", revision))
+    global _LAST_LOG_IDX, _PREV_SNAPSHOT, _SNAPSHOT
+    if _STATE is not None:
+        with _STATE.snapshot_lock:
+            prev = copy.deepcopy(_STATE.snapshot)
+            new = view_builder.build_snapshot(client=rc)
+            _STATE.snapshot = new
+            _STATE.prev_snapshot = prev
+            _STATE.last_log_idx = int(new.get("log_index", revision))
+        # Keep module globals in lockstep so legacy callers (anything
+        # still doing `from orchestrator import _SNAPSHOT`) see the
+        # same data. Cheap, ~few μs per tick.
+        _SNAPSHOT = new
+        _PREV_SNAPSHOT = prev
+        _LAST_LOG_IDX = _STATE.last_log_idx
+    else:
+        prev = copy.deepcopy(_SNAPSHOT)
+        new = view_builder.build_snapshot(client=rc)
+        _SNAPSHOT.clear()
+        _SNAPSHOT.update(new)
+        _LAST_LOG_IDX = int(new.get("log_index", revision))
 
     try:
         CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)

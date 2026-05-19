@@ -37,22 +37,19 @@ def install_dashboard(repo: str, with_metrics: bool = False) -> None:
     if _run(f"curl -fsSL '{mgmt_tar}' -o /tmp/mgmt.tar.gz") == 0:
         _run(f"tar xzf /tmp/mgmt.tar.gz -C {MGMT} --strip-components=1")
 
-    after = "network.target"
-    if with_metrics:
-        after += " bedrock-vm.service bedrock-vl.service"
-    unit = SYSTEMD_DIR / "bedrock-mgmt.service"
-    unit.write_text(
-        "[Unit]\n"
-        "Description=Bedrock Management Dashboard\n"
-        f"After={after}\n"
-        "\n"
-        "[Service]\n"
-        f"WorkingDirectory={MGMT}\n"
-        f"ExecStart=/usr/bin/python3 {MGMT}/app.py\n"
-        "Restart=always\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
+    # The dashboard is served by the unified bedrock-d process — see
+    # docs/daemon-unification.md. We no longer write a separate
+    # bedrock-mgmt.service. install.sh has already shipped
+    # bedrock-d.service; this helper only needs to ensure the mgmt/
+    # source tarball is extracted into /opt/bedrock/mgmt/ (done above)
+    # so bedrock-d can import it. Enable + start the unified daemon.
     _run("systemctl daemon-reload")
-    _run("systemctl enable --now bedrock-mgmt")
+    # Reset-failed first: a previous attempt may have left bedrock-d
+    # in a rate-limited state from before cluster.key was written.
+    _run("systemctl reset-failed bedrock-d.service 2>/dev/null", check=False)
+    _run("systemctl enable --now bedrock-d")
+    # Tidy: if a stale bedrock-mgmt.service is still installed from a
+    # pre-unification ISO, disable it so it can't shadow bedrock-d on
+    # port 8080/8443.
+    _run("systemctl disable --now bedrock-mgmt.service 2>/dev/null",
+         check=False)

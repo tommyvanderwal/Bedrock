@@ -314,12 +314,18 @@ def install(witness: str, cluster_info: dict, repo: str):
     # bedrock-net mesh discovery + routing daemon. Picks up the
     # loopback_ip we just wrote to state.json, claims it as /32 on
     # `lo`, starts probing every up interface for peer cluster members.
-    print("  Starting bedrock-net daemon (mesh discovery + routing)...")
+    # Under the unified daemon, mesh is a thread inside bedrock-d —
+    # bedrock-d.service is enabled by dashboard_install / mgmt_install.
+    # No separate enable needed here.
+    print("  Starting bedrock-d unified daemon (mesh + mgmt + orchestrator)...")
     try:
-        # systemd unit was placed by install.sh; we just enable+start.
         subprocess.run("systemctl daemon-reload", shell=True, check=False)
         subprocess.run(
-            "systemctl enable --now bedrock-net.service",
+            "systemctl reset-failed bedrock-d.service 2>/dev/null",
+            shell=True, check=False,
+        )
+        subprocess.run(
+            "systemctl enable --now bedrock-d.service",
             shell=True, check=False, capture_output=True,
         )
         # Allow rp_filter loose mode so async return paths through
@@ -366,7 +372,7 @@ def install(witness: str, cluster_info: dict, repo: str):
         # so any leftover rate-limit counter is wiped.
         subprocess.run(
             ["systemctl", "reset-failed",
-             "bedrock-rqlited.service", "bedrock-net.service"],
+             "bedrock-rqlited.service", "bedrock-d.service"],
             check=False, timeout=10,
         )
         subprocess.run(

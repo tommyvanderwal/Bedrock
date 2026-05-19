@@ -88,17 +88,16 @@ log "Downloading bedrock CLI..."
 curl -fsSL "${BEDROCK_REPO}/bedrock" -o "${INSTALL_DIR}/bedrock"
 chmod +x "${INSTALL_DIR}/bedrock"
 
-log "Downloading bedrock-net (mesh discovery + routing + election daemon)..."
-curl -fsSL "${BEDROCK_REPO}/bedrock-net" -o "${INSTALL_DIR}/bedrock-net"
-chmod +x "${INSTALL_DIR}/bedrock-net"
+log "Downloading bedrock-d (unified daemon: mesh + mgmt + orchestrator + dashboard)..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-d" -o "${INSTALL_DIR}/bedrock-d"
+chmod +x "${INSTALL_DIR}/bedrock-d"
 mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-net.service" \
-    -o /etc/systemd/system/bedrock-net.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-d.service" \
+    -o /etc/systemd/system/bedrock-d.service
 systemctl daemon-reload
 # Service unit is enabled by `bedrock init` / `bedrock join` once
-# loopback_ip is allocated, not now (the daemon needs cluster state
-# to do anything useful, and starting it pre-init would just no-op
-# in a tight retry loop).
+# loopback_ip is allocated and cluster.key written. Auto-starting
+# pre-init would just spin in a tight no-op retry loop.
 
 # rqlite — the cluster-state store (post-alpha-rewrite-notes.md D-01).
 # Per-node Raft voter, on-disk SQLite mode, bound to this node's
@@ -170,51 +169,14 @@ if [ -f /etc/systemd/system/bedrock-vg-loop.service ]; then
     systemctl enable bedrock-vg-loop.service >/dev/null 2>&1 || true
 fi
 
-# Independent fence watchdog: reboots the node if /run/bedrock-cluster.fence
-# stays present for > 5 min, indicating mgmt's fence cleanup hung or
-# crashed. Runs as a systemd timer every 30s; survives mgmt crashes
-# because it doesn't depend on mgmt at all.
-log "Installing bedrock-fence-watchdog..."
-curl -fsSL "${BEDROCK_REPO}/bedrock-fence-watchdog" \
-    -o /usr/local/bin/bedrock-fence-watchdog
-chmod +x /usr/local/bin/bedrock-fence-watchdog
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-fence-watchdog.service" \
-    -o /etc/systemd/system/bedrock-fence-watchdog.service
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-fence-watchdog.timer" \
-    -o /etc/systemd/system/bedrock-fence-watchdog.timer
-systemctl daemon-reload
-systemctl enable --now bedrock-fence-watchdog.timer >/dev/null 2>&1 || true
-
-# Dashboard TLS cert refresh — pulls local-ip.co's wildcard cert
-# every 24 h (OnBootSec=2min so a fresh install gets it in minutes).
-log "Installing bedrock-cert-refresh..."
-curl -fsSL "${BEDROCK_REPO}/bedrock-cert-refresh" \
-    -o /usr/local/bin/bedrock-cert-refresh
-chmod +x /usr/local/bin/bedrock-cert-refresh
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.service" \
-    -o /etc/systemd/system/bedrock-cert-refresh.service
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
-    -o /etc/systemd/system/bedrock-cert-refresh.timer
-systemctl daemon-reload
-systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
-
-# mDNS responder + port-80 redirector — any node on the LAN can be
-# reached by browsing to `bedrock.local`, which then 302-redirects
-# to that node's HTTPS dashboard URL.
-log "Installing bedrock-mdns + bedrock-redirect..."
-curl -fsSL "${BEDROCK_REPO}/bedrock-mdns" \
-    -o /usr/local/bin/bedrock-mdns
-chmod +x /usr/local/bin/bedrock-mdns
-curl -fsSL "${BEDROCK_REPO}/bedrock-redirect" \
-    -o /usr/local/bin/bedrock-redirect
-chmod +x /usr/local/bin/bedrock-redirect
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-mdns.service" \
-    -o /etc/systemd/system/bedrock-mdns.service
-curl -fsSL "${BEDROCK_REPO}/configs/bedrock-redirect.service" \
-    -o /etc/systemd/system/bedrock-redirect.service
-systemctl daemon-reload
-systemctl enable --now bedrock-mdns.service >/dev/null 2>&1 || true
-systemctl enable --now bedrock-redirect.service >/dev/null 2>&1 || true
+# Note: bedrock-fence-watchdog, bedrock-cert-refresh, bedrock-mdns,
+# and bedrock-redirect — each previously a separate Python script +
+# systemd unit — are now folded into the single bedrock-d process
+# (see docs/daemon-unification.md). The cert-refresh runs as an
+# asyncio task with a 24 h timer inside bedrock-d. The mDNS responder
+# and port-80 redirector run as threads inside bedrock-d. No external
+# fence-watchdog: per design the operator troubleshoots a stuck
+# bedrock-d via journalctl + systemctl restart rather than auto-reboot.
 
 # sshd drop-in: turn off PerSourcePenalties for cluster-internal SSH.
 # OpenSSH 9.8+ treats the every-3s paramiko probe burst from peer mgmt
@@ -263,6 +225,7 @@ LIB_FILES=(
     election.py
     witness.py
     s3backer_compactor.py
+    state_shared.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

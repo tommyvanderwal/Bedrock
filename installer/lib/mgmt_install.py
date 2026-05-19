@@ -296,7 +296,7 @@ WantedBy=multi-user.target
         # it here once the env file exists. Also reset-failed so we
         # ignore any stale rate-limit counter.
         _sp.run(["systemctl", "reset-failed",
-                 "bedrock-rqlited.service", "bedrock-net.service"],
+                 "bedrock-rqlited.service", "bedrock-d.service"],
                 check=False, timeout=10)
         _sp.run(["systemctl", "enable", "bedrock-rqlited.service"],
                 check=False, timeout=10)
@@ -374,15 +374,18 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"  WARN: rqlite seed failed: {e}")
 
-    # bedrock-net mesh discovery + routing daemon. Picks up the
-    # loopback_ip from state.json, claims it on `lo`, starts probing
-    # peer interfaces. systemd unit is in installer/configs/.
+    # bedrock-d unified daemon — mesh discovery, election, witness IO,
+    # rqlite_subscriber, fence_responder, boot_orchestrator, the
+    # dashboard, and cert refresh all live in this one process. systemd
+    # unit was placed by install.sh; we just enable + start.
     print()
-    print("Starting bedrock-net daemon (mesh discovery + routing)...")
+    print("Starting bedrock-d unified daemon...")
     try:
         import subprocess as _sp
         _sp.run("systemctl daemon-reload", shell=True, check=False)
-        _sp.run("systemctl enable --now bedrock-net.service",
+        _sp.run("systemctl reset-failed bedrock-d.service 2>/dev/null",
+                shell=True, check=False)
+        _sp.run("systemctl enable --now bedrock-d.service",
                 shell=True, check=False, capture_output=True)
         _sp.run(
             "sysctl -wq net.ipv4.conf.all.rp_filter=2 "
