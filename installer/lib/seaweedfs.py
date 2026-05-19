@@ -335,6 +335,14 @@ def promote_to_filer_host() -> None:
     tier-cluster volume is mounted. Starts filer + s3 gateway on
     this node. Idempotent."""
     log.info("seaweedfs: starting filer + s3 on this node")
+    # Clear any stuck start-rate-limit from a previous failed start
+    # attempt (env file race during install, mount-not-ready, etc.).
+    subprocess.run(
+        ["systemctl", "reset-failed",
+         "bedrock-weed-filer.service",
+         "bedrock-weed-s3.service"],
+        check=False, timeout=10,
+    )
     _systemctl("start", "bedrock-weed-filer.service")
     _systemctl("start", "bedrock-weed-s3.service")
 
@@ -386,6 +394,18 @@ def promote_to_master_volume_host() -> None:
     i_run_master = my_lo in master_subset
 
     if i_run_master:
+        # Reset-failed first: weed-master may have crash-looped earlier
+        # (env file not yet written → "Failed to load environment files"
+        # → restart → ... → StartLimitBurst). Clear that before we try
+        # to start it for real.
+        subprocess.run(
+            ["systemctl", "reset-failed",
+             "bedrock-weed-master.service",
+             "bedrock-weed-volume.service",
+             "bedrock-weed-filer.service",
+             "bedrock-weed-s3.service"],
+            check=False, timeout=10,
+        )
         subprocess.run(
             ["systemctl", "enable", "--now",
              "bedrock-weed-master.service",
