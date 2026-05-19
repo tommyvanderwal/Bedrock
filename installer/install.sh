@@ -169,14 +169,43 @@ if [ -f /etc/systemd/system/bedrock-vg-loop.service ]; then
     systemctl enable bedrock-vg-loop.service >/dev/null 2>&1 || true
 fi
 
-# Note: bedrock-fence-watchdog, bedrock-cert-refresh, bedrock-mdns,
-# and bedrock-redirect — each previously a separate Python script +
-# systemd unit — are now folded into the single bedrock-d process
-# (see docs/daemon-unification.md). The cert-refresh runs as an
-# asyncio task with a 24 h timer inside bedrock-d. The mDNS responder
-# and port-80 redirector run as threads inside bedrock-d. No external
-# fence-watchdog: per design the operator troubleshoots a stuck
-# bedrock-d via journalctl + systemctl restart rather than auto-reboot.
+# Three small auxiliary daemons stay AT ARM'S LENGTH from bedrock-d
+# because they touch no cluster-decision code paths:
+#
+#   bedrock-cert-refresh   — pulls the local-ip.co wildcard cert
+#                            every 24 h. Pure HTTPS download.
+#   bedrock-mdns           — answers `bedrock.local` mDNS queries.
+#                            Read-only UDP responder.
+#   bedrock-redirect       — port-80 HTTP → HTTPS 302. Stateless.
+#
+# bedrock-d can `systemctl start/stop` them via the regular systemd
+# API if/when lifecycle coordination matters. No fence-watchdog
+# (per design: single-daemon design wants direct troubleshooting).
+log "Installing bedrock-cert-refresh..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-cert-refresh" \
+    -o /usr/local/bin/bedrock-cert-refresh
+chmod +x /usr/local/bin/bedrock-cert-refresh
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.service" \
+    -o /etc/systemd/system/bedrock-cert-refresh.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
+    -o /etc/systemd/system/bedrock-cert-refresh.timer
+systemctl daemon-reload
+systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
+
+log "Installing bedrock-mdns + bedrock-redirect..."
+curl -fsSL "${BEDROCK_REPO}/bedrock-mdns" \
+    -o /usr/local/bin/bedrock-mdns
+chmod +x /usr/local/bin/bedrock-mdns
+curl -fsSL "${BEDROCK_REPO}/bedrock-redirect" \
+    -o /usr/local/bin/bedrock-redirect
+chmod +x /usr/local/bin/bedrock-redirect
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-mdns.service" \
+    -o /etc/systemd/system/bedrock-mdns.service
+curl -fsSL "${BEDROCK_REPO}/configs/bedrock-redirect.service" \
+    -o /etc/systemd/system/bedrock-redirect.service
+systemctl daemon-reload
+systemctl enable --now bedrock-mdns.service >/dev/null 2>&1 || true
+systemctl enable --now bedrock-redirect.service >/dev/null 2>&1 || true
 
 # sshd drop-in: turn off PerSourcePenalties for cluster-internal SSH.
 # OpenSSH 9.8+ treats the every-3s paramiko probe burst from peer mgmt

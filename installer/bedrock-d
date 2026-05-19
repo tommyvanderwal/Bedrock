@@ -79,25 +79,12 @@ def main() -> int:
     t_netd.start()
     log.info("bedrock-d: netd thread started")
 
-    # ── mDNS responder thread (best-effort; non-critical) ─────────
-    try:
-        from lib import mdns_responder  # type: ignore
-        def _mdns_thread():
-            try:
-                # If mdns_responder.run() accepts a stop_event we pass
-                # it; otherwise it's a tight loop we just let run as a
-                # daemon thread (dies when main thread exits).
-                if hasattr(mdns_responder, "run_with_state"):
-                    mdns_responder.run_with_state(state)
-                else:
-                    mdns_responder.run()
-            except Exception as e:
-                log.warning("bedrock-d: mdns thread exited: %r", e)
-        threading.Thread(target=_mdns_thread, name="bedrock-mdns",
-                         daemon=True).start()
-        log.info("bedrock-d: mdns thread started")
-    except Exception as e:
-        log.warning("bedrock-d: mdns init skipped: %r", e)
+    # NOTE: mdns_responder, http_redirect, and cert_manager are not
+    # cluster-decision code paths — they're cosmetic / browser-facing.
+    # They keep their own small systemd units (bedrock-mdns,
+    # bedrock-redirect, bedrock-cert-refresh.timer). bedrock-d
+    # doesn't import or own them. If we want lifecycle control later
+    # we can wrap them via `systemctl start/stop` from this process.
 
     # ── FastAPI / orchestrator ─────────────────────────────────────
     # Wire the shared state into mgmt's FastAPI app + orchestrator
