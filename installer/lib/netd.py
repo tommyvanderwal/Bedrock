@@ -898,21 +898,43 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                     f"bedrock-net: NoQuorum self-demote failed: {e!r}\n"
                 )
     elif result.should_set_mgmt_master:
+        # Probe rqlite once before attempting the write — saves 4
+        # retries × 1s = 4 s of pointless backoff when rqlited is still
+        # mid-election (the case right after a bedrock-d restart or a
+        # cluster-wide push_sources). If rqlite has no leader yet we
+        # log it cheaply and the next election tick will try again.
+        _rqlite_ready = False
         try:
+            import urllib.request as _ur, json as _jr
+            r = _ur.urlopen("http://127.0.0.1:4001/status", timeout=1)
+            _rs = _jr.loads(r.read())
+            _rqlite_ready = (
+                _rs.get("store", {}).get("raft", {}).get("state") == "Leader"
+                or _rs.get("store", {}).get("raft", {}).get("leader_addr")
+            )
+        except Exception:
+            _rqlite_ready = False
+        if not _rqlite_ready:
+            sys.stderr.write(
+                "bedrock-net: set_mgmt_master deferred — rqlite has no "
+                "leader yet (will retry next tick)\n"
+            )
+        else:
             try:
-                from . import bedrock_state as _bs
-            except ImportError:
-                from lib import bedrock_state as _bs  # type: ignore
-            rev = _bs.set_mgmt_master(d.my_node)
-            sys.stderr.write(
-                f"bedrock-net: election promoted self to mgmt_master "
-                f"(rqlite rev={rev})\n"
-            )
-        except Exception as e:
-            sys.stderr.write(
-                f"bedrock-net: set_mgmt_master failed: {e!r} "
-                f"(will retry next tick)\n"
-            )
+                try:
+                    from . import bedrock_state as _bs
+                except ImportError:
+                    from lib import bedrock_state as _bs  # type: ignore
+                rev = _bs.set_mgmt_master(d.my_node)
+                sys.stderr.write(
+                    f"bedrock-net: election promoted self to mgmt_master "
+                    f"(rqlite rev={rev})\n"
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"bedrock-net: set_mgmt_master failed: {e!r} "
+                    f"(will retry next tick)\n"
+                )
 
     # Reset NoQuorum streak + demote-once flag when we leave the
     # NoQuorum state. Without the demote_in_cycle reset, an isolated
@@ -1327,12 +1349,14 @@ def process_probe(d: Daemon, body: dict, sender_link_addr: str,
             rtt_us=0,
         )
         d.neighbours[key] = n
-        d.ever_seen_peers.add(peer_node)
+        # NOTE: ever_seen_peers is updated only when logged_up flips
+        # to True (sweep_hysteresis), NOT on first probe receipt. See
+        # the comment there for why — counting a one-way probe sender
+        # towards quorum drops every fresh-boot daemon into NoQuorum.
     else:
         n.last_seen = now
         n.peer_link_addr = peer_link_addr
         n.peer_loopback = peer_loopback
-        d.ever_seen_peers.add(peer_node)
 
 
 def nic_for_sender(d: Daemon, sender_addr: str) -> str:
@@ -1564,6 +1588,14 @@ def sweep_hysteresis(d: Daemon) -> None:
             n.logged_up = True   # local-routing flag; emit is best-effort
             if wrote:
                 n.last_quality_log = now
+            # Count this peer towards quorum from the moment it first
+            # reached logged_up. Without this gate, ever_seen_peers
+            # bumped on the very first one-way probe receipt, so
+            # n_nodes jumped to 2 before logged_up was True →
+            # my_votes=10/11 → NoQuorum → fenced before the 5 s
+            # UP_HYSTERESIS_S handshake could complete. Particularly
+            # bites startup right after a bedrock-d restart.
+            d.ever_seen_peers.add(n.peer_node)
             continue
 
         # Quality refresh: stable + ≥ refresh interval since last log
