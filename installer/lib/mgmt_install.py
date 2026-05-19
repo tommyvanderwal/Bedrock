@@ -291,6 +291,15 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"  WARN: rqlite_setup render_env failed: {e}")
             raise
+        # Enable + start. install.sh doesn't enable bedrock-rqlited at
+        # firstboot anymore (would crash-loop without env file), so do
+        # it here once the env file exists. Also reset-failed so we
+        # ignore any stale rate-limit counter.
+        _sp.run(["systemctl", "reset-failed",
+                 "bedrock-rqlited.service", "bedrock-net.service"],
+                check=False, timeout=10)
+        _sp.run(["systemctl", "enable", "bedrock-rqlited.service"],
+                check=False, timeout=10)
         _sp.run(["systemctl", "restart", "bedrock-rqlited.service"],
                 check=False, timeout=30)
         # Wait for rqlited to be Leader, not just HTTP-up. The

@@ -361,6 +361,18 @@ def install(witness: str, cluster_info: dict, repo: str):
                     break
                 _t.sleep(0.5)
         _rqs.render_env_file()
+        # install.sh doesn't enable bedrock-rqlited at firstboot anymore;
+        # do it here once the env file is in place. Reset-failed first
+        # so any leftover rate-limit counter is wiped.
+        subprocess.run(
+            ["systemctl", "reset-failed",
+             "bedrock-rqlited.service", "bedrock-net.service"],
+            check=False, timeout=10,
+        )
+        subprocess.run(
+            ["systemctl", "enable", "bedrock-rqlited.service"],
+            check=False, timeout=10,
+        )
         subprocess.run(
             ["systemctl", "restart", "bedrock-rqlited.service"],
             check=False, timeout=30,
