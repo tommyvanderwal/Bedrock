@@ -989,25 +989,33 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # (witness flapping faster than holddown keeps `witness_alive=True`
     # while peer is gone). Re-introduce if such an edge case appears.
 
-    # Refresh own witness slot every tick. Marker = local DRBD
-    # current-uuid for tier-critical (the arbiter volume). Tag bit 0
-    # (LMS) is set when we're hosting the arbiter AND have no fresh
-    # peer (Scenario B "last man standing"). cluster_arbiter sets
-    # ws.own_tag during promote_to_arbiter_host; we just push it.
+    # Refresh own witness slot every tick.
+    # - marker = local DRBD current-uuid (always)
+    # - tag.lms = (I am hosting arbiter AND no peer is logged_up).
+    #   This is the steady-state rule. cluster_arbiter sets tag
+    #   inside the takeover protocol; we re-affirm it here so it
+    #   reflects current reality once netd takes over the loop.
     try:
         uuid_hex = _read_tier_critical_uuid()
-        # If DRBD isn't up (N=1, pre-storage-promote, etc.), still
-        # publish an empty marker so other nodes see us alive. cold-
-        # boot UUID-match check only fires when the marker is non-empty.
         marker = uuid_hex.encode("ascii") if uuid_hex else b""
-        # Tag.lms reflects "I'm hosting AND solo (no logged_up peer)".
-        # Recompute per tick from the live mesh state.
         any_peer_up = any(
             getattr(n, "logged_up", False) for n in d.neighbours.values()
         )
-        lms_bit = _witness.TAG_LMS if (current_master == d.my_node and
-                                       not any_peer_up) else 0
-        _witness.set_own_slot(ws, marker=marker, tag=lms_bit)
+        # Detect "I am hosting" via local arbiter_status, NOT via
+        # cluster.json — rqlite-free, matches the spec's INV-6.
+        try:
+            try:
+                from . import cluster_arbiter as _ca
+            except ImportError:
+                from lib import cluster_arbiter as _ca  # type: ignore
+            st = _ca.arbiter_status()
+            am_hosting = bool(st.get("service_active")
+                              or st.get("ip_present"))
+        except Exception:
+            am_hosting = False
+        lms_bit = _witness.TAG_LMS if (am_hosting and not any_peer_up) else 0
+        ws.own_marker = marker
+        ws.own_tag = lms_bit
     except Exception as e:
         sys.stderr.write(f"bedrock-net: own-slot publish error: {e!r}\n")
 

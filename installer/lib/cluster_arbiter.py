@@ -376,6 +376,13 @@ def _run_takeover_protocol() -> bool:
 
     NO rqlite calls on this path — the cluster's rqlite is the very
     service we're about to recover, so it cannot be a precondition.
+
+    Fast-path: if cluster.json says I'm already the mgmt_master (or
+    no master is recorded yet), there's nothing to take over from.
+    The protocol's job is to gate failover from another node; for the
+    first promotion at storage-promote or the periodic self-renew
+    after I've already been confirmed master, we skip witness checks
+    entirely. netd publishes our slot every tick regardless.
     """
     if SHARED_STATE is None or SHARED_STATE.netd_ws is None:
         # Pre-unification or netd not running. Fall back to "always
@@ -396,57 +403,73 @@ def _run_takeover_protocol() -> bool:
     ws = SHARED_STATE.netd_ws
     my_id = ws.my_node_id
 
-    # Wait briefly for at least one witness reply so ws.slots is
-    # populated. If no witness reachable: refuse (witness is mandatory
-    # for the takeover decision per the spec).
+    # FAST PATH: no prior master OR self is the recorded master.
+    # Nothing to take over from; proceed with the promotion. The
+    # netd tick is already publishing our slot every second, so when
+    # a witness IS present it will see us. No witness reachability
+    # gate needed at this path (covers first-ever promote where the
+    # operator hasn't deployed an Echo yet).
+    last_master_id = _last_known_master_node_id()
+    if last_master_id is None or last_master_id == my_id:
+        log.info("arbiter: takeover protocol — no prior master to take "
+                 "over from (last_master=%r, self=%d); proceeding",
+                 last_master_id, my_id)
+        return True
+
+    # Witness reachability decides whether we can run the full
+    # protocol. At N>=3 the cluster has natural rqlite quorum even
+    # without the witness, and the isolated old master self-demotes
+    # via NoQuorum logic — so we can proceed cautiously. At N<=2 the
+    # witness is mandatory because rqlite quorum depends on the
+    # arbiter we're about to promote.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if _witness.is_alive(ws):
             break
         time.sleep(0.2)
-    else:
-        log.error("arbiter: takeover REFUSED — no witness reply in 5 s")
+    if not _witness.is_alive(ws):
+        n = _cluster_size()
+        if n >= 3:
+            log.warning("arbiter: takeover at N=%d without witness — "
+                        "proceeding (rqlite quorum + isolated-master "
+                        "self-demote keep this safe; deploy a witness "
+                        "for full protocol)", n)
+            return True
+        log.error("arbiter: takeover REFUSED — taking over from "
+                  "node_id=%d at N=%d but no witness reply in 5 s",
+                  last_master_id, n)
         return False
 
-    # Determine "last-known master" from local cluster.json (rqlite-
-    # free read). This is the node whose slot we'll inspect.
-    last_master_id = _last_known_master_node_id()
-    if last_master_id is None or last_master_id == my_id:
-        # No prior master OR we're already master. Skip step 1-3 (no
-        # one to take over from). Still do step 4+5 to claim our slot.
-        log.info("arbiter: takeover protocol — no prior master to "
-                 "take over from (or self); proceeding to slot claim")
-    else:
-        # Step 1+2: inspect M's slot.
-        slot_m = _witness.read_slot(ws, last_master_id)
-        if slot_m is None:
-            log.error("arbiter: takeover REFUSED — last master "
-                      "node_id=%d has no slot at witness (cannot "
-                      "verify staleness)", last_master_id)
-            return False
-        if not slot_m.is_stale():
-            log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
-                     "(tag.lms=%s); cluster healthy elsewhere",
-                     last_master_id, slot_m.lms)
-            return False
-        log.info("arbiter: slot[%d] stale (tag.lms=%s); continuing",
+    # Step 1+2: inspect M's slot.
+    slot_m = _witness.read_slot(ws, last_master_id)
+    if slot_m is None:
+        log.error("arbiter: takeover REFUSED — last master "
+                  "node_id=%d has no slot at witness (cannot verify "
+                  "staleness)", last_master_id)
+        return False
+    if not slot_m.is_stale():
+        log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
+                 "(tag.lms=%s); cluster healthy elsewhere",
                  last_master_id, slot_m.lms)
-        # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
-        local_uuid = _read_local_drbd_uuid()
-        slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
-        if not local_uuid:
-            log.error("arbiter: takeover REFUSED — drbdadm current-uuid "
-                      "tier-critical failed")
-            return False
-        if local_uuid != slot_marker:
-            log.error("arbiter: takeover REFUSED — DRBD divergence: "
-                      "local current-uuid=%s vs slot[%d].marker=%s. "
-                      "Operator must reconcile (drbdadm invalidate or "
-                      "wait for peer).",
-                      local_uuid[:12], last_master_id, slot_marker[:12])
-            return False
-        log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
-                 local_uuid[:12])
+        return False
+    log.info("arbiter: slot[%d] stale (tag.lms=%s); continuing",
+             last_master_id, slot_m.lms)
+    # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
+    local_uuid_step3 = _read_local_drbd_uuid()
+    slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
+    if not local_uuid_step3:
+        log.error("arbiter: takeover REFUSED — drbdadm current-uuid "
+                  "tier-critical failed")
+        return False
+    if local_uuid_step3 != slot_marker:
+        log.error("arbiter: takeover REFUSED — DRBD divergence: "
+                  "local current-uuid=%s vs slot[%d].marker=%s. "
+                  "Operator must reconcile (drbdadm invalidate or "
+                  "wait for peer).",
+                  local_uuid_step3[:12], last_master_id, slot_marker[:12])
+        return False
+    log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
+             local_uuid_step3[:12])
 
     # Step 4: write own slot tag=lms. netd's election tick runs at 1
     # Hz and will pick up the new tag on the very next iteration; we

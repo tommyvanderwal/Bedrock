@@ -342,31 +342,34 @@ async def _wait_for_role(timeout_s: float,
     this becomes 'follower' or 'leader' as soon as quorum is back.
 
     `ignore_fence=True`: skip the FENCE_MARKER early-return. Used by
-    fence_responder — it's the caller that will clear the marker once
-    quorum returns, so checking the marker short-circuits the wait to
-    0 seconds (observed in v22+v23: "still no quorum after 120s" log
-    line appearing 21ms after "fence: cleanup done", which then made
-    8b 2-node-HA failover fail because sim-1 stayed fenced).
+    fence_responder — the caller will clear the marker once quorum
+    is back.
 
-    Additional gate: when ignore_fence is set, also require netd's
-    last_election_outcome to be "leader" or "follower" (not
-    "noquorum"/"fenced"). cluster.json is stale during isolation
-    because the rqlite subscriber can't reach the leader to refresh
-    it; without the netd gate, _wait_for_role reads the pre-isolation
-    mgmt_master (== self), returns "leader" instantly, fence_responder
-    clears the marker, election re-flags noquorum, marker reappears,
-    flapping loop at ~5s/cycle (observed v24 5c)."""
+    Quorum-is-back signal: at least one peer is mesh-reachable AND
+    cluster.json says master is alive (someone, possibly us). We do
+    NOT gate on last_election_outcome — the election returns FENCED
+    as long as the marker is present, which is circular (we're the
+    ones holding the marker waiting for quorum to be back so we can
+    clear it). Mesh peer-liveness is the only live, marker-
+    independent quorum signal we have."""
     deadline = time.monotonic() + timeout_s
     self_name = _self_node_name()
     while time.monotonic() < deadline:
         if not ignore_fence and FENCE_MARKER.exists():
             return "fenced"
-        # Netd-outcome gate (only when ignoring the marker — i.e.
-        # called from fence_responder). We need an authoritative live
-        # signal of "are we quorate", not stale cluster.json.
-        if ignore_fence and _STATE is not None:
-            outcome = (_STATE.last_election_outcome or "").lower()
-            if outcome in ("noquorum", "fenced", ""):
+        # Live mesh check (skips circular fence-outcome dependency).
+        if ignore_fence and _STATE is not None and _STATE.netd is not None:
+            try:
+                with _STATE.netd_lock:
+                    d = _STATE.netd
+                    any_peer_up = any(
+                        getattr(n, "logged_up", False)
+                        for n in getattr(d, "neighbours", {}).values()
+                    )
+            except Exception:
+                any_peer_up = False
+            if not any_peer_up:
+                # No peer reachable; can't be quorate at any N. Wait.
                 await asyncio.sleep(1)
                 continue
         try:

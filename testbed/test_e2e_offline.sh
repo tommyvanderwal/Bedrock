@@ -666,7 +666,12 @@ else
     note "8a: no probes yet in echo log (network or HMAC mismatch?)"
 fi
 
-step "8b. Isolate current master (sim-$MASTER_SIM) — expect sim-$FOLLOWER_SIM to take over"
+step "8b. Master loses peer but keeps witness — Scenario B 'last man standing'"
+# Per docs/cluster-quorum-spec.md: the master M can still reach the
+# witness, so M flips its own slot tag→lms and KEEPS hosting. The
+# follower P sees slot[M] fresh+lms and stays follower. NO failover
+# happens — this is correct behaviour. The test asserts cluster
+# stability, not failover.
 PRE_MASTER="$MASTER_NAME"
 sssh "$MASTER_SIM" "bash -c '
 iptables -I OUTPUT -o br0 -j DROP
@@ -676,34 +681,24 @@ iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
 echo isolated
 '" || mark_fail "8b: could not apply iptables on sim-$MASTER_SIM"
-note "sim-$MASTER_SIM isolated; sleeping 60s for election + promote..."
-# 2-node-HA failover takes longer than the N=4 case: netd election
-# (5s) → cluster_arbiter promote (DRBD primary + mount + .254 IP +
-# start arbiter rqlited, ~5s) → arbiter joins local rqlited (~5s) →
-# Raft elects new leader (~10s) → set_mgmt_master writes (~1s).
-# Worst-case ~30s. 60s gives margin for slow VMs.
+note "sim-$MASTER_SIM isolated (peer dropped, witness reachable); "\
+"sleeping 60s and asserting M stays master..."
 sleep 60
-# Read mgmt_master from the (still-connected) follower.
-DURING_MASTER=$(sssh "$FOLLOWER_SIM" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-note "during-isolation mgmt_master (sim-$FOLLOWER_SIM's view): ${DURING_MASTER:-unknown}"
-if [ -n "$DURING_MASTER" ] && [ "$DURING_MASTER" = "$FOLLOWER_NAME" ]; then
-    pass "8b: failover succeeded ($PRE_MASTER → $DURING_MASTER)"
-else
-    mark_fail "8b: failover did NOT happen (mgmt_master=$DURING_MASTER, expected $FOLLOWER_NAME; 2-of-2 + witness should promote)"
-fi
-if grep -qE "claim .* ACCEPTED" "$ECHO_LOG" 2>/dev/null; then
-    pass "8b: witness recorded the failover claim"
-else
-    note "8b: no ACCEPTED claim in echo log yet"
-fi
-# The isolated old master should have self-demoted (release .254).
+# Master still hosting? Check from the master's side (it still has
+# workstation connectivity).
 if sssh "$MASTER_SIM" "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
-    mark_fail "8b: sim-$MASTER_SIM STILL holds .254 VIP (self-demote didn't fire in 45s)"
+    pass "8b: sim-$MASTER_SIM keeps .254 VIP (Scenario B last-man-standing)"
 else
-    pass "8b: sim-$MASTER_SIM released .254 VIP via NoQuorum self-demote"
+    mark_fail "8b: sim-$MASTER_SIM released .254 VIP — should have kept it (Scenario B)"
+fi
+# Follower must NOT have tried to take over.
+if sssh "$FOLLOWER_SIM" "ip -4 addr show lo | grep -q '\\.254/' 2>/dev/null"; then
+    mark_fail "8b: sim-$FOLLOWER_SIM grabbed .254 — split-brain (should have backed off on fresh+lms slot)"
+else
+    pass "8b: sim-$FOLLOWER_SIM did NOT grab .254 (backed off on fresh+lms slot)"
 fi
 
-step "8c. Restore sim-$MASTER_SIM connectivity → cluster reconverges"
+step "8c. Restore sim-$MASTER_SIM connectivity → cluster keeps the same master"
 sssh "$MASTER_SIM" "bash -c '
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic up 2>/dev/null; done
 iptables -F INPUT
@@ -715,11 +710,13 @@ echo restored
 '" || note "8c: restore returned non-zero"
 sleep 30
 POST_MASTER=$(sssh "$MASTER_SIM" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
-if [ "$POST_MASTER" = "$DURING_MASTER" ]; then
-    pass "8c: post-rejoin master unchanged ($POST_MASTER) — witness holddown held"
+if [ "$POST_MASTER" = "$PRE_MASTER" ]; then
+    pass "8c: post-rejoin master unchanged ($POST_MASTER) — Scenario B preserved"
 else
-    mark_fail "8c: master flipped after rejoin ($DURING_MASTER → $POST_MASTER) — bless holddown failed?"
+    mark_fail "8c: master changed after rejoin ($PRE_MASTER → $POST_MASTER) — Scenario B broke"
 fi
+# Set DURING_MASTER for legacy var name expected by 8d.
+DURING_MASTER="$PRE_MASTER"
 
 # After 8c, the master is on the OPPOSITE sim. Re-detect for the
 # split-brain test.
