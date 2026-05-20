@@ -1,78 +1,68 @@
 #!/usr/bin/env python3
-"""Stub BedRock Echo for testbed use.
+"""Stub BedRock Echo for testbed use — passive AEAD-encrypted K/V slot store.
 
-Listens on the LAN broadcast UDP port for cluster nodes' probe + hb
-packets, verifies the HMAC against the cluster key, and replies with
-its observed STATUS_LIST. This is the minimum implementation that
-lets lib/witness.py + lib/election.py exercise the 2-node-HA failover
-path without an ESP32 device on the bench.
+Per docs/cluster-quorum-spec.md: the witness has NO logic. It stores
+each node's most recent encrypted slot blob and returns all slots on
+every reply. The stub never decrypts slot blobs (they're AEAD-encrypted
+opaque bytes from its point of view); it does AEAD-decrypt the envelope
+to extract `(n, slot_blob)` and AEAD-encrypts the reply envelope.
 
-Wire format: same one defined in installer/lib/witness.py
-(MAGIC+msgpack, HMAC-SHA256-truncated-16 over the canonical body).
+Wire format: see installer/lib/witness.py docstring. Single primitive:
+ChaCha20-Poly1305 (12-byte nonces, 16-byte tags). 32-byte cluster_key
+loaded from --cluster-key-file or --cluster-key-hex.
 
 Usage:
-    python3 bedrock_echo_stub.py --cluster-key-file /path/to/key.bin
     python3 bedrock_echo_stub.py --cluster-key-hex <64-hex>
+    python3 bedrock_echo_stub.py --cluster-key-file /etc/bedrock/cluster.key
 
-Echo binds 0.0.0.0:9501 on every interface it can reach (we want it
-visible across the testbed's mgmt LAN AND the sims' bedrock-mesh
-links so isolation tests can put it on one side of the partition).
+UDP/9501 on 0.0.0.0. State is in-memory (testbed only); production
+echo MUST persist slots across restart.
 """
-
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac as _hmac
-import secrets
+import os
 import socket
 import sys
 import time
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "installer" / "lib"))
-from witness import MAGIC, WITNESS_PORT  # type: ignore
-import msgpack
+# Same constants the cluster nodes use.
+MAGIC = b"BREC"
+WITNESS_PORT = 9501
+NONCE_LEN = 12
 
 
-def _verify(data: bytes, key: bytes) -> dict | None:
-    if not data.startswith(MAGIC):
+def _aead(key: bytes):
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    return ChaCha20Poly1305(key)
+
+
+def _seal(key: bytes, plaintext: bytes) -> bytes:
+    nonce = os.urandom(NONCE_LEN)
+    return nonce + _aead(key).encrypt(nonce, plaintext, None)
+
+
+def _open(key: bytes, blob: bytes):
+    if len(blob) < NONCE_LEN + 16:
         return None
+    nonce, ct = blob[:NONCE_LEN], blob[NONCE_LEN:]
     try:
-        body = msgpack.unpackb(data[len(MAGIC):], raw=False)
+        return _aead(key).decrypt(nonce, ct, None)
     except Exception:
         return None
-    if not isinstance(body, dict) or "hmac" not in body:
-        return None
-    sig = body.pop("hmac")
-    canon = {k: body[k] for k in sorted(body)}
-    payload = msgpack.packb(canon, use_bin_type=True)
-    expect = _hmac.new(key, payload, hashlib.sha256).digest()[:16]
-    if not _hmac.compare_digest(sig, expect):
-        return None
-    return body
-
-
-def _pack(body: dict, key: bytes) -> bytes:
-    canon = {k: body[k] for k in sorted(body) if k != "hmac"}
-    payload = msgpack.packb(canon, use_bin_type=True)
-    sig = _hmac.new(key, payload, hashlib.sha256).digest()[:16]
-    body["hmac"] = sig
-    return MAGIC + msgpack.packb(body, use_bin_type=True)
 
 
 def main() -> int:
+    import msgpack
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cluster-key-file", help="Read the 32-byte HMAC key from a file")
-    ap.add_argument("--cluster-key-hex", help="Hex-encoded HMAC key")
-    ap.add_argument("--echo-id", default="testbed-echo-1",
-                    help="Identifier broadcast back to nodes")
+    ap.add_argument("--cluster-key-file", help="32-byte cluster.key path")
+    ap.add_argument("--cluster-key-hex", help="64-hex-char cluster_key")
+    ap.add_argument("--echo-id", default="testbed-echo-1")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     if args.cluster_key_file:
-        # Don't strip(): cluster.key is 32 raw random bytes — strip()
-        # eats whitespace-equivalent bytes if they happen to land at
-        # the boundary and silently truncates.
         key = open(args.cluster_key_file, "rb").read()
         if len(key) == 33 and key[-1:] == b"\n":
             key = key[:32]
@@ -83,7 +73,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
     if len(key) != 32:
-        print(f"ERROR: cluster key must be 32 bytes (got {len(key)})",
+        print(f"ERROR: cluster_key must be 32 bytes (got {len(key)})",
               file=sys.stderr)
         return 2
 
@@ -92,101 +82,68 @@ def main() -> int:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.bind(("0.0.0.0", WITNESS_PORT))
     print(f"bedrock-echo-stub: listening on 0.0.0.0:{WITNESS_PORT} "
-          f"echo_id={args.echo_id} cluster_uuid_filter=any",
-          file=sys.stderr, flush=True)
+          f"echo_id={args.echo_id}", file=sys.stderr, flush=True)
 
-    # STATUS_LIST: node_name → last_seen_ms (epoch). Decays naturally
-    # because clients keep heartbeating; entries older than 60s are
-    # implicitly stale.
-    status: dict[str, int] = {}
-
-    # blessed_*: the currently-recognised master + the tier-critical
-    # (arbiter-DRBD-volume) current-UUID it published on its last
-    # successful failover. Set by a claim message. Hold-down window
-    # = CLAIM_HOLDDOWN_MS — a different claimant within this window
-    # is rejected unless it carries the same drbd_uuid (which is the
-    # legitimate case of a re-promote from the same master after a
-    # brief flap).
-    CLAIM_HOLDDOWN_MS = 15_000
-    blessed_master = ""
-    blessed_drbd_uuid = ""
-    blessed_at_ms = 0
+    # Per cluster_uuid → {node_id: opaque slot blob}. Each "blob" is
+    # nonce(12)+ciphertext+tag bytes that we never decrypt. Cluster
+    # nodes decrypt locally with their cluster_key.
+    slots_by_cluster: dict[str, dict[int, bytes]] = {}
 
     while True:
         try:
-            data, src = s.recvfrom(1500)
+            data, src = s.recvfrom(2048)
         except KeyboardInterrupt:
             return 0
-        body = _verify(data, key)
-        if not body:
+        if not data.startswith(MAGIC):
+            continue
+        pt = _open(key, data[len(MAGIC):])
+        if pt is None:
             if args.verbose:
-                print(f"  ignore {src}: bad hmac / not for us",
-                      file=sys.stderr)
+                print(f"  drop {src}: bad envelope AEAD", file=sys.stderr)
             continue
-        kind = body.get("t")
-        node = str(body.get("n") or "")
-        cu = str(body.get("cu") or "")
-        if not node:
-            continue
-        now_ms = int(time.time() * 1000)
-        status[node] = now_ms
-
-        if kind == "claim":
-            claim_uuid = str(body.get("drbd_uuid") or "")
-            age = now_ms - blessed_at_ms if blessed_at_ms else None
-            accepted = False
-            reason = ""
-            if not blessed_master:
-                accepted = True
-                reason = "no prior master"
-            elif blessed_master == node:
-                accepted = True
-                reason = "same master refreshing"
-            elif age is not None and age >= CLAIM_HOLDDOWN_MS:
-                accepted = True
-                reason = f"prior bless aged {age}ms (>{CLAIM_HOLDDOWN_MS})"
-            elif claim_uuid and claim_uuid == blessed_drbd_uuid:
-                accepted = True
-                reason = "same drbd_uuid (legitimate re-claim)"
-            else:
-                reason = (f"reject: blessed={blessed_master} "
-                          f"drbd={blessed_drbd_uuid[:12]}… "
-                          f"{age}ms < {CLAIM_HOLDDOWN_MS}")
-            if accepted:
-                blessed_master = node
-                blessed_drbd_uuid = claim_uuid
-                blessed_at_ms = now_ms
-            print(f"  claim from {node} drbd_uuid={claim_uuid[:12]}… "
-                  f"→ {'ACCEPTED' if accepted else 'REJECTED'} ({reason})",
-                  file=sys.stderr)
-            reply_t = "claim_ack"
-            reply_extra = {"accepted": bool(accepted), "reason": reason}
-        else:
-            reply_t = "pong" if kind == "probe" else "hb_ack"
-            reply_extra = {}
-
-        # Build the relative STATUS_LIST (now − last_seen, ms).
-        peers = {n: now_ms - ts for n, ts in status.items()}
-        reply = {
-            "v": 1,
-            "t": reply_t,
-            "echo_id": args.echo_id,
-            "cu": cu,
-            "ts": now_ms,
-            "peers": peers,
-            "blessed_master": blessed_master,
-            "blessed_drbd_uuid": blessed_drbd_uuid,
-            "blessed_at_ms": blessed_at_ms,
-            "nonce": body.get("nonce") or secrets.token_bytes(8),
-            **reply_extra,
-        }
         try:
-            s.sendto(_pack(reply, key), src)
+            env = msgpack.unpackb(pt, raw=False, strict_map_key=False)
+        except Exception:
+            continue
+        if not isinstance(env, dict):
+            continue
+        t = env.get("t")
+        cu = env.get("cu")
+        n  = env.get("n")
+        if t not in ("hb", "probe") or not cu:
+            continue
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= n <= 250):
+            continue
+
+        # Store slot blob if this is a heartbeat with one.
+        if t == "hb" and "slot" in env:
+            blob = env["slot"]
+            if isinstance(blob, (bytes, bytearray)):
+                slots_by_cluster.setdefault(cu, {})[n] = bytes(blob)
+                if args.verbose:
+                    print(f"  hb node={n} slot stored ({len(blob)}B)",
+                          file=sys.stderr)
+        elif args.verbose:
+            print(f"  {t} node={n}", file=sys.stderr)
+
+        # Build reply: ALL slots for this cluster_uuid.
+        slots = slots_by_cluster.get(cu, {})
+        ack = msgpack.packb({
+            "v":       1,
+            "t":       "ack",
+            "echo_id": args.echo_id,
+            "cu":      cu,
+            "slots":   {int(k): v for k, v in slots.items()},
+        }, use_bin_type=True)
+        wire = MAGIC + _seal(key, ack)
+        try:
+            s.sendto(wire, src)
         except OSError as e:
-            print(f"  send reply to {src}: {e!r}", file=sys.stderr)
-        if args.verbose and kind != "claim":
-            print(f"  {kind} {node} ← {src}; status now {list(peers)}",
-                  file=sys.stderr)
+            print(f"  send to {src}: {e!r}", file=sys.stderr)
 
 
 if __name__ == "__main__":

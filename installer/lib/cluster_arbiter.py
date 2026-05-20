@@ -291,110 +291,231 @@ def _svc_stop(unit: str) -> None:
 def promote_to_arbiter_host() -> dict:
     """Take over hosting the cluster-singleton services on this node.
 
-    Two modes:
+    Runs the witness slot takeover protocol BEFORE any DRBD or service
+    state change. See docs/cluster-quorum-spec.md for the load-bearing
+    step-by-step. Witness is consulted ONLY here (and in
+    demote_arbiter_host); rqlite is NOT touched — it's the service
+    being recovered.
 
-      * N=1 (no tier-cluster DRBD resource): the singleton directory
-        is just a regular path on the local FS. No DRBD-promote, no
-        mount, no .254 floating IP, no arbiter rqlite (the single
-        per-node rqlite is already the only voter and self-elected
-        leader). filer + s3 still start so the S3 endpoint is up.
+    N=1 mode (no tier-cluster DRBD resource) skips the witness/DRBD
+    parts entirely: filer + s3 on local FS, no .254, no arbiter rqlite.
 
-      * N>=2 (tier-cluster DRBD exists): full sequence —
-          1. DRBD-promote tier-cluster
-          2. Mount /var/lib/bedrock/cluster
-          3. Ensure arbiter data dir exists (mode 0700)
-          4. Claim 100.X.Y.254/32 on lo
-          5. Render /etc/bedrock/rqlited-arbiter.env
-          6. systemctl start bedrock-rqlited-arbiter
-        Then filer + s3 start in either mode.
-
-    Returns the post-state dict. Raises on a step that genuinely
-    couldn't complete. Idempotent: safe to call on every role tick.
+    Idempotent: safe to call on every role tick. Witness checks are
+    no-ops when we're already the master in cluster.json's view.
     """
     n = _cluster_size()
     drbd_present = _drbd_resource_exists()
     ip = ""
 
-    if drbd_present:
-        log.info("arbiter: promoting (N=%d, tier-cluster DRBD present)", n)
-        _drbd_promote()
-        _mount()
-        ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
-        ip = _ip_add()
-    else:
-        # N=1 mode (or pre-DRBD-setup): create the singleton dir
-        # directly on the local FS so filer's DB has a home.
+    if not drbd_present:
+        # N=1: no DRBD, no witness consult. Simple path.
         log.info("arbiter: promoting (N=%d, no tier-cluster DRBD — "
                  "running singletons directly on local FS)", n)
         MOUNT_POINT.mkdir(parents=True, exist_ok=True, mode=0o755)
         ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # No .254/32 needed — there's no rqlite-arbiter at N=1.
-    # Now that the IP is on lo, materialise the env file. (The env
-    # file's BEDROCK_ARBITER_BIND_IP refers to .254 — we need .254
-    # bound before rqlited tries to bind, which is what the ExecStart
-    # in the unit will do.)
+        try:
+            try:
+                from . import seaweedfs
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import seaweedfs  # type: ignore
+            seaweedfs.promote_to_filer_host()
+        except Exception as e:
+            log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
+        log.info("arbiter: promotion complete (N=1; ip= mount=%s)",
+                 MOUNT_POINT)
+        return arbiter_status()
+
+    # N>=2 with tier-cluster DRBD. Run the takeover protocol.
+    log.info("arbiter: promoting (N=%d, tier-cluster DRBD present)", n)
+
+    # Idempotent fast-path: if I am already the hosting node per
+    # cluster.json, skip the witness protocol. This handles every
+    # tick after the initial promotion (converge_retry calls promote
+    # repeatedly).
+    am_already_host = (
+        _drbd_role() == "Primary"
+        and _is_mounted(MOUNT_POINT)
+        and _arbiter_ip_present()
+    )
+
+    if not am_already_host:
+        # Steps 1-5: takeover protocol. Refuse to promote if it fails.
+        if not _run_takeover_protocol():
+            log.error("arbiter: takeover protocol REFUSED — not promoting")
+            return arbiter_status()
+
+    # Steps 6: hardware/software state changes.
+    _drbd_promote()
+    _mount()
+    ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ip = _ip_add()
     try:
         from . import rqlite_setup
         from . import seaweedfs
     except ImportError:
-        import sys
-        sys.path.insert(0, "/usr/local/lib/bedrock")
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import rqlite_setup  # type: ignore
         from lib import seaweedfs  # type: ignore
-    if drbd_present:
-        rqlite_setup.render_arbiter_env_file()
-        _svc_start(ARBITER_SVC)
-    # else: N=1 → no arbiter rqlite; the single per-node rqlite is
-    # the sole Raft voter and is already running.
-    # SeaweedFS filer + S3 also follow the master role (D-07: every
-    # cluster-wide singleton lives on the tier-cluster DRBD volume).
-    # filer's SQLite metadata DB is at /var/lib/bedrock/cluster/
-    # seaweedfs/filer.db — same mount.
+    rqlite_setup.render_arbiter_env_file()
+    _svc_start(ARBITER_SVC)
     try:
         seaweedfs.promote_to_filer_host()
     except Exception as e:
         log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
     log.info("arbiter: promotion complete (ip=%s mount=%s)",
              ip, MOUNT_POINT)
-
-    # Witness claim — announce our DRBD-UUID so the witness either
-    # accepts us as the new blessed master OR (if a peer beat us to
-    # the claim) reflects that fact back on its next reply, which
-    # election.compute then converts to a NoQuorum + self-demote on
-    # the next tick. We don't roll back inside this function:
-    #   - the witness may take >2 s to age out a stale bless
-    #     (CLAIM_HOLDDOWN_MS = 15 s), and rolling back instantly
-    #     prevents takeover during that window (observed v32 8b:
-    #     sim-1 promoted, rolled back on sim-2's stale bless, sim-2
-    #     never released .254 because witness kept refusing sim-1).
-    #   - election.compute's bless-mismatch path already drives the
-    #     demote one tick later if the witness sticks with the peer.
-    if SHARED_STATE is not None and SHARED_STATE.netd_ws is not None:
-        try:
-            try:
-                from . import witness as _witness
-            except ImportError:
-                from lib import witness as _witness  # type: ignore
-            ws = SHARED_STATE.netd_ws
-            if ws is not None and ws.discovered:
-                try:
-                    out = subprocess.check_output(
-                        ["drbdadm", "current-uuid", TIER_RESOURCE],
-                        timeout=3,
-                    )
-                    uuid_hex = out.decode().strip()
-                except Exception as _ue:
-                    log.warning("arbiter: drbdadm current-uuid failed: %s",
-                                _ue)
-                    uuid_hex = ""
-                if uuid_hex:
-                    _witness.send_claim(ws, uuid_hex)
-                    log.info("arbiter: witness claim sent (drbd-uuid=%s)",
-                             uuid_hex[:8])
-        except Exception as e:
-            log.warning("arbiter: witness claim path errored: %s", e)
-
     return arbiter_status()
+
+
+def _run_takeover_protocol() -> bool:
+    """Steps 1-5 of the arbiter takeover protocol. Returns True if it
+    is safe to proceed with drbdadm primary + service starts.
+
+    NO rqlite calls on this path — the cluster's rqlite is the very
+    service we're about to recover, so it cannot be a precondition.
+    """
+    if SHARED_STATE is None or SHARED_STATE.netd_ws is None:
+        # Pre-unification or netd not running. Fall back to "always
+        # allow" — the legacy boot path relies on this.
+        log.warning("arbiter: takeover protocol skipped (no shared state)")
+        return True
+    try:
+        try:
+            from . import witness as _witness
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import witness as _witness  # type: ignore
+    except Exception as e:
+        log.error("arbiter: witness import failed: %s", e)
+        return False
+
+    ws = SHARED_STATE.netd_ws
+    my_id = ws.my_node_id
+
+    # Wait briefly for at least one witness reply so ws.slots is
+    # populated. If no witness reachable: refuse (witness is mandatory
+    # for the takeover decision per the spec).
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _witness.is_alive(ws):
+            break
+        time.sleep(0.2)
+    else:
+        log.error("arbiter: takeover REFUSED — no witness reply in 5 s")
+        return False
+
+    # Determine "last-known master" from local cluster.json (rqlite-
+    # free read). This is the node whose slot we'll inspect.
+    last_master_id = _last_known_master_node_id()
+    if last_master_id is None or last_master_id == my_id:
+        # No prior master OR we're already master. Skip step 1-3 (no
+        # one to take over from). Still do step 4+5 to claim our slot.
+        log.info("arbiter: takeover protocol — no prior master to "
+                 "take over from (or self); proceeding to slot claim")
+    else:
+        # Step 1+2: inspect M's slot.
+        slot_m = _witness.read_slot(ws, last_master_id)
+        if slot_m is None:
+            log.error("arbiter: takeover REFUSED — last master "
+                      "node_id=%d has no slot at witness (cannot "
+                      "verify staleness)", last_master_id)
+            return False
+        if not slot_m.is_stale():
+            log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
+                     "(tag.lms=%s); cluster healthy elsewhere",
+                     last_master_id, slot_m.lms)
+            return False
+        log.info("arbiter: slot[%d] stale (tag.lms=%s); continuing",
+                 last_master_id, slot_m.lms)
+        # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
+        local_uuid = _read_local_drbd_uuid()
+        slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
+        if not local_uuid:
+            log.error("arbiter: takeover REFUSED — drbdadm current-uuid "
+                      "tier-critical failed")
+            return False
+        if local_uuid != slot_marker:
+            log.error("arbiter: takeover REFUSED — DRBD divergence: "
+                      "local current-uuid=%s vs slot[%d].marker=%s. "
+                      "Operator must reconcile (drbdadm invalidate or "
+                      "wait for peer).",
+                      local_uuid[:12], last_master_id, slot_marker[:12])
+            return False
+        log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
+                 local_uuid[:12])
+
+    # Step 4: write own slot tag=lms. netd's election tick runs at 1
+    # Hz and will pick up the new tag on the very next iteration; we
+    # set it via shared state and wait for netd to send it.
+    local_uuid = _read_local_drbd_uuid()
+    marker_bytes = local_uuid.encode("ascii") if local_uuid else b""
+    _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_LMS)
+
+    # Step 5: read it back. Wait up to 3 attempts × ~1.5 s = ~4.5 s.
+    expected_marker = marker_bytes
+    for attempt in range(1, 4):
+        time.sleep(1.5)  # let netd send + receive at least one round-trip
+        own = _witness.own_slot(ws)
+        if own is not None and own.lms and own.marker == expected_marker:
+            log.info("arbiter: own slot readback OK (attempt %d, tag.lms=1, "
+                     "marker=%s)", attempt, local_uuid[:12])
+            return True
+        log.warning("arbiter: own-slot readback attempt %d not yet "
+                    "reflecting lms+marker (have=%r)", attempt,
+                    own and (own.lms, own.marker[:12]))
+    log.error("arbiter: takeover REFUSED — own-slot readback failed "
+              "after 3 attempts; witness unreachable or losing writes")
+    return False
+
+
+def _last_known_master_node_id() -> "int | None":
+    """Read /etc/bedrock/cluster.json (local, stale-tolerant). Return
+    the node_id (last octet of loopback_ip) of the current mgmt_master,
+    or None if not yet set."""
+    try:
+        cluster = json.loads(CLUSTER_JSON.read_text())
+    except (OSError, ValueError):
+        return None
+    master_name = cluster.get("mgmt_master") or ""
+    if not master_name:
+        return None
+    nodes = cluster.get("nodes") or {}
+    info = nodes.get(master_name) or {}
+    loop = info.get("loopback_ip") or ""
+    try:
+        return int(loop.rsplit(".", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_local_drbd_uuid() -> str:
+    """Read tier-critical's current-uuid via drbdadm. Returns "" if
+    DRBD isn't configured (N=1) or the call fails."""
+    try:
+        out = subprocess.check_output(
+            ["drbdadm", "current-uuid", TIER_RESOURCE], timeout=3
+        )
+        return out.decode().strip().lower().replace("0x", "")
+    except Exception:
+        pass
+    # Fallback via dump-md (used historically by netd).
+    try:
+        out = subprocess.check_output(
+            ["drbdadm", "dump-md", TIER_RESOURCE], timeout=3
+        )
+        for line in out.decode().splitlines():
+            s = line.strip()
+            if s.startswith("current-uuid"):
+                parts = s.split()
+                if len(parts) >= 2:
+                    return parts[1].rstrip(";").lower().replace("0x", "")
+    except Exception:
+        pass
+    return ""
 
 
 def demote_arbiter_host() -> dict:
@@ -432,6 +553,23 @@ def demote_arbiter_host() -> dict:
         _ip_del()
         _umount()
         _drbd_secondary()
+    # Per spec: after self-demote, clear our lms bit so a survivor's
+    # takeover protocol sees this slot as normal (recovered). The
+    # netd tick already pushes this via set_own_slot — we just need
+    # to tell it the new tag. Best-effort: witness may be unreachable.
+    if SHARED_STATE is not None and SHARED_STATE.netd_ws is not None:
+        try:
+            try:
+                from . import witness as _witness
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import witness as _witness  # type: ignore
+            ws = SHARED_STATE.netd_ws
+            marker = (_read_local_drbd_uuid() or "").encode("ascii")
+            _witness.set_own_slot(ws, marker=marker, tag=0)
+        except Exception as e:
+            log.warning("arbiter: post-demote slot clear failed: %s", e)
     return arbiter_status()
 
 

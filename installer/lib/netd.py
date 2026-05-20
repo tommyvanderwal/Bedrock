@@ -840,7 +840,9 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                       for name, info in nodes.items()}
     current_master = cluster.get("mgmt_master") or None
 
-    # 4. Decide.
+    # 4. Decide. The election is mesh-only now; the witness slot
+    # arbitration (UUID match, tag.lms, readback) is handled in
+    # cluster_arbiter.promote_to_arbiter_host() per the spec.
     result = _election.compute(
         self_name=d.my_node,
         self_loopback=d.my_loopback,
@@ -848,9 +850,6 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         node_loopbacks=node_loopbacks,
         witness_alive=_witness.is_alive(ws),
         current_mgmt_master=current_master,
-        witness_blessed_master=ws.blessed_master,
-        witness_blessed_at_ms=ws.blessed_at_ms,
-        now_ms=int(time.time() * 1000),
     )
 
     # 5. Log transitions.
@@ -990,24 +989,27 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # (witness flapping faster than holddown keeps `witness_alive=True`
     # while peer is gone). Re-introduce if such an edge case appears.
 
-    # If we are mgmt_master AND have just finished promoting the
-    # arbiter (drbd primary + mount + .254 + arbiter rqlite up),
-    # publish our tier-critical DRBD current-UUID to the witness so
-    # any zombie ex-master that tries to re-claim with a stale UUID
-    # gets refused (see lib/witness.py "blessed" handling). Cheap
-    # idempotent re-send: the Echo accepts repeat claims from the
-    # same master.
-    if current_master == d.my_node and ws.discovered:
-        try:
-            uuid_hex = _read_tier_critical_uuid()
-            if uuid_hex and ws.blessed_drbd_uuid != uuid_hex:
-                if _witness.send_claim(ws, uuid_hex):
-                    sys.stderr.write(
-                        f"bedrock-net: witness claim sent "
-                        f"(drbd_uuid={uuid_hex[:12]}…)\n"
-                    )
-        except Exception as e:
-            sys.stderr.write(f"bedrock-net: witness claim error: {e!r}\n")
+    # Refresh own witness slot every tick. Marker = local DRBD
+    # current-uuid for tier-critical (the arbiter volume). Tag bit 0
+    # (LMS) is set when we're hosting the arbiter AND have no fresh
+    # peer (Scenario B "last man standing"). cluster_arbiter sets
+    # ws.own_tag during promote_to_arbiter_host; we just push it.
+    try:
+        uuid_hex = _read_tier_critical_uuid()
+        # If DRBD isn't up (N=1, pre-storage-promote, etc.), still
+        # publish an empty marker so other nodes see us alive. cold-
+        # boot UUID-match check only fires when the marker is non-empty.
+        marker = uuid_hex.encode("ascii") if uuid_hex else b""
+        # Tag.lms reflects "I'm hosting AND solo (no logged_up peer)".
+        # Recompute per tick from the live mesh state.
+        any_peer_up = any(
+            getattr(n, "logged_up", False) for n in d.neighbours.values()
+        )
+        lms_bit = _witness.TAG_LMS if (current_master == d.my_node and
+                                       not any_peer_up) else 0
+        _witness.set_own_slot(ws, marker=marker, tag=lms_bit)
+    except Exception as e:
+        sys.stderr.write(f"bedrock-net: own-slot publish error: {e!r}\n")
 
     return result.outcome.value
 
@@ -1133,10 +1135,18 @@ def run_daemon(shared_state=None):
         import sys as _sys
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import witness as _witness, election as _election  # type: ignore
+    # node_id is the last octet of our /32 loopback (1-250 per
+    # cluster-quorum-spec.md). Always present in N>=1 once state.json
+    # has been initialised by mgmt_install/agent_install.
+    try:
+        my_node_id = int(my_loopback.rsplit(".", 1)[1]) if my_loopback else 0
+    except (ValueError, IndexError):
+        my_node_id = 0
     ws = _witness.WitnessState(
         cluster_uuid=cluster_uuid,
         cluster_key=_witness.load_cluster_key(),
-        my_node=my_node,
+        my_node_id=my_node_id,
+        my_node_name=my_node,
     )
     try:
         ws.sock = _witness.open_socket()

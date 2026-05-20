@@ -1,47 +1,33 @@
-"""Weighted-vote election — pure function over observable state.
+"""Weighted-vote election — pure function over observable mesh state.
 
-Inputs come from three sources, all already in-process on every node:
+Per docs/cluster-quorum-spec.md, election decides Leader/Follower/
+NoQuorum/Fenced from MESH peer-liveness + witness reachability only.
+The arbiter takeover protocol (witness slot inspection, drbd_uuid
+match, own-slot write+readback) lives in lib/cluster_arbiter.py and
+is gated by this election's Leader outcome.
 
-  - `peer_liveness`: dict[node_name, bool] sourced from bedrock-net's
-    neighbour table (`Neighbour.logged_up` aggregated by peer_node).
-  - `witness_alive`: bool from lib/witness.WitnessState.
-  - `cluster_info`: the rqlite snapshot — gives `mgmt_master` plus
-    every node's `loopback_ip` (used as a deterministic tiebreaker).
+Inputs (all in-process on every node):
+  - peer_liveness: dict[node_name, bool] from netd's neighbour table
+  - witness_alive: bool from lib/witness.is_alive(ws)
+  - node_loopbacks + current_mgmt_master: from cluster.json
 
 Outputs:
+  - Outcome ∈ {Leader, Follower, NoQuorum, Fenced}
+  - should_set_mgmt_master: True iff caller should write self as the
+    mgmt_master in rqlite (post-takeover bookkeeping; NOT a takeover
+    gate).
 
-  - `Outcome` ∈ {Leader, Follower, NoQuorum, Fenced}
-  - `should_set_mgmt_master: bool` — True iff we should write
-    `bs.set_mgmt_master(self_name)` to rqlite right now. Election only
-    *proposes* a master move; rqlite Raft is the actual single-writer.
-
-Weighted-vote formula (matches the original Rust prototype, kept so
-the lessons-log entry still applies):
-
-  total_votes = 10 * N_nodes + (1 if witness_present else 0)
+Weighted-vote formula (unchanged from the original Rust prototype):
+  total_votes = 10 * N_nodes + (1 if witness_alive else 0)
   majority    = total_votes // 2 + 1
-  my_votes    = 10 * count(reachable_peers, self_included) +
-                (1 if witness_alive else 0)
+  my_votes    = 10 * count(reachable) + (1 if witness_alive else 0)
 
-  I am Leader iff:
-    my_votes >= majority
-    AND ( current_master is gone-or-down OR current_master == self )
-    AND ( I am the lowest-loopback among reachable peers — tiebreaker
-          so two co-eligible peers don't race to promote )
+Leader iff my_votes >= majority AND (current_master gone OR == self),
+with lowest-loopback-octet as deterministic tiebreaker. Follower if
+master is alive and != self. NoQuorum if below majority. Fenced if
+/run/bedrock-cluster.fence is present.
 
-  I am Follower iff:
-    my_votes >= majority and current_master is alive and != self.
-
-  I am NoQuorum iff:
-    my_votes < majority.
-
-  I am Fenced iff:
-    /run/bedrock-cluster.fence exists (operator/peer told us to stand
-    down). Fence overrides Leader.
-
-This module owns no state — caller passes in everything. It also owns
-no side-effects — caller decides whether to act on
-`should_set_mgmt_master`. Single pure function, easy to unit-test."""
+Pure function. No I/O, no side effects, no time. Easy to unit test."""
 
 from __future__ import annotations
 
@@ -73,9 +59,6 @@ class Election:
 
 
 def _loopback_octet(ip: str) -> int:
-    """Last octet of a /32, used as deterministic tiebreaker. Returns
-    a large number (effectively last) for malformed input so we never
-    accidentally promote a node whose loopback we can't parse."""
     try:
         return int(ip.rsplit(".", 1)[-1])
     except Exception:
@@ -91,16 +74,11 @@ def compute(
     witness_alive: bool,
     current_mgmt_master: str | None,
     fence_marker_path: Path = FENCE_MARKER,
-    witness_blessed_master: str = "",
-    witness_blessed_at_ms: int = 0,
-    now_ms: int = 0,
-    bless_holddown_ms: int = 15_000,
 ) -> Election:
     """One-shot election decision. See module docstring for semantics.
 
-    `peer_liveness` SHOULD NOT include the self node (it's added here);
-    extra entries for self are tolerated (overridden to True).
-    """
+    `peer_liveness` SHOULD NOT include self (added here). Extra entries
+    for self are tolerated (overridden to True)."""
     if fence_marker_path.exists():
         return Election(
             outcome=Outcome.FENCED, my_votes=0, total_votes=0, majority=0,
@@ -108,20 +86,12 @@ def compute(
             reason="fence marker present",
         )
 
-    # Self is always alive to itself.
     liveness = dict(peer_liveness)
     liveness[self_name] = True
 
-    # Cluster membership for quorum math: only count nodes we've
-    # actually heard from at least once (i.e. present in
-    # peer_liveness — whether True or False), plus ourselves. The
-    # cluster.json membership (`node_loopbacks`) includes freshly
-    # registered joiners whose bedrock-net hasn't probed back yet;
-    # counting those would push the master into NoQuorum during
-    # every join and tear down its singletons mid-join. Once we've
-    # seen a peer at least once, the entry stays in peer_liveness
-    # (set False on link loss but never deleted), so this rule
-    # correctly recognises a partitioned-but-known peer.
+    # Cluster membership = nodes we've ever heard from + self. Filters
+    # fresh-joiners that haven't probed back yet (avoids the master
+    # going NoQuorum during a join).
     members = {n for n in node_loopbacks if n in peer_liveness}
     members.add(self_name)
     n_nodes = max(len(members), 1)
@@ -142,27 +112,6 @@ def compute(
     master_is_alive = bool(current_mgmt_master and liveness.get(current_mgmt_master))
 
     if current_mgmt_master == self_name:
-        # Witness has blessed a different master, and the bless is
-        # fresh: someone else took over (most likely a 2-node-HA
-        # split where the OTHER side promoted via witness vote) — we
-        # MUST demote ourselves to avoid two-primaries-claim-.254
-        # when connectivity returns. The 2-node election math gives
-        # 10+1=11/21 (quorum) to each side simultaneously, so the
-        # quorum check above can't catch this; the witness bless is
-        # what enforces single-master.
-        if witness_blessed_master and witness_blessed_master != self_name:
-            if not now_ms:
-                import time as _t
-                now_ms = int(_t.time() * 1000)
-            age_ms = now_ms - witness_blessed_at_ms if witness_blessed_at_ms else None
-            if age_ms is not None and age_ms < bless_holddown_ms:
-                return Election(
-                    outcome=Outcome.NO_QUORUM, my_votes=my_votes,
-                    total_votes=total_votes, majority=majority,
-                    should_set_mgmt_master=False, reachable_peers=reachable,
-                    reason=(f"witness blessed {witness_blessed_master} "
-                            f"({age_ms}ms ago) — demoting self"),
-                )
         return Election(
             outcome=Outcome.LEADER, my_votes=my_votes,
             total_votes=total_votes, majority=majority,
@@ -178,9 +127,8 @@ def compute(
             reason=f"following {current_mgmt_master}",
         )
 
-    # Master is gone (or never set). Deterministic tiebreak: only the
-    # reachable peer with the lowest loopback proposes. Everyone else
-    # waits a tick and converges on the same answer.
+    # Master gone (or never set). Deterministic tiebreak: lowest-octet
+    # reachable peer proposes; everyone else waits a tick and converges.
     self_octet = _loopback_octet(self_loopback or node_loopbacks.get(self_name, ""))
     contender_octets = [
         (_loopback_octet(node_loopbacks.get(n, "")), n)
@@ -195,26 +143,6 @@ def compute(
             should_set_mgmt_master=False, reachable_peers=reachable,
             reason=f"deferring to lower-octet {winner}",
         )
-
-    # Witness-blessed-master gate: if the witness recently blessed a
-    # *different* master (and the bless is still inside the hold-down
-    # window), refuse to promote — the previous master may still be
-    # alive and holding the DRBD primary on a side of the partition
-    # we can't see. Hold-down expires the bless and the election
-    # falls through to normal promotion next tick.
-    if witness_blessed_master and witness_blessed_master != self_name:
-        if not now_ms:
-            import time as _t
-            now_ms = int(_t.time() * 1000)
-        age_ms = now_ms - witness_blessed_at_ms if witness_blessed_at_ms else None
-        if age_ms is not None and age_ms < bless_holddown_ms:
-            return Election(
-                outcome=Outcome.FOLLOWER, my_votes=my_votes,
-                total_votes=total_votes, majority=majority,
-                should_set_mgmt_master=False, reachable_peers=reachable,
-                reason=(f"witness blesses {witness_blessed_master} "
-                        f"({age_ms}ms ago, < {bless_holddown_ms}ms holddown)"),
-            )
 
     return Election(
         outcome=Outcome.LEADER, my_votes=my_votes,
