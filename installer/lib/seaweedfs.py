@@ -476,7 +476,7 @@ def ensure_iso_library_mount() -> None:
     unit = (
         "[Unit]\n"
         "Description=Bedrock ISO library (SeaweedFS FUSE mount)\n"
-        "After=network-online.target bedrock-net.service\n"
+        "After=network-online.target bedrock-d.service\n"
         "Wants=network-online.target\n"
         "\n"
         "[Service]\n"

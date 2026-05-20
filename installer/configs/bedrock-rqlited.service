@@ -1,9 +1,9 @@
 [Unit]
 Description=Bedrock cluster-state store (rqlite, per-node instance)
 Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
-After=network-online.target bedrock-net.service
+After=network-online.target bedrock-d.service
 Wants=network-online.target
-Requires=bedrock-net.service
+Requires=bedrock-d.service
 
 # Don't fight systemd's start-limit during burst inits — see
 # docs/mesh-network-v1-uncertainties.md §5 for the equivalent

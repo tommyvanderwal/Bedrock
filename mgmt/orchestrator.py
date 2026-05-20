@@ -333,17 +333,42 @@ async def boot_orchestrator():
     _SERVICES_STARTED = True
 
 
-async def _wait_for_role(timeout_s: float) -> str:
+async def _wait_for_role(timeout_s: float,
+                         ignore_fence: bool = False) -> str:
     """Poll cluster.json until we have a quorum-recorded mgmt_master.
     Returns 'leader' if we are master, 'follower' if a peer is, or
     'fenced' / 'unknown' on timeout. cluster.json is written by the
     rqlite subscriber every tick from the canonical rqlite state, so
-    this becomes 'follower' or 'leader' as soon as quorum is back."""
+    this becomes 'follower' or 'leader' as soon as quorum is back.
+
+    `ignore_fence=True`: skip the FENCE_MARKER early-return. Used by
+    fence_responder — it's the caller that will clear the marker once
+    quorum returns, so checking the marker short-circuits the wait to
+    0 seconds (observed in v22+v23: "still no quorum after 120s" log
+    line appearing 21ms after "fence: cleanup done", which then made
+    8b 2-node-HA failover fail because sim-1 stayed fenced).
+
+    Additional gate: when ignore_fence is set, also require netd's
+    last_election_outcome to be "leader" or "follower" (not
+    "noquorum"/"fenced"). cluster.json is stale during isolation
+    because the rqlite subscriber can't reach the leader to refresh
+    it; without the netd gate, _wait_for_role reads the pre-isolation
+    mgmt_master (== self), returns "leader" instantly, fence_responder
+    clears the marker, election re-flags noquorum, marker reappears,
+    flapping loop at ~5s/cycle (observed v24 5c)."""
     deadline = time.monotonic() + timeout_s
     self_name = _self_node_name()
     while time.monotonic() < deadline:
-        if FENCE_MARKER.exists():
+        if not ignore_fence and FENCE_MARKER.exists():
             return "fenced"
+        # Netd-outcome gate (only when ignoring the marker — i.e.
+        # called from fence_responder). We need an authoritative live
+        # signal of "are we quorate", not stale cluster.json.
+        if ignore_fence and _STATE is not None:
+            outcome = (_STATE.last_election_outcome or "").lower()
+            if outcome in ("noquorum", "fenced", ""):
+                await asyncio.sleep(1)
+                continue
         try:
             cluster = json.loads(CLUSTER_JSON.read_text())
         except (OSError, ValueError):
@@ -449,7 +474,7 @@ async def fence_responder():
         # the cluster has reformed quorum and a leader has been elected).
         log.info("fence: cleanup done; waiting for quorum to return before "
                  "clearing marker")
-        role = await _wait_for_role(timeout_s=120.0)
+        role = await _wait_for_role(timeout_s=120.0, ignore_fence=True)
         if role not in ("leader", "follower"):
             log.warning("fence: still no quorum after 120s — leaving marker "
                         "for watchdog reboot")
@@ -461,9 +486,6 @@ async def fence_responder():
         except FileNotFoundError:
             pass
 
-        # Cluster contact re-evaluates. Role is already known (the
-        # wait above only returns on a settled role), so reconcile +
-        # restart services without waiting again.
         _SERVICES_STARTED = False
         if role in ("leader", "follower"):
             await _reconcile_paused_vms()
@@ -831,9 +853,28 @@ async def converge_retry():
         await asyncio.sleep(5)
 
 
+_TASKS_STARTED: bool = False
+import threading as _t
+_START_LOCK = _t.Lock()
+
+
 def start_all():
     """Spawn the orchestrator's tasks on the running event loop. Called
-    from FastAPI's startup hook in mgmt/app.py."""
+    from FastAPI's startup hook in mgmt/app.py. Under the unified
+    bedrock-d daemon, the FastAPI startup hook fires once per uvicorn
+    instance — and we run TWO uvicorns (8443 HTTPS + 8080 loopback) in
+    SEPARATE threads — so without a real lock the idempotency guard
+    races and every orchestrator task starts twice (visible as doubled
+    `arbiter: promoting` / `boot: role=leader` log lines, two competing
+    rqlite_subscribers, and two fence_responders that clobber each
+    other's wait_for_role timing)."""
+    global _TASKS_STARTED
+    with _START_LOCK:
+        if _TASKS_STARTED:
+            log.info("orchestrator: start_all already invoked (second "
+                     "FastAPI startup hook, dual-uvicorn) — skipping")
+            return
+        _TASKS_STARTED = True
     asyncio.create_task(rqlite_subscriber())
     asyncio.create_task(fence_responder())
     asyncio.create_task(boot_orchestrator())

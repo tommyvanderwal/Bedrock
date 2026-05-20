@@ -285,7 +285,16 @@ def _cmd_node_leave(target: str, reason: str):
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             f"root@{target_host}",
-            "systemctl stop bedrock-net bedrock-mgmt 2>/dev/null; "
+            # Under unification, all of netd+mgmt+orchestrator live in
+            # bedrock-d. Stop it so the leaver stops mesh/election/witness
+            # gossiping (otherwise it stays in surviving nodes' peer
+            # tables and inflates n_nodes — observed in v22: a "left"
+            # sim-3 kept heartbeating witness, making N=2 election see
+            # total_votes=40 instead of 20+1, blocking failover).
+            # Legacy bedrock-net + bedrock-mgmt stops are harmless on
+            # pre-unification nodes.
+            "systemctl stop bedrock-d bedrock-net bedrock-mgmt "
+            "bedrock-rqlited bedrock-rqlited-arbiter 2>/dev/null; "
             "rm -f /run/bedrock-cluster.fence; "
             "true",
         ]).returncode

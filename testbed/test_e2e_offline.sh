@@ -80,7 +80,13 @@ approve_pending_join() {
 assert_rqlite_voters() {
     local node=$1 expected=$2
     local got=""
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    # Retry window: join is mgmt-approval → joiner downloads state →
+    # renders rqlited.env → restarts rqlited → rqlited contacts leader →
+    # Raft replicates voter add. On a fresh sim with cold paramiko/SSH
+    # the joiner side can take 30-40s before rqlited starts; rqlite
+    # propagation adds another 5-10s. v22 hit the prior 30s window.
+    # 30 attempts × 3s = 90s.
+    for attempt in $(seq 1 30); do
         got=$(sssh "$node" 'curl -fsSL http://127.0.0.1:4001/nodes 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for v in d.values() if v.get(\"voter\")))"')
         [ "$got" = "$expected" ] && break
         sleep 3
@@ -95,8 +101,9 @@ assert_rqlite_voters() {
 assert_rqlite_reachable_voters() {
     local node=$1 expected=$2
     local got=""
-    # Retry — convergence can take a few seconds after a join/leave.
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    # Retry — convergence can take a while after join (see
+    # assert_rqlite_voters comment); 90s.
+    for attempt in $(seq 1 30); do
         got=$(sssh "$node" 'curl -fsSL http://127.0.0.1:4001/nodes 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for v in d.values() if v.get(\"voter\") and v.get(\"reachable\")))"')
         [ "$got" = "$expected" ] && break
         sleep 3
@@ -625,7 +632,14 @@ if [ -z "$CLUSTER_KEY_HEX" ] || [ ${#CLUSTER_KEY_HEX} -ne 64 ]; then
 else
     pass "8a: pulled cluster.key from sim-$MASTER_SIM (${#CLUSTER_KEY_HEX} hex)"
 fi
-# Start echo stub in background.
+# Start echo stub in background. First kill any leftover stubs from
+# prior runs — they bind port 9501 with a stale cluster_key and steal
+# every probe (v25: stale stub from v24 received all probes, rejected
+# them as "bad hmac", looked like witness was alive when it wasn't,
+# made 8b/8d look like real failover failures when the witness was
+# never actually counted).
+pkill -f "bedrock_echo_stub" 2>/dev/null
+sleep 1
 ECHO_LOG=/tmp/bedrock-echo-stub.log
 > "$ECHO_LOG"
 python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
@@ -634,6 +648,11 @@ ECHO_PID=$!
 sleep 3
 if ! kill -0 $ECHO_PID 2>/dev/null; then
     mark_fail "8a: echo stub died — see $ECHO_LOG"
+    head -10 "$ECHO_LOG"
+elif grep -q "Address already in use\|address in use\|errno 98" "$ECHO_LOG"; then
+    # Process is alive but bind failed — port 9501 was held by a stale
+    # stub. Surface this so we don't continue with a broken witness.
+    mark_fail "8a: echo stub couldn't bind 9501 (stale stub leaked from previous test run)"
     head -10 "$ECHO_LOG"
 else
     pass "8a: echo stub running (pid $ECHO_PID)"
@@ -657,8 +676,13 @@ iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do ip link set \$nic down 2>/dev/null; done
 echo isolated
 '" || mark_fail "8b: could not apply iptables on sim-$MASTER_SIM"
-note "sim-$MASTER_SIM isolated; sleeping 45s for election + promote..."
-sleep 45
+note "sim-$MASTER_SIM isolated; sleeping 60s for election + promote..."
+# 2-node-HA failover takes longer than the N=4 case: netd election
+# (5s) → cluster_arbiter promote (DRBD primary + mount + .254 IP +
+# start arbiter rqlited, ~5s) → arbiter joins local rqlited (~5s) →
+# Raft elects new leader (~10s) → set_mgmt_master writes (~1s).
+# Worst-case ~30s. 60s gives margin for slow VMs.
+sleep 60
 # Read mgmt_master from the (still-connected) follower.
 DURING_MASTER=$(sssh "$FOLLOWER_SIM" 'curl -fsSL --max-time 5 "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mgmt_master FROM cluster_info\"]" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"' 2>/dev/null || echo "")
 note "during-isolation mgmt_master (sim-$FOLLOWER_SIM's view): ${DURING_MASTER:-unknown}"

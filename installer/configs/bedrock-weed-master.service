@@ -1,9 +1,9 @@
 [Unit]
 Description=SeaweedFS master (cluster coordinator)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki
-After=network-online.target bedrock-net.service
+After=network-online.target bedrock-d.service
 Wants=network-online.target
-Requires=bedrock-net.service
+Requires=bedrock-d.service
 StartLimitIntervalSec=120
 StartLimitBurst=10
 

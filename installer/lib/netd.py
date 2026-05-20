@@ -127,6 +127,13 @@ ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
 NOQUORUM_HOLDDOWN_TICKS = 5
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
+# INV-4 watchdog: if I'm hosting singletons and have seen NEITHER a
+# peer nor a witness reply for this many seconds, demote unconditionally.
+# Belt for the NoQuorum streak path: covers the edge case where vote math
+# briefly stays "leader" because the witness flaps faster than the 5-tick
+# holddown. 28 s gives ~2× the witness freshness (12 s) + ~2× peer down
+# hysteresis (10 s); the user's spec calls 28 s with a small margin.
+LONE_MASTER_WATCHDOG_S = 28.0
 # Down hysteresis: enough to absorb a few missed probes but short
 # enough that the election self-fence fires within the 90 s
 # isolation window the e2e harness uses (was 30 s — left
@@ -915,12 +922,34 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         _rqlite_ready = False
         try:
             import urllib.request as _ur, json as _jr
-            r = _ur.urlopen("http://127.0.0.1:4001/status", timeout=1)
-            _rs = _jr.loads(r.read())
-            _rqlite_ready = (
-                _rs.get("store", {}).get("raft", {}).get("state") == "Leader"
-                or _rs.get("store", {}).get("raft", {}).get("leader_addr")
+            # rqlite v10's /status doesn't expose a `leader` field on
+            # the raft section — the keys are: state, term, last_contact,
+            # num_peers, latest_configuration, voter, etc. There's no
+            # store.raft.leader nor store.raft.leader_addr. The
+            # authoritative "is there a leader" answer comes from /nodes
+            # which lists every voter with leader=true on the current
+            # leader. We dial that — fast, transparent-forwarding-aware,
+            # and works regardless of whether the local node is the
+            # leader or just a follower.
+            # Probe writability directly: a trivial query through
+            # /db/query?level=strong forces a Raft read-after-write
+            # round-trip that only succeeds if a quorum-elected leader
+            # is reachable. Avoids the v26 false-negative where the
+            # local rqlited reported state=Leader but /nodes hadn't
+            # populated leader=true yet during the arbiter-join
+            # window. 3s timeout to ride out the brief Raft-elect
+            # latency right after arbiter promotion.
+            _req = _ur.Request(
+                "http://127.0.0.1:4001/db/query?level=strong",
+                data=b'["SELECT 1"]',
+                headers={"Content-Type": "application/json"},
             )
+            r = _ur.urlopen(_req, timeout=3)
+            _rs = _jr.loads(r.read()) or {}
+            # success shape: {"results": [{"columns": ["1"], "values": [[1]]}]}
+            _r0 = (_rs.get("results") or [{}])[0]
+            if "error" not in _r0 and _r0.get("values"):
+                _rqlite_ready = True
         except Exception:
             _rqlite_ready = False
         if not _rqlite_ready:
@@ -953,6 +982,13 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     if result.outcome != _election.Outcome.NO_QUORUM:
         d.noquorum_streak = 0
         d.demoted_in_cycle = False
+
+    # INV-4 (lone-master watchdog) intentionally NOT implemented here:
+    # NoQuorum self-demote at 5-tick streak (~5 s) already covers the
+    # scenario at a much tighter bound than the spec's 28 s. The
+    # watchdog only adds value as a belt against vote-math edge cases
+    # (witness flapping faster than holddown keeps `witness_alive=True`
+    # while peer is gone). Re-introduce if such an edge case appears.
 
     # If we are mgmt_master AND have just finished promoting the
     # arbiter (drbd primary + mount + .254 + arbiter rqlite up),
@@ -1012,7 +1048,26 @@ def run_daemon(shared_state=None):
     inside the unified `bedrock-d` process. Without a shared_state arg the
     function behaves exactly as before — used by the legacy `bedrock-net`
     standalone systemd unit (kept during the transition)."""
-    cluster_key, cluster_uuid, my_node, my_loopback = load_state()
+    # Under unification, bedrock-d starts BEFORE `bedrock init`/`bedrock join`
+    # has run — so cluster.key + state.json don't exist yet. The legacy
+    # standalone bedrock-net.service relied on systemd Restart=on-failure to
+    # retry after init wrote cluster.key. Inside bedrock-d we need to wait
+    # in-process instead — if we raise here the netd thread dies and stays
+    # dead, blocking the very init flow that would have unblocked us.
+    while True:
+        try:
+            cluster_key, cluster_uuid, my_node, my_loopback = load_state()
+            break
+        except RuntimeError as e:
+            if shared_state is None:
+                # Legacy standalone path — preserve the old crash-and-let-
+                # systemd-restart behaviour.
+                raise
+            sys.stderr.write(
+                f"bedrock-net: waiting for cluster bootstrap: {e}\n"
+            )
+            if shared_state.stop_event.wait(2.0):
+                return  # shutdown requested while waiting
     if not my_loopback:
         # Try cluster.json as fallback (post-init/join, before state.json refresh).
         try:
@@ -1091,6 +1146,12 @@ def run_daemon(shared_state=None):
             f"election runs without witness vote\n"
         )
         ws.sock = None
+    # Publish ws onto shared_state so cluster_arbiter can fire a
+    # witness claim at the moment of arbiter promote (rather than
+    # waiting for netd's next tick to notice cluster.json caught up).
+    if shared_state is not None:
+        with shared_state.netd_lock:
+            shared_state.netd_ws = ws
     last_election_outcome = None
     last_election_at = 0.0
 

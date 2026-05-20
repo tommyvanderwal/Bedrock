@@ -236,17 +236,21 @@ def render_arbiter_env_file(
             "contain cluster_uuid before the arbiter can start"
         )
 
-    # Peer list: every per-node rqlite (i.e. every other node's
-    # loopback at the Raft port). The arbiter joins those peers
-    # rather than the other arbiter (there's only ever one).
+    # Peer list: this node's per-node rqlite FIRST (always reachable
+    # — we're on the same host), then every other node's rqlite.
+    # Order matters: rqlited tries -join entries left-to-right with
+    # a 30s TCP connect timeout per entry. v25 showed the arbiter
+    # spending 30 seconds dialing an unreachable peer before falling
+    # back to the local one, eating the entire 45s failover window.
+    # Local-first means worst-case join time is <1s.
     my_node = state.get("node_name", "")
-    peers = _peer_loopbacks(cluster, my_node)
-    # Include this node's own per-node rqlite too — the arbiter is
-    # a separate Raft node on the same host, so it dials the per-
-    # node rqlite at the same loopback.
     my_loopback = state.get("loopback_ip", "")
-    if my_loopback and my_loopback not in peers:
+    peers: list[str] = []
+    if my_loopback:
         peers.append(my_loopback)
+    for p in _peer_loopbacks(cluster, my_node):
+        if p not in peers:
+            peers.append(p)
 
     if not peers:
         raise RuntimeError(

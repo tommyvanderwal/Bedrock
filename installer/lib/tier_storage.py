@@ -271,8 +271,24 @@ def load_cluster() -> dict:
 
 
 def save_cluster(c: dict) -> None:
+    # Atomic per-call tmp+rename. Plain write_text races with the
+    # orchestrator's view_builder writing the same path and can leave
+    # a 0-byte cluster.json on disk (v29 5c post-rejoin observed it).
     CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
-    CLUSTER_JSON.write_text(json.dumps(c, indent=2))
+    import os, tempfile
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{CLUSTER_JSON.name}.", suffix=".tmp",
+        dir=str(CLUSTER_JSON.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(c, indent=2))
+        os.replace(tmp_path, str(CLUSTER_JSON))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_state() -> dict:

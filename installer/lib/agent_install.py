@@ -311,12 +311,29 @@ def install(witness: str, cluster_info: dict, repo: str):
     except Exception as e:
         print(f"  WARN: cluster_key setup failed: {e}")
 
-    # bedrock-net mesh discovery + routing daemon. Picks up the
-    # loopback_ip we just wrote to state.json, claims it as /32 on
-    # `lo`, starts probing every up interface for peer cluster members.
-    # Under the unified daemon, mesh is a thread inside bedrock-d —
+    # bedrock-d needs /opt/bedrock/mgmt to import `mgmt.app` +
+    # `mgmt.orchestrator` at startup. The full dashboard_install runs
+    # later in this flow (line ~428), but if we don't pre-extract the
+    # mgmt tarball here bedrock-d crash-loops with ModuleNotFoundError
+    # for ~7 restarts (observed in v23 sim-2 join: 22:59:37..22:59:44
+    # six crashes before dashboard_install finally extracted /opt/
+    # bedrock/mgmt). Pre-extract from the offline payload — cheap +
+    # idempotent.
+    try:
+        os.makedirs("/opt/bedrock", exist_ok=True)
+        if os.path.exists("/var/lib/bedrock-install/mgmt.tar.gz"):
+            subprocess.run(
+                "tar xzf /var/lib/bedrock-install/mgmt.tar.gz "
+                "-C /opt/bedrock --strip-components=0",
+                shell=True, check=False,
+            )
+    except Exception as e:
+        print(f"  WARN: pre-extract mgmt.tar.gz failed: {e} (dashboard_install will retry)")
+
+    # bedrock-d unified daemon: mesh + mgmt + orchestrator + dashboard.
     # bedrock-d.service is enabled by dashboard_install / mgmt_install.
-    # No separate enable needed here.
+    # We start it here so the mesh thread can install /32 routes for
+    # rqlited (which starts via Requires=bedrock-d.service).
     print("  Starting bedrock-d unified daemon (mesh + mgmt + orchestrator)...")
     try:
         subprocess.run("systemctl daemon-reload", shell=True, check=False)

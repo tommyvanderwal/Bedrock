@@ -1,9 +1,9 @@
 [Unit]
 Description=SeaweedFS volume server (file bytes)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki
-After=network-online.target bedrock-net.service bedrock-weed-master.service
+After=network-online.target bedrock-d.service bedrock-weed-master.service
 Wants=network-online.target
-Requires=bedrock-net.service bedrock-weed-master.service
+Requires=bedrock-d.service bedrock-weed-master.service
 StartLimitIntervalSec=120
 StartLimitBurst=10
 

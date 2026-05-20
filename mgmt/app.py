@@ -136,8 +136,24 @@ def load_cluster():
 
 
 def save_cluster(cluster: dict):
+    # Atomic write — plain write_text races with view_builder writing
+    # the same path and can leave a 0-byte file. See lesson_orchestrator
+    # _atomic_write.md.
     CLUSTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CLUSTER_FILE.write_text(json.dumps(cluster, indent=2))
+    import os, tempfile
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{CLUSTER_FILE.name}.", suffix=".tmp",
+        dir=str(CLUSTER_FILE.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(cluster, indent=2))
+        os.replace(tmp_path, str(CLUSTER_FILE))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     write_scrape_config(cluster)
 
 
@@ -1543,11 +1559,24 @@ async def state_push_loop():
         await asyncio.sleep(3)
 
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
+_STARTUP_DONE: bool = False
+_STARTUP_LOCK = threading.Lock()
 
 
 @app.on_event("startup")
 async def startup():
-    global _last_state, _main_loop
+    global _last_state, _main_loop, _STARTUP_DONE
+    # Under bedrock-d we run TWO uvicorn instances (8443 HTTPS + 8080
+    # loopback) in SEPARATE threads, each with its own event loop —
+    # both call this hook on the same `app`. Without a real lock the
+    # `if _STARTUP_DONE` check + assign races and both threads proceed.
+    # That spawned two fence_responder tasks in v22, which clobbered
+    # the 120s wait_for_role (visible as "still no quorum after 120s"
+    # appearing within 0 seconds of "fence: cleanup done").
+    with _STARTUP_LOCK:
+        if _STARTUP_DONE:
+            return
+        _STARTUP_DONE = True
     _main_loop = asyncio.get_running_loop()
     # Seed with cluster.json so the sidebar shows host names instantly.
     cfg = load_cluster()
@@ -1572,7 +1601,21 @@ async def startup():
     # Boot the cluster-protocol orchestrator: log subscriber, boot
     # service-starter, fence responder, reactor. Replaces the legacy
     # standalone bedrock-watcher process.
-    import orchestrator
+    #
+    # Use sys.modules to share the SAME module instance as bedrock-d.
+    # bedrock-d does `from mgmt import orchestrator` (creates
+    # `mgmt.orchestrator`) and calls `orchestrator.attach_state(state)`
+    # there. A plain `import orchestrator` here would create a SECOND
+    # module object (because sys.path has /opt/bedrock/mgmt) with its
+    # own _STATE = None — so fence_responder's state.last_election_outcome
+    # gate never fires, marker flapping loop bites (observed v29–v31
+    # 5c regression: "fence: quorum back as leader; marker cleared"
+    # at 0 s after cleanup, repeats every 3 s).
+    import sys as _sys
+    if "mgmt.orchestrator" in _sys.modules:
+        orchestrator = _sys.modules["mgmt.orchestrator"]
+    else:
+        import orchestrator
     orchestrator.start_all()
 
 # ── REST API (same as before, for curl/scripting) ──────────────────────────

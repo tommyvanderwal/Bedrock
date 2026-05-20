@@ -356,6 +356,44 @@ def promote_to_arbiter_host() -> dict:
         log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
     log.info("arbiter: promotion complete (ip=%s mount=%s)",
              ip, MOUNT_POINT)
+
+    # Witness claim — announce our DRBD-UUID so the witness either
+    # accepts us as the new blessed master OR (if a peer beat us to
+    # the claim) reflects that fact back on its next reply, which
+    # election.compute then converts to a NoQuorum + self-demote on
+    # the next tick. We don't roll back inside this function:
+    #   - the witness may take >2 s to age out a stale bless
+    #     (CLAIM_HOLDDOWN_MS = 15 s), and rolling back instantly
+    #     prevents takeover during that window (observed v32 8b:
+    #     sim-1 promoted, rolled back on sim-2's stale bless, sim-2
+    #     never released .254 because witness kept refusing sim-1).
+    #   - election.compute's bless-mismatch path already drives the
+    #     demote one tick later if the witness sticks with the peer.
+    if SHARED_STATE is not None and SHARED_STATE.netd_ws is not None:
+        try:
+            try:
+                from . import witness as _witness
+            except ImportError:
+                from lib import witness as _witness  # type: ignore
+            ws = SHARED_STATE.netd_ws
+            if ws is not None and ws.discovered:
+                try:
+                    out = subprocess.check_output(
+                        ["drbdadm", "current-uuid", TIER_RESOURCE],
+                        timeout=3,
+                    )
+                    uuid_hex = out.decode().strip()
+                except Exception as _ue:
+                    log.warning("arbiter: drbdadm current-uuid failed: %s",
+                                _ue)
+                    uuid_hex = ""
+                if uuid_hex:
+                    _witness.send_claim(ws, uuid_hex)
+                    log.info("arbiter: witness claim sent (drbd-uuid=%s)",
+                             uuid_hex[:8])
+        except Exception as e:
+            log.warning("arbiter: witness claim path errored: %s", e)
+
     return arbiter_status()
 
 

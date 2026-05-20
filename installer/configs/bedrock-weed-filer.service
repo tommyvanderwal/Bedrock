@@ -1,9 +1,9 @@
 [Unit]
 Description=SeaweedFS filer (POSIX namespace on top of volumes)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki/Filer-Stores
-After=network-online.target bedrock-net.service bedrock-weed-master.service bedrock-weed-volume.service
+After=network-online.target bedrock-d.service bedrock-weed-master.service bedrock-weed-volume.service
 Wants=network-online.target
-Requires=bedrock-net.service bedrock-weed-master.service
+Requires=bedrock-d.service bedrock-weed-master.service
 # NOT enabled by default — cluster_arbiter.py starts/stops this as
 # part of the mgmt-master role transition (the filer SQLite DB lives
 # on the tier-cluster DRBD volume, per D-07/D-10).

@@ -6,9 +6,9 @@ Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
 # accessible. cluster_arbiter.py's promote_to_arbiter_host() drives
 # the actual sequencing — this unit is started by that script, not
 # enabled standalone.
-After=network-online.target bedrock-net.service bedrock-rqlited.service
+After=network-online.target bedrock-d.service bedrock-rqlited.service
 Wants=network-online.target
-Requires=bedrock-net.service
+Requires=bedrock-d.service
 # Allow several restarts during master-role transitions before
 # systemd gives up — each transition demotes-then-promotes which
 # can produce a quick stop/start.

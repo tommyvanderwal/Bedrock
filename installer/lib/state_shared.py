@@ -63,6 +63,13 @@ class BedrockState:
     # logging and by the dashboard for an at-a-glance status.
     last_election_outcome: str = ""
 
+    # The netd WitnessState (sock + discovered Echo endpoints +
+    # blessed_* fields). Published by netd.run_daemon so cluster_arbiter
+    # can fire witness claims at the moment of promotion (rather than
+    # the slower netd-election path that waits for cluster.json to
+    # reflect the new mgmt_master).
+    netd_ws: Optional[Any] = None
+
     # ── orchestrator-owned state (rqlite_subscriber etc.) ─────────
     # Live snapshot of cluster state, projected from rqlite by the
     # subscriber task. FastAPI handlers read this directly.
