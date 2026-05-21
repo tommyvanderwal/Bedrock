@@ -827,6 +827,97 @@ async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
 
 # ── public registration ──────────────────────────────────────────────────
 
+async def cluster_tier_watcher():
+    """Calm-loop watcher: when this node is the mgmt-master, cluster
+    size is ≥ 2, and the critical tier is still in ``mode='local'``,
+    submit the ``cluster_tier_promote_master`` saga once.
+
+    Only fires while the local node is the cluster's mgmt-master —
+    the saga MUST run on the node currently holding ``.254`` (it
+    needs the live filer/leveldb3 data on disk to snapshot before
+    promoting the LV under it). Re-checks every 10 s.
+
+    Submits the saga at most once per "needs promotion" cycle by
+    keeping a set of in-flight op_ids; if the saga fails the
+    operator can retry via ``POST /api/operations``.
+    """
+    self_name = _self_node_name()
+    while not self_name:
+        await asyncio.sleep(1)
+        self_name = _self_node_name()
+    submitted_for: set[str] = set()
+    while True:
+        await asyncio.sleep(10)
+        try:
+            if not CLUSTER_JSON.exists():
+                continue
+            try:
+                cluster = json.loads(CLUSTER_JSON.read_text())
+            except json.JSONDecodeError:
+                # cluster.json is mid-rewrite or corrupted. Skip this
+                # tick — the rqlite_subscriber will rewrite it from
+                # canonical state on the next revision advance.
+                continue
+            nodes = cluster.get("nodes") or {}
+            master = cluster.get("mgmt_master") or ""
+            if master != self_name:
+                continue                       # only the master promotes
+            if len(nodes) < 2:
+                continue                       # still N=1
+            tier_mode = ((cluster.get("tiers") or {})
+                         .get("critical") or {}).get("mode", "local")
+            if tier_mode == "drbd":
+                continue                       # already done
+            # Pick the first peer (lowest-octet) that isn't us. The
+            # promote saga's first peer becomes the initial DRBD
+            # secondary; further peers are added by a separate saga.
+            peer_name = next(
+                (n for n in sorted(nodes) if n != self_name), "")
+            if not peer_name:
+                continue
+            peer_loopback = (nodes.get(peer_name) or {}).get("loopback_ip", "")
+            if not peer_loopback:
+                continue
+            key = f"{peer_name}@{peer_loopback}"
+            if key in submitted_for:
+                continue                       # already submitted
+            log.info(
+                "cluster_tier_watcher: cluster reached N=%d, "
+                "critical=local, master=self — submitting "
+                "cluster_tier_promote_master(peer=%s)",
+                len(nodes), peer_name)
+            try:
+                from bedrock_d.orchestrator.sagas import SagaExecutor
+                from bedrock_d.orchestrator.sagas.rqlite_backend import (
+                    RqliteSagaBackend,
+                )
+                from bedrock_d import state as _st
+                # Importing registers the saga in SAGAS.
+                from bedrock_d.install import cluster_tier  # noqa: F401
+                backend = RqliteSagaBackend(_st.RqliteClient())
+                ex = SagaExecutor(backend=backend, this_node=self_name)
+                op_id = ex.submit(
+                    kind="cluster_tier_promote_master",
+                    target_node=self_name,
+                    params={"peer_node": peer_name,
+                            "peer_loopback": peer_loopback},
+                    requested_by="cluster_tier_watcher",
+                )
+                # Run synchronously in a thread so we don't have two
+                # promotes racing if the watcher fires twice.
+                await asyncio.to_thread(ex.execute_one, op_id)
+                submitted_for.add(key)
+                log.info(
+                    "cluster_tier_watcher: promote saga op=%d submitted",
+                    op_id)
+            except Exception as e:
+                log.warning(
+                    "cluster_tier_watcher: submit failed: %s "
+                    "(will retry next tick)", e)
+        except Exception as e:
+            log.warning("cluster_tier_watcher: tick failed: %s", e)
+
+
 async def converge_retry():
     """Periodically re-run cluster_arbiter.converge(). The rqlite
     subscriber already runs converge on every revision advance, but
@@ -883,5 +974,7 @@ def start_all():
     asyncio.create_task(boot_orchestrator())
     asyncio.create_task(backup_scheduler())
     asyncio.create_task(converge_retry())
+    asyncio.create_task(cluster_tier_watcher())
     log.info("orchestrator: tasks started (subscriber, fence_responder, "
-             "boot, backup_scheduler, converge_retry)")
+             "boot, backup_scheduler, converge_retry, "
+             "cluster_tier_watcher)")

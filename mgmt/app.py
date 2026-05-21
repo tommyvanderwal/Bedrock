@@ -1360,7 +1360,7 @@ class ObsPromote(BaseModel):
     kind: str = "both"   # "both", "metrics", or "logs"
 
 
-@app.post("/api/observability/promote")
+@app.post("/api/observability/backends")
 def observability_promote(req: ObsPromote, user: str = Depends(require_operator)):
     """Add or swap a backend in `obs_backends`. Runs the vmbackup-
     vmrestore seed BEFORE flipping the snapshot so the new backend
@@ -1729,6 +1729,10 @@ def list_nodes():
 
 
 # ── ISO library ─────────────────────────────────────────────────────────────
+# Three endpoints (list / upload / delete) extracted to mgmt/routes_iso.py
+# as Stage 9 PR #4 of the codebase rewrite. ISO_DIR constant + VM
+# inventory helpers stay here because the VM creation paths in app.py
+# import them; future PRs will move those too.
 
 ISO_DIR = Path("/opt/bedrock/iso")
 VM_INVENTORY_FILE = Path("/etc/bedrock/vm_inventory.json")
@@ -1746,50 +1750,10 @@ def save_inventory(inv: dict):
     VM_INVENTORY_FILE.write_text(json.dumps(inv, indent=2))
 
 
-@app.get("/api/isos")
-def api_list_isos():
-    """Return every file in /opt/bedrock/iso whose extension is `.iso`
-    case-insensitive. Microsoft's official Windows Server downloads
-    arrive with `.ISO` (uppercase) and we want them visible without
-    making the operator rename them by hand."""
-    if not ISO_DIR.exists(): return []
-    out = []
-    for p in sorted(ISO_DIR.iterdir()):
-        if p.is_file() and p.suffix.lower() == ".iso":
-            try:
-                out.append({"name": p.name, "size_bytes": p.stat().st_size})
-            except Exception:
-                continue
-    return out
-
-
-@app.post("/api/isos/upload")
-async def api_upload_iso(file: UploadFile = File(...)):
-    """Stream-upload an ISO to /opt/bedrock/iso. Chunked to stay memory-safe
-    for multi-GB Windows ISOs.
-
-    The on-disk filename gets its extension normalised to lowercase
-    `.iso` regardless of how the source named it (`.ISO`, `.iso`,
-    `.Iso`). That makes downstream tooling — including manual `ls`
-    and any path-equality check — consistent. The basename is
-    preserved verbatim so the operator still recognises their file."""
-    if not file.filename.lower().endswith(".iso"):
-        raise HTTPException(400, "filename must end in .iso")
-    ISO_DIR.mkdir(parents=True, exist_ok=True)
-    src_name = Path(file.filename).name  # strip any directory
-    # Normalise extension to lowercase .iso
-    base = src_name[:-4] if len(src_name) > 4 else src_name
-    dst = ISO_DIR / f"{base}.iso"
-    total = 0
-    with dst.open("wb") as fh:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk: break
-            fh.write(chunk)
-            total += len(chunk)
-    push_log(f"ISO uploaded: {dst.name} ({total // 1024 // 1024} MB)",
-             node="mgmt", app="bedrock-mgmt", level="info")
-    return {"status": "uploaded", "name": dst.name, "size_bytes": total}
+# routes_iso registration moved below to where push_log is defined —
+# the registration needs the push_log callable, so it must run after
+# `def push_log(...)`. Importing the module here is fine; the call
+# happens further down (see "── Route module registrations ──").
 
 
 # ── Import library (VMware/Hyper-V/qcow2 → Bedrock) ──────────────────────
@@ -2423,24 +2387,12 @@ def api_export_delete(job_id: str):
     return {"status": "deleted", "id": job_id}
 
 
-@app.delete("/api/isos/{name}")
-def api_delete_iso(name: str):
-    # Prevent path traversal
-    safe = Path(name).name
-    p = ISO_DIR / safe
-    if not p.exists() or not p.is_file():
-        raise HTTPException(404, "Not found")
-    p.unlink()
-    push_log(f"ISO deleted: {safe}", node="mgmt", app="bedrock-mgmt", level="info")
-    return {"status": "deleted", "name": safe}
-
-
 class MigrateRequest(BaseModel):
     target_node: Optional[str] = None
 
 
-class ConvertRequest(BaseModel):
-    target_type: str  # "cattle", "pet", or "vipet"
+class HaLevelRequest(BaseModel):
+    vm_type: str  # "cattle", "pet", or "vipet"
     peer_nodes: Optional[list] = None  # auto-pick if not specified
 
 
@@ -2466,16 +2418,16 @@ class VMCreateRequest(BaseModel):
 def api_vm_start(vm_name: str):
     return _vm_start(vm_name)
 
-@app.post("/api/vms/{vm_name}/shutdown")
-def api_vm_shutdown(vm_name: str):
+@app.post("/api/vms/{vm_name}/stop")
+def api_vm_stop(vm_name: str):
     return _vm_shutdown(vm_name)
 
-@app.post("/api/vms/{vm_name}/poweroff")
-def api_vm_poweroff(vm_name: str):
+@app.post("/api/vms/{vm_name}/force-stop")
+def api_vm_force_stop(vm_name: str):
     return _vm_poweroff(vm_name)
 
-@app.post("/api/vms/{vm_name}/convert")
-async def api_vm_convert(vm_name: str, req: ConvertRequest):
+@app.post("/api/vms/{vm_name}/ha-level")
+async def api_vm_set_ha_level(vm_name: str, req: HaLevelRequest):
     """Fire-and-forget. Returns task_id immediately; the dashboard reads
     progress from /api/tasks (WS 'task' channel).
 
@@ -2485,8 +2437,8 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
     if not vm: raise HTTPException(404, f"VM {vm_name} not found")
-    if req.target_type not in ("cattle", "pet", "vipet"):
-        raise HTTPException(400, f"Invalid target_type: {req.target_type}")
+    if req.vm_type not in ("cattle", "pet", "vipet"):
+        raise HTTPException(400, f"Invalid vm_type: {req.vm_type}")
     nodes_cfg = get_nodes()
     # `running_on` is empty for shut-off VMs — fall back to the first
     # `defined_on` node (where virsh dumpxml resolved) so offline
@@ -2502,16 +2454,16 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
             and _count_drbd_peers(nodes_cfg[src_name]["host"], vm["drbd_resource"]) >= 3
         else ("pet" if vm.get("drbd_resource") else "cattle")
     )
-    if current_type == req.target_type:
+    if current_type == req.vm_type:
         return {"status": "no-op", "current": current_type}
     # Upgrade (cattle/pet → pet/vipet): require enough peers up front so
     # an empty peer_nodes list errors before we burn a task on it.
     rank = {"cattle": 0, "pet": 1, "vipet": 2}
-    if rank[req.target_type] > rank[current_type]:
-        need_peers = {"pet": 1, "vipet": 2}[req.target_type]
+    if rank[req.vm_type] > rank[current_type]:
+        need_peers = {"pet": 1, "vipet": 2}[req.vm_type]
         chosen = req.peer_nodes or [n for n in nodes_cfg if n != src_name]
         # Filter to only nodes we don't already have on this resource
-        if current_type == "pet" and req.target_type == "vipet":
+        if current_type == "pet" and req.vm_type == "vipet":
             existing = _parse_drbd_res(nodes_cfg[src_name]["host"],
                                        vm["drbd_resource"]) or {}
             chosen = [n for n in chosen if n not in existing.get("peers", [])]
@@ -2521,18 +2473,18 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
         chosen = chosen[:need_peers]
         if len(chosen) < need_peers:
             raise HTTPException(400,
-                f"{req.target_type} needs {need_peers} peer node(s), "
+                f"{req.vm_type} needs {need_peers} peer node(s), "
                 f"found {len(chosen)} usable")
 
     task = task_registry().create(
-        "vm.convert", f"VM {vm_name}: {current_type} → {req.target_type}",
+        "vm.set_ha_level", f"VM {vm_name}: {current_type} → {req.vm_type}",
         vm_name=vm_name, node=src_name)
 
     async def _runner():
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
-                None, _vm_convert, vm_name, req.target_type, req.peer_nodes, task)
+                None, _vm_set_ha_level, vm_name, req.vm_type, req.peer_nodes, task)
             task.log(f"result: {result}")
             task.succeed()
         except HTTPException as e:
@@ -2542,10 +2494,10 @@ async def api_vm_convert(vm_name: str, req: ConvertRequest):
 
     asyncio.create_task(_runner())
     return {"status": "accepted", "task_id": task.id,
-            "from": current_type, "to": req.target_type}
+            "from": current_type, "to": req.vm_type}
 
 
-@app.post("/api/vms/create")
+@app.post("/api/vms")
 async def api_vm_create(req: VMCreateRequest):
     """Fire-and-forget: returns {task_id} immediately. Create can take 1-2
     minutes for VMs with a big ISO or many disks; we don't block the UI.
@@ -2743,7 +2695,7 @@ async def api_vm_delete(vm_name: str):
 
 # ── VM settings (vcpus, ram, disk, priority, cdrom) ─────────────────────────
 
-class ResourcesRequest(BaseModel):
+class ComputeRequest(BaseModel):
     vcpus: Optional[int] = None
     ram_mb: Optional[int] = None
     disk_gb: Optional[int] = None
@@ -2763,8 +2715,8 @@ def api_vm_get_settings(vm_name: str):
     return _vm_get_settings(vm_name)
 
 
-@app.post("/api/vms/{vm_name}/resources")
-def api_vm_resources(vm_name: str, req: ResourcesRequest):
+@app.post("/api/vms/{vm_name}/compute")
+def api_vm_compute(vm_name: str, req: ComputeRequest):
     return _vm_set_resources(vm_name, req)
 
 
@@ -3663,10 +3615,10 @@ def _write_drbd_res(hosts: list, resource: str, content: str):
         ssh_cmd(h, f"echo {b64} | base64 -d > {path}")
 
 
-def _vm_convert(vm_name: str, target_type: str, peer_nodes=None,
+def _vm_set_ha_level(vm_name: str, vm_type: str, peer_nodes=None,
                 task: Optional[Task] = None) -> dict:
-    if target_type not in ("cattle", "pet", "vipet"):
-        raise HTTPException(400, f"Invalid target_type: {target_type}")
+    if vm_type not in ("cattle", "pet", "vipet"):
+        raise HTTPException(400, f"Invalid vm_type: {vm_type}")
 
     state = build_cluster_state()
     vm = state["vms"].get(vm_name)
@@ -3684,15 +3636,15 @@ def _vm_convert(vm_name: str, target_type: str, peer_nodes=None,
     current_type = "vipet" if vm.get("drbd_resource") and _count_drbd_peers(src["host"], vm["drbd_resource"]) >= 3 \
                    else ("pet" if vm.get("drbd_resource") else "cattle")
 
-    if current_type == target_type:
+    if current_type == vm_type:
         return {"status": "no-op", "current": current_type}
 
     rank = {"cattle": 0, "pet": 1, "vipet": 2}
-    if rank[target_type] > rank[current_type]:
-        return _vm_convert_upgrade(vm_name, current_type, target_type, src_name,
+    if rank[vm_type] > rank[current_type]:
+        return _vm_set_ha_level_up(vm_name, current_type, vm_type, src_name,
                                    peer_nodes, task, is_running=is_running)
     else:
-        return _vm_convert_downgrade(vm_name, current_type, target_type, src_name,
+        return _vm_set_ha_level_down(vm_name, current_type, vm_type, src_name,
                                      peer_nodes, task)
 
 
@@ -3707,7 +3659,7 @@ def _count_drbd_peers(host: str, resource: str) -> int:
     return 0
 
 
-def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
+def _vm_set_ha_level_up(vm_name: str, cur: str, tgt: str, src_name: str,
                          peer_nodes, task: Optional[Task] = None,
                          is_running: bool = True) -> dict:
     """Cattle → pet / cattle → ViPet / pet → ViPet.
@@ -4007,7 +3959,7 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
             lv_name = existing["lv_name"]
             meta_lv_name = f"{lv_name}-meta"
             size_mb = (existing["size_bytes"] + 1024*1024 - 1) // (1024*1024)
-            # Meta LV sized to match the other peers — see _vm_convert_upgrade
+            # Meta LV sized to match the other peers — see _vm_set_ha_level_up
             # cattle→pet path for the formula derivation.
             size_gb = (existing["size_bytes"] + (1 << 30) - 1) >> 30
             meta_mb = max(32, 32 + size_gb * 2)
@@ -4059,7 +4011,7 @@ def _vm_convert_upgrade(vm_name: str, cur: str, tgt: str, src_name: str,
                 "duration_s": dur}
 
 
-def _vm_convert_downgrade(vm_name: str, cur: str, tgt: str, src_name: str,
+def _vm_set_ha_level_down(vm_name: str, cur: str, tgt: str, src_name: str,
                            peer_nodes, task: Optional[Task] = None) -> dict:
     """ViPet → pet / pet → cattle / ViPet → cattle. Iterates over every
     DRBD resource the VM has (one per disk)."""
@@ -4224,7 +4176,7 @@ _VALID_PRIORITIES = ("low", "normal", "high")
 # Maps priority → libvirt cpu_shares (cgroup weight; default is 1024).
 # Powers of 2 on either side so the relative weights are clearly visible.
 PRIORITY_CPU_SHARES = {"low": 256, "normal": 1024, "high": 4096}
-ISO_MOUNT_DIR = "/mnt/isos"  # identical on every cluster node (SeaweedFS FUSE)
+ISO_MOUNT_DIR = "/mnt/bedrock/iso"  # identical on every cluster node (SeaweedFS FUSE)
 
 
 def _mgmt_node_name() -> str:
@@ -4956,385 +4908,45 @@ def push_log(msg: str, node: str = "mgmt", app: str = "bedrock-mgmt",
             pass
     _vl_push_log(msg, node=node, app=app, level=level)
 
-@app.get("/api/metrics/nodes")
-def api_metrics_nodes(hours: int = 1, step: str = "30s"):
-    """CPU and memory for all nodes over time."""
-    end = int(time.time())
-    start = end - hours * 3600
-    return {
-        "cpu": query_range(
-            '100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100',
-            start, end, step),
-        "mem": query_range(
-            '(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100',
-            start, end, step),
-        "net_rx": query_range(
-            'rate(node_network_receive_bytes_total{device="br0"}[1m])',
-            start, end, step),
-        "net_tx": query_range(
-            'rate(node_network_transmit_bytes_total{device="br0"}[1m])',
-            start, end, step),
-    }
+# Metrics + logs read endpoints moved to mgmt/routes_obs.py
+# (Stage 9 PR #3 of the codebase rewrite).
+from routes_obs import register_routes as _register_obs_routes
+_register_obs_routes(app)
 
-@app.get("/api/metrics/vms")
-def api_metrics_vms(hours: int = 1, step: str = "30s"):
-    """Per-VM CPU and disk IOPS over time."""
-    end = int(time.time())
-    start = end - hours * 3600
-    return {
-        "cpu": query_range(
-            'rate(bedrock_vm_cpu_time_ns[1m]) / 1e9 * 100',
-            start, end, step),
-        "disk_rd_iops": query_range(
-            'rate(bedrock_vm_disk_read_reqs{disk="0"}[1m])',
-            start, end, step),
-        "disk_wr_iops": query_range(
-            'rate(bedrock_vm_disk_write_reqs{disk="0"}[1m])',
-            start, end, step),
-        "disk_wr_lat": query_range(
-            'rate(bedrock_vm_disk_write_time_ns{disk="0"}[1m]) / rate(bedrock_vm_disk_write_reqs{disk="0"}[1m]) / 1e6',
-            start, end, step),
-    }
-
-@app.get("/api/metrics/drbd")
-def api_metrics_drbd(hours: int = 1, step: str = "30s"):
-    """DRBD replication metrics."""
-    end = int(time.time())
-    start = end - hours * 3600
-    return {
-        "sent": query_range('rate(bedrock_drbd_sent_kb[1m])', start, end, step),
-        "received": query_range('rate(bedrock_drbd_received_kb[1m])', start, end, step),
-        "out_of_sync": query_range('bedrock_drbd_out_of_sync_kb', start, end, step),
-    }
-
-# ── Logs API (queries VictoriaLogs) ─────────────────────────────────────────
-
-@app.get("/api/logs")
-def api_logs(query: str = "*", limit: int = 50, hours: int = 1):
-    end = int(time.time())
-    start = end - hours * 3600
-    return query_logs(query, limit=limit, start=start, end=end)
-
-@app.get("/api/logs/node/{node_name}")
-def api_logs_node(node_name: str, limit: int = 50, hours: int = 1):
-    end = int(time.time())
-    start = end - hours * 3600
-    return query_logs(f'hostname:"{node_name}"', limit=limit, start=start, end=end)
-
-@app.get("/api/logs/vm/{vm_name}")
-def api_logs_vm(vm_name: str, limit: int = 50, hours: int = 1):
-    end = int(time.time())
-    start = end - hours * 3600
-    return query_logs(f'"{vm_name}"', limit=limit, start=start, end=end)
+# Generic saga submission API — POST /api/operations + the read-side.
+# Stage 8 of the rewrite: this is the surface the new CLI (and any
+# external automation) uses to submit vm_create / destroy / grow /
+# migrate / cluster_init / node_join / node_leave sagas.
+from routes_operations import register_routes as _register_operations_routes
+_register_operations_routes(app, require_operator=require_operator)
 
 
-# ── Supportability checks ───────────────────────────────────────────────────
-#
-# Live "is this cluster supportable?" checks. Each check returns one of
-# {ok, warn, fail} with a human-readable note + a remediation hint.
-# The dashboard renders these on `/support`. Operators get an "Optimal
-# Support" green badge only when everything is ok; warnings keep them
-# in supported state with caveats; fails mean we can't promise much.
-#
-# Checks run on every request (no cached state). They MUST be cheap —
-# operator may refresh frequently — and side-effect-free.
-
-@app.get("/api/support/checks")
-def api_support_checks():
-    """Run all supportability checks live and return the results."""
-    checks: list[dict] = []
-    cluster = load_cluster()
-    nodes_cfg = get_nodes()
-
-    # 1. TRIM/discard config across the stack — sampled on each node.
-    #    Verifies lvm.conf passdown, fstrim.timer enabled, and that
-    #    DRBD .res files (if any) declare discard-zeroes-if-aligned.
-    trim_summary = {"ok": [], "warn": [], "fail": []}
-    for nname, ncfg in nodes_cfg.items():
-        host = ncfg.get("host")
-        if not host:
-            continue
-        try:
-            out, rc = ssh_cmd_rc(host, (
-                "set -e; "
-                "echo \"lvm_passdown=$(grep -E '^\\s*thin_pool_discards' "
-                "/etc/lvm/lvm.conf 2>/dev/null | grep -i passdown | head -1 || "
-                "echo passdown_default)\"; "
-                "echo \"fstrim_timer=$(systemctl is-enabled fstrim.timer 2>/dev/null || echo missing)\"; "
-                "echo \"drbd_discard=$(grep -l 'discard-zeroes-if-aligned' "
-                "/etc/drbd.d/*.res 2>/dev/null | wc -l)\""
-            ), timeout=10)
-            if rc != 0:
-                trim_summary["fail"].append(nname)
-                continue
-            facts = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
-            ok = (
-                "passdown" in facts.get("lvm_passdown", "").lower() or
-                facts.get("lvm_passdown") == "passdown_default"
-            ) and facts.get("fstrim_timer") in ("enabled", "static")
-            (trim_summary["ok"] if ok else trim_summary["warn"]).append(nname)
-        except Exception:
-            trim_summary["fail"].append(nname)
-    if trim_summary["fail"]:
-        trim_status, trim_note = "fail", (
-            f"could not query TRIM config on: "
-            f"{', '.join(trim_summary['fail'])}")
-    elif trim_summary["warn"]:
-        trim_status, trim_note = "warn", (
-            f"TRIM stack not fully configured on: "
-            f"{', '.join(trim_summary['warn'])} — fstrim.timer + lvm.conf "
-            f"thin_pool_discards=passdown both required")
-    else:
-        trim_status, trim_note = "ok", (
-            f"TRIM passdown active on {len(trim_summary['ok'])} node(s); "
-            f"fstrim.timer enabled; DRBD discards configured if applicable")
-    checks.append({
-        "id": "trim_stack", "label": "TRIM / discard end-to-end",
-        "status": trim_status, "note": trim_note,
-        "remediation": ("Bedrock-bootstrap configures this automatically; "
-                        "if a check fails, re-run `bedrock bootstrap` on "
-                        "the affected node."),
-    })
-
-    # 2. Mesh reachability — every peer's loopback /32 pings.
-    #    Heuristic: every peer has a loopback_ip reachable from every other
-    #    node via the mesh (any path is fine; bedrock-net routes).
-    #    ping each peer's loopback_ip from every node.
-    if len(nodes_cfg) >= 2:
-        names = list(nodes_cfg)
-        unreachable = []
-        for src in names:
-            src_host = nodes_cfg[src].get("host")
-            for dst in names:
-                if dst == src: continue
-                dst_lo = nodes_cfg[dst].get("loopback_ip")
-                if not dst_lo:
-                    unreachable.append(f"{src}→{dst}(no loopback_ip)")
-                    continue
-                try:
-                    _o, rc = ssh_cmd_rc(src_host,
-                        f"ping -c1 -W2 -q {dst_lo} >/dev/null 2>&1",
-                        timeout=8)
-                    if rc != 0:
-                        unreachable.append(f"{src}→{dst}({dst_lo})")
-                except Exception:
-                    unreachable.append(f"{src}→{dst}({dst_lo})")
-        if not unreachable:
-            checks.append({
-                "id": "drbd_cable", "label": "Dedicated DRBD path between nodes",
-                "status": "ok",
-                "note": f"every pair of {len(names)} nodes can ping over "
-                        f"the DRBD network",
-                "remediation": "",
-            })
-        else:
-            checks.append({
-                "id": "drbd_cable", "label": "Dedicated DRBD path between nodes",
-                "status": "fail",
-                "note": "DRBD-network ping failures: " + ", ".join(unreachable),
-                "remediation": (
-                    "Connect a direct ethernet cable between the second NICs "
-                    "of each node (or a dedicated VLAN on a switch). DRBD "
-                    "replication MUST NOT share bandwidth with VM traffic."),
-            })
-    else:
-        checks.append({
-            "id": "drbd_cable", "label": "Dedicated DRBD path between nodes",
-            "status": "warn",
-            "note": "single-node cluster — DRBD path not yet meaningful",
-            "remediation": "Add a second node before this becomes a "
-                           "supportability requirement.",
-        })
-
-    # 3. Witness reachable from every node (or at least the master).
-    wit = (cluster.get("witnesses") or {})
-    if not wit:
-        checks.append({
-            "id": "witness", "label": "External witness configured",
-            "status": "warn",
-            "note": "no witness registered — 2-node clusters need a witness "
-                    "to break ties on partition; 1-node + witness is also "
-                    "the smallest fully-supported configuration",
-            "remediation": "`bedrock witness register <host>` to add one.",
-        })
-    else:
-        checks.append({
-            "id": "witness", "label": "External witness configured",
-            "status": "ok",
-            "note": f"{len(wit)} witness(es) registered",
-            "remediation": "",
-        })
-
-    # 4. No "advanced mode" overrides currently active. (For v1.0 we
-    #    don't have any such overrides; the check is a placeholder
-    #    that always passes. v1.x: any operator-set knob that
-    #    deviates from supported defaults shows up here.)
-    checks.append({
-        "id": "advanced_mode", "label": "No unsupported advanced-mode overrides",
-        "status": "ok",
-        "note": "no operator overrides outside the supported defaults set",
-        "remediation": "",
-    })
-
-    # 5. Backup target configured.
-    targets = cluster.get("backup_targets") or {}
-    if targets:
-        checks.append({
-            "id": "backups", "label": "Backup target configured",
-            "status": "ok",
-            "note": f"{len(targets)} target(s) configured: "
-                    f"{', '.join(targets.keys())}",
-            "remediation": "",
-        })
-    else:
-        checks.append({
-            "id": "backups", "label": "Backup target configured",
-            "status": "warn",
-            "note": "no backup target — VMs are not protected against "
-                    "data loss outside the cluster",
-            "remediation": "Open `/backups` and configure a target (S3 "
-                           "or filesystem). Encryption password is set "
-                           "ONCE — store it externally.",
-        })
-
-    # 6. Disk fill on every node — warn at 70 %, alarm at 80 %.
-    #    Advisory only: bedrock never refuses operations on this.
-    disk_warn: list[dict] = []
-    for nname, ncfg in nodes_cfg.items():
-        host = ncfg.get("host")
-        if not host:
-            continue
-        try:
-            out, rc = ssh_cmd_rc(host,
-                "lvs --noheadings -o lv_name,data_percent --separator='|' "
-                "-S 'lv_role=thin,pool' 2>/dev/null", timeout=8)
-            for line in out.strip().splitlines():
-                parts = [p.strip() for p in line.split("|") if p.strip()]
-                if len(parts) < 2: continue
-                pool, pct_s = parts[0], parts[1]
-                try:
-                    pct = float(pct_s)
-                except ValueError:
-                    continue
-                if pct >= 80:
-                    disk_warn.append({"node": nname, "pool": pool, "pct": pct,
-                                      "level": "alarm"})
-                elif pct >= 70:
-                    disk_warn.append({"node": nname, "pool": pool, "pct": pct,
-                                      "level": "warn"})
-        except Exception:
-            pass
-    if not disk_warn:
-        checks.append({
-            "id": "disk_fill", "label": "Thin-pool fill level (advisory)",
-            "status": "ok",
-            "note": "all thin pools below 70 % full",
-            "remediation": "",
-        })
-    else:
-        worst = max(disk_warn, key=lambda d: d["pct"])
-        status = "fail" if any(d["level"] == "alarm" for d in disk_warn) else "warn"
-        items = ", ".join(f"{d['node']}/{d['pool']} {d['pct']:.0f}%" for d in disk_warn)
-        checks.append({
-            "id": "disk_fill", "label": "Thin-pool fill level (advisory)",
-            "status": status,
-            "note": f"{items}",
-            "remediation": (
-                "Delete unused VMs, snapshots, or old backups. Note: bedrock "
-                "won't BLOCK new allocations on this — operator may need to "
-                "create a 4 GB LV to migrate a 50 GB workload off the node."),
-        })
-
-    # Roll-up: green badge requires ALL checks ok.
-    overall = "ok"
-    for c in checks:
-        if c["status"] == "fail":
-            overall = "fail"; break
-        if c["status"] == "warn":
-            overall = "warn"
-    return {"checks": checks, "overall": overall}
+# ── Supportability checks ─────────────────────────────────────────────────
+# Endpoint moved to mgmt/routes_support.py (Stage 9 PR #2). Pure
+# read-only diagnostic; see that file for the per-check details.
+from routes_support import register_routes as _register_support_routes
+_register_support_routes(
+    app,
+    load_cluster=load_cluster,
+    get_nodes=get_nodes,
+    ssh_cmd_rc=ssh_cmd_rc,
+)
 
 
-# ── Console redirect ────────────────────────────────────────────────────────
+# ── Console redirect + VNC WebSocket → raw-TCP proxy ───────────────────────
+# Implementation moved to mgmt/routes_console.py (Stage 9 PR #1 of the
+# codebase rewrite plan — extract leaf routes from app.py).
+from routes_console import register_routes as _register_console_routes
+_register_console_routes(
+    app,
+    build_cluster_state=build_cluster_state,
+    get_nodes=get_nodes,
+    get_vm_vnc_port=get_vm_vnc_port,
+)
 
-@app.get("/console/{vm_name}")
-def console_page(vm_name: str):
-    state = build_cluster_state()
-    vm = state["vms"].get(vm_name)
-    if not vm: raise HTTPException(404)
-    if not vm.get("vnc_ws_url"):
-        return HTMLResponse("<h2>VM not running or no VNC</h2>")
-    # Direct noVNC at the mgmt-hosted proxy. An empty host+port tells noVNC
-    # to use window.location, and path routes to /vnc/<vm>.
-    return RedirectResponse(
-        f"/novnc/vnc.html?path=vnc/{vm_name}"
-        f"&autoconnect=true&resize=scale&reconnect=true"
-    )
-
-# ── WebSocket → raw-TCP VNC proxy ──────────────────────────────────────────
-# Lets the browser speak WebSocket to the mgmt node; this mgmt node in turn
-# holds a TCP connection to the VM's host:VNC-port. No websockify needed on
-# cluster nodes. noVNC connects to ws://<mgmt>:8080/vnc/<vm_name>.
-
-@app.websocket("/vnc/{vm_name}")
-async def vnc_proxy(ws: WebSocket, vm_name: str):
-    # Only echo back "binary" if the client actually offered it. Modern noVNC
-    # often sends no subprotocol; Starlette will reject the handshake if we
-    # reply with one the client didn't list.
-    offered = (ws.headers.get("sec-websocket-protocol") or "").split(",")
-    offered = [o.strip() for o in offered if o.strip()]
-    if "binary" in offered:
-        await ws.accept(subprotocol="binary")
-    else:
-        await ws.accept()
-    nodes_cfg = get_nodes()
-    state = build_cluster_state()
-    vm = state["vms"].get(vm_name)
-    if not vm or vm.get("state") != "running" or not vm.get("running_on"):
-        await ws.close(code=1011, reason="VM not running")
-        return
-    host = nodes_cfg[vm["running_on"]]["host"]
-    port = get_vm_vnc_port(host, vm_name)
-    if port <= 0:
-        await ws.close(code=1011, reason="no VNC port")
-        return
-    try:
-        reader, writer = await asyncio.open_connection(host, port)
-    except Exception as e:
-        await ws.close(code=1011, reason=f"connect: {e}")
-        return
-
-    total_ws_to_tcp = 0
-    total_tcp_to_ws = 0
-    async def ws_to_tcp():
-        nonlocal total_ws_to_tcp
-        try:
-            while True:
-                data = await ws.receive_bytes()
-                total_ws_to_tcp += len(data)
-                writer.write(data)
-                await writer.drain()
-        except Exception as e:
-            log.info("vnc_proxy ws->tcp ended: %s (sent=%d)", e, total_ws_to_tcp)
-        finally:
-            try: writer.close()
-            except Exception: pass
-
-    async def tcp_to_ws():
-        nonlocal total_tcp_to_ws
-        try:
-            while True:
-                data = await reader.read(16384)
-                if not data: break
-                total_tcp_to_ws += len(data)
-                await ws.send_bytes(data)
-        except Exception as e:
-            log.info("vnc_proxy tcp->ws ended: %s (sent=%d)", e, total_tcp_to_ws)
-        finally:
-            try: await ws.close()
-            except Exception: pass
-
-    await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+# ── routes_iso (deferred from earlier — needs push_log) ──────────────────
+from routes_iso import register_routes as _register_iso_routes
+_register_iso_routes(app, push_log=push_log)
 
 
 # ── Static files (Svelte build + noVNC) ────────────────────────────────────
@@ -5366,44 +4978,48 @@ if ui_build.exists():
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def serve_main():
-    """Bind uvicorn to 8443+8080 (or 8080-only if no cert yet) and
-    block until SIGTERM. Extracted from the __main__ block so the
-    unified bedrock-d entrypoint can call it after wiring shared
-    state + starting netd thread."""
+    """Bind uvicorn to the operator/CLI ports and block until SIGTERM.
+    Extracted from the ``__main__`` block so the unified bedrock-d
+    entrypoint can call it after wiring shared state + starting the
+    netd thread.
+
+    Listeners:
+      * 8443 HTTPS — operator dashboard + LAN-reachable mgmt API.
+        Browser-trusted via the local-ip.co wildcard cert (refresh
+        timer keeps it ≤30 days from expiry). Bound only when a cert
+        is present; until then we fall back to the open-LAN bootstrap
+        port below.
+      * 127.0.0.1:8001 HTTP — local CLI / intra-process endpoint. The
+        ``bedrock`` CLI dials this; rqlite_client, view_builder, etc.
+        also point here. **Loopback-only, no LAN exposure.**
+      * 8080 LAN HTTP — bootstrap-only, used when no TLS cert exists
+        yet so a joiner can fetch ``/api/cluster``. As soon as the
+        cert-refresh timer drops the first cert (~2 min after install)
+        the next restart switches to the safe layout above.
+
+    Port 8080 is now reserved for ``weed-volume`` (see
+    docs/storage-architecture.md). Anything that previously dialled
+    ``http://localhost:8080`` for the local mgmt API has moved to
+    ``http://127.0.0.1:8001`` — that change is mechanical and stays
+    inside this codebase; no operator-facing URL changes.
+    """
     import threading
     import uvicorn
-    # Two listeners:
-    #   8080 HTTP  — intra-cluster control plane. Joiners, peer-to-peer
-    #                tier ops, storage transfers, view_builder URLs all
-    #                point here. Plain HTTP because cluster.key + the
-    #                trusted LAN are the security boundary; adding TLS
-    #                here would break every code path that constructs
-    #                http://<peer>:8080/... URLs.
-    #   8443 HTTPS — operator dashboard. Browser hits the green-padlock
-    #                wildcard cert from local-ip.co (refresh timer keeps
-    #                it ≤30 days from expiry). Only bound when a cert is
-    #                present — fresh installs serve 8080 only until the
-    #                cert-refresh OnBootSec=2min timer drops the first cert.
     cert = Path("/etc/bedrock/tls/cert.pem")
     key  = Path("/etc/bedrock/tls/key.pem")
     if cert.exists() and key.exists():
-        # 8080 → loopback only: removes the LAN attack surface for the
-        # unauthenticated control plane. The `bedrock` CLI on this node
-        # still works (it dials http://localhost:8080) and intra-process
-        # callers are fine. Anything off-host MUST go through 8443.
+        # CLI / intra-process loopback endpoint.
         t = threading.Thread(
-            target=lambda: uvicorn.run(app, host="127.0.0.1", port=8080,
+            target=lambda: uvicorn.run(app, host="127.0.0.1", port=8001,
                                        log_level="warning"),
             daemon=True)
         t.start()
         uvicorn.run(app, host="0.0.0.0", port=8443,
                     ssl_keyfile=str(key), ssl_certfile=str(cert))
     else:
-        # No cert yet (fresh install, cert-refresh hasn't fired). Bind
-        # 8080 LAN-wide so joiners can reach us in the gap before
-        # cert-refresh OnBootSec=2min runs. The window is brief and the
-        # next restart (triggered by cert install) flips to the safe
-        # loopback-bound layout above.
+        # Fresh install, no cert yet — open the bootstrap HTTP port so
+        # the joiner CLI can fetch /api/cluster. cert-refresh timer
+        # restarts us into the cert-aware layout within ~2 min.
         uvicorn.run(app, host="0.0.0.0", port=8080)
 
 

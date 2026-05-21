@@ -85,11 +85,11 @@ export async function vmStart(name: string) {
 }
 
 export async function vmShutdown(name: string) {
-	return apiPost(`/api/vms/${name}/shutdown`);
+	return apiPost(`/api/vms/${name}/stop`);
 }
 
 export async function vmPoweroff(name: string) {
-	return apiPost(`/api/vms/${name}/poweroff`);
+	return apiPost(`/api/vms/${name}/force-stop`);
 }
 
 export async function vmMigrate(name: string, targetNode?: string) {
@@ -97,7 +97,7 @@ export async function vmMigrate(name: string, targetNode?: string) {
 }
 
 export async function vmConvert(name: string, targetType: 'cattle' | 'pet' | 'vipet') {
-	return apiPost(`/api/vms/${name}/convert`, { target_type: targetType });
+	return apiPost(`/api/vms/${name}/ha-level`, { vm_type: targetType });
 }
 
 export interface VMCreateRequest {
@@ -111,7 +111,7 @@ export interface VMCreateRequest {
 }
 
 export async function vmCreate(req: VMCreateRequest) {
-	return apiPost('/api/vms/create', req);
+	return apiPost('/api/vms', req);
 }
 
 export async function vmAttachDisk(name: string, size_gb: number) {
@@ -144,7 +144,7 @@ export async function getVmSettings(name: string): Promise<VMSettings> {
 }
 
 export async function setVmResources(name: string, body: Partial<Pick<VMSettings, 'vcpus' | 'ram_mb' | 'disk_gb'>>) {
-	return apiPost(`/api/vms/${name}/resources`, body);
+	return apiPost(`/api/vms/${name}/compute`, body);
 }
 
 export async function setVmPriority(name: string, priority: 'low' | 'normal' | 'high') {
@@ -245,7 +245,7 @@ export async function deleteIso(name: string) {
 export async function uploadIso(file: File, onProgress?: (pct: number) => void) {
 	return new Promise((resolve, reject) => {
 		const xhr = new XMLHttpRequest();
-		xhr.open('POST', '/api/isos/upload');
+		xhr.open('POST', '/api/isos');
 		const _t2 = getToken(); if (_t2) xhr.setRequestHeader('Authorization', `Bearer ${_t2}`);
 		xhr.upload.onprogress = (e) => {
 			if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
