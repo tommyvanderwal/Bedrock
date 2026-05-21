@@ -5007,20 +5007,25 @@ def serve_main():
     import uvicorn
     cert = Path("/etc/bedrock/tls/cert.pem")
     key  = Path("/etc/bedrock/tls/key.pem")
+    # Always bind 127.0.0.1:8001 — the local CLI dials this regardless
+    # of cert state. Running in a daemon thread so the main thread can
+    # bring up the LAN listener (8443 with cert, 8080 without).
+    threading.Thread(
+        target=lambda: uvicorn.run(app, host="127.0.0.1", port=8001,
+                                   log_level="warning"),
+        daemon=True,
+    ).start()
     if cert.exists() and key.exists():
-        # CLI / intra-process loopback endpoint.
-        t = threading.Thread(
-            target=lambda: uvicorn.run(app, host="127.0.0.1", port=8001,
-                                       log_level="warning"),
-            daemon=True)
-        t.start()
         uvicorn.run(app, host="0.0.0.0", port=8443,
                     ssl_keyfile=str(key), ssl_certfile=str(cert))
     else:
-        # Fresh install, no cert yet — open the bootstrap HTTP port so
-        # the joiner CLI can fetch /api/cluster. cert-refresh timer
-        # restarts us into the cert-aware layout within ~2 min.
-        uvicorn.run(app, host="0.0.0.0", port=8080)
+        # No cert yet — bind the bootstrap HTTP port on **127.0.0.1**,
+        # NOT 0.0.0.0. Port 8080 on 0.0.0.0 conflicts with weed-volume
+        # which also binds 0.0.0.0:8080 on every node (see the port
+        # map in docs/storage-architecture.md). When the cert-refresh
+        # timer drops the first cert, the next bedrock-d restart
+        # flips to 8443.
+        uvicorn.run(app, host="127.0.0.1", port=8080)
 
 
 if __name__ == "__main__":

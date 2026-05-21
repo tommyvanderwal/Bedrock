@@ -258,7 +258,11 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.service" \
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
     -o /etc/systemd/system/bedrock-cert-refresh.timer
 systemctl daemon-reload
-systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
+# DO NOT enable the cert-refresh timer here — lib/cert_manager.py
+# isn't on disk yet, so the timer firing immediately would crash
+# the service with ModuleNotFoundError before LIB_FILES gets a
+# chance to populate. Enabled at the very end, after lib/ + the
+# tarballs are staged.
 
 log "Installing bedrock-mdns + bedrock-redirect..."
 curl -fsSL "${BEDROCK_REPO}/bedrock-mdns" \
@@ -407,6 +411,12 @@ if [ "$current_hn" = "localhost.localdomain" ] || [ "$current_hn" = "localhost" 
         hostnamectl set-hostname "$new_hn"
     fi
 fi
+
+# ── Enable cert-refresh timer (deferred until lib/ is staged) ─────────────
+# lib/cert_manager.py is what /usr/local/bin/bedrock-cert-refresh imports;
+# the LIB_FILES loop above is what put it there. Safe to enable the
+# timer now.
+systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
 
 # ── Run the Python bootstrap ──────────────────────────────────────────────
 
