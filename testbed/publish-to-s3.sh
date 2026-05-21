@@ -104,10 +104,14 @@ trap 'rm -rf "$STAGE"' EXIT
 echo "[publish] staging into $STAGE"
 
 # ── Allowlist ────────────────────────────────────────────────────────────
-# install.sh + CLI + daemon
-install -m 0755 -D "$REPO/installer/install.sh"   "$STAGE/install.sh"
-install -m 0755 -D "$REPO/installer/bedrock"      "$STAGE/bedrock"
-install -m 0755 -D "$REPO/installer/bedrock-d"    "$STAGE/bedrock-d"
+# install.sh + CLI + daemon + small helper scripts
+# (install.sh's curl URLs are exactly these top-level names)
+install -m 0755 -D "$REPO/installer/install.sh"            "$STAGE/install.sh"
+install -m 0755 -D "$REPO/installer/bedrock"               "$STAGE/bedrock"
+install -m 0755 -D "$REPO/installer/bedrock-d"             "$STAGE/bedrock-d"
+install -m 0755 -D "$REPO/installer/bedrock-cert-refresh"  "$STAGE/bedrock-cert-refresh"
+install -m 0755 -D "$REPO/installer/bedrock-mdns"          "$STAGE/bedrock-mdns"
+install -m 0755 -D "$REPO/installer/bedrock-redirect"      "$STAGE/bedrock-redirect"
 
 # lib/ — every .py + .sql (.md is documentation; not part of the runtime payload)
 mkdir -p "$STAGE/lib"
@@ -130,9 +134,10 @@ if [ -d "$REPO/mgmt/ui/build" ]; then
     cp -r "$REPO/mgmt/ui/build" "$STAGE/mgmt/ui/build"
 fi
 
-# systemd unit files
+# systemd unit files + timers + sshd dropins
 mkdir -p "$STAGE/configs"
-find "$REPO/installer/configs" -maxdepth 1 -type f -name "*.service" \
+find "$REPO/installer/configs" -maxdepth 1 -type f \
+    \( -name "*.service" -o -name "*.timer" -o -name "*.conf" \) \
     -exec install -m 0644 {} "$STAGE/configs/" \;
 
 # binaries/ + wheels/ — re-use the iso-build payload that's already curated
