@@ -271,19 +271,27 @@ EOF
 
 systemctl enable bedrock-firstboot.service
 
-# Operator-facing first-login banner.
+# Initial MOTD: the system is up enough to log into, but
+# bedrock-firstboot.service is still running install.sh in the
+# background (dnf installs, service staging, lib stage-out — ~3-7
+# minutes on a net-install). The login prompt comes up at
+# multi-user.target which is also when firstboot starts; both run in
+# parallel. install.sh swaps this MOTD for the "ready" banner as its
+# final step, so a stale "fresh install — run bedrock init" message
+# never shows while the install is actually still running.
 cat > /etc/motd <<'EOF'
 
   ╔══════════════════════════════════════════════════════════════════╗
-  ║                  Bedrock node — fresh install                    ║
+  ║                Bedrock — installation in progress                ║
   ╠══════════════════════════════════════════════════════════════════╣
   ║                                                                  ║
-  ║  AlmaLinux 10 + Bedrock installed via __BEDROCK_VARIANT__.       ║
+  ║  AlmaLinux 10 base install is complete.                          ║
+  ║  Bedrock first-boot bootstrap is running NOW (~3-7 min).         ║
   ║                                                                  ║
-  ║  Next step:                                                      ║
-  ║      bedrock init           — start a new cluster                ║
-  ║      bedrock join HOST      — join an existing one               ║
+  ║  Watch it:                                                       ║
+  ║      journalctl -fu bedrock-firstboot                            ║
   ║                                                                  ║
+  ║  This banner will change to "ready" once the install finishes.   ║
   ║  Default root password is `bedrock`. Change it now.              ║
   ║                                                                  ║
   ╚══════════════════════════════════════════════════════════════════╝

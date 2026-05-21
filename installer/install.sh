@@ -708,6 +708,39 @@ fi
 systemctl enable --now bedrock-cert-refresh.timer >/dev/null 2>&1 || true
 
 # ── Run the Python bootstrap ──────────────────────────────────────────────
+# This is the heavy phase: dnf installs of libvirt/qemu/drbd-kmod and
+# other cluster prereqs, hardware probing, etc. Anything from a few
+# seconds (offline install with bundled RPMs) to several minutes (net
+# install pulling from upstream mirrors).
 
 log "Running bedrock bootstrap..."
-exec /usr/local/bin/bedrock bootstrap
+if /usr/local/bin/bedrock bootstrap; then
+    log "Bedrock bootstrap finished cleanly."
+    # ── Swap MOTD: kickstart set "installation in progress"; now that
+    #    everything succeeded, replace it with the operator-ready
+    #    "next step: bedrock init / bedrock join" banner. If bootstrap
+    #    failed, the in-progress MOTD stays put so the operator
+    #    immediately sees that the install isn't complete.
+    cat > /etc/motd <<'EOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                  Bedrock node — ready                            ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║                                                                  ║
+  ║  AlmaLinux 10 + Bedrock first-boot bootstrap complete.           ║
+  ║                                                                  ║
+  ║  Next step:                                                      ║
+  ║      bedrock init           — start a new cluster                ║
+  ║      bedrock join HOST      — join an existing one               ║
+  ║                                                                  ║
+  ║  Default root password is `bedrock`. Change it now.              ║
+  ║                                                                  ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+    exit 0
+else
+    rc=$?
+    error "bedrock bootstrap failed (exit code $rc). MOTD stays as 'installation in progress' so you don't miss it. See: journalctl -u bedrock-firstboot"
+    exit $rc
+fi
