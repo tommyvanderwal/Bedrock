@@ -1056,15 +1056,35 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
 
 
 def _read_tier_critical_uuid() -> str:
-    """Read the current-UUID of the tier-critical DRBD resource via
-    `drbdadm dump-md`. Returns "" if DRBD isn't up or the resource
-    doesn't exist (N=1 mode). The current-UUID is the field DRBD
-    bumps on every writable transition — it's our generation-marker
-    for "this side has the freshest data"."""
+    """Read the current-UUID of the tier-critical DRBD resource.
+
+    DRBD9 stores live UUIDs in the kernel's debugfs at
+    ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``.
+    First line is the current UUID; subsequent lines are bitmap
+    UUIDs per peer + history UUIDs. We only want the current.
+
+    Falls back to ``drbdadm dump-md`` (which only works when the
+    resource is **down**) for N=1 setups where the resource isn't
+    yet attached — in that case the witness slot stays empty and
+    the takeover protocol's UUID check no-ops.
+
+    Returns "" if neither source has the UUID."""
+    debugfs = (
+        "/sys/kernel/debug/drbd/resources/tier-critical/volumes/0/"
+        "data_gen_id"
+    )
+    try:
+        with open(debugfs, "r") as f:
+            first = f.readline().strip()
+        # Format: "0xABCDEF0123456789" (16 hex chars + 0x prefix).
+        if first.startswith("0x"):
+            return first[2:].lower()
+    except OSError:
+        pass
+    # Fallback for down/unattached resources.
     rc, out, _ = _run_silent_capture(["drbdadm", "dump-md", "tier-critical"])
     if rc != 0:
         return ""
-    # dump-md output has lines like: `current-uuid 0xABCDEF... ;`
     for line in out.splitlines():
         s = line.strip()
         if s.startswith("current-uuid"):
