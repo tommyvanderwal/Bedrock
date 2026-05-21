@@ -275,10 +275,14 @@ def cmd_status(args):
     print(f"Role:    {state.get('role', 'compute')}")
     print(f"Mgmt IP: {state.get('mgmt_ip', '-')}")
     print()
-    # Delegate to the dashboard API if available for full cluster view
+    # Delegate to the dashboard API if available for full cluster view.
+    # Always dial the local loopback endpoint here — state.json's
+    # mgmt_url is the LAN-facing HTTPS URL meant for remote consumers
+    # (joiners, off-host dashboards) and may not even resolve from
+    # this box without a cert installed.
     import urllib.request
     try:
-        mgmt_url = state.get("mgmt_url", f"http://127.0.0.1:8001")
+        mgmt_url = "http://127.0.0.1:8001"
         r = urllib.request.urlopen(mgmt_url + "/api/cluster", timeout=3)
         import json as _json
         data = _json.loads(r.read())
