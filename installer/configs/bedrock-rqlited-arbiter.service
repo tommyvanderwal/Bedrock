@@ -8,7 +8,6 @@ Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
 # enabled standalone.
 After=network-online.target bedrock-d.service bedrock-rqlited.service
 Wants=network-online.target
-Requires=bedrock-d.service
 # Allow several restarts during master-role transitions before
 # systemd gives up — each transition demotes-then-promotes which
 # can produce a quick stop/start.

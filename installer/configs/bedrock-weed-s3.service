@@ -1,11 +1,12 @@
 [Unit]
 Description=SeaweedFS S3 API gateway
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki/AmazonS3-API
-After=network-online.target bedrock-weed-filer.service
+After=network-online.target bedrock-d.service
 Wants=network-online.target
-Requires=bedrock-weed-filer.service
-# Like the filer, NOT enabled by default — moves with the mgmt-
-# master role via cluster_arbiter.
+# Runs on EVERY node bound 0.0.0.0:8333. The filer it talks to
+# lives at .254:8888 (cluster-singleton VIP), so all S3 gateways
+# share one namespace + one IAM identity store. mDNS publishes
+# `bedrock.local` -> any UP node for external S3 clients.
 StartLimitIntervalSec=120
 StartLimitBurst=10
 
@@ -13,12 +14,14 @@ StartLimitBurst=10
 Type=simple
 EnvironmentFile=/etc/bedrock/seaweedfs.env
 
-# Listens on 0.0.0.0:8333 so external S3 clients (Kopia, awscli,
-# rclone) can connect via the operator-LAN IP. The filer endpoint
-# is the master's loopback /32, reachable via the mesh.
+# -filer is the cluster VIP (.254/32), reachable as long as
+# whichever node currently hosts the arbiter is running the filer.
+# `-config` carries S3-specific knobs; IAM identities live INSIDE
+# the filer DB via `-iam.filerBucketsPath=/buckets`.
 ExecStart=/usr/local/bin/weed s3 \
-    -filer=${SEAWEED_LOOPBACK_IP}:8888 \
+    -filer=${SEAWEED_FILER_VIP}:8888 \
     -port=8333 \
+    -ip.bind=0.0.0.0 \
     -config=/etc/bedrock/seaweedfs-s3.json
 
 Restart=on-failure

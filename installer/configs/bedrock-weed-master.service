@@ -3,15 +3,19 @@ Description=SeaweedFS master (cluster coordinator)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki
 After=network-online.target bedrock-d.service
 Wants=network-online.target
-Requires=bedrock-d.service
 StartLimitIntervalSec=120
 StartLimitBurst=10
 
 [Service]
 Type=simple
-# Runs on every node — master HA at N≥2. Binds to this node's
-# loopback /32 (the cluster identity IP — bedrock-net advertises it,
-# kernel routes through the best physical NIC).
+# Runs on the 3 nodes in seaweed_master_membership (Raft-3 group).
+# Bound to this node's loopback /32. Not on .254 — the master
+# Raft set is independent of the .254 arbiter so master availability
+# doesn't depend on arbiter handovers. The calm orchestrator
+# enables/disables this unit per the rqlite membership table.
+# `-defaultReplication=001` makes the cluster-wide default
+# 2 copies (1 extra on a different server); individual collections
+# override this via `weed shell` (scratch=000, critical=002).
 EnvironmentFile=/etc/bedrock/seaweedfs.env
 
 ExecStart=/usr/local/bin/weed master \
@@ -20,6 +24,7 @@ ExecStart=/usr/local/bin/weed master \
     -port.grpc=19333 \
     -mdir=/var/lib/bedrock/seaweedfs/master \
     -peers=${SEAWEED_MASTER_PEERS} \
+    -defaultReplication=001 \
     -resumeState=true
 
 Restart=on-failure
@@ -35,5 +40,7 @@ ReadWritePaths=/var/lib/bedrock/seaweedfs/master
 StandardOutput=journal
 StandardError=journal
 
+# Not WantedBy any target — calm orchestrator enables on the
+# Raft-3 member nodes only.
 [Install]
-WantedBy=multi-user.target
+WantedBy=

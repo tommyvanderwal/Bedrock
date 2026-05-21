@@ -3,7 +3,7 @@ Description=SeaweedFS volume server (file bytes)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki
 After=network-online.target bedrock-d.service bedrock-weed-master.service
 Wants=network-online.target
-Requires=bedrock-d.service bedrock-weed-master.service
+
 StartLimitIntervalSec=120
 StartLimitBurst=10
 
@@ -14,14 +14,19 @@ EnvironmentFile=/etc/bedrock/seaweedfs.env
 # `-disk=` operator-declared disk class (ssd / hdd / nvme) — used
 # by per-collection placement rules. Defaulted to ssd; operator
 # can override by editing seaweedfs.env and re-rendering.
+# Volume server runs on EVERY node, bound 0.0.0.0:8080 so other
+# nodes' filers/masters can reach it directly. `-publicUrl` is set
+# to this node's loopback /32 so master sees a stable per-node ID.
 ExecStart=/usr/local/bin/weed volume \
+    -ip.bind=0.0.0.0 \
     -ip=${SEAWEED_LOOPBACK_IP} \
+    -publicUrl=${SEAWEED_LOOPBACK_IP}:8080 \
     -port=8080 \
     -port.grpc=18080 \
     -dir=/var/lib/bedrock/seaweedfs/volumes \
     -disk=${SEAWEED_VOLUME_DISK_TYPE} \
     -max=${SEAWEED_VOLUME_MAX} \
-    -mserver=${SEAWEED_FILER_MASTERS}
+    -mserver=${SEAWEED_MASTER_PEERS}
 
 Restart=on-failure
 RestartSec=3s
@@ -39,4 +44,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=

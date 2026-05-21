@@ -1,9 +1,12 @@
 [Unit]
 Description=Bedrock cluster-state store (rqlite, per-node instance)
 Documentation=https://rqlite.io/ https://github.com/tommyvanderwal/Bedrock
-After=network-online.target bedrock-d.service
+After=network-online.target
 Wants=network-online.target
-Requires=bedrock-d.service
+# No Requires=bedrock-d here. The cluster_init / node_join sagas
+# inside bedrock-d explicitly start this unit at the right step
+# (after rqlited.env is rendered). Cross-Bedrock service deps
+# create dependency cycles — see docs/codebase-rewrite-plan §3.5.
 
 # Don't fight systemd's start-limit during burst inits — see
 # docs/mesh-network-v1-uncertainties.md §5 for the equivalent
@@ -71,4 +74,7 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+# bedrock-d's saga executor enables + starts this. Empty WantedBy so
+# `systemctl enable` becomes a no-op at install time; the saga turns
+# us on when the env file + state.json are ready.
+WantedBy=

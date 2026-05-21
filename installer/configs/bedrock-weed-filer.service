@@ -1,12 +1,12 @@
 [Unit]
-Description=SeaweedFS filer (POSIX namespace on top of volumes)
+Description=SeaweedFS filer (POSIX namespace + IAM on top of volumes)
 Documentation=https://github.com/seaweedfs/seaweedfs/wiki/Filer-Stores
-After=network-online.target bedrock-d.service bedrock-weed-master.service bedrock-weed-volume.service
+After=network-online.target bedrock-d.service bedrock-weed-volume.service
 Wants=network-online.target
-Requires=bedrock-d.service bedrock-weed-master.service
-# NOT enabled by default — cluster_arbiter.py starts/stops this as
-# part of the mgmt-master role transition (the filer SQLite DB lives
-# on the tier-cluster DRBD volume, per D-07/D-10).
+# Singleton — runs on the .254/32 cluster VIP host (whoever owns
+# the arbiter). cluster_arbiter.py starts/stops this as part of
+# the arbiter-host role transition; filer leveldb3 lives on the
+# tier-critical DRBD volume mounted at /var/lib/bedrock/cluster.
 StartLimitIntervalSec=120
 StartLimitBurst=10
 
@@ -14,17 +14,21 @@ StartLimitBurst=10
 Type=simple
 EnvironmentFile=/etc/bedrock/seaweedfs.env
 
-# Refuse to start if tier-cluster isn't mounted (the filer DB lives
-# under /var/lib/bedrock/cluster/seaweedfs/).
+# Refuse to start if tier-critical isn't mounted (the filer DB
+# lives under /var/lib/bedrock/cluster/seaweedfs/).
 ExecStartPre=/usr/bin/test -d /var/lib/bedrock/cluster/seaweedfs
 
+# Binds to the cluster VIP .254 so every node's volume + s3 reach
+# the same filer endpoint regardless of which physical node hosts
+# it. -peers points at the weed-master Raft-3 group.
 ExecStart=/usr/local/bin/weed filer \
-    -ip=${SEAWEED_LOOPBACK_IP} \
+    -ip=${SEAWEED_FILER_VIP} \
+    -ip.bind=${SEAWEED_FILER_VIP} \
     -port=8888 \
     -port.grpc=18888 \
-    -master=${SEAWEED_FILER_MASTERS}
-# Filer reads /etc/seaweedfs/filer.toml from the well-known search
-# paths; no `-config` flag in weed 4.25's filer subcommand.
+    -master=${SEAWEED_MASTER_PEERS}
+# Filer reads /etc/seaweedfs/filer.toml for the leveldb3 path; no
+# `-config` flag in weed 4.25's filer subcommand.
 
 Restart=on-failure
 RestartSec=3s
