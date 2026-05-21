@@ -324,15 +324,22 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"  WARN: rqlite_setup render_env failed: {e}")
             raise
-        # Enable + start. install.sh doesn't enable bedrock-rqlited at
-        # firstboot anymore (would crash-loop without env file), so do
-        # it here once the env file exists. Also reset-failed so we
-        # ignore any stale rate-limit counter.
+        # Start (not enable + start). install.sh writes the unit file
+        # but doesn't enable it (would crash-loop without env file).
+        # We don't enable here either — bedrock-rqlited.service has
+        # `WantedBy=` empty by design (see configs/bedrock-rqlited.service);
+        # the saga executor in bedrock-d is what controls its lifecycle.
+        # `systemctl enable` on an empty-WantedBy unit just emits a
+        # "no installation config" warning and otherwise does nothing.
+        #
+        # reset-failed clears any stale rate-limit counter. stderr is
+        # suppressed because the unit may not yet be in systemd's
+        # in-memory state if no daemon-reload ran since install.sh
+        # wrote the unit file — the failure mode there is harmless.
         _sp.run(["systemctl", "reset-failed",
                  "bedrock-rqlited.service", "bedrock-d.service"],
-                check=False, timeout=10)
-        _sp.run(["systemctl", "enable", "bedrock-rqlited.service"],
-                check=False, timeout=10)
+                check=False, timeout=10,
+                stderr=_sp.DEVNULL)
         _sp.run(["systemctl", "restart", "bedrock-rqlited.service"],
                 check=False, timeout=30)
         # Wait for rqlited to be Leader, not just HTTP-up. The

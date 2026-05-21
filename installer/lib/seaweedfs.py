@@ -398,11 +398,14 @@ def promote_to_filer_host() -> None:
     log.info("seaweedfs: starting filer + s3 on this node")
     # Clear any stuck start-rate-limit from a previous failed start
     # attempt (env file race during install, mount-not-ready, etc.).
+    # stderr silenced — `reset-failed` on a not-yet-loaded unit
+    # complains, but the failure mode is harmless.
     subprocess.run(
         ["systemctl", "reset-failed",
          "bedrock-weed-filer.service",
          "bedrock-weed-s3.service"],
         check=False, timeout=10,
+        stderr=subprocess.DEVNULL,
     )
     _systemctl("start", "bedrock-weed-filer.service")
     _systemctl("start", "bedrock-weed-s3.service")
@@ -456,7 +459,9 @@ def promote_to_master_volume_host() -> None:
     # Reset-failed first: any of these may have crash-looped earlier
     # (env file not yet written → "Failed to load environment files"
     # → restart → ... → StartLimitBurst). Clear before we try to
-    # start them for real.
+    # start them for real. stderr silenced because units that haven't
+    # been daemon-reloaded yet emit a "unit not loaded" message that
+    # we don't care about — reset-failed is fire-and-forget.
     subprocess.run(
         ["systemctl", "reset-failed",
          "bedrock-weed-master.service",
@@ -464,22 +469,31 @@ def promote_to_master_volume_host() -> None:
          "bedrock-weed-filer.service",
          "bedrock-weed-s3.service"],
         check=False, timeout=10,
+        stderr=subprocess.DEVNULL,
     )
 
-    # Volume + S3 on EVERY node, always.
+    # Volume + S3 on EVERY node, always. stderr silenced because the
+    # unit files have `WantedBy=` empty by design (see
+    # configs/bedrock-weed-*.service) — they're enabled imperatively
+    # by us, not at boot. `enable` on such a unit prints "no
+    # installation config" but still creates the runtime symlink we
+    # want via `--now`.
     subprocess.run(
         ["systemctl", "enable", "--now",
          "bedrock-weed-volume.service",
          "bedrock-weed-s3.service"],
         check=False, timeout=30,
+        stderr=subprocess.DEVNULL,
     )
 
-    # Master: only if in the Raft-3 set.
+    # Master: only if in the Raft-3 set. Same WantedBy= empty-by-design
+    # reason for the stderr silencing as above.
     if i_run_master:
         subprocess.run(
             ["systemctl", "enable", "--now",
              "bedrock-weed-master.service"],
             check=False, timeout=30,
+            stderr=subprocess.DEVNULL,
         )
     else:
         log.info("seaweedfs: not in master Raft-3 set "
@@ -489,6 +503,7 @@ def promote_to_master_volume_host() -> None:
             ["systemctl", "disable", "--now",
              "bedrock-weed-master.service"],
             check=False, timeout=30,
+            stderr=subprocess.DEVNULL,
         )
 
 

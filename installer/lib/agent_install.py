@@ -404,17 +404,23 @@ def install(witness: str, cluster_info: dict, repo: str):
                     break
                 _t.sleep(0.5)
         _rqs.render_env_file()
-        # install.sh doesn't enable bedrock-rqlited at firstboot anymore;
-        # do it here once the env file is in place. Reset-failed first
-        # so any leftover rate-limit counter is wiped.
+        # install.sh writes the unit file at firstboot but doesn't
+        # enable it (would crash-loop without env file). Now that the
+        # env file exists, just `restart` — we skip `enable` because
+        # bedrock-rqlited.service has `WantedBy=` empty by design
+        # (see configs/bedrock-rqlited.service); the saga executor in
+        # bedrock-d controls its lifecycle. `systemctl enable` on an
+        # empty-WantedBy unit emits "no installation config" noise
+        # and otherwise does nothing.
+        #
+        # reset-failed clears any stale rate-limit counter; stderr is
+        # silenced because the unit may not have been daemon-reloaded
+        # yet — the warning is benign.
         subprocess.run(
             ["systemctl", "reset-failed",
              "bedrock-rqlited.service", "bedrock-d.service"],
             check=False, timeout=10,
-        )
-        subprocess.run(
-            ["systemctl", "enable", "bedrock-rqlited.service"],
-            check=False, timeout=10,
+            stderr=subprocess.DEVNULL,
         )
         subprocess.run(
             ["systemctl", "restart", "bedrock-rqlited.service"],
