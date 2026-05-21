@@ -54,7 +54,7 @@ def _write_systemd(name: str, content: str):
     run("systemctl daemon-reload")
 
 
-def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
+def install_full(cluster_name: str, repo: str):
     """Install FastAPI + VM + VL + SQLite + witness.
 
     Execution: by default, the saga path
@@ -83,7 +83,6 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
         from bedrock_d.install.cluster_init import run_cluster_init
         return run_cluster_init(
             cluster_name=cluster_name,
-            witness_host=witness_host,
             repo=repo,
         )
     print("[bedrock init] legacy procedural path (BEDROCK_INIT_SAGA=0)")
@@ -212,16 +211,13 @@ WantedBy=multi-user.target
     print("  Installing + starting dashboard service (with metrics)...")
     _di.install_dashboard(repo, with_metrics=True)
 
-    if not witness_host:
-        witness_host = "self"
-
-    # Save state
+    # Save state. No witness configured at init — see the saga's
+    # docstring + docs/sagas/cluster_init.md for why.
     s["cluster_name"] = cluster_name
     s["cluster_uuid"] = s.get("cluster_uuid") or str(uuid.uuid4())
     s["role"] = "mgmt+compute"
     s["node_id"] = 0
     s["node_name"] = hw.get("hostname", "node1")
-    s["witness_host"] = witness_host
     s["mgmt_ip"] = _pick_mgmt_ip(hw)
     # Port 8080 is loopback-only (intra-node); HTTPS on 8443 is the
     # LAN-reachable endpoint and what joiners need to dial.

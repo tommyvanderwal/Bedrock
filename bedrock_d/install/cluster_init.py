@@ -3,7 +3,7 @@
 # Entry point: ``run_cluster_init(...)``
 
 Callers (``bedrock init`` via ``mgmt_install.install_full``) invoke
-``run_cluster_init(cluster_name, witness_host, repo)`` which:
+``run_cluster_init(cluster_name, repo)`` which:
 
 1. Constructs the saga ``ctx`` dict.
 2. Builds a ``FileSagaBackend`` at
@@ -88,8 +88,7 @@ INIT_PROGRESS_PATH = Path("/var/lib/bedrock/init-progress.json")
 
 
 def run_cluster_init(*, cluster_name: str,
-                     repo: str,
-                     witness_host: Optional[str] = None) -> None:
+                     repo: str) -> None:
     """Entry point for `bedrock init` via the saga path.
 
     Builds the saga ``ctx``, opens the FileSagaBackend at
@@ -99,6 +98,13 @@ def run_cluster_init(*, cluster_name: str,
 
     Raises ``RuntimeError`` on saga failure with the failed
     step name + the underlying error.
+
+    Note — no witness is configured at init time. The witness is a
+    quorum tiebreaker that only becomes load-bearing at N>=2; the
+    operator picks one (or accepts the cattle-only "no witness, no
+    auto-failover" default) at the moment the dashboard prompts
+    them to accept the first joiner. See docs/sagas/cluster_init.md
+    for the rationale.
     """
     INIT_PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     backend = FileSagaBackend(path=INIT_PROGRESS_PATH)
@@ -137,7 +143,6 @@ def run_cluster_init(*, cluster_name: str,
     # with the durable bits before submitting.
     _enrich_params_from_state(backend_params := {
         "cluster_name": cluster_name,
-        "witness_host": witness_host or "self",
         "repo": repo,
     })
 
@@ -214,7 +219,6 @@ class ClusterInit:
 
     ctx inputs (set by the caller / cmd_init):
       - cluster_name: str
-      - witness_host: str (default "self")
       - repo: str (URL of the install repo for binary downloads)
 
     ctx outputs (set as steps run):
@@ -250,7 +254,6 @@ class ClusterInit:
         s["role"] = "mgmt+compute"
         s["node_id"] = 0
         s["node_name"] = s.get("node_name") or hw.get("hostname", "node1")
-        s["witness_host"] = ctx.get("witness_host") or "self"
         s["mgmt_ip"] = self._pick_mgmt_ip(hw)
         s["mgmt_url"] = f"https://{s['mgmt_ip']}:8443"
         s["loopback_ip"] = _ca.node_loopback_ip(s["cluster_uuid"], 1)

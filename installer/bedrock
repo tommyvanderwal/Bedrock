@@ -129,7 +129,7 @@ def cmd_init(args):
     cluster_name = args.name or f"bedrock-{socket.gethostname()}"
     print(f"Creating cluster: {cluster_name}")
 
-    mgmt_install.install_full(cluster_name=cluster_name, witness_host=args.witness,
+    mgmt_install.install_full(cluster_name=cluster_name,
                               repo=get_repo())
 
     state = load_state()
@@ -274,7 +274,6 @@ def cmd_status(args):
     print(f"Node:    {state.get('node_name', socket.gethostname())}")
     print(f"Role:    {state.get('role', 'compute')}")
     print(f"Mgmt IP: {state.get('mgmt_ip', '-')}")
-    print(f"Witness: {state.get('witness_host', '-')}")
     print()
     # Delegate to the dashboard API if available for full cluster view
     import urllib.request
@@ -872,7 +871,6 @@ def main():
 
     p_init = sub.add_parser("init", help="Start a new cluster")
     p_init.add_argument("--name", help="Cluster name (default: bedrock-<hostname>)")
-    p_init.add_argument("--witness", help="External witness host (default: self-hosted)")
     p_init.set_defaults(func=cmd_init)
 
     p_join = sub.add_parser("join", help="Join an existing cluster")

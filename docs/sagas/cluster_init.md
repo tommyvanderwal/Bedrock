@@ -2,7 +2,7 @@
 
 **Module:** `bedrock_d/install/cluster_init.py`  
 **Class:** `ClusterInit`  
-**Entry:** `run_cluster_init(cluster_name, witness_host, repo)`
+**Entry:** `run_cluster_init(cluster_name, repo)`
 
 ## Purpose
 
@@ -12,9 +12,33 @@ becomes the founding master at N=1. Idempotent end-to-end — re-running
 
 ## Trigger
 
-`bedrock init --name <cluster> [--witness <host>]` CLI. The CLI
-invokes `run_cluster_init()` directly; there is no HTTP submission
-because rqlite isn't up yet — this saga IS what brings it up.
+`bedrock init --name <cluster>` CLI. The CLI invokes
+`run_cluster_init()` directly; there is no HTTP submission because
+rqlite isn't up yet — this saga IS what brings it up.
+
+### Why no `--witness` flag at init
+
+At N=1 the cluster has no quorum problem to solve — the witness is
+a tiebreaker that only becomes load-bearing on the **N=1 → N=2**
+transition. Configuring a witness during `bedrock init` would force
+the operator to answer a question they can't reasonably answer yet
+(the BedRock-Echo box may not even be deployed; the operator is
+just standing up the master).
+
+Without a witness configured, a 2-node cluster runs in **"stay
+put" mode**: neither side will auto-failover. The current master
+keeps `.254` and singletons; a surviving peer doesn't attempt a
+takeover. The cluster is functional but can't survive the master
+dying without operator intervention. That's the documented and
+intentional trade-off for cattle-only 2-node deployments.
+
+Configuring a witness later happens at the dashboard level — at
+the moment the operator clicks "accept" on the first joiner is a
+good UX hook for "would you like to scan for a witness now?". The
+mgmt API supports this via the (yet-to-be-written) witness-CRUD
+endpoints; no saga involvement needed — adding a row to the
+`witnesses` rqlite table is enough for netd to start probing it
+on the next tick.
 
 The backend is the **file-based** `FileSagaBackend` at
 `/var/lib/bedrock/init-progress.json` (not rqlite); the
@@ -26,7 +50,6 @@ backend switches to `RqliteSagaBackend` after this saga's
 | key | type | meaning |
 |-----|------|---------|
 | `cluster_name` | str | Human-readable cluster name (e.g. `bedrock-prod`) |
-| `witness_host` | str | Hostname/IP of an external BedRock-Echo witness, or `""` for self-hosted |
 | `repo` | str | URL or `file://` path of the install repo for fetching binaries |
 
 ## Outputs (`ctx` keys filled by the saga's own steps)
