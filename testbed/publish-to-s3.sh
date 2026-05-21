@@ -164,15 +164,26 @@ if [ -d "$REPO/installer/iso-build/payload/rpms" ]; then
         -printf "%f\n" | sort > MANIFEST.txt )
 fi
 
-# ISO (optional)
+# ISOs (optional). Push both the net-install and offline variants
+# under their versioned names. See docs/install-and-iso.md.
 if [ $WITH_ISO -eq 1 ]; then
-    iso="$REPO/installer/iso-build/output/bedrock-install-almalinux-10.iso"
-    if [ ! -f "$iso" ]; then
-        echo "ERROR: --with-iso requested but $iso does not exist." >&2
-        echo "       Run installer/iso-build/build-iso.sh first." >&2
+    net_iso="$REPO/installer/iso-build/output/bedrock-installer-${PREFIX}.iso"
+    offline_iso="$REPO/installer/iso-build/output/bedrock-installer-${PREFIX}-offline.iso"
+    pushed=0
+    if [ -f "$net_iso" ]; then
+        install -m 0644 "$net_iso" "$STAGE/bedrock-installer-${PREFIX}.iso"
+        pushed=$((pushed+1))
+    fi
+    if [ -f "$offline_iso" ]; then
+        install -m 0644 "$offline_iso" "$STAGE/bedrock-installer-${PREFIX}-offline.iso"
+        pushed=$((pushed+1))
+    fi
+    if [ $pushed -eq 0 ]; then
+        echo "ERROR: --with-iso requested but no ISOs found for version '$PREFIX' in" >&2
+        echo "       $REPO/installer/iso-build/output/" >&2
+        echo "       Build them first: installer/iso-build/build-iso.sh --version $PREFIX" >&2
         exit 2
     fi
-    install -m 0644 "$iso" "$STAGE/bedrock-install.iso"
 fi
 
 # Version manifest
@@ -231,6 +242,10 @@ fi
 
 echo ""
 echo "[publish] done."
-[ $DRY_RUN -eq 0 ] && echo "  install URL: https://fsn1.your-objectstorage.com/bedrock/$PREFIX/install.sh"
-[ $DRY_RUN -eq 0 ] && [ $WITH_ISO -eq 1 ] && \
-    echo "  ISO URL:     https://fsn1.your-objectstorage.com/bedrock/$PREFIX/bedrock-install.iso"
+[ $DRY_RUN -eq 0 ] && echo "  install URL: https://bedrock.fsn1.your-objectstorage.com/$PREFIX/install.sh"
+if [ $DRY_RUN -eq 0 ] && [ $WITH_ISO -eq 1 ]; then
+    [ -f "$STAGE/bedrock-installer-${PREFIX}.iso" ] && \
+        echo "  net ISO URL: https://bedrock.fsn1.your-objectstorage.com/$PREFIX/bedrock-installer-${PREFIX}.iso"
+    [ -f "$STAGE/bedrock-installer-${PREFIX}-offline.iso" ] && \
+        echo "  offline ISO: https://bedrock.fsn1.your-objectstorage.com/$PREFIX/bedrock-installer-${PREFIX}-offline.iso"
+fi

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Bedrock OOB installer bootstrap.
 #
-# Usage (on fresh AlmaLinux 9 minimal, as root):
-#   curl -sSL http://<repo-host>:8000/install.sh | bash
+# Usage (on fresh AlmaLinux 10 minimal, as root):
+#   curl -fsSL https://bedrock.fsn1.your-objectstorage.com/dev/install.sh | sudo bash
 #
-# Or for testing, point at a specific repo:
-#   BEDROCK_REPO=http://192.168.2.145:8000 curl -sSL ${BEDROCK_REPO}/install.sh | bash
+# Or pin to a specific release prefix:
+#   BEDROCK_REPO=https://bedrock.fsn1.your-objectstorage.com/v0.8 \
+#       curl -fsSL ${BEDROCK_REPO}/install.sh | sudo bash
+#
+# Local LAN dev repo (testbed):
+#   BEDROCK_REPO=http://192.168.2.145:8000 curl -fsSL ${BEDROCK_REPO}/install.sh | bash
 
 set -euo pipefail
 
@@ -30,11 +34,11 @@ if [ ! -f /etc/almalinux-release ] && ! grep -q 'AlmaLinux' /etc/os-release 2>/d
 fi
 
 # Determine the repo URL. User can override with BEDROCK_REPO env var.
-# If not set, try to auto-derive from where this script was fetched.
+# Default is the public Hetzner S3 bucket's /dev prefix (rolling dev build).
+# Pin to /v0.8 or similar for a frozen release.
 : "${BEDROCK_REPO:=}"
 if [ -z "$BEDROCK_REPO" ]; then
-    # Default test repo — dev box on the LAN
-    BEDROCK_REPO="http://192.168.100.1:8000"
+    BEDROCK_REPO="https://bedrock.fsn1.your-objectstorage.com/dev"
     log "Using default repo: $BEDROCK_REPO (override with BEDROCK_REPO=...)"
 fi
 
@@ -43,6 +47,246 @@ BEDROCK_REPO="${BEDROCK_REPO%/}"
 
 log "Bedrock installer"
 log "Repo: $BEDROCK_REPO"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── /home reclaim (XFS-can't-shrink recovery path) ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# AlmaLinux 10's default Anaconda partitioning fills the disk with XFS LVs
+# (root + swap + home, zero free PE). XFS has no shrink operation — not
+# online, not offline, not with any flag. For an operator running this
+# script on a default Alma install, the only way to make VG space
+# available for Bedrock is to remove the /home LV entirely.
+#
+# This block runs only when:
+#   * the box looks like a default Alma install (known VG name), AND
+#   * the VG has zero free PE, AND
+#   * /home is on its own LV with only the default install footprint.
+#
+# It refuses on any operator data. For new deploys the Bedrock ISO does
+# the right partitioning automatically — this path is the recovery option
+# for already-installed boxes only. See docs/install-and-iso.md.
+#
+# This whole block is one self-contained section; it can be deleted as
+# a unit if upstream defaults ever change to ship free PE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+home_reclaim_check() {
+    local vg_name=""
+    local free_pe=0
+    local home_lv=""
+
+    # Detect the OS VG. Default Alma names it "almalinux"; some
+    # custom-but-still-default-shape installs use "vg_almalinux".
+    # Anything else means this isn't the layout we know how to
+    # recover, so we skip silently.
+    if ! command -v vgs >/dev/null 2>&1; then
+        return 0  # LVM tools missing → not the layout we'd touch anyway
+    fi
+    for candidate in almalinux vg_almalinux; do
+        if vgs "$candidate" --noheadings 2>/dev/null >/dev/null; then
+            vg_name="$candidate"
+            break
+        fi
+    done
+
+    # If a "bedrock" VG already exists with free PE, this box is
+    # already laid out correctly (ISO install or operator-prepped).
+    if vgs bedrock --noheadings -o vg_free_count 2>/dev/null \
+       | awk '{print $1}' | grep -qE '^[1-9]'; then
+        return 0
+    fi
+
+    if [ -z "$vg_name" ]; then
+        # No recognized VG layout. Either custom install or already-bedrock.
+        # Leave it alone; bedrock init will surface a clear error later
+        # if space is genuinely insufficient.
+        return 0
+    fi
+
+    free_pe=$(vgs "$vg_name" --noheadings -o vg_free_count 2>/dev/null \
+              | awk '{print $1}')
+    free_pe="${free_pe:-0}"
+
+    if [ "$free_pe" -gt 0 ]; then
+        log "VG '$vg_name' has $free_pe free extents — no reclaim needed."
+        return 0
+    fi
+
+    # VG is full. We're on a default Alma install with no free PE.
+    home_lv=$(lvs "$vg_name" --noheadings -o lv_name 2>/dev/null \
+              | awk '{print $1}' | grep -x home || true)
+    if [ -z "$home_lv" ]; then
+        error ""
+        error "VG '$vg_name' has no free space, and /home is not a separate LV"
+        error "to reclaim. This installer can't free space on this layout."
+        error ""
+        error "Recommended: reinstall using the Bedrock ISO. It lays the disk"
+        error "out correctly for Bedrock from the start."
+        die "no reclaim path available"
+    fi
+
+    # /home LV exists. Run the safety checks.
+    log ""
+    log "VG '$vg_name' has no free space. Checking if /home can be safely reclaimed..."
+
+    # /home must actually be mounted at /home (not bind-mounted elsewhere).
+    local dm_name="${vg_name}-home"
+    local home_src="/dev/mapper/${dm_name}"
+    local home_mount
+    home_mount=$(findmnt -no TARGET --source "$home_src" 2>/dev/null || true)
+    if [ "$home_mount" != "/home" ]; then
+        die "LV $vg_name/home is mounted at '${home_mount:-nowhere}', not /home. Refusing to touch a non-default layout."
+    fi
+
+    # At most one user directory under /home (default Alma install
+    # creates exactly the user you set during install).
+    local user_dirs
+    user_dirs=$(find /home -maxdepth 1 -mindepth 1 -type d \
+                ! -name 'lost+found' 2>/dev/null)
+    local user_count
+    user_count=$(printf '%s\n' "$user_dirs" | grep -cE '.' || true)
+    if [ "$user_count" -gt 1 ]; then
+        error ""
+        error "/home contains multiple user directories:"
+        printf '%s\n' "$user_dirs" | sed 's/^/    /' >&2
+        error ""
+        error "Reclaim is only safe for the default single-user install."
+        die "multiple users present"
+    fi
+
+    # If exactly one user dir, walk its top-level contents and
+    # confirm only the default install footprint is present.
+    if [ "$user_count" -eq 1 ]; then
+        local user_dir
+        user_dir=$(printf '%s\n' "$user_dirs" | head -1)
+        local violations=""
+
+        while IFS= read -r -d '' entry; do
+            local name
+            name=$(basename "$entry")
+            case "$name" in
+                # Default XDG dirs — present + empty is fine.
+                Desktop|Documents|Downloads|Music|Pictures|Public|Templates|Videos)
+                    if [ -n "$(ls -A "$entry" 2>/dev/null)" ]; then
+                        violations="${violations}  $entry (not empty)
+"
+                    fi
+                    ;;
+                # Default shell dotfiles — always present, always fine.
+                .bashrc|.bash_logout|.bash_profile|.bash_logout.rpmnew)
+                    ;;
+                # bash_history: only OK if very small.
+                .bash_history)
+                    local sz
+                    sz=$(stat -c%s "$entry" 2>/dev/null || echo 0)
+                    if [ "$sz" -gt 4096 ]; then
+                        violations="${violations}  $entry (${sz}B real shell history)
+"
+                    fi
+                    ;;
+                # Default empty dotdirs — present + empty is fine.
+                .cache|.config|.local|.dbus|.mozilla|.gnupg)
+                    if [ -n "$(ls -A "$entry" 2>/dev/null)" ]; then
+                        violations="${violations}  $entry (not empty)
+"
+                    fi
+                    ;;
+                # .ssh is fine unless it has real authorized_keys content.
+                .ssh)
+                    if [ -s "$entry/authorized_keys" ]; then
+                        violations="${violations}  $entry/authorized_keys (real SSH keys)
+"
+                    fi
+                    ;;
+                # Minor stragglers that some default installs leave behind.
+                lost+found|.viminfo|.lesshst|.xauthority|.Xauthority|.ICEauthority|.face|.face.icon)
+                    ;;
+                # Anything else: operator data.
+                *)
+                    violations="${violations}  $entry
+"
+                    ;;
+            esac
+        done < <(find "$user_dir" -maxdepth 1 -mindepth 1 -print0 2>/dev/null)
+
+        if [ -n "$violations" ]; then
+            error ""
+            error "$user_dir contains files outside the default install set:"
+            printf '%s' "$violations" >&2
+            error ""
+            error "Cannot safely reclaim /home automatically. Options:"
+            error "  - Back up these files elsewhere, remove them from /home,"
+            error "    and re-run this installer."
+            error "  - Reinstall from the Bedrock ISO (recommended for new"
+            error "    deploys)."
+            die "/home contains user data; reclaim refused"
+        fi
+    fi
+
+    # All safety checks passed. Show the plan + prompt.
+    local home_size
+    home_size=$(lvs --noheadings -o lv_size --units g "$vg_name/home" 2>/dev/null \
+                | awk '{print $1}')
+
+    cat <<EOF
+
+  ─────────────────────────────────────────────────────────────────────
+   VG '$vg_name' has no free space. Bedrock needs roughly 50 GB.
+
+   Plan: remove LV '$vg_name/home' ($home_size) to reclaim VG space.
+   /home contains only the default install footprint, so no data is
+   lost.
+
+   This step exists because AlmaLinux's default installer puts /home
+   on an XFS volume, which can't be shrunk. For new deploys the
+   Bedrock ISO partitions the disk correctly from the start — this
+   path is the recovery option for already-installed boxes only.
+  ─────────────────────────────────────────────────────────────────────
+
+EOF
+    log "Type the LV name to confirm, or anything else to cancel."
+    log "  expected: $vg_name/home"
+
+    if [ ! -t 0 ] && [ ! -t 2 ]; then
+        die "stdin/stderr are not a tty (piped install) — re-run interactively, or use the Bedrock ISO."
+    fi
+
+    local reply
+    if [ -e /dev/tty ]; then
+        read -r -p "  > " reply </dev/tty
+    else
+        read -r -p "  > " reply
+    fi
+    if [ "$reply" != "$vg_name/home" ]; then
+        die "reclaim cancelled by operator"
+    fi
+
+    log ""
+    log "Reclaiming $vg_name/home..."
+
+    umount /home || die "umount /home failed"
+    lvremove -y "$vg_name/home" || die "lvremove $vg_name/home failed"
+
+    # Drop /home from /etc/fstab so reboots don't try to mount it.
+    if grep -qE '^[^#]+[[:space:]]/home[[:space:]]' /etc/fstab 2>/dev/null; then
+        cp /etc/fstab /etc/fstab.bedrock-bak
+        sed -i.tmp -E '/^[^#]+[[:space:]]\/home[[:space:]]/d' /etc/fstab
+        rm -f /etc/fstab.tmp
+    fi
+
+    # Keep /home as an empty mount point (other parts of the OS may
+    # poke at it). It's just a directory now, no LV behind it.
+    mkdir -p /home
+
+    local now_free
+    now_free=$(vgs "$vg_name" --noheadings -o vg_free --units g 2>/dev/null \
+               | awk '{print $1}')
+    log "Done. VG $vg_name now has $now_free free."
+    log ""
+}
+
+home_reclaim_check
 
 # ── Check internet / repo reachability ─────────────────────────────────────
 

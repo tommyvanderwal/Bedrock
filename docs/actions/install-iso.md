@@ -1,173 +1,202 @@
-# Build & install from the bedrock-install ISO
+# Build & install from the Bedrock installer ISOs
 
-A single bootable ISO that turns a fresh box (real hardware or testbed
-VM) into a bedrock-ready node with **zero network access required**
-during install. AlmaLinux 10.1 + the bedrock storage layout + every
-RPM, wheel, and binary bedrock needs — all baked into one file.
+Two ISO variants per release, both produced by the same build script
+and kickstart. See `docs/install-and-iso.md` for the architecture
+and naming convention.
+
+| ISO | Size | Source | Internet at install? | Use when |
+|---|---|---|---|---|
+| `bedrock-installer-<version>.iso` | ~1 GB | AlmaLinux 10 boot.iso | Yes | Most installs. Default visible download. |
+| `bedrock-installer-<version>-offline.iso` | ~5 GB | AlmaLinux 10 DVD | No | Airgap / MSP-ship-to-site. Operator-control deliverable. |
+
+Same kickstart partitioning, same first-boot UX, same end state:
+Bedrock installed, services prepared, waiting for the operator to
+run `bedrock init` (new cluster) or `bedrock join HOST` (joiner).
 
 **Triggered by:**
 
-- Build host: `installer/iso-build/build-iso.sh`
-- Real hardware: `dd if=bedrock-install-almalinux-10.iso of=/dev/sdX bs=4M`
+- Build host: `installer/iso-build/build-iso.sh --version <version>`
+- Real hardware: `dd if=bedrock-installer-<version>.iso of=/dev/sdX bs=4M`
   to a USB stick, boot from USB
-- Testbed: `virt-install --cdrom bedrock-install-almalinux-10.iso …`
+- Testbed: `virt-install --cdrom bedrock-installer-<version>-offline.iso …`
+  (testbed uses the offline variant to avoid S3 dependency)
 
 **Source:**
-`installer/iso-build/build-iso.sh`,
-`installer/iso-build/bedrock-almalinux-10.ks`,
-`installer/lib/packages.py` (offline branch).
+- `installer/iso-build/build-iso.sh` — orchestrates both variants
+- `installer/iso-build/bedrock-almalinux-10.ks` — single kickstart template,
+  build script sed-substitutes placeholders per variant
+- `installer/iso-build/payload/` — bundled into the offline ISO
 
-## What goes into the ISO
+## What goes into each ISO
 
-```
-bedrock-install-almalinux-10.iso  (≈9.5 GB with full bundle)
-├── EFI/, boot/, isolinux/, images/      ← AlmaLinux 10 DVD contents
-├── BaseOS/Packages/, AppStream/Packages/  ← stock OS RPMs
-├── ks.cfg                                ← bedrock kickstart, auto-loaded
-└── bedrock/                              ← bedrock payload
-    ├── install.sh                        ← runs at first boot
-    ├── bedrock                           ← operator CLI
-    ├── bedrock-rust                      ← cluster-protocol daemon
-    ├── bedrock-fence-watchdog            ← independent fence reaper
-    ├── mgmt.tar.gz                       ← FastAPI + Svelte build
-    ├── kopia                             ← backup repo client
-    ├── lib/*.py                          ← installer libraries
-    ├── configs/*                         ← systemd units, etc.
-    ├── rpms/                             ← ELRepo: kmod-drbd9x + utils
-    ├── wheels/                           ← Python: fastapi, uvicorn,
-    │                                       paramiko, websockets,
-    │                                       pydantic, multipart, msgpack
-    ├── virtio-win.iso                    ← Windows VM driver disk
-    └── alpine.qcow2                      ← cattle-VM default boot image
-```
-
-The grub menu's `Install AlmaLinux 10.1` entry is rewritten by the
-build script to include `inst.ks=cdrom:/dev/sr0:/ks.cfg`, so anaconda
-runs unattended. `inst.stage2=hd:LABEL=Bedrock-Install-10` matches the
-new volume label, so the installer finds its own stage2 image
-without falling back to network.
-
-## What the install does
+### Net ISO (`bedrock-installer-<version>.iso`)
 
 ```
-  T=0    Operator inserts USB stick / virt-install --cdrom
-         │
-         │ Firmware (BIOS or UEFI) boots the El Torito image
-         │
-  T+5s   GRUB menu renders. 1-second timeout — auto-picks
-         "Install AlmaLinux 10.1" with our kickstart args.
-         │
-  T+30s  Anaconda kernel + initrd loaded, stage2 mounts the
-         /run/install/repo from the ISO.
-         │
-  T+60s  Kickstart parsed:
-         │   - clearpart --all
-         │   - 500 MB /boot/efi (vfat)
-         │   - 1 GB /boot (xfs)
-         │   - rest = LVM PV → bedrock VG
-         │   - thinpool fills the VG
-         │   - 16 GB thin root LV (xfs) for /
-         │   - no swap
-         │
-  T+~3m  AlmaLinux 10 base packages installed from
-         the bundled DVD repo (no network).
-         │
-  T+~5m  %post script runs in chroot:
-         │   - copies /run/install/repo/bedrock → /var/lib/bedrock-install/
-         │   - writes /etc/systemd/system/bedrock-firstboot.service
-         │   - enables it
-         │   - writes /etc/motd with next-step guidance
-         │
-  T+~6m  Anaconda reboots the VM (reboot --eject — VM ejects the ISO
-         so it boots from the just-installed disk).
-         │
-  T+~7m  AlmaLinux 10 boots from disk. systemd reaches multi-user.target.
-         │
-  T+~8m  bedrock-firstboot.service runs:
-         │   - BEDROCK_REPO=file:///var/lib/bedrock-install
-         │   - bash /var/lib/bedrock-install/install.sh
-         │   - install.sh fetches every asset via curl file:///…
-         │   - packages.py prefers bundled RPMs + wheels over network
-         │   - bedrock CLI + bedrock-rust unit installed
-         │   - mgmt.tar.gz extracted to /opt/bedrock/mgmt
-         │   - touches /var/lib/bedrock-install/.bootstrap-done
-         │   - disables itself
-         │
-  T+~9m  Operator login prompt + motd:
-         │   ╔════════════════════════════╗
-         │   ║  Bedrock node — fresh install    ║
-         │   ║  Next step:                      ║
-         │   ║    bedrock init                  ║
-         │   ║    bedrock join HOST             ║
-         │   ╚══════════════════════════════════╝
-         │
-         │ At this point: no network was needed for any of the above.
-         │ Network is needed from `bedrock init` onward (peers talk).
+bedrock-installer-dev.iso  (≈1 GB)
+├── EFI/, boot/, isolinux/, images/        ← AlmaLinux 10 boot.iso content
+└── ks.cfg                                  ← Bedrock kickstart
+                                              (fetches packages from
+                                               Alma mirror + Bedrock from
+                                               https://bedrock.fsn1.your-objectstorage.com/<version>)
 ```
 
-## Build the ISO
+First-boot service runs:
+```
+curl -fsSL ${BEDROCK_REPO}/install.sh -o /tmp/bedrock-install.sh
+bash /tmp/bedrock-install.sh
+```
+where `BEDROCK_REPO` matches the version-baked filename — an ISO
+named `…-v0.8.iso` fetches from `/v0.8/`, never from `/dev/`.
+
+### Offline ISO (`bedrock-installer-<version>-offline.iso`)
+
+```
+bedrock-installer-dev-offline.iso  (≈5 GB)
+├── EFI/, boot/, isolinux/, images/        ← AlmaLinux 10 DVD content
+├── BaseOS/Packages/, AppStream/Packages/  ← stock OS RPMs (offline-usable)
+├── ks.cfg                                  ← Bedrock kickstart (cdrom mode)
+└── bedrock/                                ← full Bedrock payload
+    ├── install.sh                          ← runs at first boot from /var/lib/bedrock-install
+    ├── bedrock                             ← operator CLI
+    ├── bedrock-d                           ← unified daemon
+    ├── bedrock-{cert-refresh,mdns,redirect}
+    ├── mgmt.tar.gz                         ← FastAPI + Svelte build
+    ├── bedrock_d.tar.gz                    ← unified daemon code tree
+    ├── kopia                               ← backup repo client
+    ├── lib/*.py                            ← installer libraries
+    ├── configs/*                           ← systemd units, etc.
+    ├── rpms/                               ← ELRepo: kmod-drbd9x + utils
+    ├── wheels/                             ← Python deps (httpx, fastapi, etc.)
+    ├── virtio-win.iso                      ← Windows VM driver disk
+    └── alpine.qcow2                        ← cattle-VM default boot image
+```
+
+First-boot service runs `/var/lib/bedrock-install/install.sh` with
+`BEDROCK_REPO=file:///var/lib/bedrock-install`. Zero network calls.
+
+## First-boot UX (both variants)
+
+Single-disk happy path, blank disk: **zero prompts.** Kernel boots,
+Anaconda runs from kickstart, partitions per the Bedrock layout
+(`bedrock` VG, thinpool, root LV), installs packages, reboots into a
+Bedrock-ready node.
+
+Multi-disk box: the kickstart's `%pre` script lists disks and prompts
+on the install console for which to use. Single question, no other UI.
+
+Disk with existing partitions: the kickstart's `%pre` script halts
+before any wipe and shows the partition layout with a single consent
+prompt:
+
+```
+  Disk /dev/sda has existing partitions:
+
+    sda     465G  disk
+    ├─sda1  600M  part  /boot/efi
+    ├─sda2    1G  part  /boot
+    └─sda3  464G  part  (LVM PV — VG "almalinux")
+
+  Installing Bedrock will erase all of them. There is no undo.
+
+  Type 'yes' to wipe and proceed, anything else to cancel:
+```
+
+No colors louder than the default terminal; one screen; one prompt.
+
+End state: bedrock CLI installed, daemons not started.
+Login banner instructs the operator to run `bedrock init` (new
+cluster) or `bedrock join <master>` (joiner). The ISO **does not**
+run `bedrock init` automatically — joiners outnumber first-node
+installs at any operating MSP, and the ISO has no way to know which
+case the operator is in.
+
+## Build the ISOs
 
 ```bash
 cd installer/iso-build
-./build-iso.sh                 # full build, 8.5 GB DVD base + payload
-./build-iso.sh --quick         # boot.iso base + skip large bundles
-                               # (≈1 GB output, needs network at install)
-./build-iso.sh --skip-payload-refresh   # reuse cached payload/
+./build-iso.sh                              # both variants, version=dev
+./build-iso.sh --version v0.8               # both variants, version=v0.8
+./build-iso.sh --version dev --variant net  # just the net ISO
+./build-iso.sh --variant offline            # just the offline ISO
+./build-iso.sh --testbed                    # bake in the dev-box SSH key
+./build-iso.sh --skip-payload-refresh       # reuse cached payload/
 ```
 
-First-time full build: ~5 min download (DVD ISO + ELRepo RPMs +
-wheels + virtio-win + alpine) + ~2 min repack = ~7 min wall-clock.
+First-time full build: ~5 min download (DVD ISO + boot.iso + ELRepo
+RPMs + wheels + virtio-win + alpine) + ~2 min repack per variant.
 
-Subsequent builds (`--skip-payload-refresh`): ~2 min repack only.
+Subsequent builds (`--skip-payload-refresh`): ~2 min per variant
+once source ISOs are cached.
 
-Output: `installer/iso-build/output/bedrock-install-almalinux-10.iso`
-plus a SHA256 line printed at end of run.
+Outputs:
+- `installer/iso-build/output/bedrock-installer-<version>.iso`
+- `installer/iso-build/output/bedrock-installer-<version>-offline.iso`
 
-## Deploy the ISO
+Each printed with size + sha256 at end of run.
+
+## Deploy
 
 ### Real hardware
 
 ```bash
-# After build, on the dev box:
-sudo dd if=bedrock-install-almalinux-10.iso of=/dev/sdX bs=4M status=progress
+sudo dd if=bedrock-installer-dev.iso of=/dev/sdX bs=4M status=progress
 sync
 ```
 
-Eject USB, plug into target node, boot from USB (one-time BIOS/UEFI
-boot menu — usually F12/F11/Esc on most boards). Walk away ~8 min.
+Plug USB into target node, boot from USB, walk away. Single-disk
+clean box = no prompts. Multi-disk = one prompt for disk selection.
+Existing partitions = one prompt for wipe confirmation.
 
 ### Testbed
 
 ```bash
-# After build:
 testbed/spawn.py up 4
 ```
 
-`spawn.py` v1.0+ uses the bedrock-install ISO instead of the cloud
-image, so testbed installs go through the exact same path as
-production. (Earlier versions used cloud-image + post-install carve;
-that path stays in `tier_storage.carve_pv_from_boot_disk_tail` as a
-greenfield-from-cloud-image fallback.)
+`spawn.py` uses `bedrock-installer-dev-offline.iso` (offline variant,
+no S3 dependency at install time).
 
-## Failure modes and recovery
+## Publish to S3
+
+```bash
+# Build first
+installer/iso-build/build-iso.sh --version dev
+
+# Then push both ISOs + the install repo to S3 /dev/
+testbed/publish-to-s3.sh --prefix dev --with-iso --allow-dirty
+```
+
+For releases, use `--prefix v0.8 --tag` (refuses `--allow-dirty`,
+treats prefix as immutable unless `--allow-tag-overwrite`).
+
+## Failure modes
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `dracut-initqueue` timeout, "Could not find LABEL=Bedrock-Install-10" | dd to USB didn't complete or USB is corrupt | Re-write USB; verify with `sha256sum`. |
-| Anaconda complains "no kickstart found" | Bootloader edit failed during build | Re-run `build-iso.sh`; check `/EFI/BOOT/grub.cfg` in the output ISO contains `inst.ks=…`. |
-| Install hangs at "Storage configuration" | Kickstart partitioning failed (disk too small) | Need ≥20 GB disk for /boot + thinpool minimum. |
-| Boot loops after install | Initramfs missing LVM modules | `dracut --add lvm -f` from a rescue console; sometimes happens with custom AlmaLinux respins. |
-| `bedrock-firstboot.service` failed | Look at `journalctl -u bedrock-firstboot` — usually a missing payload file (build pipeline issue) | Re-run build-iso.sh. |
-| `dnf install -y kmod-drbd9x` fails post-install | Bundled RPMs not registered as a local repo | Manual: `dnf install /var/lib/bedrock-install/rpms/*.rpm` |
+| Anaconda "no kickstart found" | Bootloader edit failed during build | Re-run build-iso.sh; verify `/EFI/BOOT/grub.cfg` in the ISO has `inst.ks=…` |
+| Install halts at disk-prompt asking for input | Multi-disk box or existing partitions detected — by design | Answer the prompt on the install console |
+| Net ISO firstboot fails: `curl: (6) Could not resolve host` | No DHCP / no network at first boot | Either use the offline ISO, or attach the box to a network with DHCP before first boot |
+| Net ISO firstboot fails: HTTP 404 on install.sh | Version prefix doesn't exist in S3 | Build matches a published prefix? Net ISO's `BEDROCK_REPO` is baked at build time; for unpublished dev work use the offline ISO |
+| `dnf install -y kmod-drbd9x` fails post-install | Offline ISO: bundled RPMs not registered; Net ISO: ELRepo mirrors unreachable | Offline: `dnf install /var/lib/bedrock-install/rpms/*.rpm`. Net: check ELRepo reachability |
+| Boot loops after install | Initramfs missing LVM modules | `dracut --add lvm -f` from a rescue console — rare on stock Alma |
 
 ## Update cadence
 
-The ISO needs a refresh whenever:
-- AlmaLinux ships a new minor version (10.1 → 10.2 → …) — pulls fresh DVD
-- bedrock-rust binary is rebuilt — pulls from `installer/binaries/`
-- mgmt.tar.gz is repacked — pulls from `installer/`
-- Kopia release we pin to changes — bump `KOPIA_VERSION` in `build-iso.sh`
-- ELRepo's kmod-drbd9x version changes — bump in `build-iso.sh`
+The ISOs need a rebuild whenever:
+- AlmaLinux ships a new minor version (10.1 → 10.2) — Alma source ISO changes
+- Anything in `installer/` or `bedrock_d/` or `mgmt/` changes (offline ISO bundles them)
+- `Kopia`, `weed`, `rqlited`, or other pinned binary versions change
+- ELRepo's `kmod-drbd9x` ships a new release
 
-A simple CI step (`./build-iso.sh && upload-to-cdn.sh`) gives a fresh
-ISO per bedrock release.
+For `dev` builds, rebuild + republish daily-ish during active
+development. For tagged releases (`v0.8`, `v1.0`), each release
+gets a fresh ISO once and the prefix is treated as immutable.
+
+## See also
+
+- `docs/install-and-iso.md` — architecture, design principles, ISO
+  naming convention.
+- `installer/install.sh` — the post-install bootstrap that runs at
+  first boot. Includes the `/home` reclaim recovery path for
+  operators who run `install.sh` on already-installed Alma boxes
+  (i.e. didn't use the ISO).

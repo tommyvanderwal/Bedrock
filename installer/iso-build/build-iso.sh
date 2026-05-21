@@ -1,33 +1,39 @@
 #!/usr/bin/env bash
-# Build the bedrock-install-almalinux-10.iso — a single bootable ISO
-# that:
-#   1. Installs AlmaLinux 10.1 unattended via the bundled kickstart
-#   2. Lays out the disk per docs/01-storage-stack.md (single VG, thin
-#      pool, root as a thin LV, no swap)
-#   3. Stages the bedrock payload (binaries, RPMs, Python wheels,
-#      mgmt.tar.gz, virtio-win.iso, alpine.qcow2) into
-#      /var/lib/bedrock-install on the target system
-#   4. Arms a one-shot first-boot service that runs install.sh
-#      against the local payload — bedrock bootstrap completes
-#      without ever reaching the network.
+# Build Bedrock installer ISOs.
 #
-# Output: ISO that boots on testbed VMs (virt-install --cdrom) AND
-# real hardware (dd to USB stick, boot from USB). Same install
-# experience either way.
+# Produces, by default, BOTH variants for the requested version:
+#
+#   bedrock-installer-<version>.iso          (net-install, ~1 GB)
+#   bedrock-installer-<version>-offline.iso  (full offline, ~4-8 GB)
+#
+# Both come from the same kickstart (bedrock-almalinux-10.ks) with
+# variant-specific placeholders substituted at build time. See
+# docs/install-and-iso.md for the design rationale.
+#
+# Net ISO: starts from AlmaLinux's boot.iso, pulls Alma packages from
+#   Alma's mirrors during install, fetches Bedrock from S3 at first
+#   boot. Small download, requires internet at install time.
+#
+# Offline ISO: starts from AlmaLinux's dvd.iso, bundles every Bedrock
+#   artefact (RPMs, wheels, binaries, VM images) onto the disc. No
+#   network needed at install or first-boot. The deliverable for
+#   airgap / MSP-ship-to-site use cases.
+#
+# Use:
+#   ./build-iso.sh                              # version=dev, both variants
+#   ./build-iso.sh --version v0.8               # version=v0.8, both variants
+#   ./build-iso.sh --version dev --variant net  # just the net ISO
+#   ./build-iso.sh --version dev --variant offline
+#   ./build-iso.sh --skip-payload-refresh       # reuse cached payload
+#   ./build-iso.sh --testbed                    # embed dev-box SSH key
+#                                               # for testbed access
 #
 # Build host requirements:
 #   - xorriso  (for ISO repack)
-#   - curl, gunzip, sha256sum, find, sed
-#   - dnf or rpm  (only if we need to fetch ELRepo RPMs without a
-#                  pre-populated cache; otherwise just curl)
-#   - ~25 GB free disk for source ISO + extracted contents + output
-#
-# Use:
-#   ./build-iso.sh                          # full build
-#   ./build-iso.sh --skip-payload-refresh   # reuse cached payload
-#   ./build-iso.sh --quick                  # boot.iso + skip large
-#                                           # bundles (virtio-win etc.)
-#                                           # for fast dev iteration
+#   - curl, sha256sum, find, sed
+#   - isomd5sum (for implantisomd5 — optional but recommended)
+#   - pip3 (for fetching Python wheels into the payload, offline build)
+#   - ~25 GB free disk for source ISOs + extracts + outputs
 
 set -euo pipefail
 
@@ -38,82 +44,78 @@ REPO_ROOT="$(cd "$INSTALLER/.." && pwd)"
 BUILD_DIR="$HERE/build"
 PAYLOAD_DIR="$HERE/payload"
 OUT_DIR="$HERE/output"
-KS_FILE="$HERE/bedrock-almalinux-10.ks"
+KS_TEMPLATE="$HERE/bedrock-almalinux-10.ks"
 
 mkdir -p "$BUILD_DIR" "$PAYLOAD_DIR" "$OUT_DIR"
 
 # ── Argument parsing ──────────────────────────────────────────────
+VERSION="dev"
+VARIANT="both"
 SKIP_PAYLOAD_REFRESH=0
-QUICK=0
-for arg in "$@"; do
-    case "$arg" in
-        --skip-payload-refresh) SKIP_PAYLOAD_REFRESH=1 ;;
-        --quick) QUICK=1 ;;
-        *) echo "unknown arg: $arg" >&2; exit 1 ;;
+TESTBED=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version)               VERSION="$2"; shift 2 ;;
+        --variant)               VARIANT="$2"; shift 2 ;;
+        --skip-payload-refresh)  SKIP_PAYLOAD_REFRESH=1; shift ;;
+        --testbed)               TESTBED=1; shift ;;
+        -h|--help)               sed -n '2,35p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-# ── Source ISO ────────────────────────────────────────────────────
+case "$VARIANT" in
+    both|net|offline) ;;
+    *) echo "ERROR: --variant must be one of: both, net, offline" >&2; exit 2 ;;
+esac
+
+# S3 endpoint the net ISO points at. Version must match the prefix
+# under bedrock.fsn1.your-objectstorage.com/<version>/.
+S3_BASE="https://bedrock.fsn1.your-objectstorage.com/$VERSION"
+
 ALMA_VERSION="10"
-if [ "$QUICK" -eq 1 ]; then
-    SRC_KIND="boot"   # 926 MB, network install
+
+# Map variant → (source ISO kind, output filename, BEDROCK_REPO,
+# firstboot ExecStart line, install method directive, label suffix).
+NET_SRC_KIND="boot"      # ~1 GB AlmaLinux network install ISO
+OFFLINE_SRC_KIND="dvd"   # ~8.5 GB AlmaLinux DVD ISO
+
+NET_OUT_NAME="bedrock-installer-${VERSION}.iso"
+OFFLINE_OUT_NAME="bedrock-installer-${VERSION}-offline.iso"
+
+# Authorized-keys block (testbed only). Production ISOs ship empty
+# /root/.ssh/authorized_keys; operator wires their own key via
+# console at first login or a cloud-init-style mechanism later.
+if [ "$TESTBED" -eq 1 ]; then
+    AUTHORIZED_KEYS_BLOCK='cat > /root/.ssh/authorized_keys <<PUBKEY_EOF
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXS8J+TpzUuO2WDCeSxV9baR5p7p14ZtaXWRvVlZgqp tommy@HP-G1a
+PUBKEY_EOF'
 else
-    SRC_KIND="dvd"    # 8.5 GB, fully offline
+    AUTHORIZED_KEYS_BLOCK='# (production build — no authorized_keys preloaded)'
 fi
-SRC_ISO_NAME="AlmaLinux-${ALMA_VERSION}-latest-x86_64-${SRC_KIND}.iso"
-SRC_ISO="$BUILD_DIR/$SRC_ISO_NAME"
-SRC_URL="https://repo.almalinux.org/almalinux/${ALMA_VERSION}/isos/x86_64/$SRC_ISO_NAME"
 
-OUT_ISO="$OUT_DIR/bedrock-install-almalinux-${ALMA_VERSION}.iso"
+# ── Step 1: refresh the offline payload directory ─────────────────
+# The net build doesn't bundle the payload, but the offline build
+# does. We refresh once and re-use; net ISO simply doesn't copy it.
 
-# ── Step 1: download AlmaLinux source ISO if missing ──────────────
-echo "[bedrock-iso] step 1/5: source ISO"
-if [ ! -f "$SRC_ISO" ]; then
-    echo "  fetching $SRC_URL ..."
-    curl -fSL --progress-bar -o "$SRC_ISO" "$SRC_URL"
-fi
-echo "  source: $SRC_ISO ($(du -h "$SRC_ISO" | cut -f1))"
-
-# ── Step 2: refresh payload directory ─────────────────────────────
-# Layout:
-#   payload/
-#     install.sh                ← from installer/
-#     bedrock                   ← from installer/
-#     bedrock-rust              ← from installer/binaries/
-#     bedrock-fence-watchdog    ← from installer/
-#     mgmt.tar.gz               ← from installer/
-#     lib/*.py                  ← from installer/lib/
-#     configs/*                 ← from installer/configs/
-#     rpms/                     ← ELRepo packages (kmod-drbd9x +
-#                                  drbd9x-utils + elrepo-release)
-#     wheels/                   ← Python wheels for mgmt deps
-#     virtio-win.iso            ← Windows VM driver disk
-#     alpine.qcow2              ← cattle-VM default boot image
-#     kopia                     ← Kopia binary
-
-if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
-    echo "[bedrock-iso] step 2/5: refreshing payload"
+refresh_payload() {
+    echo "[bedrock-iso] refreshing offline payload"
     rm -rf "$PAYLOAD_DIR"
     mkdir -p "$PAYLOAD_DIR"/{binaries,lib,configs,rpms,wheels}
 
-    # 2a. Bedrock files. Layout mirrors what install.sh expects from
-    #     a BEDROCK_REPO-style HTTP server — same paths whether the
-    #     operator's BEDROCK_REPO is a URL or `file:///…`. lib/
-    #     modules under lib/, configs/ holds the systemd units.
-    cp "$INSTALLER/install.sh"                 "$PAYLOAD_DIR/install.sh"
-    cp "$INSTALLER/bedrock"                    "$PAYLOAD_DIR/bedrock"
-    cp "$INSTALLER/bedrock-d"                  "$PAYLOAD_DIR/bedrock-d"
-    # bedrock-net and bedrock-fence-watchdog are absorbed into bedrock-d.
-    # The three remaining auxiliaries (mdns, redirect, cert-refresh)
-    # stay at arm's length — they're not cluster-decision code.
-    cp "$INSTALLER/bedrock-cert-refresh"       "$PAYLOAD_DIR/bedrock-cert-refresh"
-    cp "$INSTALLER/bedrock-mdns"               "$PAYLOAD_DIR/bedrock-mdns"
-    cp "$INSTALLER/bedrock-redirect"           "$PAYLOAD_DIR/bedrock-redirect"
-    # Rebuild mgmt.tar.gz from current mgmt/ sources if it's stale
-    # (any file in mgmt/ newer than the tarball). Keeps the ISO in
-    # sync with the working tree without requiring a separate manual
-    # step. Skip if --skip-mgmt-tar was passed (saves ~30s on iso-only
-    # re-spins).
+    # Bedrock CLI + daemons + helpers + configs. Layout mirrors what
+    # install.sh expects from a BEDROCK_REPO HTTP server, so the
+    # same code paths work with file:// (offline) and https://
+    # (testbed dev repo / S3).
+    cp "$INSTALLER/install.sh"            "$PAYLOAD_DIR/install.sh"
+    cp "$INSTALLER/bedrock"               "$PAYLOAD_DIR/bedrock"
+    cp "$INSTALLER/bedrock-d"             "$PAYLOAD_DIR/bedrock-d"
+    cp "$INSTALLER/bedrock-cert-refresh"  "$PAYLOAD_DIR/bedrock-cert-refresh"
+    cp "$INSTALLER/bedrock-mdns"          "$PAYLOAD_DIR/bedrock-mdns"
+    cp "$INSTALLER/bedrock-redirect"      "$PAYLOAD_DIR/bedrock-redirect"
+
+    # Rebuild mgmt.tar.gz if any mgmt/ source is newer than the tarball.
     MGMT_DIR="$REPO_ROOT/mgmt"
     if [ -d "$MGMT_DIR" ]; then
         if [ ! -f "$INSTALLER/mgmt.tar.gz" ] || \
@@ -122,24 +124,28 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
             (cd "$REPO_ROOT" && tar czf "$INSTALLER/mgmt.tar.gz" mgmt)
         fi
     fi
-    cp "$INSTALLER/mgmt.tar.gz"                "$PAYLOAD_DIR/mgmt.tar.gz"
-    # Cluster-time binaries (mgmt: victoria-metrics, victoria-logs,
-    # node_exporter; observability agents; rqlited; SeaweedFS weed).
-    # mgmt_install + agent_install pull these from $BEDROCK_REPO/binaries/
-    # when `bedrock init` / `bedrock join` runs.
+    cp "$INSTALLER/mgmt.tar.gz"  "$PAYLOAD_DIR/mgmt.tar.gz"
+
+    # bedrock_d daemon code tarball — install.sh extracts to /opt/bedrock-d
+    BEDROCK_D_DIR="$REPO_ROOT/bedrock_d"
+    if [ -d "$BEDROCK_D_DIR" ]; then
+        if [ ! -f "$INSTALLER/bedrock_d.tar.gz" ] || \
+           [ -n "$(find "$BEDROCK_D_DIR" -newer "$INSTALLER/bedrock_d.tar.gz" -print -quit 2>/dev/null)" ]; then
+            echo "  bedrock_d/ newer than bedrock_d.tar.gz — rebuilding"
+            (cd "$REPO_ROOT" && tar czf "$INSTALLER/bedrock_d.tar.gz" bedrock_d)
+        fi
+        cp "$INSTALLER/bedrock_d.tar.gz"  "$PAYLOAD_DIR/bedrock_d.tar.gz"
+    fi
+
+    # Cluster-time binaries (rqlited, weed, victoria-* etc.)
     for b in victoria-metrics victoria-logs node_exporter \
              vmagent vlagent vmbackup vmrestore rqlited weed; do
         if [ -f "$INSTALLER/binaries/$b" ]; then
             cp "$INSTALLER/binaries/$b" "$PAYLOAD_DIR/binaries/$b"
         else
-            # Auto-fetch missing upstream binaries we know how to find.
-            # Each upstream URL is pinned to a specific version below;
-            # bump as needed when upgrading. Kept here (not in git)
-            # because some of these (weed at 144 MB, vmbackup at 65 MB)
-            # exceed GitHub's per-file size cap.
             case "$b" in
                 weed)
-                    echo "  fetching weed v4.25 ($b not in git)..."
+                    echo "  fetching weed v4.25 (not in tree)..."
                     curl -fSL --progress-bar -o /tmp/weed.tgz \
                         "https://github.com/seaweedfs/seaweedfs/releases/download/4.25/linux_amd64.tar.gz" \
                         && tar xzf /tmp/weed.tgz -C /tmp \
@@ -148,14 +154,12 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
                         && rm -f /tmp/weed.tgz /tmp/weed
                     ;;
                 rqlited)
-                    echo "  fetching rqlited v10.0.5 ($b not in git)..."
+                    echo "  fetching rqlited v10.0.5 (not in tree)..."
                     curl -fSL --progress-bar -o /tmp/rqlite.tgz \
                         "https://github.com/rqlite/rqlite/releases/download/v10.0.5/rqlite-v10.0.5-linux-amd64.tar.gz" \
                         && tar xzf /tmp/rqlite.tgz -C /tmp \
-                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited \
-                                          "$PAYLOAD_DIR/binaries/$b" \
-                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited \
-                                          "$INSTALLER/binaries/$b" \
+                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited "$PAYLOAD_DIR/binaries/$b" \
+                        && install -m 0755 /tmp/rqlite-v10.0.5-linux-amd64/rqlited "$INSTALLER/binaries/$b" \
                         && rm -rf /tmp/rqlite.tgz /tmp/rqlite-v10.0.5-linux-amd64
                     ;;
                 *)
@@ -164,216 +168,234 @@ if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
             esac
         fi
     done
-    # Python helper bundled alongside the static binaries.
     if [ -f "$INSTALLER/binaries/vm_exporter.py" ]; then
         cp "$INSTALLER/binaries/vm_exporter.py" "$PAYLOAD_DIR/binaries/vm_exporter.py"
     fi
-    cp "$INSTALLER/lib/"*.py                   "$PAYLOAD_DIR/lib/"
-    # Non-Python lib assets — bedrock_schema.sql is consumed by
-    # mgmt_install at `bedrock init` time to bootstrap rqlite.
-    cp "$INSTALLER/lib/"*.sql                  "$PAYLOAD_DIR/lib/" 2>/dev/null || true
-    cp -r "$INSTALLER/configs/"*               "$PAYLOAD_DIR/configs/" 2>/dev/null || true
 
-    # 2b. ELRepo + DRBD RPMs — pinned versions for reproducibility.
+    # Lib + configs.
+    cp "$INSTALLER/lib/"*.py   "$PAYLOAD_DIR/lib/"
+    cp "$INSTALLER/lib/"*.sql  "$PAYLOAD_DIR/lib/" 2>/dev/null || true
+    cp -r "$INSTALLER/configs/"*  "$PAYLOAD_DIR/configs/" 2>/dev/null || true
+
+    # ELRepo + DRBD RPMs.
     EL=10
     ELREPO_RPMS=(
         "https://www.elrepo.org/elrepo-release-${EL}.el${EL}.elrepo.noarch.rpm"
         "https://elrepo.org/linux/elrepo/el${EL}/x86_64/RPMS/kmod-drbd9x-9.3.2-1.el${EL}_1.elrepo.x86_64.rpm"
         "https://elrepo.org/linux/elrepo/el${EL}/x86_64/RPMS/drbd9x-utils-9.34.0-1.el${EL}.elrepo.x86_64.rpm"
     )
-    echo "  fetching ELRepo + DRBD RPMs..."
     for url in "${ELREPO_RPMS[@]}"; do
         out="$PAYLOAD_DIR/rpms/$(basename "$url")"
         [ -f "$out" ] || curl -fsSL -o "$out" "$url"
-        echo "    $(basename "$out") ($(du -h "$out" | cut -f1))"
     done
+    # Manifest so install.sh's RPM fetch knows what to pull (used by
+    # the http(s) repo path; redundant for file:// but harmless).
+    (cd "$PAYLOAD_DIR/rpms" && ls *.rpm > MANIFEST.txt) || true
 
-    # 2c. Kopia binary (≥256-bit hash backup repo client)
+    # Kopia (backup client).
     KOPIA_VERSION="0.21.1"
-    KOPIA_URL="https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
     if [ ! -f "$PAYLOAD_DIR/kopia" ]; then
         echo "  fetching kopia ${KOPIA_VERSION}..."
-        curl -fsSL -o "$BUILD_DIR/kopia.tgz" "$KOPIA_URL"
+        curl -fsSL -o "$BUILD_DIR/kopia.tgz" \
+            "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
         tar -xzf "$BUILD_DIR/kopia.tgz" -C "$BUILD_DIR"
         cp "$BUILD_DIR/kopia-${KOPIA_VERSION}-linux-x64/kopia" "$PAYLOAD_DIR/kopia"
         chmod +x "$PAYLOAD_DIR/kopia"
     fi
-    echo "    kopia ($(du -h "$PAYLOAD_DIR/kopia" | cut -f1))"
 
-    # 2d. Python wheels for mgmt deps. We use pip download into the
-    # wheels/ dir; bedrock-bootstrap then `pip install --no-index
-    # --find-links wheels/` for full offline.
-    if [ "$QUICK" -eq 0 ]; then
-        echo "  downloading Python wheels..."
-        pip3 download -q --dest "$PAYLOAD_DIR/wheels" \
-            fastapi uvicorn paramiko websockets pydantic python-multipart msgpack \
-            httpx \
-            >/dev/null
-        echo "    $(ls "$PAYLOAD_DIR/wheels" | wc -l) wheels ($(du -sh "$PAYLOAD_DIR/wheels" | cut -f1))"
+    # Python wheels for mgmt deps. Always include httpx — install.sh
+    # depends on it from the wheels dir before any http call.
+    echo "  downloading Python wheels..."
+    pip3 download -q --dest "$PAYLOAD_DIR/wheels" \
+        fastapi uvicorn paramiko websockets pydantic python-multipart msgpack httpx \
+        >/dev/null
+    (cd "$PAYLOAD_DIR/wheels" && ls *.whl > MANIFEST.txt) || true
+
+    # virtio-win + alpine — big-asset bundles for VM creation.
+    if [ ! -f "$PAYLOAD_DIR/virtio-win.iso" ]; then
+        echo "  fetching virtio-win.iso..."
+        curl -fsSL -o "$PAYLOAD_DIR/virtio-win.iso" \
+            "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
     fi
-
-    # 2e. Big-asset bundles. Skipped in --quick (saves ~1 GB).
-    if [ "$QUICK" -eq 0 ]; then
-        # virtio-win for Windows VM driver disk
-        if [ ! -f "$PAYLOAD_DIR/virtio-win.iso" ]; then
-            echo "  fetching virtio-win.iso..."
-            curl -fsSL -o "$PAYLOAD_DIR/virtio-win.iso" \
-                "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
-        fi
-        # Alpine for cattle-VM default boot disk
-        if [ ! -f "$PAYLOAD_DIR/alpine.qcow2" ]; then
-            echo "  fetching alpine.qcow2..."
-            ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.7-x86_64-bios-cloudinit-r0.qcow2"
-            curl -fsSL -o "$PAYLOAD_DIR/alpine.qcow2" "$ALPINE_URL"
-        fi
+    if [ ! -f "$PAYLOAD_DIR/alpine.qcow2" ]; then
+        echo "  fetching alpine.qcow2..."
+        curl -fsSL -o "$PAYLOAD_DIR/alpine.qcow2" \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.7-x86_64-bios-cloudinit-r0.qcow2"
     fi
 
     chmod +x "$PAYLOAD_DIR"/install.sh "$PAYLOAD_DIR"/bedrock \
-              "$PAYLOAD_DIR"/bedrock-net \
-              "$PAYLOAD_DIR"/bedrock-fence-watchdog \
+              "$PAYLOAD_DIR"/bedrock-d \
               "$PAYLOAD_DIR"/bedrock-cert-refresh \
               "$PAYLOAD_DIR"/bedrock-mdns \
               "$PAYLOAD_DIR"/bedrock-redirect 2>/dev/null || true
     chmod +x "$PAYLOAD_DIR"/binaries/* 2>/dev/null || true
+
+    echo "  payload total: $(du -sh "$PAYLOAD_DIR" | cut -f1)"
+}
+
+if [ "$VARIANT" != "net" ] && [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
+    refresh_payload
 fi
 
-PAYLOAD_SIZE=$(du -sh "$PAYLOAD_DIR" | cut -f1)
-echo "  payload total: $PAYLOAD_SIZE"
+# ── ISO build function ────────────────────────────────────────────
+# Args: $1 = variant (net|offline)
+build_one() {
+    local variant="$1"
+    local src_kind out_name include_payload firstboot_exec install_method bedrock_repo variant_label
+    local src_iso src_url out_iso
 
-# ── Step 3: extract source ISO contents ───────────────────────────
-echo "[bedrock-iso] step 3/5: extract source ISO"
-EXTRACT_DIR="$BUILD_DIR/iso-extract"
-rm -rf "$EXTRACT_DIR"
-mkdir -p "$EXTRACT_DIR"
-xorriso -osirrox on -indev "$SRC_ISO" -extract / "$EXTRACT_DIR" 2>&1 | tail -3
-chmod -R u+w "$EXTRACT_DIR"
-
-# ── Step 4: stage kickstart + payload + edit boot configs ─────────
-echo "[bedrock-iso] step 4/5: stage kickstart + payload"
-
-# Kickstart at root of ISO — anaconda finds it via inst.ks=cdrom:/dev/sr0:/ks.cfg
-cp "$KS_FILE" "$EXTRACT_DIR/ks.cfg"
-
-# Payload at /bedrock on the ISO; %post copies into /var/lib/bedrock-install
-rm -rf "$EXTRACT_DIR/bedrock"
-cp -r "$PAYLOAD_DIR" "$EXTRACT_DIR/bedrock"
-
-# Add inst.ks=... to the bootloader configs so anaconda runs unattended.
-# We also rewrite the stage2 label so anaconda finds the install
-# medium under our new volume id (Bedrock-Install-10) — without this,
-# the installer would look for the old AlmaLinux label and fail.
-# Kernel args added to every install entry:
-#   inst.ks=…       — auto-load our kickstart
-#   console=tty0,ttyS0 — render anaconda on both video AND serial,
-#                        so headless installs (testbed virt-install
-#                        --graphics none, USB-on-real-hw with a
-#                        serial port) work without a monitor.
-#   rd.live.check=0  — skip the boot-time ISO checksum (we rebuild
-#                      the ISO above; original implant no longer
-#                      matches; we re-implant a fresh one as the last
-#                      step, but rd.live.check=0 also suppresses the
-#                      90-second prompt that appears even when the
-#                      checksum is valid).
-#   inst.ks=hd:LABEL=…:/ks.cfg — load ks.cfg from the install medium
-#                      *without* the unmount/re-insert dance that
-#                      `inst.ks=cdrom:/dev/sr0:/ks.cfg` triggers (the
-#                      cdrom syntax pops the tray, expects an
-#                      operator to re-insert; on a one-medium install
-#                      that's a deadlock — the same disc holds both
-#                      ks.cfg AND stage2, so re-inserting is the only
-#                      way to proceed but anaconda can't auto-do it).
-KS_ARG="inst.ks=hd:LABEL=Bedrock-Install-${ALMA_VERSION}:/ks.cfg console=tty0 console=ttyS0,115200n8 rd.live.check=0"
-
-# In --quick mode the source is boot.iso, which carries NO package
-# repository on the disc — only kernel + initrd + stage2. The
-# kickstart says `cdrom` to remain valid for the DVD path, so we
-# override the actual install repo via `inst.repo=` kernel arg in
-# --quick mode. Real hardware offline installs use the DVD path
-# where the on-disc repo is sufficient and no override is needed.
-if [ "$QUICK" -eq 1 ]; then
-    KS_ARG="$KS_ARG inst.repo=https://repo.almalinux.org/almalinux/${ALMA_VERSION}/BaseOS/x86_64/os/"
-fi
-NEW_VOLID="Bedrock-Install-${ALMA_VERSION}"
-
-# Discover the source ISO's volume label so we can rewrite it.
-SRC_VOLID=$(xorriso -indev "$SRC_ISO" 2>&1 | \
-            awk -F"'" '/^Volume id/ {print $2; exit}')
-echo "  source volid: ${SRC_VOLID:-?}"
-echo "  new    volid: ${NEW_VOLID}"
-
-# isolinux/isolinux.cfg (BIOS, only present on some images)
-if [ -f "$EXTRACT_DIR/isolinux/isolinux.cfg" ]; then
-    sed -i "s|append initrd=initrd.img|append initrd=initrd.img $KS_ARG|" \
-        "$EXTRACT_DIR/isolinux/isolinux.cfg"
-    [ -n "$SRC_VOLID" ] && sed -i "s|LABEL=$SRC_VOLID|LABEL=$NEW_VOLID|g" \
-        "$EXTRACT_DIR/isolinux/isolinux.cfg"
-    sed -i 's|^timeout .*|timeout 10|' "$EXTRACT_DIR/isolinux/isolinux.cfg"
-fi
-
-# Grub configs — UEFI uses /EFI/BOOT/grub.cfg, BIOS-grub uses
-# /boot/grub2/grub.cfg. Rewrite both.
-for grub_cfg in "$EXTRACT_DIR/EFI/BOOT/grub.cfg" \
-                "$EXTRACT_DIR/boot/grub2/grub.cfg"; do
-    if [ -f "$grub_cfg" ]; then
-        # Add our kickstart arg to every linux/linuxefi entry that
-        # doesn't already mention inst.ks (idempotent if the source
-        # ISO already carried one).
-        sed -i "/inst.ks=/!s|linuxefi /images/pxeboot/vmlinuz|linuxefi /images/pxeboot/vmlinuz $KS_ARG|" "$grub_cfg"
-        sed -i "/inst.ks=/!s|linux /images/pxeboot/vmlinuz|linux /images/pxeboot/vmlinuz $KS_ARG|" "$grub_cfg"
-        # Rewrite the stage2 label so anaconda finds OUR ISO.
-        [ -n "$SRC_VOLID" ] && sed -i "s|LABEL=$SRC_VOLID|LABEL=$NEW_VOLID|g" "$grub_cfg"
-        # 1-second timeout instead of 60.
-        sed -i 's|^set timeout=.*|set timeout=1|' "$grub_cfg"
+    if [ "$variant" = "net" ]; then
+        src_kind="$NET_SRC_KIND"
+        out_name="$NET_OUT_NAME"
+        include_payload=0
+        install_method="url --url=https://repo.almalinux.org/almalinux/${ALMA_VERSION}/BaseOS/x86_64/os/"
+        bedrock_repo="$S3_BASE"
+        # NOTE: use `;` with `set -e` instead of `&&` — awk's gsub
+        # treats `&` as the matched-text backreference.
+        firstboot_exec="ExecStart=/bin/bash -c 'set -e; curl -fsSL \${BEDROCK_REPO}/install.sh -o /tmp/bedrock-install.sh; bash /tmp/bedrock-install.sh'"
+        variant_label="the net-install ISO ($VERSION)"
+    else
+        src_kind="$OFFLINE_SRC_KIND"
+        out_name="$OFFLINE_OUT_NAME"
+        include_payload=1
+        install_method="cdrom"
+        bedrock_repo="file:///var/lib/bedrock-install"
+        firstboot_exec="ExecStart=/bin/bash /var/lib/bedrock-install/install.sh"
+        variant_label="the offline ISO ($VERSION)"
     fi
-done
 
-# ── Step 5: repack the ISO with xorriso ───────────────────────────
-echo "[bedrock-iso] step 5/5: repacking ISO"
+    src_iso="$BUILD_DIR/AlmaLinux-${ALMA_VERSION}-latest-x86_64-${src_kind}.iso"
+    src_url="https://repo.almalinux.org/almalinux/${ALMA_VERSION}/isos/x86_64/AlmaLinux-${ALMA_VERSION}-latest-x86_64-${src_kind}.iso"
+    out_iso="$OUT_DIR/$out_name"
 
-# Use -indev / -outdev mode so xorriso replicates the source ISO's
-# exact boot setup (isolinux MBR, El Torito catalogue, EFI partition)
-# without us having to extract & re-pass the bootloader binaries by
-# hand. `-update_rl` overlays the modified $EXTRACT_DIR onto the
-# image, picking up our edited isolinux.cfg / grub.cfg + the kickstart
-# + the /bedrock payload, while `-boot_image any replay` reuses the
-# original boot info verbatim.
-rm -f "$OUT_ISO"
-xorriso \
-    -indev "$SRC_ISO" \
-    -outdev "$OUT_ISO" \
-    -volid "Bedrock-Install-${ALMA_VERSION}" \
-    -boot_image any replay \
-    -update_r "$EXTRACT_DIR" / \
-    -close on \
-    -commit_eject all 2>&1 | tail -8
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "  Building $out_name  (variant: $variant)"
+    echo "═══════════════════════════════════════════════════════════════════"
 
-# Implant a fresh isomd5 checksum so anaconda's built-in
-# checkisomd5@dev-sr0.service doesn't refuse to mount our ISO. The
-# installer's initrd embeds checkisomd5; without a valid implant it
-# halts with "Media check failed... System will halt in 12 hours"
-# even when rd.live.check=0 is on the cmdline (the prompt is
-# suppressed, but the failure path can still trip if the implant is
-# missing entirely).
-if command -v implantisomd5 >/dev/null 2>&1; then
-    echo "  implanting isomd5..."
-    implantisomd5 --supported-iso "$OUT_ISO" >/dev/null
-else
-    echo "  WARN: implantisomd5 not installed (apt: isomd5sum). The ISO" >&2
-    echo "        will boot but anaconda may complain about media check." >&2
+    # Source ISO.
+    if [ ! -f "$src_iso" ]; then
+        echo "[bedrock-iso] fetching $(basename "$src_iso")..."
+        curl -fSL --progress-bar -o "$src_iso" "$src_url"
+    fi
+    echo "[bedrock-iso] source: $(basename "$src_iso") ($(du -h "$src_iso" | cut -f1))"
+
+    # Materialize the kickstart from the template with variant-specific
+    # substitutions.
+    local ks_out="$BUILD_DIR/bedrock-almalinux-10-${variant}.ks"
+    # Use awk for multi-line-safe substitution. The placeholders are
+    # single-line tokens so sed is fine for those.
+    awk -v auth="$AUTHORIZED_KEYS_BLOCK" \
+        -v repo="$bedrock_repo" \
+        -v exec="$firstboot_exec" \
+        -v method="$install_method" \
+        -v variant="$variant_label" '
+        {
+            gsub(/__BEDROCK_AUTHORIZED_KEYS__/, auth)
+            gsub(/__BEDROCK_REPO__/, repo)
+            gsub(/__BEDROCK_FIRSTBOOT_EXEC__/, exec)
+            gsub(/__BEDROCK_INSTALL_METHOD__/, method)
+            gsub(/__BEDROCK_VARIANT__/, variant)
+            print
+        }
+    ' "$KS_TEMPLATE" > "$ks_out"
+
+    # Extract source ISO.
+    local extract_dir="$BUILD_DIR/iso-extract-${variant}"
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    echo "[bedrock-iso] extracting source ISO..."
+    xorriso -osirrox on -indev "$src_iso" -extract / "$extract_dir" 2>&1 | tail -3
+    chmod -R u+w "$extract_dir"
+
+    # Place kickstart at /ks.cfg on the ISO.
+    cp "$ks_out" "$extract_dir/ks.cfg"
+
+    # Bundle payload only for offline variant.
+    if [ "$include_payload" -eq 1 ]; then
+        echo "[bedrock-iso] bundling payload..."
+        rm -rf "$extract_dir/bedrock"
+        cp -r "$PAYLOAD_DIR" "$extract_dir/bedrock"
+    fi
+
+    # Boot config edits.
+    local volid="Bedrock-Installer-${VERSION}-${variant}"
+    # Truncate volid to ISO 9660's 32-char limit.
+    volid="${volid:0:32}"
+    local ks_arg="inst.ks=hd:LABEL=${volid}:/ks.cfg console=tty0 console=ttyS0,115200n8 rd.live.check=0"
+
+    # Net build also needs inst.repo= to point at Alma upstream, since
+    # boot.iso carries no on-disc package repository.
+    if [ "$variant" = "net" ]; then
+        ks_arg="$ks_arg inst.repo=https://repo.almalinux.org/almalinux/${ALMA_VERSION}/BaseOS/x86_64/os/"
+    fi
+
+    # Discover source volid so we can rewrite LABEL= references.
+    local src_volid
+    src_volid=$(xorriso -indev "$src_iso" 2>&1 | awk -F"'" '/^Volume id/ {print $2; exit}' || true)
+
+    # isolinux.cfg (BIOS) — if present.
+    if [ -f "$extract_dir/isolinux/isolinux.cfg" ]; then
+        sed -i "s|append initrd=initrd.img|append initrd=initrd.img $ks_arg|" \
+            "$extract_dir/isolinux/isolinux.cfg"
+        [ -n "$src_volid" ] && sed -i "s|LABEL=$src_volid|LABEL=$volid|g" \
+            "$extract_dir/isolinux/isolinux.cfg"
+        sed -i 's|^timeout .*|timeout 10|' "$extract_dir/isolinux/isolinux.cfg"
+    fi
+
+    # grub configs (UEFI + BIOS-grub).
+    for grub_cfg in "$extract_dir/EFI/BOOT/grub.cfg" \
+                    "$extract_dir/boot/grub2/grub.cfg"; do
+        if [ -f "$grub_cfg" ]; then
+            sed -i "/inst.ks=/!s|linuxefi /images/pxeboot/vmlinuz|linuxefi /images/pxeboot/vmlinuz $ks_arg|" "$grub_cfg"
+            sed -i "/inst.ks=/!s|linux /images/pxeboot/vmlinuz|linux /images/pxeboot/vmlinuz $ks_arg|" "$grub_cfg"
+            [ -n "$src_volid" ] && sed -i "s|LABEL=$src_volid|LABEL=$volid|g" "$grub_cfg"
+            sed -i 's|^set timeout=.*|set timeout=1|' "$grub_cfg"
+        fi
+    done
+
+    # Repack.
+    echo "[bedrock-iso] repacking $out_name..."
+    rm -f "$out_iso"
+    xorriso \
+        -indev "$src_iso" \
+        -outdev "$out_iso" \
+        -volid "$volid" \
+        -boot_image any replay \
+        -update_r "$extract_dir" / \
+        -close on \
+        -commit_eject all 2>&1 | tail -6
+
+    if command -v implantisomd5 >/dev/null 2>&1; then
+        implantisomd5 --supported-iso "$out_iso" >/dev/null
+    fi
+
+    local size sha
+    size=$(du -h "$out_iso" | cut -f1)
+    sha=$(sha256sum "$out_iso" | cut -d' ' -f1)
+    echo "[bedrock-iso] built: $out_iso  ($size)"
+    echo "             sha256: $sha"
+}
+
+# ── Build the requested variants ──────────────────────────────────
+if [ "$VARIANT" = "both" ] || [ "$VARIANT" = "net" ]; then
+    build_one net
+fi
+if [ "$VARIANT" = "both" ] || [ "$VARIANT" = "offline" ]; then
+    build_one offline
 fi
 
-# ── Done ───────────────────────────────────────────────────────────
-SIZE=$(du -h "$OUT_ISO" | cut -f1)
-SHA=$(sha256sum "$OUT_ISO" | cut -d' ' -f1)
-echo
-echo "=========================================="
-echo "  bedrock-install ISO built"
-echo "=========================================="
-echo "  path:   $OUT_ISO"
-echo "  size:   $SIZE"
-echo "  sha256: $SHA"
-echo
-echo "  next:"
-echo "    sudo dd if=$OUT_ISO of=/dev/sdX bs=4M status=progress"
-echo "    (or in testbed: virt-install --cdrom $OUT_ISO …)"
-echo
+# ── Summary ───────────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════════════════════════════════════"
+echo "  Build complete (version=$VERSION)"
+echo "═══════════════════════════════════════════════════════════════════"
+ls -lh "$OUT_DIR"/bedrock-installer-${VERSION}*.iso 2>/dev/null | awk '{print "  " $9 "  " $5}'
+echo ""
+echo "  Net ISO points at:  $S3_BASE"
+echo "  Offline ISO uses:   file:///var/lib/bedrock-install (bundled)"
+echo ""
+echo "  Test with:"
+echo "    sudo dd if=$OUT_DIR/$NET_OUT_NAME of=/dev/sdX bs=4M status=progress"
+echo "    virt-install --cdrom $OUT_DIR/$OFFLINE_OUT_NAME ..."
+echo ""

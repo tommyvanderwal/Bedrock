@@ -27,13 +27,11 @@ NETWORKS_DIR = TESTBED / "networks"
 CLOUD_INIT_DIR = TESTBED / "cloud-init"
 STATE_DIR = TESTBED / "state"
 
-# bedrock-install ISO is the canonical install medium — built once
-# by installer/iso-build/build-iso.sh, then sims and real hardware
-# use the same media for the same install path. The cloud-image
-# fallback (commented below) stays around for fast dev iteration when
-# the ISO doesn't need rebuilding.
+# Bedrock installer ISO — built by installer/iso-build/build-iso.sh.
+# Testbed uses the offline variant (no S3 dependency at install
+# time). For dev-build naming see docs/install-and-iso.md.
 BEDROCK_ISO = (TESTBED.parent / "installer/iso-build/output/"
-                                "bedrock-install-almalinux-10.iso")
+                                "bedrock-installer-dev-offline.iso")
 # (Old cloud-image path — unused by default but useful when iterating
 # on bedrock-bootstrap WITHOUT rebuilding the ISO every time. Spawn
 # with BEDROCK_TESTBED_USE_CLOUD_IMG=1 to switch back.)

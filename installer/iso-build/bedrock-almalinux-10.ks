@@ -6,13 +6,20 @@
 # in the one thin pool, matching docs/01-storage-stack.md.
 #
 # After install, a one-shot systemd unit (bedrock-firstboot.service)
-# runs install.sh from the bundled payload, completing bedrock
-# bootstrap before handing off to the operator. No network required
-# during install — every package and every bedrock asset comes from
-# the ISO itself.
+# runs install.sh. For the offline ISO build, install.sh is read from
+# the bundled payload at /var/lib/bedrock-install. For the net ISO
+# build, install.sh is fetched from the matching S3 prefix. Both
+# variants are produced from this single kickstart — build-iso.sh
+# substitutes the placeholder tokens below to pick the right mode.
+#
+# See docs/install-and-iso.md for the design rationale.
 
-# ── Install method: pull packages from the bundled DVD repo on the ISO
-cdrom
+# ── Install method:
+#   - Offline build: `cdrom` (packages on the bundled DVD)
+#   - Net build:     `url` (packages from Alma's mirror, injected by
+#                    build-iso.sh via kernel arg inst.repo=…)
+# The token below is sed-replaced by build-iso.sh per variant.
+__BEDROCK_INSTALL_METHOD__
 
 # ── Localization (override in your kickstart fork if non-US/UTC)
 lang en_US.UTF-8
@@ -27,61 +34,141 @@ rootpw --plaintext --allow-ssh bedrock
 selinux --permissive
 firewall --disabled
 
-# ── Networking — DHCP on the first NIC anaconda finds; bedrock's
-#    network helper rewrites this to a static br0 + bedrock-drbd
-#    setup at first `bedrock init` / `bedrock join`. We don't pin
-#    a device name here because real-hardware NIC names vary
-#    (enp1s0, eno1, eth0…) and anaconda's `link` autodetect
+# ── Networking — DHCP on the first NIC anaconda finds. The hostname
+#    gets rewritten to bedrock-<MAC suffix> by install.sh's hostname
+#    derivation block (see installer/install.sh §"Hostname"). We
+#    don't pin a device name here because real-hardware NIC names
+#    vary (enp1s0, eno1, eth0…) and anaconda's `link` autodetect
 #    isn't supported in 10.1's anaconda.
 network --bootproto=dhcp --activate
 
 # ── Reboot when done
 reboot --eject
 
-# ── Disk: wipe everything, build the bedrock layout
+# ── Disk selection + partitioning — done in %pre, included below.
+#    Single-disk happy path: no prompts.
+#    Multi-disk: operator picks at the install console.
+#    Disk with existing partitions: operator confirms wipe at the
+#    install console (one prompt with full partition readout).
+%pre --interpreter=/bin/bash --erroronfail --log=/tmp/bedrock-pre.log
+
+set -euo pipefail
+
+# Open the install console for tty I/O. Anaconda's %pre runs early
+# enough that /dev/tty1 is the only reliable interactive console.
+exec </dev/tty1 >/dev/tty1 2>&1
+
+echo ""
+echo "  ── Bedrock installer ────────────────────────────────────────────────"
+echo ""
+
+# Find candidate install disks: real block devices, not loop/cdrom/RO.
+# We sort by size ascending — Bedrock convention is "OS on the smallest
+# disk, data tiers on the larger disks". Single-disk boxes don't care.
+candidates=$(lsblk -dno NAME,SIZE,TYPE,RO 2>/dev/null \
+             | awk '$3=="disk" && $4=="0" {print $2"\t"$1}' \
+             | sort -h \
+             | awk '{print $2}')
+
+count=$(printf '%s\n' "$candidates" | grep -cE '.' || true)
+
+if [ "$count" -eq 0 ]; then
+    echo "  ERROR: no writable disks detected. Cannot install."
+    exit 1
+fi
+
+if [ "$count" -eq 1 ]; then
+    DISK=$(printf '%s\n' "$candidates" | head -1)
+    DISK_SIZE=$(lsblk -dno SIZE "/dev/$DISK")
+    DISK_MODEL=$(lsblk -dno MODEL "/dev/$DISK" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
+    echo "  Single disk detected: /dev/$DISK ($DISK_SIZE ${DISK_MODEL:-})"
+else
+    echo "  Multiple disks detected. Choose where to install Bedrock:"
+    echo ""
+    i=1
+    for d in $candidates; do
+        size=$(lsblk -dno SIZE "/dev/$d")
+        model=$(lsblk -dno MODEL "/dev/$d" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
+        printf "    [%d] /dev/%-8s  %6s  %s\n" "$i" "$d" "$size" "${model:-}"
+        i=$((i+1))
+    done
+    echo ""
+    while true; do
+        read -r -p "  Enter number [1-$count]: " choice
+        if printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+            DISK=$(printf '%s\n' "$candidates" | sed -n "${choice}p")
+            break
+        fi
+        echo "  Invalid choice."
+    done
+    echo "  Selected: /dev/$DISK"
+fi
+
+# Existing partitions on the chosen disk?
+has_parts=$(lsblk -no NAME "/dev/$DISK" 2>/dev/null | tail -n +2 | grep -cE '.' || true)
+if [ "${has_parts:-0}" -gt 0 ]; then
+    echo ""
+    echo "  Disk /dev/$DISK has existing partitions:"
+    echo ""
+    lsblk "/dev/$DISK" | sed 's/^/    /'
+    echo ""
+    echo "  Installing Bedrock will erase all of them. There is no undo."
+    echo ""
+    read -r -p "  Type 'yes' to wipe and proceed, anything else to cancel: " reply
+    if [ "$reply" != "yes" ]; then
+        echo "  Cancelled by operator."
+        exit 1
+    fi
+fi
+
+# Write the disk-spec include that the main kickstart will load.
+# The kickstart partitioning directives go here, not in the main file.
+cat > /tmp/bedrock-disk-spec.ks <<EOF
+# Generated by Bedrock kickstart %pre — disk selection: $DISK
+ignoredisk --only-use=$DISK
 zerombr
-clearpart --all --initlabel
+clearpart --all --initlabel --drives=$DISK
 
-# Boot partitions — outside the LVM (bootloaders + kernel must be
-# directly readable by firmware/grub). biosboot is a 1MiB unformatted
-# slot grub-bios uses to embed core.img on a GPT-labeled disk; ESP is
-# the EFI partition used in UEFI boot. We allocate BOTH so the same
-# install image works on legacy-BIOS and UEFI machines without an
-# operator-time choice. Cost: ~501 MiB on the boot disk, trivial.
-part biosboot  --fstype=biosboot --size=1
-part /boot/efi --fstype=efi --size=500 --asprimary
-part /boot     --fstype=xfs --size=1024 --asprimary
+# Boot partitions — outside LVM. biosboot is a 1MiB unformatted slot
+# grub-bios uses to embed core.img on a GPT-labeled disk; ESP is the
+# EFI partition used in UEFI boot. We allocate BOTH so the same install
+# image works on legacy-BIOS and UEFI machines without operator choice.
+part biosboot  --fstype=biosboot --size=1 --ondisk=$DISK
+part /boot/efi --fstype=efi --size=500 --asprimary --ondisk=$DISK
+part /boot     --fstype=xfs --size=1024 --asprimary --ondisk=$DISK
 
-# The rest of the disk is one PV → one VG `bedrock`.
-part pv.bedrock --size=1 --grow --asprimary
-
+# The rest of the disk is one PV → one VG 'bedrock'.
+part pv.bedrock --size=1 --grow --asprimary --ondisk=$DISK
 volgroup bedrock pv.bedrock
 
 # Single thin pool taking MOST of the VG space, leaving headroom for
 # thick LVs that live OUTSIDE the pool (DRBD external metadata
-# volumes: tier-critical-meta etc.). Anaconda's `--grow` here would
-# eat 100% of VG → ensure_meta_lv would fail with "VG has insufficient
-# free space" at storage-promote time. Hold back 1 GiB.
+# volumes: tier-critical-meta etc.). Hold back 1 GiB.
 # metadatasize=512 MB gives generous pool-meta headroom for the
-# operations bedrock generates (per-VM thin LVs, snapshots, restores).
+# operations Bedrock generates (per-VM thin LVs, snapshots, restores).
 logvol none --thinpool --name=thinpool --vgname=bedrock --size=1 --grow --maxsize=130048 --metadatasize=512
 
 # Root as a thin LV inside the pool. 16 GB virtual covers any
 # reasonable AlmaLinux install footprint; xfs supports online
-# `xfs_growfs` so the operator can grow later if needed.
-# (Single line — anaconda 10.1 doesn't reliably parse the `\`
-# continuation in kickstart files.)
+# xfs_growfs so the operator can grow later if needed.
 logvol / --name=root --vgname=bedrock --thin --poolname=thinpool --size=16384 --fstype=xfs
 
 # No swap by default. Swap-on-thin can panic the kernel when the pool
 # fills, and a hypervisor with VMs has no business swapping. Operator
-# can opt in with `bedrock storage swap-set <gb>` post-install.
+# can opt in with 'bedrock storage swap-set <gb>' post-install.
+EOF
+
+echo ""
+echo "  Partitioning /dev/$DISK..."
+
+%end
+
+%include /tmp/bedrock-disk-spec.ks
 
 bootloader --location=mbr --append="console=tty0 console=ttyS0,115200n8"
 
 # ── Minimal package set. The bedrock payload's bootstrap step layers
 #    everything else (kvm, libvirt, drbd, mgmt deps) on top.
-#    --excludedocs only (no --excludeenvs in 10.1 anaconda).
 %packages --excludedocs
 @core
 xfsprogs
@@ -94,43 +181,46 @@ tar
 #    payload from the ISO into the target system. This MUST run
 #    with `--nochroot` because the install media is only mounted in
 #    the installer environment at /run/install/repo, not inside the
-#    chroot the default %post enters. The chrooted second %post
-#    below then arms the first-boot service against the staged
-#    payload.
-%post --nochroot --interpreter=/bin/bash --erroronfail --log=/mnt/sysroot/var/log/bedrock-postinstall-stage-a.log
+#    chroot the default %post enters.
+#
+#    For the OFFLINE ISO build, /run/install/repo/bedrock exists
+#    (the payload was copied onto the ISO). For the NET ISO build,
+#    there's no /bedrock on the ISO — install.sh fetches from S3 at
+#    first boot. The conditional below handles both cases.
+%post --nochroot --interpreter=/bin/bash --log=/mnt/sysroot/var/log/bedrock-postinstall-stage-a.log
 
 set -euo pipefail
 
-# Anaconda mounts the ISO at /run/install/repo for %post. Target
-# system root is at /mnt/sysroot. Copy /bedrock from the ISO to
-# /var/lib/bedrock-install on the new system so first-boot can read
-# the payload after the ISO is ejected.
 SRC=/run/install/repo/bedrock
 DST=/mnt/sysroot/var/lib/bedrock-install
-[ -d "$SRC" ] || { echo "ERROR: $SRC missing on install media"; ls -la /run/install/repo/; exit 1; }
-mkdir -p "$DST"
-cp -r "$SRC"/. "$DST/"
-chmod +x "$DST"/install.sh "$DST"/bedrock "$DST"/binaries/bedrock-rust 2>/dev/null || true
-echo "[stage-a] payload copied: $(du -sh "$DST" | cut -f1)"
+
+if [ -d "$SRC" ]; then
+    # Offline build: payload is on the ISO.
+    mkdir -p "$DST"
+    cp -r "$SRC"/. "$DST/"
+    chmod +x "$DST"/install.sh "$DST"/bedrock 2>/dev/null || true
+    echo "[stage-a] offline payload copied: $(du -sh "$DST" | cut -f1)"
+else
+    # Net build: no on-ISO payload. First-boot will curl install.sh.
+    mkdir -p "$DST"
+    echo "[stage-a] net build — payload will be fetched at first boot"
+fi
 %end
 
 # ── Post-install (stage B — inside chroot): arm the first-boot
-#    bootstrap service + write the operator MOTD. Runs against the
-#    payload staged in stage A.
+#    bootstrap service. The BEDROCK_REPO env + ExecStart command
+#    are sed-replaced by build-iso.sh to pick offline vs net mode.
 %post --interpreter=/bin/bash --erroronfail --log=/var/log/bedrock-postinstall.log
 
 set -euo pipefail
 
 # Testbed convenience: drop the dev-box operator's public key into
 # root's authorized_keys so test scripts can SSH key-based. Real
-# deployments leave authorized_keys empty (passwd auth only until
-# operator wires their own key).
+# deployments built without --testbed leave this section empty.
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-cat > /root/.ssh/authorized_keys <<'PUBKEY_EOF'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXS8J+TpzUuO2WDCeSxV9baR5p7p14ZtaXWRvVlZgqp tommy@HP-G1a
-PUBKEY_EOF
-chmod 600 /root/.ssh/authorized_keys
+__BEDROCK_AUTHORIZED_KEYS__
+[ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
 
 # OpenSSH 9.8+ (AlmaLinux 10) ships with PerSourcePenalties enabled
 # by default. A burst of failed auths from one source IP (e.g.
@@ -152,24 +242,23 @@ MaxStartups 100:30:200
 EOF
 chmod 644 /etc/ssh/sshd_config.d/99-bedrock-no-persource.conf
 
-# First-boot one-shot service: runs install.sh against the local
-# payload. Self-disables after success so it never re-runs.
+# First-boot one-shot service: runs install.sh.
+# build-iso.sh substitutes __BEDROCK_REPO__ and __BEDROCK_FIRSTBOOT_EXEC__
+# per variant (offline vs net).
 cat > /etc/systemd/system/bedrock-firstboot.service <<'EOF'
 [Unit]
-Description=Bedrock first-boot bootstrap (offline install)
+Description=Bedrock first-boot bootstrap
 After=network-online.target local-fs.target
 Wants=network-online.target
-ConditionPathExists=/var/lib/bedrock-install/install.sh
 ConditionPathExists=!/var/lib/bedrock-install/.bootstrap-done
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 StandardOutput=journal+console
-Environment=BEDROCK_REPO=file:///var/lib/bedrock-install
-ExecStart=/bin/bash /var/lib/bedrock-install/install.sh
-ExecStartPost=/bin/bash -c 'touch /var/lib/bedrock-install/.bootstrap-done; \
-  systemctl disable bedrock-firstboot.service'
+Environment=BEDROCK_REPO=__BEDROCK_REPO__
+__BEDROCK_FIRSTBOOT_EXEC__
+ExecStartPost=/bin/bash -c 'mkdir -p /var/lib/bedrock-install; touch /var/lib/bedrock-install/.bootstrap-done; systemctl disable bedrock-firstboot.service'
 
 [Install]
 WantedBy=multi-user.target
@@ -177,22 +266,18 @@ EOF
 
 systemctl enable bedrock-firstboot.service
 
-# Operator-facing first-login banner: explain what just happened +
-# the next step (`bedrock init` or `bedrock join`).
+# Operator-facing first-login banner.
 cat > /etc/motd <<'EOF'
 
   ╔══════════════════════════════════════════════════════════════════╗
   ║                  Bedrock node — fresh install                    ║
   ╠══════════════════════════════════════════════════════════════════╣
   ║                                                                  ║
-  ║  AlmaLinux 10 + bedrock storage layout installed offline from    ║
-  ║  the install ISO. First-boot bootstrap finished at:              ║
-  ║      /var/lib/bedrock-install/.bootstrap-done                    ║
+  ║  AlmaLinux 10 + Bedrock installed via __BEDROCK_VARIANT__.       ║
   ║                                                                  ║
   ║  Next step:                                                      ║
   ║      bedrock init           — start a new cluster                ║
   ║      bedrock join HOST      — join an existing one               ║
-  ║      bedrock storage status — show the LVM thin-pool layout     ║
   ║                                                                  ║
   ║  Default root password is `bedrock`. Change it now.              ║
   ║                                                                  ║
@@ -200,5 +285,5 @@ cat > /etc/motd <<'EOF'
 
 EOF
 
-echo "[bedrock-postinstall] payload staged; firstboot service armed"
+echo "[bedrock-postinstall] firstboot service armed (__BEDROCK_VARIANT__)"
 %end
