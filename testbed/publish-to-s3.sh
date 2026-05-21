@@ -141,6 +141,11 @@ if [ -d "$REPO/installer/iso-build/payload/binaries" ]; then
 fi
 if [ -d "$REPO/installer/iso-build/payload/wheels" ]; then
     cp -r "$REPO/installer/iso-build/payload/wheels" "$STAGE/wheels"
+    # Manifest for HTTP installs — install.sh enumerates this list and
+    # curl-fetches each entry. (Object stores disable bucket listing so
+    # we can't directory-scrape.)
+    ( cd "$STAGE/wheels" && find . -maxdepth 1 -type f -name "*.whl" \
+        -printf "%f\n" | sort > MANIFEST.txt )
 fi
 
 # ISO (optional)

@@ -46,7 +46,13 @@ log "Repo: $BEDROCK_REPO"
 
 # ── Check internet / repo reachability ─────────────────────────────────────
 
-if ! curl -fsSL --max-time 5 "${BEDROCK_REPO}/" >/dev/null 2>&1; then
+# Probe a specific known file (install.sh itself) rather than the bucket
+# root. Object stores typically disable bucket listing, so a bare
+# ``$BEDROCK_REPO/`` request returns 403 even when every file inside is
+# fetchable. The HEAD on install.sh works against both a public S3
+# bucket and a plain HTTP server (testbed serve.py), and via ``file://``
+# the same flag falls through to a path stat.
+if ! curl -fsI --max-time 5 "${BEDROCK_REPO}/install.sh" >/dev/null 2>&1; then
     die "Cannot reach repo at $BEDROCK_REPO. Check BEDROCK_REPO env var."
 fi
 
@@ -67,10 +73,43 @@ dnf install -y -q python3 python3-pip curl >/dev/null 2>&1 || {
 # state store and `bedrock init` will silently produce an empty
 # rqlite (see lessons-log: 25s init-with-no-httpx debug session).
 log "Installing httpx via pip (offline wheels)..."
-WHEELS_DIR="${BEDROCK_REPO#file://}/wheels"
-if [ ! -d "$WHEELS_DIR" ]; then
-    die "wheels dir missing: $WHEELS_DIR"
-fi
+# Two-path wheels handling:
+#   * file://  — pass the local dir straight to pip --find-links
+#   * http(s):// — fetch the wheels into a tmp dir first, then point pip
+#                  at it. pip's --find-links speaks URL too but only as
+#                  a directory-listing scrape, which 403s on S3-style
+#                  buckets that disable bucket-listing.
+case "$BEDROCK_REPO" in
+    file://*)
+        WHEELS_DIR="${BEDROCK_REPO#file://}/wheels"
+        if [ ! -d "$WHEELS_DIR" ]; then
+            die "wheels dir missing: $WHEELS_DIR"
+        fi
+        ;;
+    http://*|https://*)
+        # Probe a known wheel (httpx — installed unconditionally below)
+        # to verify the wheels/ prefix is reachable before downloading
+        # everything. Manifest is wheels/MANIFEST.txt if present.
+        if ! curl -fsI --max-time 5 "${BEDROCK_REPO}/wheels/MANIFEST.txt" >/dev/null 2>&1 \
+           && ! curl -fsI --max-time 5 "${BEDROCK_REPO}/wheels/" >/dev/null 2>&1; then
+            warn "wheels reachability probe failed; will still try the fetch"
+        fi
+        WHEELS_DIR="$(mktemp -d -t bedrock-wheels.XXXX)"
+        log "  fetching wheel manifest from ${BEDROCK_REPO}/wheels/MANIFEST.txt"
+        if curl -fsSL "${BEDROCK_REPO}/wheels/MANIFEST.txt" -o "$WHEELS_DIR/MANIFEST.txt"; then
+            while IFS= read -r whl; do
+                [ -z "$whl" ] && continue
+                curl -fsSL "${BEDROCK_REPO}/wheels/$whl" -o "$WHEELS_DIR/$whl" \
+                    || die "wheel fetch failed: $whl"
+            done < "$WHEELS_DIR/MANIFEST.txt"
+        else
+            die "MANIFEST.txt missing under ${BEDROCK_REPO}/wheels/ — publish.sh must regenerate it"
+        fi
+        ;;
+    *)
+        die "BEDROCK_REPO must be file:// or http(s)://, got: $BEDROCK_REPO"
+        ;;
+esac
 python3 -m pip install --break-system-packages --no-index \
     --find-links="$WHEELS_DIR" httpx \
     || die "httpx install failed — see pip output above. rqlite_client cannot work without it."
