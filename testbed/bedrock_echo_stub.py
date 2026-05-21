@@ -15,7 +15,7 @@ Usage:
     python3 bedrock_echo_stub.py --cluster-key-hex <64-hex>
     python3 bedrock_echo_stub.py --cluster-key-file /etc/bedrock/cluster.key
 
-UDP/9501 on 0.0.0.0. State is in-memory (testbed only); production
+UDP/12321 on 0.0.0.0. State is in-memory (testbed only); production
 echo MUST persist slots across restart.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ import time
 
 # Same constants the cluster nodes use.
 MAGIC = b"BREC"
-WITNESS_PORT = 9501
+WITNESS_PORT = 12321  # canonical bedrock-echo UDP port (matches firmware repo)
 NONCE_LEN = 12
 
 

@@ -633,7 +633,7 @@ else
     pass "8a: pulled cluster.key from sim-$MASTER_SIM (${#CLUSTER_KEY_HEX} hex)"
 fi
 # Start echo stub in background. First kill any leftover stubs from
-# prior runs — they bind port 9501 with a stale cluster_key and steal
+# prior runs — they bind port 12321 with a stale cluster_key and steal
 # every probe (v25: stale stub from v24 received all probes, rejected
 # them as "bad hmac", looked like witness was alive when it wasn't,
 # made 8b/8d look like real failover failures when the witness was
@@ -650,9 +650,9 @@ if ! kill -0 $ECHO_PID 2>/dev/null; then
     mark_fail "8a: echo stub died — see $ECHO_LOG"
     head -10 "$ECHO_LOG"
 elif grep -q "Address already in use\|address in use\|errno 98" "$ECHO_LOG"; then
-    # Process is alive but bind failed — port 9501 was held by a stale
+    # Process is alive but bind failed — port 12321 was held by a stale
     # stub. Surface this so we don't continue with a broken witness.
-    mark_fail "8a: echo stub couldn't bind 9501 (stale stub leaked from previous test run)"
+    mark_fail "8a: echo stub couldn't bind 12321 (stale stub leaked from previous test run)"
     head -10 "$ECHO_LOG"
 else
     pass "8a: echo stub running (pid $ECHO_PID)"
