@@ -165,7 +165,12 @@ echo "  Partitioning /dev/$DISK..."
 
 %include /tmp/bedrock-disk-spec.ks
 
-bootloader --location=mbr --append="console=tty0 console=ttyS0,115200n8"
+# `quiet` lowers the kernel's default console_loglevel so info/notice
+# messages (selinux policy reloads, dm capability deprecation notices,
+# routine ELRepo out-of-tree module taints) don't paint over the
+# operator's login prompt. Warnings and errors still show. Operators
+# debugging boot can drop `quiet` from the grub entry at the menu.
+bootloader --location=mbr --append="console=tty0 console=ttyS0,115200n8 quiet"
 
 # ── Minimal package set. The bedrock payload's bootstrap step layers
 #    everything else (kvm, libvirt, drbd, mgmt deps) on top.

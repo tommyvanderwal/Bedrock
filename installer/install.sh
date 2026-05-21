@@ -48,6 +48,20 @@ BEDROCK_REPO="${BEDROCK_REPO%/}"
 log "Bedrock installer"
 log "Repo: $BEDROCK_REPO"
 
+# Quiet the kernel-to-console noise for the duration of this install.
+# Default console_loglevel is KERN_DEBUG (7); we lower to KERN_WARNING
+# (4) so the operator's view of the install isn't covered by routine
+# selinux policy-reload chatter and dm/LVM capability notices. The
+# messages still go to dmesg/journal — only the console copy is muted.
+# Restored on exit (success or failure) so post-install boot retains
+# whatever the kernel cmdline asks for.
+prev_console_loglevel=$(awk '{print $2}' /proc/sys/kernel/printk 2>/dev/null || echo 7)
+dmesg -n 4 2>/dev/null || true
+restore_console_loglevel() {
+    dmesg -n "${prev_console_loglevel:-7}" 2>/dev/null || true
+}
+trap restore_console_loglevel EXIT
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ── /home reclaim (XFS-can't-shrink recovery path) ───────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,7 +444,9 @@ chmod +x "${INSTALL_DIR}/bedrock-d"
 mkdir -p /etc/systemd/system /etc/bedrock /var/lib/bedrock
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-d.service" \
     -o /etc/systemd/system/bedrock-d.service
-systemctl daemon-reload
+# (No daemon-reload here — bedrock-d is enabled by `bedrock init` /
+# `bedrock join`, not now. We batch the reload before the first
+# `enable --now` call further down to keep generator chatter down.)
 # Service unit is enabled by `bedrock init` / `bedrock join` once
 # loopback_ip is allocated and cluster.key written. Auto-starting
 # pre-init would just spin in a tight no-op retry loop.
@@ -474,7 +490,7 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-rqlited-arbiter.service" \
     -o /etc/systemd/system/bedrock-rqlited-arbiter.service
 mkdir -p /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
 chmod 700 /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
-systemctl daemon-reload
+# (No daemon-reload — batched before the first `enable --now` below.)
 # Do NOT enable bedrock-rqlited here. Its EnvironmentFile=/etc/bedrock/
 # rqlited.env doesn't exist until `bedrock init`/`join` writes it.
 # Auto-starting at multi-user.target would crash-loop rqlited AND
@@ -500,10 +516,9 @@ log "Installing bedrock-vg-loop boot helper..."
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-vg-loop.service" \
     -o /etc/systemd/system/bedrock-vg-loop.service 2>/dev/null || \
     warn "bedrock-vg-loop.service not in payload (older ISO?); skipping"
-if [ -f /etc/systemd/system/bedrock-vg-loop.service ]; then
-    systemctl daemon-reload
-    systemctl enable bedrock-vg-loop.service >/dev/null 2>&1 || true
-fi
+# vg-loop.service is enabled below alongside mdns/redirect after
+# the consolidated daemon-reload (single reload = single rc-local-
+# generator + selinux refresh cycle, much quieter console).
 
 # Three small auxiliary daemons stay AT ARM'S LENGTH from bedrock-d
 # because they touch no cluster-decision code paths:
@@ -525,7 +540,8 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.service" \
     -o /etc/systemd/system/bedrock-cert-refresh.service
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-cert-refresh.timer" \
     -o /etc/systemd/system/bedrock-cert-refresh.timer
-systemctl daemon-reload
+# (No daemon-reload — batched below; cert-refresh.timer is enabled
+# at the very end of install.sh after lib/ is staged.)
 # DO NOT enable the cert-refresh timer here — lib/cert_manager.py
 # isn't on disk yet, so the timer firing immediately would crash
 # the service with ModuleNotFoundError before LIB_FILES gets a
@@ -543,7 +559,12 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-mdns.service" \
     -o /etc/systemd/system/bedrock-mdns.service
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-redirect.service" \
     -o /etc/systemd/system/bedrock-redirect.service
+# Consolidated daemon-reload: picks up every .service file written
+# above in a single pass, so generators (rc-local-generator, etc.)
+# only run once instead of once-per-batch. Quieter install console.
 systemctl daemon-reload
+[ -f /etc/systemd/system/bedrock-vg-loop.service ] && \
+    systemctl enable bedrock-vg-loop.service >/dev/null 2>&1 || true
 systemctl enable --now bedrock-mdns.service >/dev/null 2>&1 || true
 systemctl enable --now bedrock-redirect.service >/dev/null 2>&1 || true
 
