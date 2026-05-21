@@ -520,16 +520,31 @@ def _last_known_master_node_id() -> "int | None":
 
 
 def _read_local_drbd_uuid() -> str:
-    """Read tier-critical's current-uuid via drbdadm. Returns "" if
-    DRBD isn't configured (N=1) or the call fails."""
+    """Read tier-critical's current-UUID. Returns "" if DRBD isn't
+    configured (N=1) or no source has it.
+
+    Primary source: DRBD9's debugfs at
+    ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``.
+    First line is the current UUID. Works while the resource is UP
+    (the takeover-protocol case).
+
+    Fallback: ``drbdadm dump-md`` — only works when the resource is
+    detached (N=1 scratch path).
+
+    ``drbdadm current-uuid`` does NOT exist in DRBD 9.34 — removed
+    upstream after the 8.x → 9.x split. Don't reach for it."""
+    debugfs = (
+        f"/sys/kernel/debug/drbd/resources/{TIER_RESOURCE}/volumes/0/"
+        "data_gen_id"
+    )
     try:
-        out = subprocess.check_output(
-            ["drbdadm", "current-uuid", TIER_RESOURCE], timeout=3
-        )
-        return out.decode().strip().lower().replace("0x", "")
-    except Exception:
+        with open(debugfs, "r") as f:
+            first = f.readline().strip()
+        if first.startswith("0x"):
+            return first[2:].lower()
+    except OSError:
         pass
-    # Fallback via dump-md (used historically by netd).
+    # Fallback for down/unattached resources.
     try:
         out = subprocess.check_output(
             ["drbdadm", "dump-md", TIER_RESOURCE], timeout=3
