@@ -46,16 +46,20 @@ def _cluster() -> dict:
     return {"nodes": {}}
 
 
-def _api_get(state, path: str) -> dict:
-    url = state.get("mgmt_url", "http://127.0.0.1:8001") + path
-    r = urllib.request.urlopen(url, timeout=5)
+# The CLI runs locally on the node; always dial the loopback HTTP listener
+# rather than state["mgmt_url"] (which is the LAN HTTPS URL meant for remote
+# consumers and has a cert SAN that won't match the LAN IP).
+_LOCAL_API = "http://127.0.0.1:8001"
+
+
+def _api_get(_state, path: str) -> dict:
+    r = urllib.request.urlopen(_LOCAL_API + path, timeout=5)
     return json.loads(r.read())
 
 
-def _api_post(state, path: str, body: dict = None) -> dict:
-    url = state.get("mgmt_url", "http://127.0.0.1:8001") + path
+def _api_post(_state, path: str, body: dict = None) -> dict:
     data = json.dumps(body or {}).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
+    req = urllib.request.Request(_LOCAL_API + path, data=data, method="POST",
                                  headers={"Content-Type": "application/json"})
     r = urllib.request.urlopen(req, timeout=30)
     return json.loads(r.read())

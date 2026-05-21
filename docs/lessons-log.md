@@ -1161,3 +1161,172 @@ up the new probe target on the next tick.
 **Note**: `bedrock join --witness HOST` is unchanged. That flag is
 the master endpoint the joiner dials (overloaded name; separate
 concern).
+
+---
+
+## L37 — Master returning from kill steals master back from the takeover peer
+**Date**: 2026-05-21
+**Files**: `installer/lib/cluster_arbiter.py`
+**Scenario**: Failover B recovery (`testbed/2-sim N=2 + Echo`)
+
+**What we thought**: after a clean Failover B (peer takes over via
+witness slot), restarting the killed node would heal into the
+cluster as Secondary. The witness slot for the new master is fresh
+and tagged LMS; the returning node should read it and stand down.
+
+**What we found**: two concurrent arbiter bugs cause the *returning*
+node to seize back the master role on boot.
+
+1. **`demote when no longer singleton` on the current master**.
+   sim-2's arbiter holds `.254` + Primary after Failover B. The
+   instant sim-1 reconnects, sim-2's converge tick logs `arbiter:
+   demoting this node (was singleton host)` and unwinds the whole
+   stack — `ip addr del 100.64.105.254/32`, `systemctl stop
+   bedrock-rqlited-arbiter`, `umount`, `drbdadm secondary`. The
+   "singleton" heuristic conflates *"I was alone"* with *"I should
+   stop being master now that peers are back"*. Correct rule:
+   demote only when arbitration explicitly hands the role away.
+
+2. **Takeover protocol on the rejoining node checks only its own
+   slot**. sim-1's arbiter sees `tier-cluster DRBD present` and
+   walks the takeover guard, finds its own pre-shutdown slot
+   `last_master=1, self=1`, concludes *"no prior master to take
+   over from"*, and immediately runs `drbdadm primary`. It never
+   reads the *peer's* slot, which still has a fresh LMS-tagged
+   marker from sim-2. With (1) already having demoted the rightful
+   master, the primary-grab succeeds.
+
+Observed sequence:
+```
+14:58:35 sim-2  arbiter: promotion complete (ip=100.64.105.254 mount=…)   # Failover B success
+14:59:30 sim-2  arbiter: demoting this node (was singleton host)          # bug #1 fires on peer rejoin
+15:02:23 sim-1  arbiter: takeover protocol — no prior master to take      # bug #2 misreads own slot
+                  over from (last_master=1, self=1); proceeding
+15:02:23 sim-1  arbiter: promotion complete (ip=100.64.105.254 mount=…)
+```
+
+Cluster is functionally available throughout (one node always
+owns `.254`), but the master role thrashed unnecessarily: a
+crash-restart cycle ping-pongs Primary back to the (less
+trustworthy) node that just died. That's the opposite of what
+you want — you want to *stay* with the proven-surviving peer.
+
+A third minor finding: `drbdadm up tier-critical` is not invoked
+on boot before the arbiter tries `drbdadm primary`. The first
+several converge ticks fail with `Unknown resource` until DRBD is
+brought up manually (or by another path). The arbiter must `up`
+the resource as a prerequisite of promote, or a separate
+reactor step has to handle it before promotion is attempted.
+
+**What we changed**: nothing yet — captured for v1.0 fix.
+Concrete changes needed:
+- Remove the `was-singleton` demote path. Master demotes only on:
+  (a) loss of quorum, (b) successful peer takeover protocol
+  proven via witness slot, (c) operator-initiated `bedrock node
+  leave`. Re-joining a peer is not a demote trigger.
+- Rejoining-node takeover guard must read **peer slot**, not just
+  self slot. If peer slot is fresh (age < N seconds) AND
+  `tag.lms=1`, peer is the current master — stand down and become
+  Secondary regardless of own slot history.
+- Promote step must `drbdadm up <resource>` before `drbdadm
+  primary`. Currently relies on something else to bring the
+  resource up on boot.
+
+**Reference**: this scenario, no commit yet.
+
+---
+
+## L38 — Local CLI must not use `state["mgmt_url"]` for its own API calls
+**Date**: 2026-05-21
+**Files**: `installer/lib/vm.py`, `installer/bedrock` (multiple callsites)
+**Scenario**: VM lifecycle smoke test on the 2-sim testbed
+
+**What we thought**: `state["mgmt_url"]` is a single source of truth
+for the cluster's management endpoint; CLI code can dial it
+transparently regardless of where the CLI runs.
+
+**What we found**: `state["mgmt_url"]` is the **LAN-facing HTTPS URL**
+(e.g. `https://192.168.2.51:8443`). It exists for *remote* consumers
+(browser dashboards on other nodes, peer-node API calls). When the
+local `bedrock` CLI on the master dialed it for `vm list` / `vm
+delete`, two things broke:
+
+1. **Cert SAN mismatch**: the mgmt cert is issued for the cluster
+   hostname / `100.64.105.254`, not the LAN IP, so
+   `urllib.request.urlopen` raised
+   `CERTIFICATE_VERIFY_FAILED: certificate is not valid for
+   '192.168.2.51'`.
+2. **Even after pointing to `127.0.0.1:8001`** (the loopback HTTP
+   listener that bypasses TLS), `vm list` and `vm delete` returned
+   `HTTP Error 401 Unauthorized` — the loopback API requires a
+   Bearer operator token. `/api/cluster` is exempt (that's why
+   `bedrock status` works), but `/api/vms/*` is not.
+
+**What we changed**:
+- `lib/vm.py`: stopped reading `state["mgmt_url"]` for local calls;
+  both `_api_get` and `_api_post` now hardcode
+  `http://127.0.0.1:8001`. Same fix had to be applied earlier to
+  `bedrock status` and `cmd_operator` — this completes the pattern
+  for VM operations.
+- Open: the loopback API needs to either trust local UID 0 (it's
+  already loopback-only) or the CLI needs to obtain a token from
+  `/etc/bedrock/local-cli-token` on disk (rotated by `bedrock-d`).
+  Today the workaround is `BEDROCK_OPERATOR_TOKEN=… bedrock vm …`,
+  which is fine for CI but not for an admin SSH'd into a node.
+
+**Side finding**: a *running* `bedrock vm create` log line says
+`[state] vm_created write skipped: rqlite POST … Connection
+refused`. The VM was still created (lvcreate + image fetch + virsh
+define succeeded), but the rqlite write to record the new VM never
+happened. Need to confirm whether the orchestrator picks this up on
+next snapshot fold or whether the state is silently lost.
+
+**Reference**: this scenario, no commit yet.
+
+---
+
+## L39 — Testbed sim's second PV (`loop0`) comes up read-only after `virsh destroy`
+**Date**: 2026-05-21
+**Files**: testbed-only — `/var/lib/bedrock-vg-extra.img` setup
+**Scenario**: Failover B recovery on `bedrock-sim-1`
+
+**What we thought**: a `virsh destroy` + `virsh start` cycle is
+equivalent to an unclean power cycle and the VM should come back to
+a usable state, including its loopback-backed second PV.
+
+**What we found**: after `virsh destroy`, the next boot left
+`/dev/loop0` attached **read-only**:
+
+```
+NAME       SIZELIMIT OFFSET AUTOCLEAR RO BACK-FILE
+/dev/loop0         0      0         0  1 /var/lib/bedrock-vg-extra.img
+                                       ^ RO=1
+```
+
+The backing file `/var/lib/bedrock-vg-extra.img` was still 0644 and
+writable at the filesystem level — the RO flag was on the loop
+device itself. LVM happily activated the VG over the mixed-mode PVs
+and basic LVs worked, but any operation that needed to write VG
+metadata (e.g. `lvcreate -V … --thin`) failed with:
+
+```
+Error writing device /dev/loop0 at 33280 length 4608.
+WARNING: bcache_invalidate: block (1, 0) still dirty.
+Failed to write metadata to /dev/loop0.
+Failed to write VG bedrock.
+```
+
+That's what surfaced as the `bedrock vm create` failure before it
+could even reach the rest of the create flow.
+
+Fix is `losetup -d /dev/loop0 && losetup --find --show
+/var/lib/bedrock-vg-extra.img && pvscan --cache && vgchange -ay
+bedrock`.
+
+**Status**: testbed-only — production nodes don't use loop-backed
+PVs. Captured because the symptom (`lvcreate` failing with
+`Error writing device`) was confusing in the moment and the
+underlying RO state isn't obvious from `vgs` / `lvs` alone — only
+`losetup -l` exposes it.
+
+**Reference**: this scenario, no commit.
