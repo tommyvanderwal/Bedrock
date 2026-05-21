@@ -101,7 +101,27 @@ def cmd_init(args):
         print("ERROR: run `bedrock bootstrap` first.")
         return 1
 
-    if state.get("cluster_uuid"):
+    # Saga default: init-progress.json is the source of truth for
+    # "is init done?". A failed or in-flight saga falls through so
+    # run_cluster_init() can resume / retry it. Legacy opt-out
+    # (BEDROCK_INIT_SAGA=0) uses state.json's cluster_uuid.
+    if os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
+        from pathlib import Path as _P
+        import json as _J
+        prog = _P("/var/lib/bedrock/init-progress.json")
+        if prog.exists():
+            try:
+                ops = _J.loads(prog.read_text()).get("ops", {}) or {}
+                init_ops = [o for o in ops.values()
+                            if o.get("kind") == "cluster_init"]
+                if init_ops and all(
+                        o["state"] == "completed" for o in init_ops):
+                    print(f"Cluster {state.get('cluster_name')!r} "
+                          f"already initialised (saga completed).")
+                    return 1
+            except Exception:
+                pass
+    elif state.get("cluster_uuid"):
         print(f"Already a member of cluster {state.get('cluster_name')}")
         return 1
 
@@ -116,7 +136,7 @@ def cmd_init(args):
     print()
     print(f"Cluster {state.get('cluster_name')} initialised.")
     my_ip = state.get("mgmt_ip", "<node-ip>")
-    print(f"Dashboard: http://{my_ip}:8080")
+    print(f"Dashboard: https://{my_ip}:8443")
     print()
 
 
@@ -128,7 +148,27 @@ def cmd_join(args):
         print("ERROR: run `bedrock bootstrap` first.")
         return 1
 
-    if state.get("cluster_uuid"):
+    # Saga default: init-progress.json owns "is join done?" — the
+    # node_join saga writes state.json's cluster_uuid mid-flow, so
+    # a failed/in-flight join needs to fall through and resume.
+    if os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
+        from pathlib import Path as _P
+        import json as _J
+        prog = _P("/var/lib/bedrock/init-progress.json")
+        if prog.exists():
+            try:
+                ops = _J.loads(prog.read_text()).get("ops", {}) or {}
+                join_ops = [o for o in ops.values()
+                            if o.get("kind") == "node_join"]
+                if join_ops and all(
+                        o["state"] == "completed" for o in join_ops):
+                    print(f"Already joined cluster "
+                          f"{state.get('cluster_name')!r} "
+                          f"(saga completed).")
+                    return 1
+            except Exception:
+                pass
+    elif state.get("cluster_uuid"):
         print(f"Already a member of cluster {state.get('cluster_name')}")
         return 1
 
@@ -136,23 +176,86 @@ def cmd_join(args):
 
     witness = args.witness
     if not witness:
-        print("Discovering cluster on LAN...")
-        found = discovery.find_witness()
-        if not found:
-            print("No cluster found. Use --witness to specify manually.")
-            return 1
-        witness = found
-        print(f"Found witness: {witness}")
+        print("Discovering Bedrock clusters on the LAN (mDNS)...")
+        candidates = discovery.discover_clusters(timeout=2.5)
+        if not candidates:
+            print("No clusters answered mDNS. Falling back to subnet scan...")
+            found = discovery.find_witness()
+            if not found:
+                print("No cluster found. Use --witness <ip|host> to "
+                      "specify manually.")
+                return 1
+            witness = found
+            print(f"Found via fallback: {witness}")
+        elif args.yes:
+            # Auto-pick: prefer the first TCP-reachable candidate on
+            # :8443. Lets a USB4-only join fall through to the
+            # link-local IP when the LAN IP isn't reachable.
+            picked = discovery.first_reachable(candidates)
+            if picked is None:
+                print("No candidate is reachable on :8443; "
+                      "tried:")
+                for c in candidates:
+                    print(f"  {c.label()}")
+                return 1
+            witness = picked.ip
+            print(f"Found: {picked.label()}")
+        else:
+            print(f"Found {len(candidates)} cluster(s):")
+            for i, c in enumerate(candidates, 1):
+                print(f"  [{i}] {c.label()}")
+            print("  [m] enter IP / hostname manually")
+            sel = input(f"Pick [1-{len(candidates)}/m]: ").strip().lower()
+            if sel == "m":
+                witness = input("IP or hostname: ").strip()
+                if not witness:
+                    print("No IP given; aborting.")
+                    return 1
+            else:
+                try:
+                    idx = int(sel) - 1
+                    witness = candidates[idx].ip
+                except (ValueError, IndexError):
+                    print("Invalid selection; aborting.")
+                    return 1
 
     cluster_info = discovery.query_cluster(witness)
     if not cluster_info:
         print(f"Cannot get cluster info from {witness}")
         return 1
 
-    print(f"Cluster: {cluster_info.get('cluster_name')} "
-          f"({len(cluster_info.get('nodes', []))} existing nodes)")
+    # Display this-node's identity BEFORE the saga starts so the
+    # operator can match the fingerprint shown here against the
+    # one the dashboard popup shows when they approve.
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import peer_auth as _pa, state as _st
+        from lib import join_handshake as _jh
+        s = _st.load()
+        my_pubkey = _pa.pubkey_hex()
+        my_fp = _jh.fingerprint(my_pubkey)
+        my_node = s.get("hardware", {}).get("hostname", "(unknown)")
+    except Exception as e:
+        my_pubkey = my_fp = my_node = "?"
+        print(f"  warn: could not derive local identity: {e}")
+
+    print()
+    print("─── This node ─────────────────────────────────────────")
+    print(f"  node name:      {my_node}")
+    print(f"  bedrock pubkey: {my_pubkey}")
+    print(f"  fingerprint:    {my_fp}")
+    print()
+    print("─── Joining cluster ───────────────────────────────────")
+    print(f"  name:           {cluster_info.get('cluster_name', '?')}")
+    print(f"  uuid:           {cluster_info.get('cluster_uuid', '?')}")
+    print(f"  master:         {cluster_info.get('mgmt_url') or witness}")
+    print(f"  existing nodes: {len(cluster_info.get('nodes', []))}")
+    print()
+    print("Approve this fingerprint on the cluster dashboard (or via")
+    print(f"  `bedrock join approve` on the master).")
     if not args.yes:
-        ans = input("Join this cluster? [Y/n] ").strip().lower()
+        ans = input("Continue? [Y/n] ").strip().lower()
         if ans == "n":
             return 0
 
@@ -176,7 +279,7 @@ def cmd_status(args):
     # Delegate to the dashboard API if available for full cluster view
     import urllib.request
     try:
-        mgmt_url = state.get("mgmt_url", f"http://{state.get('mgmt_ip', 'localhost')}:8080")
+        mgmt_url = state.get("mgmt_url", f"http://127.0.0.1:8001")
         r = urllib.request.urlopen(mgmt_url + "/api/cluster", timeout=3)
         import json as _json
         data = _json.loads(r.read())
@@ -217,19 +320,34 @@ def _cmd_node_list():
 def _cmd_node_leave(target: str, reason: str):
     """Cleanly remove `target` from the cluster. Run on the master.
 
-    The master writes node_unregister to rqlite; Raft replicates it
-    to every peer; each peer's view_builder folds the row out of
-    cluster.json on next subscriber tick. The election layer in
-    bedrock-net picks up the new membership automatically.
-
-    The TARGET node is then asked (via SSH) to shut down its own
-    bedrock services so it stops heartbeating to the witness — the
-    witness's STATUS_LIST entry for that node ages out within the
-    takeover threshold and the cluster never sees it again.
-
-    Idempotent: removing a node that's already gone is a no-op append
-    plus a no-op SSH (best-effort).
+    By default delegates to the node_leave saga
+    (bedrock_d.install.node_leave.run_node_leave) for crash-safe
+    multi-step removal. Legacy procedural body preserved as the
+    ``BEDROCK_INIT_SAGA=0`` opt-out for one release.
     """
+    if os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
+        from lib import state as _state
+        s = _state.load()
+        self_name = s.get("node_name", "")
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _root = _Path(__file__).resolve().parent.parent
+            if str(_root) not in _sys.path:
+                _sys.path.insert(0, str(_root))
+            for p in ("/usr/local/lib/bedrock",):
+                if p not in _sys.path:
+                    _sys.path.insert(0, p)
+            from bedrock_d.install.node_leave import run_node_leave
+            run_node_leave(target_name=target, reason=reason,
+                           self_name=self_name)
+            print(f"  {target}: leave saga completed")
+            return 0
+        except RuntimeError as e:
+            print(f"  ERROR: {e}")
+            return 1
+
+    print("[bedrock node leave] legacy procedural path (BEDROCK_INIT_SAGA=0)")
     from lib import bedrock_state as bs, view_builder, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
@@ -606,7 +724,7 @@ def cmd_operator(args):
     import urllib.request as _ur
     import urllib.error as _ue
     import getpass as _gp
-    mgmt_url = "http://localhost:8080"
+    mgmt_url = "http://127.0.0.1:8001"
     token = _op_token(mgmt_url)
     auth = {"Authorization": f"Bearer {token}",
             "Content-Type": "application/json"}
@@ -672,7 +790,7 @@ def cmd_observability(args):
     # CLI always runs on the local node, so dial the local mgmt directly.
     # state.json's mgmt_url points at the node's LAN IP, which is on 8080
     # only via loopback (8080 binds to 127.0.0.1 since the auth split).
-    mgmt_url = "http://localhost:8080"
+    mgmt_url = "http://127.0.0.1:8001"
 
     if args.action == "status":
         # /cluster-info is public; read the cluster.json directly for
@@ -718,7 +836,7 @@ def cmd_observability(args):
             "kind":     args.kind,
         }).encode()
         req = urllib.request.Request(
-            mgmt_url + "/api/observability/promote",
+            mgmt_url + "/api/observability/backends",
             data=body,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {token}"})

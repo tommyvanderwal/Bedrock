@@ -120,6 +120,26 @@ def _install_peer_pubkeys(pubkeys: list):
 
 
 def install(witness: str, cluster_info: dict, repo: str):
+    """Joiner-side install. By default delegates to the node_join
+    saga (bedrock_d.install.node_join.run_node_join). The legacy
+    procedural body below is the ``BEDROCK_INIT_SAGA=0`` opt-out
+    for one release while the saga path bakes."""
+    import os as _os
+    if _os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
+        import sys as _sys
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parents[2]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        for p in ("/usr/local/lib/bedrock",):
+            if p not in _sys.path:
+                _sys.path.insert(0, p)
+        from bedrock_d.install.node_join import run_node_join
+        return run_node_join(
+            witness=witness, cluster_info=cluster_info, repo=repo,
+        )
+    print("[bedrock join] legacy procedural path (BEDROCK_INIT_SAGA=0)")
+
     s = state.load()
     hw = s.get("hardware", {})
 
@@ -281,11 +301,11 @@ def install(witness: str, cluster_info: dict, repo: str):
             shell=True, check=False)
         print(f"  Pre-scanned {len(peer_ips)} peer host keys.")
 
-    # ISO library: SeaweedFS FUSE mount at /mnt/isos. Set up later
-    # (after bedrock-weed-filer is reachable on the cluster) by
+    # Shared namespace: SeaweedFS FUSE mount at /mnt/bedrock. Set up
+    # later (after bedrock-weed-filer is reachable on the cluster) by
     # seaweedfs.ensure_iso_library_mount(). At install time we just
-    # ensure the mountpoint exists.
-    Path("/mnt/isos").mkdir(exist_ok=True)
+    # ensure the mountpoint exists. ISOs land at /mnt/bedrock/iso/.
+    Path("/mnt/bedrock").mkdir(exist_ok=True)
 
     # Storage tiers — N=1 setup on this node first (creates local LVs
     # and /bedrock/<tier> symlinks). Cluster-wide transition to N>=2
@@ -428,9 +448,9 @@ def install(witness: str, cluster_info: dict, repo: str):
         _sw.write_filer_config()
         _sw.write_s3_config()
         _sw.promote_to_master_volume_host()
-        # ISO library: FUSE-mount the filer's /isos subtree so
-        # libvirt's --cdrom /mnt/isos/<name>.iso just works on this
-        # node like on every other.
+        # Shared namespace: FUSE-mount the filer root at /mnt/bedrock
+        # so libvirt's --cdrom /mnt/bedrock/iso/<name>.iso just works
+        # on this node like on every other.
         _sw.ensure_iso_library_mount()
     except Exception as e:
         print(f"  WARN: SeaweedFS setup failed: {e}")

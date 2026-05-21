@@ -6,12 +6,13 @@ and bedrock-mgmt (FastAPI + orchestrator) — into one Python process.
 All in-process subsystems share a single BedrockState object so
 there is NO file-based IPC for live decisions any more. The bedrock
 CLI stays a separate executable; it dials this process over
-HTTP loopback:8080.
+HTTP loopback:8001. (Port 8080 belongs to weed-volume per
+docs/storage-architecture.md.)
 
 Top-level layout:
 
     main thread (asyncio event loop)
-      ├── FastAPI on :8443 (HTTPS, LAN) and :8080 (HTTP, loopback)
+      ├── FastAPI on :8443 (HTTPS, LAN) and :8001 (HTTP, loopback)
       ├── orchestrator tasks: rqlite_subscriber, fence_responder,
       │   boot_orchestrator, converge_retry, backup_scheduler
       └── cert_refresh task (24 h interval)

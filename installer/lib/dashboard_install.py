@@ -1,6 +1,6 @@
 """Dashboard install — runs on every node so the Svelte UI + FastAPI is
 reachable at https://<any-node>:8443 (operator browser, TLS via the
-local-ip.co wildcard cert) and http://localhost:8080 (per-node CLI).
+local-ip.co wildcard cert) and http://127.0.0.1:8001 (per-node CLI).
 
 The master node also runs the metrics + logs stack (VictoriaMetrics +
 VictoriaLogs); followers only get the dashboard. The mgmt API on a

@@ -55,7 +55,39 @@ def _write_systemd(name: str, content: str):
 
 
 def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
-    """Install FastAPI + VM + VL + SQLite + witness."""
+    """Install FastAPI + VM + VL + SQLite + witness.
+
+    Execution: by default, the saga path
+    (``bedrock_d.install.cluster_init.run_cluster_init``) — 21
+    ordered idempotent steps, progress persisted to
+    ``/var/lib/bedrock/init-progress.json``, resumable from crash.
+
+    Legacy procedural body below is preserved as the
+    ``BEDROCK_INIT_SAGA=0`` opt-out for one release while the saga
+    path bakes. Operators reach for the legacy path only if a saga
+    step has a bug we haven't caught yet. It will be deleted once
+    the saga path passes a clean testbed e2e + 0.8-beta tag.
+    """
+    import os as _os
+    if _os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
+        # Default: saga path.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parents[2]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        # Also add the installed location so on-node imports work.
+        for p in ("/usr/local/lib/bedrock",):
+            if p not in _sys.path:
+                _sys.path.insert(0, p)
+        from bedrock_d.install.cluster_init import run_cluster_init
+        return run_cluster_init(
+            cluster_name=cluster_name,
+            witness_host=witness_host,
+            repo=repo,
+        )
+    print("[bedrock init] legacy procedural path (BEDROCK_INIT_SAGA=0)")
+
     s = state.load()
     hw = s.get("hardware", {})
 
@@ -75,7 +107,8 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
 
     # 3. ISO library: master holds the canonical /opt/bedrock/iso tree,
     #    SeaweedFS filer serves it cluster-wide; every node FUSE-mounts
-    #    /mnt/isos via seaweedfs.ensure_iso_library_mount().
+    #    the filer root at /mnt/bedrock (ISOs appear at /mnt/bedrock/iso/)
+    #    via seaweedfs.ensure_iso_library_mount().
     iso_dir = BEDROCK_BASE / "iso"
     iso_dir.mkdir(parents=True, exist_ok=True)
     (iso_dir / "README.md").write_text(
@@ -109,11 +142,12 @@ def install_full(cluster_name: str, witness_host: Optional[str], repo: str):
             print("  WARN: virtio-win.iso download failed; Windows installs "
                   "will need the driver ISO attached manually.")
     # ISO library lives in the SeaweedFS filer namespace; see
-    # seaweedfs.ensure_iso_library() — every node FUSE-mounts the
-    # filer at /mnt/isos so libvirt's --cdrom path works unchanged.
-    # Seed any virtio-win.iso staged here into the filer namespace
-    # once master+volume+filer+s3 are up (handled by
-    # promote_to_filer_host's first-time setup).
+    # seaweedfs.ensure_iso_library_mount() — every node FUSE-mounts
+    # the filer root at /mnt/bedrock, so libvirt's --cdrom path
+    # /mnt/bedrock/iso/<name>.iso works unchanged everywhere. Seed
+    # any virtio-win.iso staged here into the filer namespace once
+    # master+volume+filer+s3 are up (handled by promote_to_filer_host's
+    # first-time setup).
 
     # 4. FastAPI + Svelte dashboard files. Same helper runs on
     # followers too — the dashboard is reachable from ANY node.
@@ -224,10 +258,13 @@ WantedBy=multi-user.target
     print(f"  Dashboard:    https://{s['mgmt_ip']}:8443")
 
     # Storage tiers — N=1 single-node setup. Idempotent; safe on re-run.
+    # NB: rqlite is not yet up at this point — setup_n1 only writes
+    # local tier state (cluster.json). The cluster_init flow mirrors
+    # tier rows into rqlite later, after rqlited has reached Leader.
     print()
     print("Setting up storage tiers (N=1: local LV thin)...")
     try:
-        tier_storage.setup_n1()
+        tier_storage.setup_n1(write_rqlite=False)
     except Exception as e:
         print(f"  WARN: tier setup failed: {e}")
         print(f"  You can re-run with: bedrock storage init")
@@ -307,6 +344,8 @@ WantedBy=multi-user.target
         # /db/execute returns 503 'leader not found' until Raft
         # elects. Seeding before Leader-up = silent schema-empty
         # cluster.
+        leader_reached = False
+        last_raft_state = "?"
         for _attempt in range(60):
             _t.sleep(0.5)
             rc = _sp.run(
@@ -317,13 +356,23 @@ WantedBy=multi-user.target
             if rc.returncode != 0:
                 continue
             try:
-                raft_state = _json.loads(rc.stdout.decode())["store"]["raft"]["state"]
+                last_raft_state = _json.loads(
+                    rc.stdout.decode())["store"]["raft"]["state"]
             except Exception:
                 continue
-            if raft_state == "Leader":
+            if last_raft_state == "Leader":
+                leader_reached = True
                 break
-        else:
-            print(f"  WARN: rqlited didn't reach Leader within 30s")
+        if not leader_reached:
+            # Hard fail — there's nothing useful to do next without
+            # a writable rqlite. Surface the actual Raft state so
+            # the operator can diagnose (e.g. "Candidate" = quorum
+            # failure, "Follower" = elected someone else, "?" = HTTP
+            # never came up).
+            raise RuntimeError(
+                f"rqlited didn't reach Leader within 30s "
+                f"(last raft state: {last_raft_state}); "
+                f"check `journalctl -u bedrock-rqlited`")
         # Master's Bedrock identity Ed25519 (idempotent across runs).
         master_bedrock_pub = _pa.pubkey_hex()
         # Seed the initial operator account so the dashboard is
@@ -371,8 +420,28 @@ WantedBy=multi-user.target
                 client=rqlite,
             )
             _bs.set_mgmt_master(s["node_name"], client=rqlite)
+
+        # Now that rqlite is up + schema applied + this node
+        # registered, push the local tier_state into rqlite. Done
+        # OUTSIDE the `with RqliteClient()` block since
+        # mirror_tier_state_to_rqlite opens its own short-lived
+        # client.
+        try:
+            tier_storage.mirror_tier_state_to_rqlite()
+        except Exception as e:
+            # If THIS fails after rqlite is up + we already registered
+            # this node, it's a real bug. Raise so init aborts.
+            raise RuntimeError(
+                f"tier_state mirror to rqlite failed: {e}") from e
     except Exception as e:
-        print(f"  WARN: rqlite seed failed: {e}")
+        # The seed phase is load-bearing — if it fails, the cluster
+        # is half-initialised and quietly broken. Fail loud so the
+        # operator (or test harness) knows to re-run / clean up
+        # rather than continuing with a zombie state.
+        print(f"  ERROR: rqlite seed failed: {e}", flush=True)
+        print(f"         cluster is half-initialised; remediate before "
+              f"re-running.", flush=True)
+        raise SystemExit(1)
 
     # bedrock-d unified daemon — mesh discovery, election, witness IO,
     # rqlite_subscriber, fence_responder, boot_orchestrator, the

@@ -47,13 +47,13 @@ def _cluster() -> dict:
 
 
 def _api_get(state, path: str) -> dict:
-    url = state.get("mgmt_url", "http://localhost:8080") + path
+    url = state.get("mgmt_url", "http://127.0.0.1:8001") + path
     r = urllib.request.urlopen(url, timeout=5)
     return json.loads(r.read())
 
 
 def _api_post(state, path: str, body: dict = None) -> dict:
-    url = state.get("mgmt_url", "http://localhost:8080") + path
+    url = state.get("mgmt_url", "http://127.0.0.1:8001") + path
     data = json.dumps(body or {}).encode()
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Content-Type": "application/json"})

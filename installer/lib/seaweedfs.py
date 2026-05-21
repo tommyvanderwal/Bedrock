@@ -232,18 +232,49 @@ def write_filer_config() -> None:
     log.info("seaweedfs: wrote %s (filer db at %s)", FILER_TOML, FILER_HOME)
 
 
+def _master_set() -> list[str]:
+    """The Raft-3 weed-master member set (deterministic at v1.0:
+    the three lowest-octet loopbacks). The calm orchestrator will
+    eventually own this via the seaweed_master_membership rqlite
+    table; this fallback works pre-rqlite (during install) and
+    when the table is empty.
+
+    N=1 → 1 master; N=2 → 1 master (single-node Raft);
+    N≥3 → 3 masters."""
+    my_lo = _my_loopback()
+    if not my_lo:
+        return []
+    all_lo = sorted([my_lo] + _peer_loopbacks(), key=_loopback_octet)
+    n_nodes = len(all_lo)
+    if n_nodes <= 2:
+        return all_lo[:1]
+    return all_lo[:3]
+
+
+def _filer_vip() -> str:
+    """The cluster-singleton VIP (.254/32) where the filer binds.
+    Derived from this cluster's CGNAT /24."""
+    my_lo = _my_loopback()
+    if not my_lo:
+        return ""
+    # e.g. 100.X.Y.Z -> 100.X.Y.254
+    return ".".join(my_lo.split(".")[:3] + ["254"])
+
+
 def write_env_file(*, volume_max: int = 50,
                    disk_type: str = "") -> None:
-    """Render /etc/bedrock/seaweedfs.env consumed by all four
-    weed systemd units. Variables:
+    """Render /etc/bedrock/seaweedfs.env consumed by all weed
+    systemd units. Variables:
 
-      SEAWEED_LOOPBACK_IP    — this node's cluster /32, bind addr
-      SEAWEED_MASTER_PEERS   — comma-joined master:9333 list (every
-                                node, in stable sorted order)
+      SEAWEED_LOOPBACK_IP      — this node's cluster /32 (volume
+                                  + master bind, FUSE publicUrl)
+      SEAWEED_FILER_VIP        — the .254 cluster VIP where the
+                                  filer binds; identical on every node
+      SEAWEED_MASTER_PEERS     — comma-joined master:9333 list of
+                                  the Raft-3 member set
       SEAWEED_VOLUME_DISK_TYPE — operator-declared class for this
-                                node's volume server (`ssd`/`hdd`/etc.)
-      SEAWEED_VOLUME_MAX     — max volumes per directory (sized to LV
-                                capacity; default 50)
+                                  node's volume server (`ssd`/`hdd`)
+      SEAWEED_VOLUME_MAX       — max volumes per directory
 
     Idempotent: identical inputs produce identical file."""
     my_lo = _my_loopback()
@@ -251,28 +282,17 @@ def write_env_file(*, volume_max: int = 50,
         raise RuntimeError(
             "seaweedfs: loopback_ip not in state.json — can't render env"
         )
-    # Master subset: same odd-only rule as write_master_config.
-    all_lo = sorted([my_lo] + _peer_loopbacks(), key=_loopback_octet)
-    n_nodes = len(all_lo)
-    if n_nodes <= 1:
-        master_subset = all_lo
-    elif n_nodes == 2:
-        master_subset = all_lo[:1]
-    else:
-        odd_n = n_nodes if n_nodes % 2 == 1 else n_nodes - 1
-        master_subset = all_lo[:odd_n]
-    if len(master_subset) <= 1:
-        master_peers = "none"
-    else:
-        master_peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_subset)
-    # Filer/volume clients dial ALL elected masters (one of them is
-    # the Raft leader, the others are followers — the client picks).
-    filer_masters = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_subset)
+    master_set = _master_set()
+    master_peers = ",".join(f"{ip}:{MASTER_PORT}" for ip in master_set) or "none"
+    filer_vip = _filer_vip()
 
     env = {
         "SEAWEED_LOOPBACK_IP":      my_lo,
+        "SEAWEED_FILER_VIP":        filer_vip,
         "SEAWEED_MASTER_PEERS":     master_peers,
-        "SEAWEED_FILER_MASTERS":    filer_masters,
+        # Kept for backwards-compat with any unit referencing the
+        # old name — same value as MASTER_PEERS.
+        "SEAWEED_FILER_MASTERS":    master_peers,
         "SEAWEED_VOLUME_DISK_TYPE": disk_type,
         "SEAWEED_VOLUME_MAX":       str(int(volume_max)),
     }
@@ -281,30 +301,71 @@ def write_env_file(*, volume_max: int = 50,
     tmp.write_text("\n".join(f"{k}={v}" for k, v in env.items()) + "\n")
     import os as _os
     _os.replace(tmp, SEAWEED_ENV)
-    log.info("seaweedfs: wrote %s (peers=%s)", SEAWEED_ENV, master_peers)
+    log.info("seaweedfs: wrote %s (master_set=%s, filer_vip=%s)",
+             SEAWEED_ENV, master_peers, filer_vip)
 
 
 def write_s3_config() -> None:
-    """Render the S3 API config. v1.0 testbed default: anonymous
-    Read+Write+List. Operator can lock down per-bucket via
-    `weed shell` once credentials are in place. Future:
-    pull credentials from rqlite operators/secrets table."""
+    """Render /etc/bedrock/seaweedfs-s3.json.
+
+    SeaweedFS 4.25 refuses to start when the config has identities
+    without credentials (logged as "no admin/credentials supplied
+    — set AWS_ACCESS_KEY_ID etc."). The 0.8-alpha shape:
+
+    - One ``admin`` identity carrying generated credentials so the
+      gateway has a valid auth identity at startup.
+    - One ``anonymous`` identity with broad actions for testbed
+      convenience (Kopia/awscli/rclone push without auth).
+
+    Credentials are generated once per cluster (sourced from
+    ``/etc/bedrock/cluster.key`` so every node deterministically
+    derives the same admin creds — the same secret material
+    underwriting witness AEAD also underwrites S3 admin). Future
+    move (locked design): IAM identities live INSIDE the filer DB
+    via ``weed s3 -iam.filerBucketsPath=/buckets``; this file
+    bootstraps the gateway long enough for that DB to come up.
+    """
     S3_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    access_key, secret_key = _derive_admin_credentials()
     cfg = {
         "identities": [
             {
+                "name": "admin",
+                "credentials": [
+                    {"accessKey": access_key, "secretKey": secret_key}
+                ],
+                "actions": ["Admin", "Read", "Write", "List", "Tagging"],
+            },
+            {
                 "name": "anonymous",
-                # Read + Write + List + Tagging covers the
-                # marker-PUT/GET round trip the scale-lifecycle test
-                # does, and the typical Kopia/awscli/rclone backup
-                # flows. Operators must override this before any
-                # production deploy.
-                "actions": ["Read", "Write", "List", "Tagging",
-                            "Admin"],
-            }
-        ]
+                # Testbed convenience: kopia/awscli/rclone PUT-without-auth
+                # for the e2e marker round trip. Operators override this
+                # before any production deploy.
+                "actions": ["Read", "Write", "List", "Tagging"],
+            },
+        ],
     }
     S3_CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def _derive_admin_credentials() -> tuple[str, str]:
+    """Deterministically derive (access_key, secret_key) from the
+    cluster_key so every node renders the same admin identity. The
+    cluster_key is 32 random bytes from /etc/bedrock/cluster.key
+    (created at install). Falls back to fixed testbed creds if the
+    key isn't present yet (very early bootstrap)."""
+    import hashlib
+    key_path = Path("/etc/bedrock/cluster.key")
+    if not key_path.exists():
+        return ("bedrock-admin", "bedrock-admin-secret")
+    raw = key_path.read_bytes()
+    if len(raw) == 33 and raw[-1:] == b"\n":
+        raw = raw[:32]
+    # Two non-overlapping hashes — same input, different domain tags
+    # — so leaking one doesn't leak the other.
+    access_key = hashlib.sha256(b"bedrock-s3-access\0" + raw).hexdigest()[:20]
+    secret_key = hashlib.sha256(b"bedrock-s3-secret\0" + raw).hexdigest()
+    return (access_key, secret_key)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -371,111 +432,100 @@ def reconcile_master_config() -> None:
 
 
 def promote_to_master_volume_host() -> None:
-    """Called by the install / orchestrator path on every node.
-    Volume server runs on EVERY node (peer-of-everyone HA pattern);
-    master ONLY runs on the odd-numbered subset (SeaweedFS Raft
-    refuses even peer counts), recomputed each call from the live
-    cluster.json + state.json so additions/removals re-balance the
-    quorum. Filer + s3 follow the mgmt master via cluster_arbiter.
+    """Called by install / orchestrator on every node.
 
-    If this node was in the master subset before but isn't now, the
-    master unit is stopped + disabled (cluster shrank from N=3 to N=2
-    is the common case — the 3rd master must step down)."""
+    Locked v1.0 topology (see docs/storage-architecture.md):
+    - **weed-volume**: runs on EVERY node, bound 0.0.0.0:8080.
+    - **weed-s3**:     runs on EVERY node, bound 0.0.0.0:8333.
+    - **weed-master**: runs only on the Raft-3 member set
+                       (N=1→1, N=2→1, N≥3→3 lowest-octet nodes).
+    - **weed-filer**:  singleton on .254 (owned by cluster_arbiter).
+
+    Re-shuffles to the master set are calm-orchestrator-driven via
+    the `seaweed_master_membership` rqlite table; this function is
+    idempotent and uses the deterministic lowest-octet rule as a
+    fallback when the table isn't yet populated.
+
+    If this node was in the master set before but isn't now (e.g.
+    a new lower-octet node joined and bumped us out), the master
+    unit is stopped + disabled."""
     my_lo = _my_loopback()
-    all_lo = sorted([my_lo] + _peer_loopbacks(), key=_loopback_octet)
-    n_nodes = len(all_lo)
-    if n_nodes <= 1:
-        master_subset = all_lo
-    elif n_nodes == 2:
-        master_subset = all_lo[:1]
-    else:
-        odd_n = n_nodes if n_nodes % 2 == 1 else n_nodes - 1
-        master_subset = all_lo[:odd_n]
-    i_run_master = my_lo in master_subset
+    master_set = _master_set()
+    i_run_master = my_lo in master_set
 
+    # Reset-failed first: any of these may have crash-looped earlier
+    # (env file not yet written → "Failed to load environment files"
+    # → restart → ... → StartLimitBurst). Clear before we try to
+    # start them for real.
+    subprocess.run(
+        ["systemctl", "reset-failed",
+         "bedrock-weed-master.service",
+         "bedrock-weed-volume.service",
+         "bedrock-weed-filer.service",
+         "bedrock-weed-s3.service"],
+        check=False, timeout=10,
+    )
+
+    # Volume + S3 on EVERY node, always.
+    subprocess.run(
+        ["systemctl", "enable", "--now",
+         "bedrock-weed-volume.service",
+         "bedrock-weed-s3.service"],
+        check=False, timeout=30,
+    )
+
+    # Master: only if in the Raft-3 set.
     if i_run_master:
-        # Reset-failed first: weed-master may have crash-looped earlier
-        # (env file not yet written → "Failed to load environment files"
-        # → restart → ... → StartLimitBurst). Clear that before we try
-        # to start it for real.
-        subprocess.run(
-            ["systemctl", "reset-failed",
-             "bedrock-weed-master.service",
-             "bedrock-weed-volume.service",
-             "bedrock-weed-filer.service",
-             "bedrock-weed-s3.service"],
-            check=False, timeout=10,
-        )
         subprocess.run(
             ["systemctl", "enable", "--now",
-             "bedrock-weed-master.service",
-             "bedrock-weed-volume.service"],
+             "bedrock-weed-master.service"],
             check=False, timeout=30,
         )
     else:
-        # Stop the master if we were running it before. Volume always
-        # runs (every node serves bytes regardless of master role).
-        log.info("seaweedfs: not in master subset at N=%d "
-                 "(loopback %s, subset %s) — stopping master if active",
-                 n_nodes, my_lo, master_subset)
+        log.info("seaweedfs: not in master Raft-3 set "
+                 "(loopback %s, set %s) — stopping master if active",
+                 my_lo, master_set)
         subprocess.run(
             ["systemctl", "disable", "--now",
              "bedrock-weed-master.service"],
             check=False, timeout=30,
         )
-        subprocess.run(
-            ["systemctl", "enable", "--now",
-             "bedrock-weed-volume.service"],
-            check=False, timeout=30,
-        )
 
 
 # ─────────────────────────────────────────────────────────────────────
-# ISO library — `weed mount` (FUSE) of the filer's /isos subtree on
-# every node. libvirt sees /mnt/isos/<name>.iso as a regular local
-# path; SeaweedFS replicates the bytes via volume servers. ISOs are
-# uploaded once into the filer (via S3 or via /mnt/isos from any node)
-# and become visible cluster-wide.
+# Shared FUSE namespace — `weed mount` of the entire filer root at
+# /mnt/bedrock on every node. libvirt sees /mnt/bedrock/iso/<name>.iso
+# as a regular local path; SeaweedFS replicates the bytes via volume
+# servers. ISOs are uploaded once into the filer (via S3 or via the
+# FUSE mount on any node) and become visible cluster-wide.
 # ─────────────────────────────────────────────────────────────────────
 
-ISO_MOUNTPOINT  = Path("/mnt/isos")
-ISO_FILER_PATH  = "/isos"
-ISO_MOUNT_UNIT  = "bedrock-isos-mount.service"
+FUSE_MOUNTPOINT = Path("/mnt/bedrock")
+# Unit name stays `.service` (not `.mount`): `weed mount` is a
+# long-running FUSE-helper process, not a one-shot mount() syscall,
+# so we run it as a Service unit. Naming it `.mount` would require
+# the strict systemd [Mount]/What=/Where= shape which doesn't fit
+# a fuse-helper that auto-reconnects.
+ISO_MOUNT_UNIT  = "bedrock-fuse-mount.service"
 
 
 def ensure_iso_library_mount() -> None:
-    """Install a systemd unit that FUSE-mounts the filer's /isos
-    subtree at /mnt/isos, and start it. Idempotent.
+    """Install a systemd `.mount` unit that FUSE-mounts the filer at
+    `/mnt/bedrock` on every node. Identical config across the cluster.
 
-    The filer endpoint is the **current mgmt-master's loopback /32**
-    (read from cluster.json's `mgmt_master` field). At N=1 that's
-    "self"; at N≥2 it follows the master via mesh routing — the same
-    /32 stays reachable as the master role moves (the mesh updates
-    routes within seconds of a transition).
+    Per docs/storage-architecture.md the filer is a singleton on
+    `.254/32` (the cluster VIP). All nodes point at that same VIP
+    so the mount target string doesn't change when the arbiter-host
+    flips — the VIP moves with the arbiter and the FUSE client
+    auto-reconnects.
     """
-    import json as _json
+    FUSE_MOUNTPOINT.mkdir(parents=True, exist_ok=True)
 
-    ISO_MOUNTPOINT.mkdir(parents=True, exist_ok=True)
-
-    # Resolve the master's loopback from cluster.json. Fall back to
-    # this node's own loopback if cluster.json isn't ready yet (very
-    # early bootstrap); that's safe because at that point the master
-    # IS self.
-    filer_host = _my_loopback()
-    try:
-        cluster = _json.loads(CLUSTER_JSON.read_text())
-        mm = cluster.get("mgmt_master", "")
-        if mm:
-            mm_lo = (cluster.get("nodes") or {}).get(mm, {}).get("loopback_ip", "")
-            if mm_lo:
-                filer_host = mm_lo
-    except Exception:
-        pass
-    filer_target = f"{filer_host}:8888"
+    filer_target = f"{_filer_vip()}:8888"
 
     unit = (
         "[Unit]\n"
-        "Description=Bedrock ISO library (SeaweedFS FUSE mount)\n"
+        "Description=Bedrock shared FUSE namespace (SeaweedFS filer)\n"
         "After=network-online.target bedrock-d.service\n"
         "Wants=network-online.target\n"
         "\n"
@@ -485,11 +535,11 @@ def ensure_iso_library_mount() -> None:
         # if the filer isn't up yet, so the mount eventually completes
         # in the background — never block the caller.
         "Type=simple\n"
-        f"ExecStartPre=/usr/bin/mkdir -p {ISO_MOUNTPOINT}\n"
+        f"ExecStartPre=/usr/bin/mkdir -p {FUSE_MOUNTPOINT}\n"
         f"ExecStart=/usr/local/bin/weed mount -filer={filer_target} "
-        f"-dir={ISO_MOUNTPOINT} -filer.path={ISO_FILER_PATH} "
+        f"-dir={FUSE_MOUNTPOINT} "
         "-allowOthers -dirAutoCreate\n"
-        f"ExecStopPost=/bin/sh -c 'fusermount -u {ISO_MOUNTPOINT} 2>/dev/null || true'\n"
+        f"ExecStopPost=/bin/sh -c 'fusermount -u {FUSE_MOUNTPOINT} 2>/dev/null || true'\n"
         "Restart=on-failure\n"
         "RestartSec=3s\n"
         "TimeoutStopSec=10\n"
@@ -515,22 +565,87 @@ def ensure_iso_library_mount() -> None:
         ["systemctl", action, "--no-block", ISO_MOUNT_UNIT],
         check=False, timeout=10,
     )
-    log.info("seaweedfs: ISO library mounted at %s via filer=%s",
-             ISO_MOUNTPOINT, filer_target)
+    log.info("seaweedfs: FUSE namespace mounted at %s via filer=%s",
+             FUSE_MOUNTPOINT, filer_target)
+
+
+def init_collections() -> None:
+    """One-shot per cluster: configure the three SeaweedFS
+    collections via ``weed shell``. Idempotent — ``fs.configure
+    -apply`` overwrites the previous config for the same
+    locationPrefix, so re-running on a cluster that already has
+    these is a no-op.
+
+    Collections (per docs/storage-architecture.md):
+
+    - ``scratch``  — replication ``000`` (1 copy, RAID0). Available
+      at N≥1. Lost on the hosting node's failure.
+    - ``standard`` — replication ``001`` (2 copies on different
+      servers). Available at N≥2. Default for ISOs, templates,
+      snapshots, ordinary backups.
+    - ``critical`` — replication ``002`` (3 copies on different
+      servers). Available at N≥3. Customer backups, things that
+      must survive 2 simultaneous node losses.
+
+    Called from cluster_init step ``seaweedfs_init_collections``.
+    """
+    if not WEED_BIN.exists():
+        log.warning("init_collections: weed binary missing at %s",
+                    WEED_BIN)
+        return
+    # `fs.configure` is the bucket/path config command in weed
+    # shell. -apply makes it persistent. The default master URL
+    # comes from /etc/bedrock/seaweedfs.env (SEAWEED_MASTER_PEERS);
+    # we point at the first one explicitly so the shell connects
+    # cleanly without needing the env file present.
+    master_set = _master_set()
+    if not master_set:
+        log.warning("init_collections: no master in master_set yet — "
+                    "deferring until calm orchestrator settles membership")
+        return
+    master_url = f"{master_set[0]}:{MASTER_PORT}"
+
+    commands = [
+        # locationPrefix MUST end with a slash for fs.configure to
+        # match the directory tree.
+        "fs.configure -locationPrefix=/scratch/   -collection=scratch  -replication=000 -apply",
+        "fs.configure -locationPrefix=/iso/       -collection=standard -replication=001 -apply",
+        "fs.configure -locationPrefix=/templates/ -collection=standard -replication=001 -apply",
+        "fs.configure -locationPrefix=/snapshots/ -collection=standard -replication=001 -apply",
+        "fs.configure -locationPrefix=/backups/   -collection=critical -replication=002 -apply",
+    ]
+    script = "\n".join(commands) + "\n"
+    try:
+        r = subprocess.run(
+            [str(WEED_BIN), "shell", "-master", master_url],
+            input=script, capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            log.warning("init_collections: weed shell rc=%d stderr=%s",
+                        r.returncode,
+                        (r.stderr or "")[:200])
+            return
+        log.info("init_collections: configured 5 path policies "
+                 "(scratch=000, iso/templates/snapshots=001, "
+                 "backups=002) via master=%s", master_url)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("init_collections: %s", e)
 
 
 def seed_iso_library(source_dir: Path = Path("/opt/bedrock/iso")) -> None:
     """Copy any ISOs staged in `source_dir` (e.g. virtio-win.iso baked
-    into the install ISO) into the filer's /isos subtree. Runs once
-    on the mgmt-master after the filer is up. Idempotent — `cp -n`
-    skips files that already exist in the namespace.
+    into the install ISO) into the filer's `/iso/` subtree, visible
+    as `/mnt/bedrock/iso/<name>.iso` on every node. Runs once on the
+    arbiter-host after the filer is up. Idempotent — skips files
+    that already exist in the namespace.
     """
     if not source_dir.exists() or not source_dir.is_dir():
         return
-    target = ISO_MOUNTPOINT
-    if not target.is_mount():
+    target = FUSE_MOUNTPOINT / "iso"
+    if not FUSE_MOUNTPOINT.is_mount():
         # Mount isn't up yet — ensure it.
         ensure_iso_library_mount()
+    target.mkdir(parents=True, exist_ok=True)
     isos = list(source_dir.glob("*.iso"))
     if not isos:
         return
@@ -540,8 +655,8 @@ def seed_iso_library(source_dir: Path = Path("/opt/bedrock/iso")) -> None:
             continue
         subprocess.run(["cp", "-n", str(src), str(dst)],
                        check=False, timeout=300)
-        log.info("seaweedfs: seeded ISO %s -> /isos/%s",
-                 src.name, src.name)
+        log.info("seaweedfs: seeded ISO %s -> %s/%s",
+                 src.name, target, src.name)
 
 
 # ─────────────────────────────────────────────────────────────────────
