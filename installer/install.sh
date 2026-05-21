@@ -321,13 +321,36 @@ LIB_FILES=(
     rqlite_setup.py
     election.py
     witness.py
-    s3backer_compactor.py
     state_shared.py
+    workload.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \
         || die "Failed to fetch lib/${f}"
 done
+
+# ── bedrock_d/ package (sagas, daemon orchestration) ─────────────────
+# Shipped as a tarball so adding a new submodule doesn't need an
+# install.sh edit. Lands at /usr/local/lib/bedrock/bedrock_d/ so
+# `bedrock` CLI and `bedrock-d` daemon can import it (both add
+# /usr/local/lib/bedrock to sys.path).
+log "Downloading bedrock_d package tarball..."
+curl -fsSL "${BEDROCK_REPO}/bedrock_d.tar.gz" -o /tmp/bedrock_d.tar.gz \
+    || die "Failed to fetch bedrock_d.tar.gz"
+tar xzf /tmp/bedrock_d.tar.gz -C /usr/local/lib/bedrock/ \
+    || die "Failed to extract bedrock_d.tar.gz"
+rm -f /tmp/bedrock_d.tar.gz
+
+# ── mgmt/ package (FastAPI + Svelte UI + orchestrator) ───────────────
+# Same shape — tarball so the UI build's sea of immutable assets
+# doesn't require a manifest. Lands at /opt/bedrock/mgmt/.
+log "Downloading mgmt package tarball..."
+mkdir -p /opt/bedrock
+curl -fsSL "${BEDROCK_REPO}/mgmt.tar.gz" -o /tmp/mgmt.tar.gz \
+    || die "Failed to fetch mgmt.tar.gz"
+tar xzf /tmp/mgmt.tar.gz -C /opt/bedrock/ \
+    || die "Failed to extract mgmt.tar.gz"
+rm -f /tmp/mgmt.tar.gz
 
 # Sanity-check: list every .py in the payload's lib/ dir and refuse
 # to continue if anything is missing locally. Catches the "developer

@@ -118,21 +118,22 @@ mkdir -p "$STAGE/lib"
 find "$REPO/installer/lib" -maxdepth 1 -type f \( -name "*.py" -o -name "*.sql" \) \
     -exec install -m 0644 {} "$STAGE/lib/" \;
 
-# bedrock_d/ — the new package, all .py files preserving subdirs
-mkdir -p "$STAGE/bedrock_d"
-( cd "$REPO/bedrock_d" \
-  && find . -type f -name "*.py" -not -path "*/__pycache__/*" \
-  | while read -r f; do install -m 0644 -D "$f" "$STAGE/bedrock_d/$f"; done )
+# bedrock_d/ — shipped as a tarball so install.sh doesn't need to
+# enumerate files (and new submodules don't need an install.sh edit).
+# Extracted to /usr/local/lib/bedrock/ on the target, where the
+# bedrock CLI + bedrock-d daemon already have sys.path entries.
+( cd "$REPO" && tar czf "$STAGE/bedrock_d.tar.gz" \
+    --exclude="__pycache__" --exclude="*.pyc" \
+    bedrock_d )
 
-# mgmt/ — .py files + the built dashboard if present
-mkdir -p "$STAGE/mgmt"
-( cd "$REPO/mgmt" \
-  && find . -maxdepth 1 -type f -name "*.py" \
-  | while read -r f; do install -m 0644 "$f" "$STAGE/mgmt/$f"; done )
-if [ -d "$REPO/mgmt/ui/build" ]; then
-    mkdir -p "$STAGE/mgmt/ui"
-    cp -r "$REPO/mgmt/ui/build" "$STAGE/mgmt/ui/build"
-fi
+# mgmt/ — same shape. Extracted to /opt/bedrock/. Includes the
+# Svelte UI build dir which is large but already minified.
+( cd "$REPO" && tar czf "$STAGE/mgmt.tar.gz" \
+    --exclude="__pycache__" --exclude="*.pyc" \
+    --exclude="mgmt/ui/node_modules" \
+    --exclude="mgmt/ui/.svelte-kit" \
+    --exclude="mgmt/ui/src" \
+    mgmt )
 
 # systemd unit files + timers + sshd dropins
 mkdir -p "$STAGE/configs"
