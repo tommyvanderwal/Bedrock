@@ -260,3 +260,94 @@ CREATE TABLE IF NOT EXISTS obs_backends (
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (stack, position)
 );
+
+-- ─────────────────────────────────────────────────────────────────
+-- DRBD resources — one row per DRBD resource (cluster + per-VM).
+-- Per docs/storage-architecture.md: one thin data LV + one thin
+-- meta LV per resource in a named thinpool. The orchestrator
+-- materialises the LV pair + drbd_resource on each target node
+-- from the rows here.
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS drbd_resources (
+    name             TEXT PRIMARY KEY,         -- e.g. "cluster", "vm-foo-disk0"
+    minor            INTEGER NOT NULL,         -- DRBD minor number
+    data_lv          TEXT NOT NULL,            -- e.g. "bedrock-data-vm-foo-disk0"
+    meta_lv          TEXT NOT NULL,            -- e.g. "bedrock-meta-vm-foo-disk0"
+    thinpool         TEXT NOT NULL DEFAULT 'thinpool',
+    data_size_bytes  INTEGER NOT NULL,
+    meta_size_bytes  INTEGER NOT NULL,
+    max_peers        INTEGER NOT NULL DEFAULT 7,
+    -- JSON array of node_names that should host this resource.
+    -- For cluster singleton: capped at 3. For per-VM: replica count
+    -- per VM type (cattle=0, pet=2, vipet=3).
+    peers            TEXT NOT NULL DEFAULT '[]',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+-- Membership of the 3-peer tier-critical set. The calm
+-- orchestrator owns this table; on a node leave/join it picks
+-- replacements deliberately (resource-aware) and schedules
+-- drbdadm new-peer / detach operations via the operations table.
+-- Which nodes carry the cluster-singleton DRBD resource (capped
+-- at 3). This is the set the .254 arbiter VIP can migrate to.
+-- The calm orchestrator owns this table; on a node leave/join it
+-- picks replacements deliberately (resource-aware) and schedules
+-- drbdadm new-peer / detach operations via the operations table.
+CREATE TABLE IF NOT EXISTS cluster_drbd_membership (
+    node_name   TEXT PRIMARY KEY,
+    joined_at   INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+-- Membership of the Raft-3 SeaweedFS master set. Same calm-loop
+-- ownership pattern as cluster_drbd_membership.
+CREATE TABLE IF NOT EXISTS seaweed_master_membership (
+    node_name   TEXT PRIMARY KEY,
+    joined_at   INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Sagas — generic crash-safe orchestration. Every long-running
+-- cluster operation writes intent here, executes idempotent steps,
+-- and writes "done". Recovery from power loss: on boot, query for
+-- in-flight operations, resume from last incomplete step. Per
+-- docs/storage-architecture.md "Everything goes through rqlite".
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS operations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT NOT NULL,         -- e.g. "drbd_resource_create",
+                                         --      "tier_critical_promote",
+                                         --      "weed_master_reshuffle",
+                                         --      "node_leave"
+    target_node   TEXT,                  -- node that runs this; NULL = any
+    params        TEXT NOT NULL,         -- JSON of operation-specific fields
+    state         TEXT NOT NULL DEFAULT 'pending',
+                                         -- 'pending'|'in_progress'|
+                                         -- 'completed'|'failed'
+    requested_by  TEXT NOT NULL DEFAULT '',
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    completed_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_operations_state  ON operations(state);
+CREATE INDEX IF NOT EXISTS idx_operations_target ON operations(target_node, state);
+CREATE INDEX IF NOT EXISTS idx_operations_kind   ON operations(kind, state);
+
+CREATE TABLE IF NOT EXISTS operation_steps (
+    op_id        INTEGER NOT NULL,
+    step_name    TEXT NOT NULL,
+    state        TEXT NOT NULL,          -- 'done' | 'failed'
+    error        TEXT,
+    started_at   INTEGER,
+    finished_at  INTEGER,
+    PRIMARY KEY (op_id, step_name),
+    FOREIGN KEY (op_id) REFERENCES operations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_steps_op ON operation_steps(op_id);

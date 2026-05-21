@@ -8,8 +8,11 @@ singletons are:
 - the **arbiter rqlite** instance (a separate `rqlited` on ports
   4011/4012, bound to the .254 VIP)
 - the `.254/32` master VIP on `lo`
-- the SeaweedFS filer + S3 gateway (which need `/var/lib/bedrock/cluster/seaweedfs/`
-  to be the same on whichever node currently holds master)
+- the SeaweedFS **filer** (which needs `/var/lib/bedrock/cluster/seaweedfs/`
+  to be the same leveldb3 on whichever node currently holds master).
+  **Not** the S3 gateway — that runs on every node bound `0.0.0.0`
+  and authenticates against IAM identities living inside the
+  filer DB. See `docs/storage-architecture.md`.
 
 `converge()` is the idempotent entry point called from
 `mgmt/orchestrator.rqlite_subscriber` every rqlite-revision change
@@ -53,9 +56,10 @@ propagates via Raft to state.json on every node, which flips
 - `_drbd_promote()` — `drbdadm primary tier-critical`. If that
   fails with "Need access to UpToDate data" (peer unreachable
   during failover), retries with `drbdadm -- --force primary` —
-  the election layer + witness DRBD-UUID blessing are the
-  authority on who owns the data, and --force is correct in that
-  case.
+  the takeover protocol (`docs/cluster-quorum-spec.md`) has already
+  verified `slot[prev_master].marker == local drbdadm current-uuid`
+  before this function is called, so the local data IS UpToDate
+  even if DRBD can't reach the peer to confirm.
 - `_drbd_secondary()` — `drbdadm secondary tier-critical`. Idempotent
   failure (already secondary) is logged but not raised.
 - `_is_mounted(path) -> bool` — `findmnt -n -T <path>` returns 0.

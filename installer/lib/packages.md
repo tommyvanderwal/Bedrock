@@ -9,9 +9,9 @@ The deliberate design is **no per-role package sets**. Every node
 gets the same packages. The mgmt FastAPI app's Python deps are
 installed on every node, not just the initial master, because any
 node may take over the mgmt role via
-[`tier_storage.transfer_mgmt_role()`](tier_storage.md#transfer_mgmt_role)
-and must be ready to start `bedrock-mgmt.service` without a runtime
-`pip install`. (See lessons-log
+[`cluster_arbiter.promote_to_arbiter_host()`](cluster_arbiter.md)
+and must be ready to start the mgmt service inside `bedrock-d`
+without a runtime `pip install`. (See lessons-log
 [L17](../../docs/lessons-log.md#l17).)
 
 ---
@@ -295,7 +295,8 @@ single-purpose box — venv adds friction without benefit.
 ### Bedrock project
 - [`docs/lessons-log.md` — L17](../../docs/lessons-log.md#l17) — why
   mgmt deps are now installed on every node.
-- [`tier_storage.md` — `transfer_mgmt_role`](tier_storage.md#transfer_mgmt_role)
-  — the operation that requires every node to be mgmt-ready.
+- [`cluster_arbiter.md`](cluster_arbiter.md) — the
+  promote/demote operations that require every node to be
+  mgmt-ready.
 - [`installer/bedrock` — `cmd_bootstrap`](../bedrock) — the entry
   point that calls `install_base()`.

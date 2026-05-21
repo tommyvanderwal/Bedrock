@@ -45,9 +45,8 @@ doesn't go NoQuorum mid-join.
   malformed loopback can never accidentally be the "winner".
 - `compute(*, self_name, self_loopback, peer_liveness,
   node_loopbacks, witness_alive, current_mgmt_master,
-  fence_marker_path=FENCE_MARKER, witness_blessed_master="",
-  witness_blessed_at_ms=0, now_ms=0, bless_holddown_ms=15_000)
-  -> Election` — the only public entry point.
+  fence_marker_path=FENCE_MARKER) -> Election` — the only public
+  entry point. Pure function: no I/O, no state, no time.
 
   Decision tree, in order:
   1. **Fence override** — if `fence_marker_path` exists,
@@ -74,16 +73,14 @@ doesn't go NoQuorum mid-join.
   7. **Master is gone.** Promotion candidate: only the reachable
      peer with the lowest loopback octet promotes. Others defer
      ("Follower, reason=deferring to lower-octet").
-  8. **Witness-bless gate.** If the witness recently blessed a
-     *different* master and the bless is still inside its
-     holddown window (default 15 s), refuse to promote — the
-     previous master may still be alive on the other side of the
-     partition and the witness is the authoritative blessing.
-     After the holddown expires, the bless is stale and the
-     election proceeds.
-  9. **Else return `LEADER, should_set_mgmt_master=True`.** Caller
+  8. **Else return `LEADER, should_set_mgmt_master=True`.** Caller
      writes `bs.set_mgmt_master(self)` to rqlite (Raft enforces
-     single-writer in case two peers race).
+     single-writer in case two peers race). The actual takeover
+     (drbdadm primary + `.254` + filer + s3) is gated separately
+     by `cluster_arbiter.promote_to_arbiter_host()` per
+     `docs/cluster-quorum-spec.md` — election only decides
+     Leader/Follower; the takeover protocol decides whether it's
+     safe to flip `.254`.
 - `write_fence_marker(reason)` — drop `/run/bedrock-cluster.fence`
   with the reason text. Best-effort: silently swallows OSError
   (the watchdog timer will reboot us if the marker can't be

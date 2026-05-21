@@ -9,12 +9,15 @@ every Bedrock node runs. Three jobs in one process, one tick loop:
    inter-node traffic (DRBD, libvirt, SeaweedFS, SSH) uses the
    best wire instead of falling back to the LAN router.
 2. **Witness + weighted-vote election.** Discovers BedRock Echo on
-   the LAN, heartbeats it, runs `lib.election.compute()` once per
+   the LAN, heartbeats it (each beat carries this node's own
+   AEAD-sealed slot), runs `lib.election.compute()` once per
    second over its own peer-liveness table + the rqlite snapshot,
    acts on the outcome: `set_mgmt_master(self)` on Leader-promote,
    `write_fence_marker` + `cluster_arbiter.demote_arbiter_host()`
-   on NoQuorum, `send_claim(drbd_uuid)` when this node owns the
-   master role.
+   on NoQuorum. Each tick, `witness.set_own_slot(marker=drbdadm
+   current-uuid, tag=TAG_LMS iff hosting AND no peer logged_up)`
+   updates what this node will publish next. There is no
+   "claim/bless" — see `docs/cluster-quorum-spec.md`.
 3. **Self-fence.** When NoQuorum persists past the streak holddown
    (`NOQUORUM_HOLDDOWN_TICKS=5` ≈ 5 s), directly call
    `cluster_arbiter.demote_arbiter_host()` so the master VIP +
@@ -25,8 +28,9 @@ every Bedrock node runs. Three jobs in one process, one tick loop:
 
 Replaces the deleted `bedrock-rust` daemon. Reads `state.json` for
 the cluster_uuid + node_name + loopback_ip; reads `cluster.json`
-for the membership it should know about; reads `cluster.key` for
-witness HMAC. Writes routes, `/run/bedrock-cluster.fence`, and
+for the membership it should know about; reads `cluster.key`
+(32-byte AEAD key) for witness ChaCha20-Poly1305 encryption.
+Writes routes, `/run/bedrock-cluster.fence`, and
 `cluster_info.mgmt_master` in rqlite.
 
 Higher-level mesh-design rationale (why a per-cluster CGNAT /24,
@@ -166,9 +170,12 @@ implementation reference.
      marker + `demote_arbiter_host` (once per cycle via
      `demoted_in_cycle` flag); Leader + `should_set_mgmt_master`
      → `bs.set_mgmt_master(self_name)` to rqlite.
-  7. If we are mgmt_master AND have discovered an Echo, call
-     `_read_tier_critical_uuid()` and `witness.send_claim()`
-     so the Echo records our DRBD generation marker.
+  7. Update our own witness slot: `_read_tier_critical_uuid()`
+     gives the current DRBD generation marker;
+     `witness.set_own_slot(ws, marker=uuid, tag=TAG_LMS iff
+     hosting-and-alone, kind=DRBD_ARBITER_UUID)` is queued for
+     the NEXT `heartbeat_all` packet. The witness has no concept
+     of master/claim; this just publishes this node's view.
 - `_read_tier_critical_uuid() -> str` — parses `drbdadm dump-md
   tier-critical` for `current-uuid 0xABCDEF…`, returns the hex.
   Empty string when DRBD isn't up (N=1, pre-promote).
@@ -204,4 +211,6 @@ Trigger: 5 consecutive NoQuorum ticks. Action: drop fence marker
 | Self-fence too slow | `DOWN_HYSTERESIS_S` (10 s) + 5-tick streak ≈ 12-15 s total |
 | Joiner sees stale quorum count | `ever_seen_peers` not yet populated → joiner-grace ✓ |
 | Witness vote not counted | check `lib/witness.is_alive()`; reply must be ≤12 s old |
+| Slot writes silently dropped at Echo | AEAD verify-fail (wrong cluster_key) — Echo doesn't tell, packet is just gone |
+| Own slot stale on every readback | `set_own_slot` not being called per tick; or `heartbeat_all` failing send |
 | ECMP route rejected by iproute2 | `metric N` must come BEFORE first nexthop |
