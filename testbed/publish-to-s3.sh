@@ -148,6 +148,16 @@ if [ -d "$REPO/installer/iso-build/payload/wheels" ]; then
         -printf "%f\n" | sort > MANIFEST.txt )
 fi
 
+# rpms/ — DRBD kmod + utils + ELRepo release. Same manifest pattern.
+# These are the slow leg of `bedrock bootstrap` if dnf has to pull
+# from elrepo.org's mirrors; mirroring them on S3 means a Hetzner
+# install is fast even on a cold box.
+if [ -d "$REPO/installer/iso-build/payload/rpms" ]; then
+    cp -r "$REPO/installer/iso-build/payload/rpms" "$STAGE/rpms"
+    ( cd "$STAGE/rpms" && find . -maxdepth 1 -type f -name "*.rpm" \
+        -printf "%f\n" | sort > MANIFEST.txt )
+fi
+
 # ISO (optional)
 if [ $WITH_ISO -eq 1 ]; then
     iso="$REPO/installer/iso-build/output/bedrock-install-almalinux-10.iso"

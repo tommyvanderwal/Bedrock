@@ -116,6 +116,35 @@ python3 -m pip install --break-system-packages --no-index \
 python3 -c "import httpx; print('  [bedrock] httpx', httpx.__version__, 'ready')" \
     || die "httpx installed but not importable"
 
+# ── Stage RPM payload (DRBD + ELRepo) ──────────────────────────────────────
+# `bedrock bootstrap` checks /var/lib/bedrock-install/rpms/ for the
+# DRBD kmod + utils + ELRepo release before falling back to ELRepo's
+# mirrors. Mirror them locally for the HTTPS install path so the
+# bootstrap step doesn't spend minutes on slow upstream mirrors.
+log "Staging RPM payload (DRBD kmod + utils + ELRepo release)..."
+LOCAL_RPMS_DIR=/var/lib/bedrock-install/rpms
+mkdir -p "$LOCAL_RPMS_DIR"
+case "$BEDROCK_REPO" in
+    file://*)
+        SRC_RPMS="${BEDROCK_REPO#file://}/rpms"
+        if [ -d "$SRC_RPMS" ]; then
+            cp -f "$SRC_RPMS"/*.rpm "$LOCAL_RPMS_DIR/" 2>/dev/null || true
+        fi
+        ;;
+    http://*|https://*)
+        if curl -fsSL "${BEDROCK_REPO}/rpms/MANIFEST.txt" \
+               -o "$LOCAL_RPMS_DIR/MANIFEST.txt" 2>/dev/null; then
+            while IFS= read -r rpm; do
+                [ -z "$rpm" ] && continue
+                curl -fsSL "${BEDROCK_REPO}/rpms/$rpm" -o "$LOCAL_RPMS_DIR/$rpm" \
+                    || warn "rpm fetch failed: $rpm (bootstrap will fall back to ELRepo)"
+            done < "$LOCAL_RPMS_DIR/MANIFEST.txt"
+        else
+            warn "no rpms/MANIFEST.txt at ${BEDROCK_REPO}; bootstrap will use ELRepo's mirrors"
+        fi
+        ;;
+esac
+
 # ── Download bedrock CLI + lib ─────────────────────────────────────────────
 
 INSTALL_DIR=/usr/local/bin
