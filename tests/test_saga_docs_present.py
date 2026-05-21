@@ -26,6 +26,7 @@ from bedrock_d.install import (  # noqa: E402
     node_leave,
 )
 from bedrock_d.vm import create, destroy, grow, migrate  # noqa: E402,F401
+from bedrock_d.cluster import rename as _cluster_rename  # noqa: E402,F401
 from bedrock_d.orchestrator.sagas import SAGAS  # noqa: E402
 
 SAGAS_DIR = ROOT / "docs" / "sagas"

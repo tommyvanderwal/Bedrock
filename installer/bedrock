@@ -298,6 +298,51 @@ def cmd_node(args):
         _cmd_node_leave(args.target, getattr(args, "reason", "leave") or "leave")
 
 
+def cmd_cluster(args):
+    """Cluster-wide subcommands."""
+    if args.action == "rename":
+        return _cmd_cluster_rename(args.new_name)
+
+
+def _cmd_cluster_rename(new_name: str) -> int:
+    """Submit the ``cluster_rename`` saga via POST /api/operations.
+
+    cluster_uuid is immutable; only the display tag changes. The
+    rename takes effect within ~2 s in cluster.json / state.json
+    and within ~60 s in mDNS TXT records.
+    """
+    import json as _json
+    import urllib.request as _ur
+    import urllib.error as _ue
+    from lib import state as _state
+    s = _state.load()
+    mgmt_url = s.get("mgmt_url", "http://127.0.0.1:8001")
+    token = _op_token(mgmt_url)
+    body = _json.dumps({
+        "kind": "cluster_rename",
+        "params": {"new_name": new_name},
+        "wait": True,
+    }).encode()
+    req = _ur.Request(
+        mgmt_url + "/api/operations",
+        data=body,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+    )
+    try:
+        r = _ur.urlopen(req, timeout=10)
+    except _ue.HTTPError as e:
+        print(f"ERROR: {e.read().decode(errors='replace')}")
+        return 1
+    resp = _json.loads(r.read())
+    if resp.get("state") == "completed":
+        print(f"Cluster renamed to {new_name!r} (op_id={resp.get('op_id')}).")
+        print("Note: mDNS TXT records refresh within ~60 s.")
+        return 0
+    print(f"FAILED: {resp.get('error') or resp}")
+    return 1
+
+
 def _cmd_node_list():
     """Print nodes from the materialised snapshot."""
     from lib import view_builder, state as _state
@@ -879,6 +924,16 @@ def main():
     p_join.set_defaults(func=cmd_join)
 
     sub.add_parser("status", help="Cluster + node status").set_defaults(func=cmd_status)
+
+    p_cluster = sub.add_parser("cluster",
+        help="Cluster-wide operations (rename, …)")
+    p_cluster_sub = p_cluster.add_subparsers(dest="action", required=True)
+    p_cluster_rename = p_cluster_sub.add_parser(
+        "rename",
+        help="Change the cluster's display name (cluster_uuid stays the same)")
+    p_cluster_rename.add_argument("new_name",
+        help="New name (1..64 chars, [A-Za-z0-9_.-])")
+    p_cluster.set_defaults(func=cmd_cluster)
 
     p_node = sub.add_parser("node", help="Node operations")
     p_node_sub = p_node.add_subparsers(dest="action", required=True)

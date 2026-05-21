@@ -27,6 +27,7 @@ and [`docs/storage-architecture.md`](../storage-architecture.md#everything-goes-
 | [`node_leave`](node_leave.md) | `bedrock_d/install/node_leave.py` | `bedrock node leave` (on master) | n/a — terminal |
 | [`cluster_tier_promote_master`](cluster_tier_promote_master.md) | `bedrock_d/install/cluster_tier.py` | orchestrator `cluster_tier_watcher` task | manual (`bedrock storage demote-critical`, not yet implemented) |
 | [`cluster_tier_join_peer`](cluster_tier_join_peer.md) | `bedrock_d/install/cluster_tier.py` | last step of `node_join` | drops out automatically when peer leaves |
+| [`cluster_rename`](cluster_rename.md) | `bedrock_d/cluster/rename.py` | `bedrock cluster rename <new-name>` | run again with the previous name |
 | [`vm_create`](vm_create.md) | `bedrock_d/vm/create.py` | `POST /api/vms` | [`vm_destroy`](vm_destroy.md) |
 | [`vm_destroy`](vm_destroy.md) | `bedrock_d/vm/destroy.py` | `DELETE /api/vms/{name}` | n/a — terminal |
 | [`vm_grow`](vm_grow.md) | `bedrock_d/vm/grow.py` | `POST /api/vms/{name}/grow` | manual (shrink not supported online) |

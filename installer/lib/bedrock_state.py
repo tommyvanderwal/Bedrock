@@ -87,6 +87,31 @@ def cluster_init(cluster_uuid: str, cluster_name: str,
         raise
 
 
+def set_cluster_name(cluster_name: str,
+                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Update the singleton ``cluster_info.cluster_name`` — the
+    display tag every node projects into ``cluster.json``,
+    ``state.json``, and the mDNS TXT record. The ``cluster_uuid`` is
+    immutable; only the name changes.
+
+    Bumps ``bedrock_meta.revision`` so every node's
+    ``rqlite_subscriber`` re-projects within ~2 s and the mDNS
+    responder picks up the new TXT field on its next refresh tick
+    (≤60 s).
+    """
+    c, owns = _client(client)
+    try:
+        c.execute([
+            ["UPDATE cluster_info SET cluster_name = ?, updated_at = ? "
+             "WHERE id = 1", cluster_name, _now()],
+        ])
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
 def set_mgmt_master(node_name: str,
                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Atomically (a) set cluster_info.mgmt_master and (b) update

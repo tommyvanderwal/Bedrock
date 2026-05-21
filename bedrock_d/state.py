@@ -23,7 +23,8 @@ Moving the implementations now would break in-flight imports across
   apply_schema, bump_revision, RqliteError, RqliteRowError).
 - ``cluster_init``, ``node_register``, ``node_loopback``,
   ``node_unregister``, ``node_maintenance``, ``operator_set``,
-  ``obs_backends_set``, ``set_mgmt_master``, ``tier_state``,
+  ``obs_backends_set``, ``set_cluster_name``, ``set_mgmt_master``,
+  ``tier_state``,
   ``drbd_node_id_assigned``, ``drbd_node_id_freed``, etc. —
   high-level cluster-state mutators (typed columns, transaction-
   safe). All of these write the typed rows + bump the revision
@@ -69,6 +70,7 @@ from lib.bedrock_state import (  # noqa: F401, E402
     node_maintenance,
     operator_set,
     obs_backends_set,
+    set_cluster_name,
     set_mgmt_master,
     tier_state,
     drbd_node_id_assigned,
@@ -98,7 +100,7 @@ __all__ = [
     # cluster-state mutators
     "cluster_init", "node_register", "node_loopback", "node_unregister",
     "node_maintenance", "operator_set", "obs_backends_set",
-    "set_mgmt_master", "tier_state",
+    "set_cluster_name", "set_mgmt_master", "tier_state",
     "drbd_node_id_assigned", "drbd_node_id_freed",
     # local state.json
     "load_local_state", "save_local_state",

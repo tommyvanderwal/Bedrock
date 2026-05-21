@@ -73,6 +73,7 @@ def register_routes(app: FastAPI, *,
         from bedrock_d.install import node_join  # noqa: F401
         from bedrock_d.install import node_leave  # noqa: F401
         from bedrock_d.install import cluster_tier  # noqa: F401
+        from bedrock_d.cluster import rename as _cluster_rename  # noqa: F401
 
     @app.post("/api/operations")
     def api_op_submit(req: OpSubmit,
