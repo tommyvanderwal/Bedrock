@@ -400,6 +400,30 @@ log "Downloading bedrock CLI..."
 curl -fsSL "${BEDROCK_REPO}/bedrock" -o "${INSTALL_DIR}/bedrock"
 chmod +x "${INSTALL_DIR}/bedrock"
 
+# RHEL-family `sudo` defaults to `secure_path = /sbin:/bin:/usr/sbin:/usr/bin`,
+# which omits /usr/local/bin where bedrock lives. Without this drop-in,
+# a regular user running `sudo bedrock init` gets "bedrock: command not
+# found". Add /usr/local/{s,}bin to secure_path so all bedrock-* binaries
+# (bedrock, bedrock-d, bedrock-cert-refresh, etc.) resolve under sudo.
+log "Extending sudo secure_path to include /usr/local/bin..."
+cat > /etc/sudoers.d/bedrock-path <<'EOF'
+# Added by Bedrock installer — see installer/install.sh.
+# RHEL ships secure_path = /sbin:/bin:/usr/sbin:/usr/bin which omits
+# the standard /usr/local/{s,}bin where third-party packages install.
+# Bedrock CLI + daemons all live in /usr/local/bin, so without this
+# drop-in `sudo bedrock <cmd>` fails with "command not found" for any
+# non-root login.
+Defaults    secure_path = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+chmod 0440 /etc/sudoers.d/bedrock-path
+# Validate the resulting sudoers config; if it's somehow broken we'd
+# rather find out now than the next time the operator runs sudo.
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/bedrock-path >/dev/null 2>&1 \
+        || { rm -f /etc/sudoers.d/bedrock-path; \
+             die "sudoers drop-in failed validation; sudo would have broken"; }
+fi
+
 log "Downloading bedrock-d (unified daemon: mesh + mgmt + orchestrator + dashboard)..."
 curl -fsSL "${BEDROCK_REPO}/bedrock-d" -o "${INSTALL_DIR}/bedrock-d"
 chmod +x "${INSTALL_DIR}/bedrock-d"
