@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Publish the Bedrock install repo to a public S3 prefix.
+#
+# Use:
+#   testbed/publish-to-s3.sh --prefix dev            # rolling dev build
+#   testbed/publish-to-s3.sh --prefix dev --with-iso # also push the ~10GB ISO
+#   testbed/publish-to-s3.sh --prefix v0.8 --tag     # frozen release
+#   testbed/publish-to-s3.sh --prefix v0.8 --tag --as-latest --with-iso
+#   testbed/publish-to-s3.sh --prefix dev --dry-run  # show what would change
+#
+# Safety rails:
+#   * Allowlist sync — only the install artefacts listed below get pushed.
+#     Everything else is left out: tests, docs, .git, build intermediates,
+#     symlinks, anything matching *.key / *.pem / *.env / cluster.key*.
+#   * Refuses to push a versioned prefix (v*) without --tag.
+#   * Refuses to push to an existing versioned prefix without
+#     --allow-tag-overwrite (versioned releases should be immutable).
+#   * Refuses to run with a dirty working tree unless --allow-dirty.
+#   * --dry-run prints rclone's planned changes; no upload happens.
+#
+# Credentials: ~/.config/bedrock-s3/rclone.conf (mode 0600, outside repo).
+set -euo pipefail
+
+CONFIG="$HOME/.config/bedrock-s3/rclone.conf"
+REMOTE="bedrock:bedrock"               # rclone remote name : bucket name
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+PREFIX=""
+TAG_MODE=0
+WITH_ISO=0
+DRY_RUN=0
+ALLOW_DIRTY=0
+ALLOW_TAG_OVERWRITE=0
+AS_LATEST=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prefix)               PREFIX="$2"; shift 2 ;;
+        --tag)                  TAG_MODE=1; shift ;;
+        --with-iso)             WITH_ISO=1; shift ;;
+        --dry-run)              DRY_RUN=1; shift ;;
+        --allow-dirty)          ALLOW_DIRTY=1; shift ;;
+        --allow-tag-overwrite)  ALLOW_TAG_OVERWRITE=1; shift ;;
+        --as-latest)            AS_LATEST=1; shift ;;
+        -h|--help)
+            sed -n '2,30p' "$0"
+            exit 0 ;;
+        *)
+            echo "ERROR: unknown arg: $1" >&2
+            exit 2 ;;
+    esac
+done
+
+[ -n "$PREFIX" ] || { echo "ERROR: --prefix is required (e.g. dev, v0.8)" >&2; exit 2; }
+[ -f "$CONFIG" ] || { echo "ERROR: rclone config missing at $CONFIG" >&2; exit 2; }
+
+# Versioned releases need --tag and must be immutable.
+case "$PREFIX" in
+    v[0-9]*)
+        if [ $TAG_MODE -ne 1 ]; then
+            echo "ERROR: pushing to versioned prefix '$PREFIX' requires --tag" >&2
+            exit 2
+        fi
+        ;;
+    dev|latest)
+        if [ $TAG_MODE -eq 1 ]; then
+            echo "ERROR: --tag is for versioned prefixes only (got --prefix $PREFIX)" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "ERROR: --prefix must be 'dev', 'latest', or 'vN*' (got: $PREFIX)" >&2
+        exit 2
+        ;;
+esac
+
+# Working tree clean unless explicitly allowed.
+cd "$REPO"
+if [ "$(git status --porcelain | wc -l)" -gt 0 ] && [ $ALLOW_DIRTY -ne 1 ]; then
+    echo "ERROR: working tree has uncommitted changes. Commit first, or pass --allow-dirty." >&2
+    git status --short
+    exit 2
+fi
+
+# If --tag, refuse overwrite of an existing release unless --allow-tag-overwrite.
+if [ $TAG_MODE -eq 1 ] && [ $ALLOW_TAG_OVERWRITE -ne 1 ]; then
+    existing=$(rclone --config "$CONFIG" lsf "$REMOTE/$PREFIX/" 2>/dev/null | head -1)
+    if [ -n "$existing" ]; then
+        echo "ERROR: $PREFIX/ already has content on S3 (e.g. $existing)." >&2
+        echo "       Releases should be immutable; pass --allow-tag-overwrite to override." >&2
+        exit 2
+    fi
+fi
+
+COMMIT=$(git rev-parse --short HEAD)
+COMMIT_LONG=$(git rev-parse HEAD)
+NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Build a temp tree with ONLY the allowlisted paths, in the layout we want
+# the bucket to have. rclone sync against this temp tree → S3.
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "[publish] staging into $STAGE"
+
+# ── Allowlist ────────────────────────────────────────────────────────────
+# install.sh + CLI + daemon
+install -m 0755 -D "$REPO/installer/install.sh"   "$STAGE/install.sh"
+install -m 0755 -D "$REPO/installer/bedrock"      "$STAGE/bedrock"
+install -m 0755 -D "$REPO/installer/bedrock-d"    "$STAGE/bedrock-d"
+
+# lib/ — every .py + .sql (.md is documentation; not part of the runtime payload)
+mkdir -p "$STAGE/lib"
+find "$REPO/installer/lib" -maxdepth 1 -type f \( -name "*.py" -o -name "*.sql" \) \
+    -exec install -m 0644 {} "$STAGE/lib/" \;
+
+# bedrock_d/ — the new package, all .py files preserving subdirs
+mkdir -p "$STAGE/bedrock_d"
+( cd "$REPO/bedrock_d" \
+  && find . -type f -name "*.py" -not -path "*/__pycache__/*" \
+  | while read -r f; do install -m 0644 -D "$f" "$STAGE/bedrock_d/$f"; done )
+
+# mgmt/ — .py files + the built dashboard if present
+mkdir -p "$STAGE/mgmt"
+( cd "$REPO/mgmt" \
+  && find . -maxdepth 1 -type f -name "*.py" \
+  | while read -r f; do install -m 0644 "$f" "$STAGE/mgmt/$f"; done )
+if [ -d "$REPO/mgmt/ui/build" ]; then
+    mkdir -p "$STAGE/mgmt/ui"
+    cp -r "$REPO/mgmt/ui/build" "$STAGE/mgmt/ui/build"
+fi
+
+# systemd unit files
+mkdir -p "$STAGE/configs"
+find "$REPO/installer/configs" -maxdepth 1 -type f -name "*.service" \
+    -exec install -m 0644 {} "$STAGE/configs/" \;
+
+# binaries/ + wheels/ — re-use the iso-build payload that's already curated
+if [ -d "$REPO/installer/iso-build/payload/binaries" ]; then
+    cp -r "$REPO/installer/iso-build/payload/binaries" "$STAGE/binaries"
+fi
+if [ -d "$REPO/installer/iso-build/payload/wheels" ]; then
+    cp -r "$REPO/installer/iso-build/payload/wheels" "$STAGE/wheels"
+fi
+
+# ISO (optional)
+if [ $WITH_ISO -eq 1 ]; then
+    iso="$REPO/installer/iso-build/output/bedrock-install-almalinux-10.iso"
+    if [ ! -f "$iso" ]; then
+        echo "ERROR: --with-iso requested but $iso does not exist." >&2
+        echo "       Run installer/iso-build/build-iso.sh first." >&2
+        exit 2
+    fi
+    install -m 0644 "$iso" "$STAGE/bedrock-install.iso"
+fi
+
+# Version manifest
+cat > "$STAGE/VERSION" <<EOF
+prefix=$PREFIX
+commit=$COMMIT_LONG
+commit_short=$COMMIT
+published_at=$NOW_UTC
+EOF
+
+# Per-file SHA-256s for verification on the download side
+( cd "$STAGE" && find . -type f -not -name "SHA256SUMS" \
+    -exec sha256sum {} + \
+  | sed 's|  \./|  |' \
+  > SHA256SUMS )
+
+# ── Hard exclude (paranoia even after allowlist) ─────────────────────────
+# Refuse if anything that looks secret-ish made it into the stage tree.
+found_bad=$(find "$STAGE" -type f \
+    \( -name "*.key" -o -name "*.pem" -o -name "*.env" \
+       -o -name "cluster.key*" -o -name "id_*" \
+       -o -name "*.pyc" \) 2>/dev/null)
+if [ -n "$found_bad" ]; then
+    echo "ERROR: secret-looking file(s) reached stage tree — refusing to upload:" >&2
+    echo "$found_bad" >&2
+    exit 2
+fi
+
+echo ""
+echo "[publish] stage tree summary:"
+( cd "$STAGE" && find . -type f | wc -l ) | xargs printf "  %s files\n"
+du -sh "$STAGE" | awk '{printf "  total size: %s\n", $1}'
+echo ""
+
+# ── Sync ─────────────────────────────────────────────────────────────────
+SYNC_FLAGS="--config $CONFIG --progress --transfers 8 --checkers 16"
+# (acl=public-read + no_check_bucket are set in rclone.conf so they apply to
+# all operations against this remote; not CLI flags on rclone 1.60.)
+if [ $DRY_RUN -eq 1 ]; then
+    SYNC_FLAGS="$SYNC_FLAGS --dry-run"
+    echo "[publish] DRY RUN — no upload"
+fi
+
+echo "[publish] syncing $STAGE/ → $REMOTE/$PREFIX/"
+rclone sync $SYNC_FLAGS "$STAGE/" "$REMOTE/$PREFIX/"
+
+# ── Copy to /latest/ if requested ────────────────────────────────────────
+if [ $AS_LATEST -eq 1 ]; then
+    if [ $TAG_MODE -ne 1 ]; then
+        echo "WARNING: --as-latest without --tag is unusual; skipping latest update." >&2
+    else
+        echo "[publish] copying $PREFIX/ → latest/"
+        rclone sync $SYNC_FLAGS "$STAGE/" "$REMOTE/latest/"
+    fi
+fi
+
+echo ""
+echo "[publish] done."
+[ $DRY_RUN -eq 0 ] && echo "  install URL: https://fsn1.your-objectstorage.com/bedrock/$PREFIX/install.sh"
+[ $DRY_RUN -eq 0 ] && [ $WITH_ISO -eq 1 ] && \
+    echo "  ISO URL:     https://fsn1.your-objectstorage.com/bedrock/$PREFIX/bedrock-install.iso"
