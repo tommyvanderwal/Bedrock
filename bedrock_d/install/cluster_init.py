@@ -87,7 +87,7 @@ log = logging.getLogger(__name__)
 INIT_PROGRESS_PATH = Path("/var/lib/bedrock/init-progress.json")
 
 
-def run_cluster_init(*, cluster_name: str,
+def run_cluster_init(*, cluster_name: Optional[str] = None,
                      repo: str) -> None:
     """Entry point for `bedrock init` via the saga path.
 
@@ -96,16 +96,21 @@ def run_cluster_init(*, cluster_name: str,
     operation, and runs it. On crash + re-run, the executor picks
     up at the first not-``done`` step.
 
+    ``cluster_name`` is a display tag (defaults to
+    ``bedrock-<hostname>`` when omitted); the cluster's real
+    identity is the ``cluster_uuid`` allocated in
+    ``step_allocate_identity``. Renamable later via
+    ``bedrock cluster rename``.
+
+    ``repo`` is the install repo URL used to fetch binaries during
+    the install_obs_binaries / install_exporters steps.
+
     Raises ``RuntimeError`` on saga failure with the failed
     step name + the underlying error.
-
-    Note — no witness is configured at init time. The witness is a
-    quorum tiebreaker that only becomes load-bearing at N>=2; the
-    operator picks one (or accepts the cattle-only "no witness, no
-    auto-failover" default) at the moment the dashboard prompts
-    them to accept the first joiner. See docs/sagas/cluster_init.md
-    for the rationale.
     """
+    if not cluster_name:
+        import socket as _socket
+        cluster_name = f"bedrock-{_socket.gethostname()}"
     INIT_PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     backend = FileSagaBackend(path=INIT_PROGRESS_PATH)
     # Best-effort: identify the operator who triggered this for
@@ -218,8 +223,8 @@ class ClusterInit:
     """`bedrock init <name>` — first-node bootstrap.
 
     ctx inputs (set by the caller / cmd_init):
-      - cluster_name: str
-      - repo: str (URL of the install repo for binary downloads)
+      - cluster_name: str  (display tag; cluster identity is cluster_uuid)
+      - repo: str          (URL of the install repo for binary downloads)
 
     ctx outputs (set as steps run):
       - cluster_uuid: str

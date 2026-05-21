@@ -12,33 +12,15 @@ becomes the founding master at N=1. Idempotent end-to-end — re-running
 
 ## Trigger
 
-`bedrock init --name <cluster>` CLI. The CLI invokes
+`bedrock init [--name <cluster>]` CLI. The CLI invokes
 `run_cluster_init()` directly; there is no HTTP submission because
 rqlite isn't up yet — this saga IS what brings it up.
 
-### Why no `--witness` flag at init
-
-At N=1 the cluster has no quorum problem to solve — the witness is
-a tiebreaker that only becomes load-bearing on the **N=1 → N=2**
-transition. Configuring a witness during `bedrock init` would force
-the operator to answer a question they can't reasonably answer yet
-(the BedRock-Echo box may not even be deployed; the operator is
-just standing up the master).
-
-Without a witness configured, a 2-node cluster runs in **"stay
-put" mode**: neither side will auto-failover. The current master
-keeps `.254` and singletons; a surviving peer doesn't attempt a
-takeover. The cluster is functional but can't survive the master
-dying without operator intervention. That's the documented and
-intentional trade-off for cattle-only 2-node deployments.
-
-Configuring a witness later happens at the dashboard level — at
-the moment the operator clicks "accept" on the first joiner is a
-good UX hook for "would you like to scan for a witness now?". The
-mgmt API supports this via the (yet-to-be-written) witness-CRUD
-endpoints; no saga involvement needed — adding a row to the
-`witnesses` rqlite table is enough for netd to start probing it
-on the next tick.
+No witness is configured here. The `witnesses` rqlite table starts
+empty; a 2-node cluster without an entry runs in "stay put" mode
+(current master holds `.254`, no auto-failover). Witnesses are
+added later via dashboard / API by writing a row into the
+`witnesses` table — no saga needed.
 
 The backend is the **file-based** `FileSagaBackend` at
 `/var/lib/bedrock/init-progress.json` (not rqlite); the
@@ -47,10 +29,10 @@ backend switches to `RqliteSagaBackend` after this saga's
 
 ## Inputs (`ctx` keys set by the entry point)
 
-| key | type | meaning |
-|-----|------|---------|
-| `cluster_name` | str | Human-readable cluster name (e.g. `bedrock-prod`) |
-| `repo` | str | URL or `file://` path of the install repo for fetching binaries |
+| key | required | type | meaning |
+|-----|----------|------|---------|
+| `cluster_name` | optional | str | Display tag (defaults to `bedrock-<hostname>`). The real identity is `cluster_uuid`, allocated by `allocate_identity`; the name is just for the dashboard, the mDNS TXT record, and `bedrock status`. Renamable later — see `bedrock cluster rename`. |
+| `repo` | required | str | URL or `file://` path of the install repo for fetching binaries. The CLI auto-fills this from the install location the bootstrap ran from (`get_repo()`); operators never type it. |
 
 ## Outputs (`ctx` keys filled by the saga's own steps)
 
@@ -172,9 +154,9 @@ saga when the cluster grows to N=2.
 
 ### `render_rqlited_env`
 
-Writes `/etc/bedrock/rqlited.env` with the per-node rqlite config
-(node_id derived from the loopback's last octet for stability —
-see [`lesson_rqlite_node_id_stability`](../../../.claude/projects/-home-tommy-projects/memory/lesson_rqlite_node_id_stability.md)).
+Writes `/etc/bedrock/rqlited.env` with the per-node rqlite config.
+The node_id is derived from the loopback's last octet so it stays
+stable across reboots and joins.
 
 ### `start_rqlited`
 

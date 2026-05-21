@@ -84,8 +84,7 @@ Re-running `bedrock join` after a crash picks up the existing
 `_enrich_params_from_state` seeds `node_name` + `bedrock_pubkey`
 from durable sources (state.json + the on-disk Ed25519 key) so a
 resumed run after `derive_identity` was already done still has
-those values in ctx — see
-[`lesson_join_saga_resume_keyerrors`](../../../.claude/projects/-home-tommy-projects/memory/lesson_join_saga_resume_keyerrors.md).
+those values in ctx.
 
 `request_join_approval` is the only blocking step — it polls the
 master at 2 s intervals up to 10 min and gives up if no operator
@@ -181,10 +180,10 @@ soon as rqlited comes up in the next step.
 ### `wait_master_reachable`
 
 Polls `ping master_loopback` until reachable, with a 15 s timeout.
-This is where the mesh-loopback routing has to work — see
-[`lesson_mesh_loopback_asymmetric_routes`](../../../.claude/projects/-home-tommy-projects/memory/lesson_mesh_loopback_asymmetric_routes.md)
-and [`lesson_mesh_rp_filter`](../../../.claude/projects/-home-tommy-projects/memory/lesson_mesh_rp_filter.md)
-for the sysctls that make this work on a multi-NIC mesh.
+Depends on the mesh routing being up — `ensure_routing_sysctls()`
+in `installer/lib/netd.py` applies the multi-NIC sysctls
+(`arp_ignore`, `arp_announce`, `rp_filter`) that make this work
+when each NIC carries a `169.254.0.0/16` link-local.
 
 ### `render_rqlited_env`
 

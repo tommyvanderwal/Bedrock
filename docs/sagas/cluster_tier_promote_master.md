@@ -114,8 +114,9 @@ the full sequence:
 4. `cp -a /var/lib/bedrock/cluster/. /var/lib/bedrock-promote-snapshot/`
    to preserve the filer data
 5. `umount /var/lib/bedrock/local/critical`
-6. `drbdadm create-md --force --max-peers=7` — **skipped if resource
-   already configured** (idempotency fix added 2026-05-21)
+6. `drbdadm create-md --force --max-peers=7` — skipped if the
+   resource is already configured (DRBD9 refuses create-md on a
+   configured device; this lets the step re-run safely)
 7. `drbdadm up tier-critical`
 8. `drbdadm primary --force tier-critical` (initial sync source)
 9. `mount -t xfs /dev/drbd1101 /var/lib/bedrock/cluster` (fresh XFS

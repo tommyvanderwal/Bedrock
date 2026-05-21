@@ -1124,3 +1124,40 @@ The takeaway: any process that writes to bedrock-rust's log MUST
 verify it's running on the mgmt master first. Even daemons that
 seem "local" (like a per-node mesh discovery daemon) violate
 single-writer if they all append independently.
+
+
+## L36 — Witness configuration belongs at N=2, not at `bedrock init`
+
+**Date**: 2026-05-21
+**Files**: `bedrock_d/install/cluster_init.py`,
+`installer/lib/mgmt_install.py`, `installer/bedrock`
+
+**What we thought**: `bedrock init` should collect the witness host
+up front so the cluster is "configured" from day 1.
+
+**What we found**: at N=1 the cluster has no quorum problem — the
+witness is a tiebreaker that only becomes load-bearing on the
+N=1→N=2 transition. Asking the operator for a witness during
+init forces a choice they can't reasonably make yet (the
+BedRock-Echo box may not even be deployed; the operator is just
+standing up the master). The supplied value just sat in
+`state.json["witness_host"]` unused until the first peer joined.
+
+**What we changed**: dropped `witness_host` from
+`run_cluster_init()`, `install_full()`, the `bedrock init`
+argparse, the `bedrock status` print, and the saga's identity
+step. A 2-node cluster without a configured witness runs in
+"stay put" mode — current master holds `.254` + singletons,
+survivor never auto-promotes. Cluster keeps serving from whichever
+node is master but can't survive that master dying without
+operator intervention. Documented as the intentional default for
+cattle-only 2-node deployments.
+
+The future witness-add UX lives at the dashboard level (likely a
+prompt when the operator accepts the first joiner); it writes a
+row into the rqlite `witnesses` table — no saga needed, netd picks
+up the new probe target on the next tick.
+
+**Note**: `bedrock join --witness HOST` is unchanged. That flag is
+the master endpoint the joiner dials (overloaded name; separate
+concern).

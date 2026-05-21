@@ -92,14 +92,9 @@ Calls `bedrock_state.node_unregister(target_name)` which:
 ### `rqlite_voter_remove`
 
 `DELETE /nodes/<node_id>` against rqlite's admin API to remove the
-target as a Raft voter. Without this, rqlite Raft still expects the
-target to vote on every commit and slows down (or stalls if N//2+1
-of the remaining voters can't form quorum with the target absent).
-
-This is the step lesson
-[`lesson_node_leave_rqlite_remove`](../../../.claude/projects/-home-tommy-projects/memory/lesson_node_leave_rqlite_remove.md)
-exists for — earlier versions skipped this and consecutive leaves
-bricked the cluster at N/2 voters.
+target as a Raft voter. Without this, rqlite Raft still expects
+the target to vote on every commit and stalls if `N//2+1` of the
+remaining voters can't form quorum with the target absent.
 
 ### `propagate_daemon_config`
 
