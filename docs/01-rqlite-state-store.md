@@ -1,8 +1,7 @@
 # Bedrock cluster-state store — rqlite
 
 > **Status**: this doc replaces the old "bedrock-rust hash-chained log"
-> material. The log is gone. Cluster state lives in rqlite, per
-> [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md) D-01..D-22.
+> material. The log is gone. Cluster state lives in rqlite.
 
 ## What rqlite is, in 30 seconds
 
@@ -23,7 +22,7 @@ For Bedrock-specific properties:
 
 ## Cluster shape at each scale
 
-Per [post-alpha-rewrite-notes D-02 + D-04..D-08](post-alpha-rewrite-notes.md#state-store-and-consensus):
+Cluster shapes:
 
 ```
 N=1 (1-node NAS box):
@@ -46,8 +45,8 @@ N=3..N=8 (larger clusters):
 The arbiter is NOT a separate machine. It's a second `rqlited`
 process co-resident with the elected mgmt master, bound to a
 `100.X.Y.254/32` secondary IP on `lo`. Its data dir lives on the
-`tier-cluster` DRBD volume so it moves with the mgmt master on
-role transitions. See [`docs/post-alpha-rewrite-notes.md` D-05](post-alpha-rewrite-notes.md#arbiter-form).
+`tier-critical` DRBD volume so it moves with the mgmt master on
+role transitions. See [`storage-architecture.md`](storage-architecture.md).
 
 ## Schema
 

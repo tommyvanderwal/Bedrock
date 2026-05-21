@@ -12,6 +12,7 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - Each DRBD pair is an independent failure domain. 100 VMs means 100 pairs, not one big cluster. No cluster-wide blast radius.
 - The state machine is tiny: both healthy, one down with witness confirming, failed node returning, admin-requested migration. Four or five states. Keep it there.
 - Say NO to unneeded complexity. Frameworks only work if you use them as intended — building on plain components avoids framework fights.
+- **All cluster orchestration goes through rqlite as sagas.** Every long-running operation (VM create, disk grow, DRBD attach, node join, cluster-DRBD membership change, weed-master reshuffle, SeaweedFS replica fix-up after a node returns, …) writes intent → executes idempotent steps → writes "done" — each step durable in rqlite. Power-loss at any step is recoverable: on boot, pick up where the `operation_steps` log says we left off. The ONE exception is recovering the rqlite arbiter itself, which is what the witness + arbiter-takeover protocol exists for. See [`docs/cluster-quorum-spec.md`](docs/cluster-quorum-spec.md) and [`docs/storage-architecture.md`](docs/storage-architecture.md).
 
 ## Hardware — 0.1 Lab
 - 2x GMKtec Zen4 mini PC, 32GB RAM, 1TB NVMe, 2x 2.5gbit NIC each
@@ -23,7 +24,7 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 ## Software stack
 - **Base OS:** AlmaLinux 10.1. (Earlier drafts targeted 9 because DRBD-kmod against the 10.0 kernel had open issues; ELRepo's `kmod-drbd9x-9.3.x` against el10_1 resolves that.)
 - **Hypervisor:** KVM/QEMU/libvirt (standard AlmaLinux packages)
-- **Storage:** **One disk per node, one VG, one thin pool.** Everything dynamic — host root LV, optional swap LV, storage tiers, every VM disk — lives as a thin LV in that single pool. Boot needs ~1.5 GB outside (EFI + /boot); the rest is flexible and freely re-allocatable. TRIM/discard end-to-end so freed blocks return to the pool. DRBD per VM disk for pet/ViPet replication, on top of those thin LVs.
+- **Storage:** **One VG per node (`bedrock-vg`), one thinpool (`thinpool`).** Cluster singletons (rqlite arbiter + SeaweedFS filer + S3 IAM) live on a DRBD-replicated LV pair capped at 3 peers; per-VM DRBD LV pairs live alongside; the local SeaweedFS volume server gets one LV (NOT DRBD — SeaweedFS handles file-level replication via collections). Boot needs ~1.5 GB outside the VG (EFI + /boot); everything else is thin-provisioned and freely re-allocatable. TRIM/discard end-to-end. **One thin meta LV per DRBD resource**. See `docs/storage-architecture.md` for the full layout.
 - **Networking:** br0 bridge on management NIC for VM traffic. Mesh-aware overlay (`bedrock-net` daemon, on every node) for cluster-internal traffic — every NIC is a path candidate, the kernel routes per-peer through the best available physical link, DRBD multi-paths over the real per-NIC addresses. See `docs/06-mesh-network.md`. Cluster identity lives in RFC 6598 Shared Address Space (`100.64.0.0/10`, derived `/24` per cluster from `cluster_uuid`); per-NIC link addresses come from RFC 3927 IPv4 link-local assigned by NetworkManager. Operator plugs any cable into any port and the system figures out the rest.
 - **Orchestrator:** Python based. Most code should be python based. Only realtime critical items should potentially be rust components. e.q. a custom docker DRBD witness on Mikrotik, would probably be rust.
 
@@ -40,12 +41,40 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - PVE's opinions on storage/networking/HA don't align with our DRBD-per-VM architecture
 
 ## Storage architecture — critical decisions
-- **One disk → one VG → one thin pool, per node.** Mini-PC has one NVMe; we use it maximally. Boot needs a ~500 MB EFI partition + ~1 GB /boot outside the LVM; everything else (host root, optional swap, all storage tiers, every VM disk) is a thin LV in the single pool. Operator can reallocate space between any of these consumers without repartitioning.
-- **One DRBD resource per VM disk**, on top of that thin LV. QEMU opens `/dev/drbd/by-res/vm-name-disk0/0` as raw block device.
-- **TRIM/discard must work end-to-end:** guest FS → QEMU (`discard=unmap`) → DRBD (`discard-zeroes-if-aligned`) → LVM thin (`thin_pool_discards=passdown`) → NVMe. Bedrock-bootstrap configures every layer; the supportability dashboard verifies live.
-- **No artificial fill cap.** Operator can run the pool to 99% if that's what migrating data away requires. Monitoring signals at 70% (warn) and 80% (alarm); writes are NEVER refused on those thresholds.
-- **Swap is opt-in.** Default is none — swap-on-thin can panic the kernel when the pool fills, and swap-on-a-hypervisor is generally a footgun. Operator can request a small thin swap LV via `bedrock storage swap-set <gb>` for last-resort use on a 1-survivor-of-2-node-HA scenario.
-- **No NFS or cluster filesystem in the VM-disk path.** Both nodes already have every byte via DRBD.
+**Authoritative reference:** `docs/storage-architecture.md`. Summary:
+
+- **One VG per node (`bedrock-vg`), one thinpool
+  (`thinpool`)** holding everything: the DRBD-replicated
+  cluster-singleton LV pair (capped at 3 peers), DRBD LV pairs per
+  VM disk, and the local SeaweedFS volume LV. SeaweedFS does its
+  own file-level replication via collection policy; LVM doesn't
+  need to slice by tier.
+- **One DRBD resource per VM disk**, one thin data LV +
+  one thin meta LV per resource. `max-peers=7` baked at create-md.
+  QEMU opens `/dev/drbd/by-res/vm-name-disk0/0` as raw block.
+  Online grow = `lvextend meta` (if needed) + `lvextend data` +
+  `drbdadm resize`; no downtime.
+- **`.254/32` cluster-singleton VIP** on loopback at all N
+  (including N=1). Hosts rqlite arbiter, SeaweedFS filer:8888,
+  mgmt HTTPS:8443. Failover moves the VIP + DRBD primary +
+  filer + rqlite-arbiter atomically.
+- **SeaweedFS** for shared file/object storage: filer singleton on
+  `.254` (DRBD-backed leveldb3); weed-master Raft-3 on three
+  regular nodes (NOT on `.254`); weed-volume + weed-s3 on every
+  node bound `0.0.0.0`; every node FUSE-mounts the filer at
+  `/mnt/bedrock` pointing at `.254:8888`. Three collections —
+  `scratch` (replication 000), `standard` (001, default),
+  `critical` (002, 3 copies). S3 IAM identities live inside the
+  filer DB.
+- **TRIM/discard end-to-end:** guest FS → QEMU
+  (`discard=unmap`) → DRBD (`discard-zeroes-if-aligned`) → LVM
+  thin (`thin_pool_discards=passdown`) → NVMe.
+- **No artificial fill cap.** Monitoring warns at 70 %, alarms at
+  80 %; writes are NEVER refused at those thresholds.
+- **Swap is opt-in.** Default none — swap-on-thin can panic the
+  kernel when the pool fills.
+- **No NFS or cluster filesystem in the VM-disk path.** Every node
+  with a replica already has every byte via DRBD.
 
 ## Live migration — how it works
 1. VM runs on node1. DRBD resource is Primary/Secondary.
@@ -56,10 +85,35 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 6. Zero storage I/O over the network during migration. Only RAM transfer.
 
 ## HA failover — how it works
-- Watchdog on each node monitors: other node reachable? witness (MikroTik) reachable? DRBD connected?
-- Other node down + witness reachable = promote DRBD, start VMs on survivor.
-- No automatic failback. Failed node returns as secondary, resyncs, waits for admin decision.
-- Witness prevents split-brain: if you can't reach the witness either, assume YOU are isolated, don't promote.
+**Authoritative reference:** `docs/cluster-quorum-spec.md`. Summary:
+
+- **Witness is a passive K/V slot store** (a "bedrock-echo" device:
+  ESP32 firmware or a tiny container on a MikroTik). UDP/12321,
+  AEAD-encrypted with the cluster's shared key. Each node owns
+  one slot, writes its own slot every 1 s, reads every other
+  node's slot on each reply.
+- **No "blessing", no claim acceptance, no holddown.** The witness
+  has zero logic — it stores last-write per slot and returns all
+  slots on every reply. All decisions are local to each node.
+- **Weighted-vote election** (`10 × N_nodes + 1 if witness alive`)
+  decides Leader / Follower / NoQuorum on every node's 1 Hz tick.
+- **Arbiter takeover protocol:** before becoming the new
+  `.254`-host, the candidate node inspects the previous master's
+  slot, verifies its local `drbdadm current-uuid tier-critical`
+  exactly matches the slot's `marker` field, flips its own slot's
+  `lms` bit, reads back from the next witness reply, then
+  promotes. Refuses to promote on UUID mismatch.
+- **Self-demote on NoQuorum:** the current `.254`-host stops
+  services and releases the VIP after 5 consecutive NoQuorum
+  ticks (≈ 5 s), BEFORE any cluster-visible state change. So
+  there's never a window where two nodes both hold `.254`.
+- **No automatic failback.** Failed node returns as secondary,
+  re-syncs DRBD, and waits for the calm orchestrator's
+  reconciliation pass.
+- **The calm orchestrator** (slower, deliberate) handles
+  arbiter-set membership changes, weed-master Raft re-shuffles,
+  and capacity-driven decisions — none of those are on the
+  critical failover path.
 
 ## Version roadmap
 - **0.1:** Manual install, scripts, working live migration + HA failover, Linux + Windows VMs. This document.

@@ -24,9 +24,9 @@ Any `.py` file whose functions:
 - Change persistent system config
 
 …must have an accompanying `<module>.md` next to it. The Python file's
-docstring at the top must reference it. Example: `tier_storage.py`'s
-docstring opens with "See `tier_storage.md` (next to this file) for the
-full operational spec".
+docstring at the top must reference it. Example: `cluster_arbiter.py`'s
+docstring opens with "See `cluster_arbiter.md` (next to this file) for
+the full operational spec".
 
 Pure-data modules (`state.py`, `workload.py` definitions, etc.) do not
 need a companion `.md`.
@@ -92,12 +92,11 @@ separator). The parent `<module>.md` then has a short summary section
 for that function plus a relative link to the dedicated file.
 
 Examples:
-- `installer/lib/tier_storage.md` — module overview + invariants +
-  state map; brief summaries for each entry-point with relative links
-  to the detail docs below.
-- `installer/lib/tier_storage__migrate_scratch_into_garage.md` —
-  full deep-dive on that one function.
-- `installer/lib/tier_storage__drbd_remove_peer.md` — same.
+- `installer/lib/cluster_arbiter.md` — module overview + invariants
+  + entry points; brief summaries with relative links to detail
+  docs below.
+- `installer/lib/cluster_arbiter__promote_to_arbiter_host.md` —
+  full deep-dive on that one function (when one is needed).
 
 This keeps `<module>.md` skimmable as a top-level reference while the
 deep-dive docs stay focused. Cross-reference via relative links so
@@ -189,8 +188,10 @@ The `.md` and the code comments are aimed at different reading modes
 
 ## Good current examples to copy from
 
-- [`installer/lib/tier_storage.md`](../installer/lib/tier_storage.md)
-  — full template covering all seven sections.
+- [`installer/lib/cluster_arbiter.md`](../installer/lib/cluster_arbiter.md)
+  — module overview + invariants + entry points.
+- [`installer/lib/witness.md`](../installer/lib/witness.md) —
+  module purpose + constants + per-function summaries.
 
 ## Modules currently lacking companion `.md` (queue)
 

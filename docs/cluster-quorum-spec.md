@@ -34,7 +34,7 @@ Plaintext fields (msgpack):
 `marker` is the "single most relevant state fingerprint" for what the slot guards. Today only the arbiter slot is exercised; its marker is the tier-critical DRBD `current-uuid`. The witness doesn't interpret marker bytes; readers do.
 
 ## Wire protocol (envelope)
-UDP/9501 (echo) or atomic file write `slot-<NN>.bin` (fileshare). Either way:
+UDP/12321 (echo) or atomic file write `slot-<NN>.bin` (fileshare). Either way:
 
 ```
 b"BREC"                                # 4-byte magic, lets receivers drop garbage cheaply
@@ -162,7 +162,7 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 ## Backends
 | backend | mechanism | persistence | notes |
 |---|---|---|---|
-| `bedrock-echo` (UDP/9501) | ESP32 firmware or Python stub. AEAD-encrypted packets, slot map kept in memory + flushed to flash on every accepted write. | Required in production. Testbed stub may be RAM-only. | Failure mode: LAN flap → all slots stale → cluster halts safely. |
+| `bedrock-echo` (UDP/12321) | ESP32 firmware or Python stub. AEAD-encrypted packets, slot map kept in memory + flushed to flash on every accepted write. | Required in production. Testbed stub may be RAM-only. | Failure mode: LAN flap → all slots stale → cluster halts safely. |
 | fileshare (SMB / NFS / S3) | One file per slot, `slot-<NN>.bin`. Atomic `tmp + rename` per write. Same payload, same envelope, no UDP framing. | The fileshare itself. | Failure mode: network flap → same. Latency tolerance: writes must land in < 1 s. |
 | multi-witness quorum | Send each write to all N configured witnesses. A read returns the slot only if a majority of witnesses agree. | Each backend's own. | Post-v1.0. Wire protocol already permits multiple endpoints in `WitnessState.discovered`. |
 
@@ -195,7 +195,7 @@ Files affected (all four):
 - `testbed/bedrock_echo_stub.py` — strip all claim/blessed logic. Becomes a pure encrypted K/V slot server. Roughly half the line count.
 
 ## Out of scope (today)
-- Multi-witness quorum reads + writes (D-17 in `post-alpha-rewrite-notes.md`; planned post-v1.0).
+- Multi-witness quorum reads + writes (planned post-v1.0; wire protocol already permits multiple endpoints in `WitnessState.discovered`).
 - Automated DRBD-divergence recovery. Step 3 surfaces; operator runs `drbdadm invalidate` manually.
 - Per-node sub-keys. The cluster_key is the auth boundary; within-cluster impersonation is not in the threat model.
 - Slot history / audit log on the witness. The witness keeps the latest write only; cluster nodes' bedrock-d logs are the audit trail.

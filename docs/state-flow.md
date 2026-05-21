@@ -260,12 +260,16 @@ seconds:
    - `ip addr add 100.X.Y.254/32 dev lo`
    - Start `bedrock-rqlited-arbiter`
    - `seaweedfs.promote_to_filer_host()` — starts filer + s3
-6. New master reads its tier-critical DRBD current-UUID via
-   `drbdadm dump-md` and calls `witness.send_claim(uuid)` —
-   publishes the master + DRBD-UUID to any BedRock Echo on the LAN.
-7. Witness records `blessed_master = new_master, blessed_drbd_uuid
-   = <uuid>, blessed_at_ms = now` and includes that in every reply
-   for the holddown window (15 s).
+6. The new master reads its tier-critical DRBD current-UUID via
+   `drbdadm dump-md` and updates its own witness slot —
+   `witness.set_own_slot(marker=uuid, tag=TAG_LMS iff alone)`.
+   The next `heartbeat_all` packet publishes the AEAD-sealed slot
+   to the LAN's bedrock-echo, which stores it verbatim.
+7. The witness has NO concept of "blessed master" — each node owns
+   one slot and writes only its own. Other nodes verify
+   `slot[M].marker == drbdadm current-uuid` locally before any
+   takeover attempt. See `docs/cluster-quorum-spec.md` for the
+   protocol.
 
 **End state during isolation:** the isolated old master holds none
 of the singletons; the new master serves filer/s3 at .254. From
@@ -284,10 +288,13 @@ normally.
    master is alive → outcome = `Follower`. `should_set_mgmt_master
    = False`. `demoted_in_cycle` resets so the next NoQuorum event
    can act.
-4. Witness still holds the blessing for the new master. Within the
-   15 s holddown window any attempt to flip back gets refused —
-   the election outcome on the old master defers if it sees a
-   different `witness_blessed_master`.
+4. The witness still holds the new master's slot (fresh
+   ts_writer, `tag.lms` if applicable, current DRBD-UUID marker).
+   If the old master tried to take over, it would inspect the new
+   master's slot, see it's fresh (not stale ≥ 15 s) and either
+   `tag.lms == 1` (legitimate solo) or the master is mesh-reachable
+   anyway → step 2 of takeover refuses. Old master stays Follower
+   per `cluster-quorum-spec.md` Scenario B.
 5. The old master's per-node rqlite re-joins Raft (already a Voter,
    just catches up the log).
 6. `orchestrator.fence_responder` waits for `_wait_for_role` to

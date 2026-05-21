@@ -34,21 +34,26 @@ a thin orchestrator on top.
 │   │                              shipped in v1.0 but may return in v1.1+)
 │   ├── bedrock                 ← the operator CLI
 │   └── mgmt.tar.gz             ← packaged dashboard (FastAPI + Svelte build)
-├── mgmt/                       ← the dashboard service
-│   ├── app.py                  ← FastAPI backend (REST + WebSocket)
-│   ├── orchestrator.py         ← cluster reactor: log subscriber, fence
+├── mgmt/                       ← dashboard service (runs in bedrock-d)
+│   ├── app.py                  ← FastAPI backend (REST + WebSocket) on :8443
+│   ├── orchestrator.py         ← calm reactor: rqlite subscriber, fence
 │   │                              responder, boot orchestrator, target reconcile
 │   ├── backup.py               ← Kopia orchestration (LV snapshot + dd | kopia)
 │   ├── tasks.py                ← in-process task registry for long ops
 │   ├── ui/                     ← Svelte 5 frontend (build/ is shipped)
 │   └── novnc/                  ← bundled noVNC for in-browser console
-├── rust/bedrock-rust/          ← realtime cluster-protocol daemon (election,
-│                                 fence, replicated log; written in Rust for
-│                                 sub-second timing)
 ├── testbed/                    ← nested-KVM lab harness (spawn 1–4 sim nodes,
 │                                 install repo HTTP server, e2e test)
-└── dev-witness/                ← witness daemon for the dev box during testing
+└── dev-witness/                ← legacy dev-witness; today's witness is the
+                                  passive UDP/12321 echo (see
+                                  docs/cluster-quorum-spec.md)
 ```
+
+> **Note**: there is no separate `rust/bedrock-rust/` directory in
+> the current tree. The May-2026 rewrite unified the realtime
+> netd, mgmt, and orchestrator components into a single
+> `bedrock-d` Python process. See
+> [`docs/daemon-unification.md`](docs/daemon-unification.md).
 
 ## How the pieces connect at runtime
 
@@ -57,33 +62,39 @@ a thin orchestrator on top.
             │                                │
             ▼                                ▼
     ┌───────────────┐               ┌───────────────┐
-    │  /backups,    │  HTTP/WS      │  bedrock      │
+    │  /backups,    │  HTTPS/WS     │  bedrock      │
     │  /vm/<name>,  │ ────────────▶ │  init / vm /  │
-    │  /vms/new …   │               │  backup …     │
+    │  /vms/new …   │  :8443        │  backup …     │
     └───────────────┘               └───────────────┘
                        \           /
                         ▼         ▼
-                   ┌─────────────────┐    on every node
-                   │ bedrock-mgmt    │    (FastAPI :8080)
-                   │ (mgmt/app.py)   │
-                   │  ┌───────────┐  │
-                   │  │orchestrat.│  │ ── reactor reacts to
-                   │  └───────────┘  │     each cluster-log entry
-                   │  ┌───────────┐  │
-                   │  │  backup   │  │ ── kopia + LV snapshots
-                   │  └───────────┘  │
-                   └─────┬───────────┘
-                         │ Unix socket /run/bedrock-rust.sock
-                         ▼
-                   ┌─────────────────┐
-                   │ bedrock-rust    │ ── replicated log, election,
-                   │ (Rust daemon)   │     fence marker. Sub-second.
-                   └─────┬───────────┘
-                         │ TCP :8200 between peers
-                         ▼
+                  ┌──────────────────────┐   on every node
+                  │   bedrock-d          │   (single Python process)
+                  │  ┌────────────────┐  │
+                  │  │ mgmt FastAPI   │  │ ── :8443 HTTPS (bound to .254
+                  │  │ (mgmt/app.py)  │  │     on the arbiter-host)
+                  │  └────────────────┘  │
+                  │  ┌────────────────┐  │
+                  │  │ orchestrator   │  │ ── calm loop: rqlite-driven
+                  │  │ (calm loop)    │  │     reconcile, capacity, placement
+                  │  └────────────────┘  │
+                  │  ┌────────────────┐  │
+                  │  │ netd thread    │  │ ── critical loop: mesh probes,
+                  │  │ (1 Hz)         │  │     election, witness, takeover
+                  │  └────────────────┘  │
+                  └─────┬────────────────┘
+                        │
+                        ▼
+                  ┌─────────────────────┐
+                  │ rqlite (state) +    │ ── cluster state on tier-critical
+                  │ bedrock-echo        │     DRBD; witness on UDP/12321
+                  │ (witness, passive)  │     (passive AEAD K/V slot store)
+                  └─────┬───────────────┘
+                        ▼
                   ┌──────────────────┐
                   │ libvirtd, DRBD,  │ ── unchanged stock pieces
                   │ qemu-kvm, LVM,   │
+                  │ SeaweedFS,       │
                   │ kopia (backup)   │
                   └──────────────────┘
 ```

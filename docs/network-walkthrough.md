@@ -674,9 +674,8 @@ Say B is power-cycled. From A's point of view:
     `adv_table[B]` entry is considered stale and falls out of
     `best_transit_paths`. So nothing tries to route via B for
     other peers either.
-  * The cluster log eventually records B as down via the
-    bedrock-rust witness mechanism (different system, see
-    `03-witness-and-orchestrator.md`).
+  * The cluster eventually records B as down via the witness
+    mechanism (different system, see `cluster-quorum-spec.md`).
 
 The whole thing self-heals, no operator intervention required.
 

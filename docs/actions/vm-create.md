@@ -149,10 +149,10 @@ The dashboard's state push picks this up in ≤ 3 s.
   T+3s   _next_drbd_minor(home_host)   # picks first unused 1000..1899
          │   port = 7000 + minor                # config uses 7000+minor
          │
-         │ generate DRBD 2-way resource (meta-disk is internal in the CLI
-         │ create path; the convert path uses external meta — see
-         │ docs/components/drbd.md). With --max-peers=7 at create-md you
-         │ can later grow the same resource to ViPet without wipe-md.
+         │ generate DRBD 2-way resource. v1.0 design uses external meta
+         │ on a per-resource thin LV (`bedrock-meta-vm-NAME-diskN`) — see
+         │ docs/storage-architecture.md. With --max-peers=7 at create-md
+         │ you can later grow the same resource to ViPet without wipe-md.
          │
          │ for h in (home, peer):
          │   ssh h: cat > /etc/drbd.d/vm-NAME-disk0.res

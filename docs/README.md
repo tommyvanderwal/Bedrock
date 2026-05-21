@@ -16,13 +16,28 @@ This documentation exists so any engineer picking up the project can answer:
 
 ## Start here
 
+- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) —
+  **authoritative spec for the witness + arbiter takeover
+  protocol.** Passive K/V slot store, AEAD on UDP 12321, weighted
+  vote, exact-UUID-match takeover. Replaces all earlier
+  witness/bless/holddown writing.
+- [`storage-architecture.md`](storage-architecture.md) —
+  **authoritative spec for the storage stack:** one thinpool per
+  node, per-resource thin meta LV per DRBD instance, cluster-
+  singleton DRBD capped at 3 peers, SeaweedFS topology (filer on
+  `.254`, master Raft-3 on regular nodes, volume + S3 on every
+  node), three SeaweedFS collections, calm-vs-critical loop split.
+- [`sagas/README.md`](sagas/README.md) — **index of every
+  long-running cluster operation as a saga.** Per-saga docs list
+  inputs / outputs / step-by-step contents / revert behaviour /
+  idempotency guarantees. Read here first when adding a new
+  cluster operation — the saga pattern + step-doc template are
+  load-bearing for crash-safety.
 - [`state-flow.md`](state-flow.md) — **what each node does in each
   cluster state, what triggers transitions, and what failure modes
   look like.** Covers N=1 init → join → critical-tier promote →
   healthy N≥2 → isolation+failover → master rejoin → 2-node HA →
   scale-down → boot recovery, plus a what-can-go-wrong matrix.
-  ~20 minutes to read; the single best place to start after the
-  May-2026 Rust-removal rewrite.
 - [`architecture.md`](architecture.md) — the whole stack on one page, with a
   component map, port list, and data-flow diagram.
 - [`network-walkthrough.md`](network-walkthrough.md) — a friendly,
@@ -81,49 +96,55 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 
 ## Components (what each service does)
 
-| Component | Port | Doc |
-|---|---|---|
-| mgmt dashboard (FastAPI + Svelte) | 8080 | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
-| **rqlite (cluster-state store)** | 4001 HTTP / 4002 Raft | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
-| **rqlite-arbiter (3rd voter, follows mgmt master)** | same ports on `100.X.Y.254/32` | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
-| **SeaweedFS master + volume + filer + s3** | 9333 / 8080 / 8888 / 8333 | [`components/storage-tiers.md`](components/storage-tiers.md) |
-| VictoriaMetrics | 8428 | [`components/metrics.md`](components/metrics.md) |
-| VictoriaLogs | 9428 (syslog 5140) | [`components/metrics.md`](components/metrics.md) |
-| node_exporter + vm_exporter | 9100 / 9177 | [`components/exporters.md`](components/exporters.md) |
-| DRBD | kernel + port 7000+minor | [`components/drbd.md`](components/drbd.md) |
-| bedrock-net (mesh discovery + routing) | UDP 7732 (discovery) + ICMP echo (latency) + UDP 7733 (advertisement) | [`06-mesh-network.md`](06-mesh-network.md) |
-| bedrock-rust (witness + fence + peer heartbeat — POST-REWRITE) | TCP 8200 peer | [`03-witness-and-orchestrator.md`](03-witness-and-orchestrator.md) |
-| Cockpit | 9090 | —  (upstream docs) |
+| Component | Port | Bind | Doc |
+|---|---|---|---|
+| mgmt dashboard (FastAPI + Svelte) | 8443 HTTPS | `.254` (singleton) | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
+| **rqlite (per-node)** | 4001 HTTP + Raft | node loopback | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **rqlite-arbiter (3rd voter)** | 4011 HTTP + Raft | `.254` (singleton) | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **SeaweedFS master** | 9333 | node loopback (Raft-3 nodes only) | [`storage-architecture.md`](storage-architecture.md) |
+| **SeaweedFS volume** | 8080 | `0.0.0.0` (every node) | [`storage-architecture.md`](storage-architecture.md) |
+| **SeaweedFS filer** | 8888 | `.254` (singleton; DRBD-backed) | [`storage-architecture.md`](storage-architecture.md) |
+| **SeaweedFS s3** | 8333 | `0.0.0.0` (every node) | [`storage-architecture.md`](storage-architecture.md) |
+| **bedrock-echo (witness)** | UDP 12321 | LAN appliance | [`cluster-quorum-spec.md`](cluster-quorum-spec.md) |
+| VictoriaMetrics | 8428 | node loopback | [`components/metrics.md`](components/metrics.md) |
+| VictoriaLogs | 9428 (syslog 5140) | node loopback | [`components/metrics.md`](components/metrics.md) |
+| node_exporter + vm_exporter | 9100 / 9177 | node loopback | [`components/exporters.md`](components/exporters.md) |
+| DRBD | kernel + per-link port | per-NIC IP | [`storage-architecture.md`](storage-architecture.md) + [`05-drbd-internals.md`](05-drbd-internals.md) |
+| bedrock-net (mesh) | UDP 7732 mcast + ICMP + UDP 7733 | per-NIC | [`06-mesh-network.md`](06-mesh-network.md) |
+| **bedrock-d (unified daemon)** | — | — | [`daemon-unification.md`](daemon-unification.md) |
+| Cockpit | 9090 | node | —  (upstream docs) |
 
-> **Post-0.8-alpha rewrite (2026-05-18)**: cluster state lives in
-> **rqlite**; the bedrock-rust hash-chained log is gone. S3 storage
-> uses **SeaweedFS** (Garage + RustFS retired). See
-> [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md) for
-> the full design rationale (D-01..D-22).
+> **Post-alpha state (2026-05+)**: cluster state lives in
+> **rqlite**; the bedrock-rust hash-chained log is gone. Witness is
+> a passive AEAD K/V slot store on UDP 12321 (see
+> [`cluster-quorum-spec.md`](cluster-quorum-spec.md)). S3 storage
+> uses **SeaweedFS** (Garage + RustFS retired); see
+> [`storage-architecture.md`](storage-architecture.md). The
+> per-component daemons (netd, mgmtd, orchd) are unified into a
+> single `bedrock-d` Python process.
+> Design rationale for those choices (D-01..D-22) lived in
+> `post-alpha-rewrite-notes.md`; it has since been retired (git
+> history retains it).
 
 ---
 
 ## Deep dives (design-level internals)
 
-Older design documents that predate the operational docs above and cover
-the internals in more detail:
-
-- [`01-storage-stack.md`](01-storage-stack.md) — physical-to-virtual mapping
-  of how a VM's disk reaches the guest kernel.
-- [`02-drbd-replication.md`](02-drbd-replication.md) — network topology and
-  DRBD wire protocol.
-- [`03-witness-and-orchestrator.md`](03-witness-and-orchestrator.md) — the
-  failover orchestrator design and 2-of-3 quorum logic.
-- [`04-boot-recovery-gaps.md`](04-boot-recovery-gaps.md) — known gaps in
-  auto-recovery on cold boot.
-- [`05-drbd-internals.md`](05-drbd-internals.md) — activity log, bitmap,
-  and how DRBD stays fast + crash-safe.
-- [`06-mesh-network.md`](06-mesh-network.md) — bedrock-net daemon,
-  per-NIC link-local addressing, kernel routing, DRBD multi-path
-  integration, cross-segment collision handling.
+- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) — witness +
+  arbiter takeover protocol.
+- [`storage-architecture.md`](storage-architecture.md) — on-disk
+  layout, DRBD topology, SeaweedFS deployment.
+- [`05-drbd-internals.md`](05-drbd-internals.md) — DRBD activity
+  log, bitmap, how DRBD stays fast + crash-safe (pure DRBD primer
+  — backend-agnostic).
+- [`06-mesh-network.md`](06-mesh-network.md) — bedrock-net mesh
+  daemon, per-NIC link-local addressing, kernel routing, DRBD
+  multi-path integration.
 - [`mesh-network-v1-uncertainties.md`](mesh-network-v1-uncertainties.md) —
-  honest list of what's tested, what isn't, and what's known-to-be-fragile
-  in the mesh layer.
+  honest list of what's tested, what isn't, and what's
+  known-to-be-fragile in the mesh layer.
+- [`daemon-unification.md`](daemon-unification.md) — design and
+  rationale for the single-`bedrock-d` Python process.
 
 ## Conventions used in these docs
 

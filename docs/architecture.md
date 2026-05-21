@@ -1,12 +1,34 @@
 # Architecture
 
+> **⚠ Sections of this doc are out of date.** Specifically, the
+> witness model described here (HTTPS on 9443, HMAC, active
+> blessing) and the `bedrock-rust` references are superseded.
+> Current authoritative sources:
+> - **Witness + arbiter takeover:**
+>   [`cluster-quorum-spec.md`](cluster-quorum-spec.md) (passive
+>   AEAD K/V slot store on UDP/12321; exact-UUID takeover gate).
+> - **Storage stack:**
+>   [`storage-architecture.md`](storage-architecture.md)
+>   (three thinpools, per-resource thin meta LV, SeaweedFS
+>   topology, three collections).
+> - **Daemon unification:**
+>   [`daemon-unification.md`](daemon-unification.md) (single
+>   `bedrock-d` Python process; no separate bedrock-rust /
+>   bedrock-netd / bedrock-mgmtd / bedrock-orchd).
+>
+> The system layout, ports, and data-flow sections below are
+> still useful as a high-level orientation; trust the linked docs
+> for the load-bearing details.
+
 Bedrock runs on every node. There is no external control plane; each node is
 self-sufficient and can become the management node in a pinch. A node has
 three roles, which can overlap:
 
 - **compute** — runs VMs (KVM + DRBD)
 - **mgmt** — runs the dashboard, metrics, logs, and cluster state
-- **witness** — ties 2-node clusters (optional; MikroTik container today)
+- **witness** — passive K/V slot store (bedrock-echo on ESP32 or
+  a tiny container on a MikroTik); UDP/12321, AEAD-encrypted. See
+  [`cluster-quorum-spec.md`](cluster-quorum-spec.md).
 
 A 3-node cluster typically looks like this:
 
@@ -99,8 +121,10 @@ cattle:                 pet (2-way):                  ViPet (3-way):
 ```
 
 **P** = DRBD Primary (VM runs here), **S** = Secondary.
-`meta LV` is a ~4 MB thin LV holding DRBD external metadata — see the
-[DRBD conversion lessons](../installer/../docs/components/drbd.md).
+`meta LV` is a per-resource thin LV holding DRBD external metadata,
+sized to the data volume + `max-peers=7`. See
+[`storage-architecture.md`](storage-architecture.md) for the
+LV-pair layout and growth semantics.
 
 ## Control plane — how state flows
 
@@ -149,10 +173,11 @@ orchestration targets that observe rqlite changes via the
 `rqlite_subscriber` task and converge their local state accordingly.
 
 The earlier "bedrock-rust hash-chained log" model was retired in the
-post-0.8-alpha rewrite (see [`post-alpha-rewrite-notes.md`](post-alpha-rewrite-notes.md)
-D-01..D-22). bedrock-rust now scopes to witness arbitration +
-self-fence + peer-liveness heartbeat + status IPC only; it no
-longer carries a log or replicates state.
+post-0.8-alpha rewrite. bedrock-rust itself was subsequently
+removed; its responsibilities (election, witness IO, self-fence)
+moved into the netd thread inside `bedrock-d`. See
+[`daemon-unification.md`](daemon-unification.md) and
+[`cluster-quorum-spec.md`](cluster-quorum-spec.md).
 
 ## Components in one paragraph each
 
@@ -187,7 +212,7 @@ Block-level replication. Bedrock provisions resources with **external**
 meta-disks (so `/dev/drbdN` matches the data LV size byte-for-byte) and
 `--max-peers=7` (so peers can be added later without re-creating metadata).
 Resources are named `vm-<name>-disk0`. Minor numbers start at 1000.
-Ports = `7000 + minor`. See [`components/drbd.md`](components/drbd.md).
+Ports = `7000 + minor`. See [`storage-architecture.md`](storage-architecture.md).
 
 ### bedrock CLI (`installer/bedrock`)
 

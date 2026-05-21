@@ -264,10 +264,8 @@ diagnose config-vs-kernel divergence (the core L3/L4 issue) you need
 `drbdadm dump <res>` (parsed config view) or just the raw `.res` file.
 The mismatch in node-ids was invisible until I ran `drbdsetup show`.
 
-**What we changed:** added a "kernel state debug" recipe to
-`tier_storage.md`'s troubleshooting section. Operators chasing weird
-DRBD adjust errors should `drbdsetup show <res>` first to ground the
-investigation.
+**What we changed:** operators chasing weird DRBD adjust errors
+should `drbdsetup show <res>` first to ground the investigation.
 
 ---
 
@@ -279,8 +277,9 @@ edit historical entries — they're a record of what we knew when. If a
 later finding supersedes an earlier one, write a new entry that
 references it.
 
-Per-module specs (`tier_storage.md`, etc.) should be revised in place
-to reflect *current* implementation; this log is the journey.
+Per-module specs (the companion `<module>.md` next to each
+substantial `.py`) should be revised in place to reflect *current*
+implementation; this log is the journey.
 
 ---
 
