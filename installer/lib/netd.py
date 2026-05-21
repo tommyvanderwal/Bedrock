@@ -732,9 +732,42 @@ def ensure_routing_sysctls() -> None:
       path machinery hitting peer.loopback), L4 hashing actually
       distributes traffic across cables. See post-alpha-rewrite-
       notes.md D-15.
+
+    * `net.ipv4.conf.all.arp_ignore=1` — only reply to ARP for an
+      IP if that IP is configured on the RECEIVING interface. The
+      default (0) replies from any NIC, which is fatal for mesh
+      nodes with multiple NICs all carrying `169.254.0.0/16`
+      link-local addresses. Without this, peer A's ARP for "who has
+      169.254.X.Y" on enp3s0 gets replied from peer B's enp3s0,
+      enp4s0, enp5s0 — each reply carries a DIFFERENT MAC, and the
+      asker's neighbour cache fills with wrong-MAC entries pointing
+      to the wrong bridge. Result: traffic sent to peer-loopback
+      exits the wrong physical NIC and is dropped at the wrong
+      bridge. See lesson_mesh_loopback_asymmetric_routes.md.
+
+    * `net.ipv4.conf.all.arp_announce=2` — when sending an ARP
+      request, use the BEST local source address matching the
+      target (preferring an address on the outgoing interface).
+      Pairs with arp_ignore=1 to keep ARP exchanges symmetric per
+      physical wire. ``default`` is set too so newly created NICs
+      pick up the same policy automatically.
     """
     knobs = {
         "/proc/sys/net/ipv4/fib_multipath_hash_policy": "1",
+        "/proc/sys/net/ipv4/conf/all/arp_ignore":      "1",
+        "/proc/sys/net/ipv4/conf/default/arp_ignore":  "1",
+        "/proc/sys/net/ipv4/conf/all/arp_announce":    "2",
+        "/proc/sys/net/ipv4/conf/default/arp_announce":"2",
+        # rp_filter=2 ("loose mode"): accept incoming packets if their
+        # source IP has ANY route on this host, regardless of which NIC
+        # the kernel would have chosen as the outgoing path. The strict
+        # default (1) drops the asymmetric mesh probes that come in on
+        # enp<N> when sim-1's route to that src would have exited a
+        # different enp<M>. ARP itself is unaffected (it's raw-socket
+        # below the routing layer); only L3 traffic (ICMP, UDP, TCP)
+        # depends on this knob. See lesson_mesh_loopback_asymmetric_routes.
+        "/proc/sys/net/ipv4/conf/all/rp_filter":       "2",
+        "/proc/sys/net/ipv4/conf/default/rp_filter":   "2",
     }
     for path, value in knobs.items():
         try:

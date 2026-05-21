@@ -43,7 +43,7 @@ from typing import Iterable, Optional
 
 # Wire constants — kept tiny so an ESP32 firmware can implement this
 # in a few hundred lines.
-WITNESS_PORT = 9501
+WITNESS_PORT = 12321  # canonical bedrock-echo UDP port (github.com/.../bedrock-echo)
 MAGIC = b"BREC"
 NONCE_LEN = 12        # ChaCha20Poly1305 nonce
 WITNESS_FRESHNESS_S = 12.0     # reply-freshness for "witness reachable" vote

@@ -303,13 +303,25 @@ def get_tier_state(tier: str) -> dict:
     return c.get("tiers", {}).get(tier, {"mode": "local", "version": 1})
 
 
-def set_tier_state(tier: str, **kv) -> None:
+def set_tier_state(tier: str, *, write_rqlite: bool = True, **kv) -> None:
+    """Write tier state to local cluster.json and (by default) to rqlite.
+
+    Pass ``write_rqlite=False`` during bootstrap (``bedrock init`` /
+    ``bedrock join``) when rqlite isn't yet up. The init/join saga
+    has a later step that mirrors the local tier state into rqlite
+    AFTER rqlited has reached Leader. Calling this during bootstrap
+    with the default ``write_rqlite=True`` causes a chain of
+    ``ConnectError`` warnings that masked the real failure mode that
+    bit the 0.8-alpha e2e run.
+    """
     c = load_cluster()
     c.setdefault("tiers", {})
     cur = c["tiers"].setdefault(tier, {"mode": "local", "version": 1})
     cur.update(kv)
     cur["version"] = cur.get("version", 0) + 1
     save_cluster(c)
+    if not write_rqlite:
+        return
     # Mirror to rqlite so view_builder sees the change on every node.
     # Master-only per D-20; followers no-op.
     if not _is_mgmt_master():
@@ -324,7 +336,11 @@ def set_tier_state(tier: str, **kv) -> None:
             backend_path=cur.get("backend_path"),
         )
     except Exception as e:
-        print(f"  [state] tier_state write skipped: {e}")
+        # If we get here it's a real bug (network down mid-init or
+        # rqlite-leader-lost). Make it loud but don't crash the
+        # caller — operator gets to see it and decide.
+        print(f"  ERROR: tier_state rqlite-mirror failed for {tier!r}: {e}",
+              flush=True)
 
 
 # ── Atomic symlink swap (POSIX rename) ─────────────────────────────────────
@@ -736,9 +752,17 @@ def umount_quiet(mount: str) -> None:
 
 # ── N=1: local-only setup ──────────────────────────────────────────────────
 
-def setup_n1() -> None:
+def setup_n1(*, write_rqlite: bool = False) -> None:
     """Single-node tier setup. Creates LVs, mounts them, points
     /bedrock/<tier> at the local mount. Idempotent.
+
+    During ``bedrock init`` this is called BEFORE rqlite is up, so
+    ``write_rqlite`` defaults to False. The cluster_init flow has a
+    later step that mirrors the local tier state into rqlite after
+    rqlited reaches Leader (see ``mirror_tier_state_to_rqlite``).
+
+    Called from outside init (e.g. ``bedrock storage init``)
+    should pass ``write_rqlite=True`` — rqlite IS up at that point.
     """
     print("  [tier] Ensuring thin pool...")
     ensure_thinpool()
@@ -761,11 +785,32 @@ def setup_n1() -> None:
         atomic_symlink(str(local_mount), PUBLIC_ROOT / tier)
 
         set_tier_state(tier, mode="local", master=None,
-                       backend_path=str(local_mount))
+                       backend_path=str(local_mount),
+                       write_rqlite=write_rqlite)
 
         print(f"  [tier] {tier:<10} {size:>3}G -> {local_mount}")
 
     print("  [tier] N=1 setup complete: /bedrock/{scratch,bulk,critical} ready")
+
+
+def mirror_tier_state_to_rqlite() -> None:
+    """Push every locally-known tier_state row into rqlite. Called
+    by the cluster_init / node_join saga AFTER rqlited has reached
+    Leader. Idempotent — bedrock_state.tier_state is INSERT OR
+    REPLACE."""
+    c = load_cluster()
+    tiers = c.get("tiers", {}) or {}
+    if not tiers:
+        return
+    from . import bedrock_state as _bs
+    for tier, cur in tiers.items():
+        _bs.tier_state(
+            tier=tier,
+            mode=cur.get("mode", "local"),
+            master=cur.get("master"),
+            peers=cur.get("peers"),
+            backend_path=cur.get("backend_path"),
+        )
 
 
 # ── DRBD resource config ───────────────────────────────────────────────────
@@ -1197,9 +1242,23 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     if run_ok(f"mountpoint -q {local_mount}"):
         run(f"umount {local_mount}")
 
-    # 5. Initialize DRBD metadata + bring up the resource as primary --force
-    run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
+    # 5. Initialize DRBD metadata + bring up the resource as primary
+    #    --force, BUT skip create-md if the resource is already
+    #    configured (idempotent re-run of the saga's
+    #    promote_local_to_drbd step). DRBD9 refuses ``create-md``
+    #    on a configured device even with ``--force`` — exit 20,
+    #    "Device 'N' is configured!". Detect by parsing
+    #    ``drbdadm status`` — anything other than "no resources
+    #    defined!" means the resource exists.
+    rc_chk = subprocess.run(
+        ["drbdadm", "status", f"tier-{tier}"],
+        capture_output=True, text=True,
+    )
+    if rc_chk.returncode != 0 or "no resources" in (rc_chk.stderr or "").lower():
+        run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
     run(f"drbdadm up tier-{tier}")
+    # ``drbdadm primary --force`` is idempotent — it's a no-op if
+    # we're already Primary.
     run(f"drbdadm primary --force tier-{tier}")
 
     # 6. Mount the DRBD device — fresh empty XFS at first promote.
@@ -1724,7 +1783,8 @@ def node_reset_local() -> None:
         "/var/lib/bedrock/local/bulk",
         "/var/lib/bedrock/local/critical",
         "/var/lib/bedrock/seaweedfs",
-        "/mnt/isos",
+        "/mnt/bedrock",
+        "/mnt/isos",  # legacy path; kept in cleanup list during transition
     )
     for mp in mounts:
         if run_ok(f"mountpoint -q {mp}"):
@@ -1744,7 +1804,8 @@ def node_reset_local() -> None:
     # 4. Drop fstab lines for anything bedrock-related.
     fstab = Path("/etc/fstab")
     if fstab.exists():
-        tokens = ("/var/lib/bedrock", "tier-", "/mnt/isos", " /bedrock/")
+        tokens = ("/var/lib/bedrock", "tier-", "/mnt/bedrock",
+                  "/mnt/isos", " /bedrock/")
         new = [l for l in fstab.read_text().splitlines()
                if not any(t in l for t in tokens)]
         fstab.write_text("\n".join(new).rstrip() + "\n")

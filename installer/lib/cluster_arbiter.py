@@ -297,8 +297,10 @@ def promote_to_arbiter_host() -> dict:
     demote_arbiter_host); rqlite is NOT touched — it's the service
     being recovered.
 
-    N=1 mode (no tier-cluster DRBD resource) skips the witness/DRBD
-    parts entirely: filer + s3 on local FS, no .254, no arbiter rqlite.
+    N=1 mode (no tier-cluster DRBD resource): bind .254 + start
+    singletons on local FS. .254 is bound at every N including N=1
+    per docs/storage-architecture.md so client config (filer URL,
+    mgmt URL) is identical from day 1.
 
     Idempotent: safe to call on every role tick. Witness checks are
     no-ops when we're already the master in cluster.json's view.
@@ -310,9 +312,11 @@ def promote_to_arbiter_host() -> dict:
     if not drbd_present:
         # N=1: no DRBD, no witness consult. Simple path.
         log.info("arbiter: promoting (N=%d, no tier-cluster DRBD — "
-                 "running singletons directly on local FS)", n)
+                 "running singletons on local FS, .254 on lo)", n)
         MOUNT_POINT.mkdir(parents=True, exist_ok=True, mode=0o755)
         ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Bind .254 to lo so filer + mgmt URLs work uniformly from N=1.
+        ip = _ip_add()
         try:
             try:
                 from . import seaweedfs
@@ -323,8 +327,8 @@ def promote_to_arbiter_host() -> dict:
             seaweedfs.promote_to_filer_host()
         except Exception as e:
             log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
-        log.info("arbiter: promotion complete (N=1; ip= mount=%s)",
-                 MOUNT_POINT)
+        log.info("arbiter: promotion complete (N=1; ip=%s mount=%s)",
+                 ip, MOUNT_POINT)
         return arbiter_status()
 
     # N>=2 with tier-cluster DRBD. Run the takeover protocol.
@@ -571,9 +575,13 @@ def demote_arbiter_host() -> dict:
         seaweedfs.demote_filer_host()
     except Exception as e:
         log.warning("arbiter: SeaweedFS filer demote failed: %s", e)
+    # Release the .254 VIP at every cluster size. promote_to_arbiter_host
+    # binds it in both the N=1 and the N>=2 paths, so demote must
+    # release it in both too — otherwise a follower with a stale .254
+    # from a previous role briefly answers on the cluster VIP.
+    _ip_del()
     if drbd_present:
         _svc_stop(ARBITER_SVC)
-        _ip_del()
         _umount()
         _drbd_secondary()
     # Per spec: after self-demote, clear our lms bit so a survivor's
@@ -644,23 +652,45 @@ def i_should_host_arbiter() -> bool:
 
 
 def converge() -> dict:
-    """Single-shot converge: if I should host singletons and don't,
-    promote; if I shouldn't and do, demote. Called from the
-    orchestrator's revision-watcher and from boot_orchestrator
-    after role settles.
+    """Single-shot converge: actuate local hosting state to match
+    what the realtime layer (netd's election + witness slot) has
+    decided. If I should host singletons and don't, promote; if I
+    shouldn't and do, demote. Called from the orchestrator's
+    converge_retry tick and from boot_orchestrator after role settles.
 
     "Hosting" at N>=2 means: arbiter rqlite running on .254 + DRBD
-    primary + mount + filer + s3. At N=1 it means: filer + s3 only.
-    Detection looks at the arbiter rqlite service for N>=2 and the
-    filer service for N=1.
+    primary + mount + filer + s3. At N=1 it means: filer + s3 + .254.
+
+    Layering rule (load-bearing — see docs/cluster-quorum-spec.md):
+    converge() NEVER writes to rqlite. Master selection lives in the
+    realtime layer (election → witness slot → cluster.json via
+    netd.set_mgmt_master). cluster_arbiter just actuates whatever the
+    realtime layer has put in cluster.json. The rqlite ``cluster_info``
+    row is a follower of the realtime decision, not the source of it.
+
+    Two flavours of "am I hosting":
+      * ``am_host_complete`` — every singleton is up. Skip promote.
+      * ``am_host_partial`` — any singleton state present. Demote
+        when cluster.json names someone else, even if only .254 is
+        bound (so a follower with leftover state from a prior role
+        is reliably cleaned up).
     """
     should_host = i_should_host_arbiter()
     status = arbiter_status()
     drbd_present = _drbd_resource_exists()
     if drbd_present:
-        am_host = status["service_active"] and status["ip_present"]
+        # Promote-direction: skip the promote ONLY if every singleton
+        # is already up. Any missing piece → re-promote (idempotent).
+        am_host_complete = (status["service_active"]
+                            and status["ip_present"])
+        # Demote-direction: ANY singleton state present → demote needs
+        # to run to clean it up. A stale .254 on a follower (after a
+        # failed promote, or a leftover from a prior role) must be
+        # released even if no other state is up.
+        am_host_partial = (status["service_active"]
+                           or status["ip_present"]
+                           or status["mounted"])
     else:
-        # N=1: am_host = filer is running
         try:
             try:
                 from . import seaweedfs
@@ -668,12 +698,28 @@ def converge() -> dict:
                 import sys
                 sys.path.insert(0, "/usr/local/lib/bedrock")
                 from lib import seaweedfs  # type: ignore
-            am_host = seaweedfs.is_filer_active()
+            filer_active = seaweedfs.is_filer_active()
         except Exception:
-            am_host = False
-    if should_host and not am_host:
+            filer_active = False
+        am_host_complete = filer_active and status["ip_present"]
+        am_host_partial  = filer_active or status["ip_present"]
+    # Two-sided am_host: ``complete`` is the "everything's up" check
+    # used to skip promote; ``partial`` is the "anything's up" check
+    # used to fire demote when our role disagrees with cluster.json.
+    am_host = am_host_complete
+
+    # Note: cluster_arbiter intentionally does NOT write to rqlite.
+    # Master selection is owned by the realtime layer (netd's
+    # election + the witness slot). The rqlite ``cluster_info`` row
+    # is a follower of that decision, written exclusively by netd's
+    # ``set_mgmt_master`` path once it sees a stable LEADER outcome.
+    # converge()'s job is to actuate hosting state (filer, .254,
+    # DRBD primary) based on what the realtime layer has decided
+    # via cluster.json — never the reverse.
+
+    if should_host and not am_host_complete:
         return promote_to_arbiter_host()
-    if not should_host and am_host:
+    if not should_host and am_host_partial:
         return demote_arbiter_host()
     return status
 
