@@ -1465,4 +1465,57 @@ does nothing on AMD. The per-platform code isn't worth the
 complexity for ≤2 Gbps of upside. Bedrock's mesh-link preference
 just needs an honest speed bucket — which is now 15000.
 
-**Reference**: this scenario, commit pending.
+**Source-level RCA (2026-05-22 follow-up):** read the kernel
+source. The 12 Gbps wall is set by a single constant in
+`drivers/thunderbolt/nhi.c::nhi_enable_int_throttling()`:
+
+```c
+/* Throttling is specified in 256ns increments */
+u32 throttle = DIV_ROUND_UP(128 * NSEC_PER_USEC, 256);
+...
+for (i = 0; i < MSIX_MAX_VECS; i++)
+    iowrite32(throttle, nhi->iobase + REG_INT_THROTTLING_RATE + i*4);
+```
+
+**128 µs hardcoded** per MSI-X vector. 1 / 128 µs = 7,812 IRQ/sec.
+With 2 active vectors × 64-packet NAPI default × 1500-byte MTU
+that's 11.99 Gbps — matches the measured 12.0 Gbps wall exactly.
+
+Other source facts:
+- `TBNET_RING_SIZE = 256`, single ring depth RX and TX.
+- NAPI weight is the kernel default 64 (no explicit weight).
+- **Zero AMD-specific code** — `pci_device_id nhi_ids[]` lists
+  only Intel device IDs plus a `PCI_CLASS_SERIAL_USB_USB4`
+  catch-all that AMD Phoenix matches. Same throttle, same ring
+  depth, same NAPI weight on both vendors.
+- Driver defines no `ethtool_ops`, so `ethtool -C` can't tune
+  the throttle and `ethtool -S` reports "no stats available".
+- No multi-queue patches in mainline or net-next.
+
+The "AMD is slower than Intel" community framing turns out to be
+partially wrong. Both vendors are bounded by the same constant
+for a single point-to-point cable. The Intel-25 Gbps reports
+come from aggregate across multiple TB cables in a ring
+topology, or from Intel NHIs activating more MSI-X vectors than
+AMD's 2-vector configuration. Per-pair, both top out near 12
+Gbps from this constant.
+
+The patch to break the ceiling is trivial in code (lower the
+128 to e.g. 32) but requires either:
+  - An in-tree kernel patch + LKML conversation (Mario
+    Limonciello at AMD maintains thunderbolt-net),
+  - A locally-built kernel module override (out of Bedrock's
+    distribution scope), or
+  - The macOS-26.2-style native RDMA-over-Thunderbolt path,
+    which has no Linux counterpart as of kernel 6.18.
+
+Windows reference (sparse): Microsoft's "USB4 Bridge" driver
+on Intel TB4 hits ~15–16 Gbps unidir Mac↔Windows (Brejcha 2024),
+~50% better than Linux on the same Intel hardware, suggesting
+Windows doesn't apply the same throttle constant. No
+Windows-on-AMD-Phoenix iperf3 numbers are published anywhere.
+
+**Reference**: this scenario, commit pending. Source file
+references: `drivers/thunderbolt/nhi.c` (throttle constant) +
+`drivers/net/thunderbolt/main.c` (ring + NAPI setup) +
+`drivers/thunderbolt/nhi_regs.h` (REG_INT_THROTTLING_RATE).
