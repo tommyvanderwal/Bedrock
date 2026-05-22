@@ -1519,3 +1519,141 @@ Windows-on-AMD-Phoenix iperf3 numbers are published anywhere.
 references: `drivers/thunderbolt/nhi.c` (throttle constant) +
 `drivers/net/thunderbolt/main.c` (ring + NAPI setup) +
 `drivers/thunderbolt/nhi_regs.h` (REG_INT_THROTTLING_RATE).
+
+---
+
+**Deeper RCA — the actual Intel/AMD difference (2026-05-22 third pass):**
+
+The "same throttle, different throughput" puzzle resolves at
+`drivers/thunderbolt/nhi.c:1169-1190`:
+
+```c
+static void nhi_check_quirks(struct tb_nhi *nhi) {
+    if (nhi->pdev->vendor == PCI_VENDOR_ID_INTEL) {
+        /* Intel hardware supports auto clear of the interrupt
+         * status register right after interrupt is being issued. */
+        nhi->quirks |= QUIRK_AUTO_CLEAR_INT;
+        ...
+```
+
+**The throttle isn't the binding bottleneck on AMD — `QUIRK_AUTO_CLEAR_INT`
+not being set is.**
+
+- **Intel path** (quirk set): the NHI auto-clears the interrupt
+  status bit at IRQ assert. The controller can re-arm immediately
+  and coalesce more completions during the NAPI drain window.
+  Result on TB4: ~400 IRQ/sec, ~10,000 packets per IRQ, ~25 Gbps.
+- **AMD path** (quirk NOT set — vendor-ID-gated): the driver
+  must manually MMIO-write to `REG_RING_INT_CLEAR` in the hard-IRQ
+  handler (`nhi.c:448-460`) *before* NAPI runs. Until that
+  uncached MMIO write retires, the controller can't re-arm. Any
+  completions arriving during the NAPI window get coalesced into
+  the *next* IRQ. The IRQ rate climbs until it hits the 128 µs
+  throttle ceiling. Result: ~7,600 IRQ/sec, ~66 packets per IRQ,
+  ~12 Gbps.
+
+The kernel comment at `nhi.c:112-115` explains *why* AMD's path
+disables auto-clear:
+
+> *"Other routers explicitly disable auto-clear to prevent
+> conditions that may occur where two MSIX interrupts are
+> simultaneously active and reading the register clears both
+> of them."*
+
+So AMD's NHI has a documented hardware race condition with
+auto-clear of MSI-X status registers. Mario Limonciello (AMD's
+USB4 kernel maintainer) wrote the conservative fallback path in
+commit `468c49f44759` ("thunderbolt: Disable interrupt auto
+clear for rings") to avoid the race. The cost is the per-IRQ
+batch starvation we measure.
+
+**The per-descriptor flag is set unconditionally**, at
+`nhi.c:251`:
+
+```c
+descriptor->flags = RING_DESC_POSTED | RING_DESC_INTERRUPT;
+```
+
+So the silicon is asked to interrupt on every completed frame.
+On Intel the auto-clear lets the controller coalesce anyway. On
+AMD it can't.
+
+**Proof the AMD silicon CAN batch more**: same Pink Sardine
+controller carrying tunneled PCIe traffic (NVMe-over-TB) hits
+25-30 Gbps. That path uses the NVMe controller's own MSI-X
+policy and bypasses the NHI ring entirely. So the silicon DMA
+fabric isn't the limit — only the NHI ring's manual-clear
+protocol is.
+
+**Trivial-looking experiments that would move AMD's wall** (none
+attempted yet; not Bedrock scope but logged for the curious):
+
+1. **3-line change**: set `RING_DESC_INTERRUPT` only on every Nth
+   descriptor (e.g. every 64th) in `nhi.c:251`. The hardware
+   stops asserting IRQ on every frame; it batches at descriptor
+   granularity. Safe: the 128 µs throttle still bounds worst-case
+   latency. Predicted: AMD goes from 12 → ~25 Gbps (hitting the
+   single-softirq-core wall Intel hits today).
+2. **Risky**: enable `QUIRK_AUTO_CLEAR_INT` for AMD Pink Sardine
+   and benchmark. Could expose the dual-MSI-X-clear race the
+   conservative path was written to avoid. Worth scoping with
+   Mario Limonciello.
+
+**Hardware-buying corollary** — for boxes that should beat the
+12 Gbps wall today without kernel hacking, use platforms with
+**discrete Intel TB controllers**, regardless of host CPU vendor:
+
+| Host CPU | Discrete TB chip | Predicted thunderbolt-net |
+|---|---|---|
+| Ryzen 7640HS (integrated AMD USB4) | none | ~12 Gbps (observed) |
+| Ryzen 7800X3D on ASUS ProArt X670E | Intel JHL8540 Maple Ridge | ~20-25 Gbps |
+| Ryzen AI Max 395 on Minisforum MS-S1 Max | Intel JHL9580 Barlow Ridge (TB5) | ~25-40 Gbps (untested) |
+| Any Intel Core Ultra | integrated/discrete Intel | ~25 Gbps (TB4), more on TB5 |
+
+The `QUIRK_AUTO_CLEAR_INT` gate is by vendor ID of the NHI PCI
+device — not by the host CPU. AMD CPU + discrete Intel TB chip
+= Intel quirk path enabled. The PCI vendor of the controller is
+what matters.
+
+**Multi-queue extension (logged for completeness):**
+
+The driver currently allocates **1 RX ring, 1 TX ring, 2 active
+MSI-X vectors, 1 NAPI instance** per `thunderbolt-net` device.
+The NHI hardware supports up to 12 hops per direction and the
+driver requests 6-16 MSI-X vectors via `pci_alloc_irq_vectors`.
+Infrastructure exists; the driver just doesn't use it.
+
+A multi-queue rewrite (e.g. 4 RX rings + 4 TX rings + 8 MSI-X
+vectors + 4 NAPI instances) would spread softirq work across 4
+CPUs. Predicted ceilings:
+
+- **AMD Phoenix integrated USB4**: 4 × ~12 Gbps single-queue cap
+  = ~48 Gbps theoretical, bounded by the TB3/TB4 wire at 40 Gbps.
+  Real-world ~30+ Gbps likely.
+- **Intel TB4 + multi-queue**: 4 × ~25 Gbps = ~100 Gbps
+  theoretical, bounded by wire at 40 Gbps. Real-world wire-rate.
+- **Intel TB5 (Barlow Ridge) + multi-queue**: 4 × ~25 Gbps
+  bounded by wire at 80 Gbps. Real-world ~60+ Gbps likely.
+
+Caveats:
+- A **single TCP flow** can only use one RX queue (in-order
+  delivery requirement). Multi-queue helps **aggregate**
+  throughput across multiple concurrent flows. For Bedrock
+  that's still useful: DRBD per-resource, SeaweedFS volume
+  sync, mgmt traffic, witness heartbeats — many flows.
+- The Thunderbolt protocol has the concept of "hops" — virtual
+  channels between endpoints. Each NHI ring corresponds to a
+  hop. Negotiating 4 RX hops + 4 TX hops with the peer is a
+  protocol-level change, not just a driver-internal one.
+- Rewrite is **substantial**, not a 3-line change. New flow
+  steering, NAPI multiplexing, hop negotiation. A real upstream
+  contribution, weeks of work.
+
+So Tommy's multi-queue arithmetic is correct in principle. The
+3-line descriptor-coalescing patch above is the cheap path to
+unlock the AMD-specific gap (12→25 Gbps). The multi-queue rewrite
+is the only path to wire rate, applies to both vendors, and is
+a much bigger upstream conversation.
+
+Captured as a future upstream contribution; not a Bedrock v1.0
+deliverable.
