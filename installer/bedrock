@@ -89,7 +89,8 @@ def cmd_bootstrap(args):
     print()
     print("Bootstrap complete. Next steps:")
     print("  bedrock init             — start a new cluster")
-    print("  bedrock join [--witness HOST]  — join existing cluster")
+    print("  bedrock join             — join existing cluster (mDNS-discovers; "
+          "or pass an IP positionally)")
     print()
 
 
@@ -174,19 +175,24 @@ def cmd_join(args):
 
     print("\n=== Bedrock Join (existing cluster) ===\n")
 
-    witness = args.witness
-    if not witness:
+    # The "node to dial" is any current cluster member. The operator
+    # can pass it as a positional arg (`bedrock join 192.168.2.141`),
+    # otherwise we discover candidates via mDNS on the LAN and either
+    # auto-pick (`--yes`) or present a numbered menu.
+    node_ip = args.node_ip
+    if not node_ip:
         print("Discovering Bedrock clusters on the LAN (mDNS)...")
         candidates = discovery.discover_clusters(timeout=2.5)
         if not candidates:
             print("No clusters answered mDNS. Falling back to subnet scan...")
             found = discovery.find_witness()
             if not found:
-                print("No cluster found. Use --witness <ip|host> to "
-                      "specify manually.")
+                print("No cluster found. Re-run as "
+                      "`bedrock join <ip-of-a-cluster-node>` if mDNS "
+                      "is blocked on this LAN.")
                 return 1
-            witness = found
-            print(f"Found via fallback: {witness}")
+            node_ip = found
+            print(f"Found via fallback: {node_ip}")
         elif args.yes:
             # Auto-pick: prefer the first TCP-reachable candidate on
             # :8443. Lets a USB4-only join fall through to the
@@ -198,7 +204,7 @@ def cmd_join(args):
                 for c in candidates:
                     print(f"  {c.label()}")
                 return 1
-            witness = picked.ip
+            node_ip = picked.ip
             print(f"Found: {picked.label()}")
         else:
             print(f"Found {len(candidates)} cluster(s):")
@@ -207,21 +213,21 @@ def cmd_join(args):
             print("  [m] enter IP / hostname manually")
             sel = input(f"Pick [1-{len(candidates)}/m]: ").strip().lower()
             if sel == "m":
-                witness = input("IP or hostname: ").strip()
-                if not witness:
+                node_ip = input("IP or hostname: ").strip()
+                if not node_ip:
                     print("No IP given; aborting.")
                     return 1
             else:
                 try:
                     idx = int(sel) - 1
-                    witness = candidates[idx].ip
+                    node_ip = candidates[idx].ip
                 except (ValueError, IndexError):
                     print("Invalid selection; aborting.")
                     return 1
 
-    cluster_info = discovery.query_cluster(witness)
+    cluster_info = discovery.query_cluster(node_ip)
     if not cluster_info:
-        print(f"Cannot get cluster info from {witness}")
+        print(f"Cannot get cluster info from {node_ip}")
         return 1
 
     # Display this-node's identity BEFORE the saga starts so the
@@ -249,7 +255,7 @@ def cmd_join(args):
     print("─── Joining cluster ───────────────────────────────────")
     print(f"  name:           {cluster_info.get('cluster_name', '?')}")
     print(f"  uuid:           {cluster_info.get('cluster_uuid', '?')}")
-    print(f"  master:         {cluster_info.get('mgmt_url') or witness}")
+    print(f"  master:         {cluster_info.get('mgmt_url') or node_ip}")
     print(f"  existing nodes: {len(cluster_info.get('nodes', []))}")
     print()
     print("Approve this fingerprint on the cluster dashboard (or via")
@@ -259,7 +265,11 @@ def cmd_join(args):
         if ans == "n":
             return 0
 
-    agent_install.install(witness=witness, cluster_info=cluster_info, repo=get_repo())
+    # agent_install.install() still names its arg `witness` (legacy);
+    # we pass node_ip into it. Renaming the parameter is a separate
+    # cleanup pass — call sites within agent_install reference it
+    # heavily and the rename has no functional effect.
+    agent_install.install(witness=node_ip, cluster_info=cluster_info, repo=get_repo())
     print("\nJoined. Check status with: bedrock status")
 
 
@@ -923,7 +933,11 @@ def main():
     p_init.set_defaults(func=cmd_init)
 
     p_join = sub.add_parser("join", help="Join an existing cluster")
-    p_join.add_argument("--witness", help="Witness host (auto-discovered if omitted)")
+    p_join.add_argument(
+        "node_ip", nargs="?",
+        help="IP or hostname of a current cluster node (any member, "
+             "not necessarily the master). Auto-discovered via mDNS "
+             "on the LAN if omitted.")
     p_join.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     p_join.set_defaults(func=cmd_join)
 

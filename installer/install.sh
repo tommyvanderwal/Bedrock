@@ -322,9 +322,18 @@ log "Installing prerequisites..."
 # bundled wheel cache via pip (the alternative — putting httpx in dnf —
 # is a no-op at best and on AlmaLinux 10 makes the line return 1 which
 # previously bricked the rqlite_client transport at firstboot).
-dnf install -y -q python3 python3-pip curl >/dev/null 2>&1 || {
-    warn "dnf install python3/pip/curl returned non-zero (already installed?). Continuing."
+dnf install -y -q python3 python3-pip python3-cryptography curl >/dev/null 2>&1 || {
+    warn "dnf install python3/pip/cryptography/curl returned non-zero (already installed?). Continuing."
 }
+# python3-cryptography is the load-bearing one here. Bedrock's
+# peer_auth / join_handshake / witness modules unconditionally import
+# cryptography.*, and historically that package arrived as a
+# transitive dep of libvirt-client-qemu via `bedrock bootstrap`. That
+# dep chain is unreliable across Alma mirror snapshots — when dnf
+# chose a different libvirt-client-* subset the package didn't land,
+# and `bedrock join` died with ModuleNotFoundError before the
+# operator could even read the error. Pin it explicitly here so it's
+# there before any bedrock subcommand needs it.
 # httpx is the rqlite_client.py HTTP transport. Install from the
 # bundled wheel cache (always offline at firstboot). Failure here is
 # fatal — without httpx, the rqlite_client can't reach the cluster
@@ -731,7 +740,9 @@ if /usr/local/bin/bedrock bootstrap; then
   ║                                                                  ║
   ║  Next step:                                                      ║
   ║      bedrock init           — start a new cluster                ║
-  ║      bedrock join HOST      — join an existing one               ║
+  ║      bedrock join           — join an existing cluster           ║
+  ║                                (mDNS-discovers on LAN; pass an   ║
+  ║                                 IP positionally if needed)       ║
   ║                                                                  ║
   ║  Default root password is `bedrock`. Change it now.              ║
   ║                                                                  ║
