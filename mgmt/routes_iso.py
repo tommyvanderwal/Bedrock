@@ -1,10 +1,18 @@
 """ISO library routes (Stage 9 PR #4 of the rewrite).
 
-Three endpoints — list, upload, delete — over the local
-``/opt/bedrock/iso`` tree. The tree itself is the SeaweedFS FUSE
-mount at ``/mnt/bedrock/iso`` on every node (single source of
-truth, cluster-replicated). These routes operate on the local
-view; SeaweedFS handles replication.
+Three endpoints — list, upload, delete — over the cluster-wide
+SeaweedFS FUSE mount at ``/mnt/bedrock/iso``. Writes go through
+the FUSE mount so the filer replicates per the /iso/ collection
+policy (see installer/lib/seaweedfs.py::init_collections).
+Listings on any node show the same files; a delete on any node
+deletes cluster-wide.
+
+Earlier versions wrote to ``/opt/bedrock/iso`` (master-local) and
+relied on a separate symlink or mirror step to surface them under
+``/mnt/bedrock/iso`` where virt-install reads from. That left
+uploads invisible to libvirt and produced "ERROR Validating
+install media" on cattle-VM create. Direct writes to the FUSE
+mount eliminate the second path.
 
 Same dependency-injection pattern as ``routes_console`` —
 ``push_log`` is passed in to avoid a circular import.
@@ -18,10 +26,10 @@ from typing import Callable
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
 
-# This dir lives on every node — SeaweedFS FUSE mounts the filer's
-# /iso/ subtree here. Listings on any node show the same files; a
-# delete on any node deletes cluster-wide.
-ISO_DIR = Path("/opt/bedrock/iso")
+# This dir is the SeaweedFS FUSE mount, identical on every cluster
+# node. Writing here goes through the filer; SeaweedFS handles
+# replication per the /iso/ collection policy.
+ISO_DIR = Path("/mnt/bedrock/iso")
 
 
 def register_routes(app: FastAPI, *, push_log: Callable) -> None:

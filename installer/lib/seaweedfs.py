@@ -142,6 +142,16 @@ def _loopback_octet(ip: str) -> int:
         return 9999
 
 
+def _n_cluster_nodes() -> int:
+    """Number of nodes in cluster.json. Used by init_collections to
+    pick a replication factor that the current cluster can actually
+    satisfy — pinning /iso/ to 001 on an N=1 box bricks ISO uploads.
+    Returns 1 if cluster.json is missing or empty (fresh install)."""
+    cluster = _read_cluster()
+    nodes = cluster.get("nodes") or {}
+    return max(1, len(nodes))
+
+
 def write_master_config() -> None:
     """Render the master.toml — peer list pointing at every other
     node's master grpc, defaultReplication based on cluster size
@@ -620,14 +630,30 @@ def init_collections() -> None:
         return
     master_url = f"{master_set[0]}:{MASTER_PORT}"
 
+    # Replication has to be satisfiable by the current cluster size,
+    # or SeaweedFS hangs writes at volume-assign time (filer retries
+    # "rpc error: code = Canceled" for 30s, then FUSE close returns
+    # I/O error). At N=1 only 000 is satisfiable; N=2 adds 001; N=3+
+    # adds 002. The cluster-default replication in MASTER_TOML
+    # follows the same rule (see _write_master_toml). init_collections
+    # matches it per-prefix so e.g. /iso/ doesn't get pinned to 001
+    # on an N=1 box and brick every ISO upload.
+    n_nodes = _n_cluster_nodes()
+    standard_repl = "000" if n_nodes <= 1 else "001"
+    critical_repl = (
+        "000" if n_nodes <= 1
+        else "001" if n_nodes <= 2
+        else "002"
+    )
+
     commands = [
         # locationPrefix MUST end with a slash for fs.configure to
         # match the directory tree.
         "fs.configure -locationPrefix=/scratch/   -collection=scratch  -replication=000 -apply",
-        "fs.configure -locationPrefix=/iso/       -collection=standard -replication=001 -apply",
-        "fs.configure -locationPrefix=/templates/ -collection=standard -replication=001 -apply",
-        "fs.configure -locationPrefix=/snapshots/ -collection=standard -replication=001 -apply",
-        "fs.configure -locationPrefix=/backups/   -collection=critical -replication=002 -apply",
+        f"fs.configure -locationPrefix=/iso/       -collection=standard -replication={standard_repl} -apply",
+        f"fs.configure -locationPrefix=/templates/ -collection=standard -replication={standard_repl} -apply",
+        f"fs.configure -locationPrefix=/snapshots/ -collection=standard -replication={standard_repl} -apply",
+        f"fs.configure -locationPrefix=/backups/   -collection=critical -replication={critical_repl} -apply",
     ]
     script = "\n".join(commands) + "\n"
     try:

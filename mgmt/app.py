@@ -1734,7 +1734,10 @@ def list_nodes():
 # inventory helpers stay here because the VM creation paths in app.py
 # import them; future PRs will move those too.
 
-ISO_DIR = Path("/opt/bedrock/iso")
+# Cluster-wide SeaweedFS FUSE mount — identical on every node, so
+# `--cdrom {ISO_DIR}/<name>.iso` works from anywhere. See routes_iso.py
+# for the upload path that writes here.
+ISO_DIR = Path("/mnt/bedrock/iso")
 VM_INVENTORY_FILE = Path("/etc/bedrock/vm_inventory.json")
 
 
