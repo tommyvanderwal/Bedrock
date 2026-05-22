@@ -1330,3 +1330,47 @@ underlying RO state isn't obvious from `vgs` / `lvs` alone — only
 `losetup -l` exposes it.
 
 **Reference**: this scenario, no commit.
+
+---
+
+## L40 — Build pipeline must rebuild the Svelte UI, not just tar it
+**Date**: 2026-05-22
+**Files**: `installer/iso-build/build-iso.sh`, `testbed/publish-to-s3.sh`
+**Scenario**: ISO upload returns 405 Method Not Allowed on the dashboard
+
+**What we thought**: `mgmt.tar.gz` packaging was a pure tar operation
+— the mgmt/ source tree is the deliverable. Whoever's working on
+the UI runs `npm run build` themselves when they change a `.svelte`
+or `.ts` file, and the next package picks it up.
+
+**What we found**: that assumption silently rotted. On 2026-05-13
+the Svelte UI was built. On 2026-05-20 commit `f6842c6` renamed
+backend endpoints — including the ISO upload route from
+`/api/isos/upload` to `/api/isos`. `mgmt/ui/src/lib/api.ts` was
+updated to match. **No one ran `npm run build`.** The compiled
+chunk `Cal9XJuY.js` in `mgmt/ui/build/_app/immutable/chunks/`
+stayed 7 days stale, still POSTing to the old `/api/isos/upload`.
+The backend, correctly, returned 405.
+
+Worse, `testbed/publish-to-s3.sh` excludes `mgmt/ui/src/` from the
+tarball (it's only meant to ship the prebuilt bundle). So even
+the right source code can't reach the deployed dashboard — only
+the stale build does. Operators see a dashboard with broken
+buttons that can't be fixed without rebuilding upstream.
+
+This is structurally the same shape as L11 (ISO payload layout
+drifts silently): a packager assumes someone else did the
+build step, and no CI check catches it.
+
+**What we changed**: both `build-iso.sh` and `publish-to-s3.sh`
+now detect when `mgmt/ui/src/` is newer than `mgmt/ui/build/` and
+run `(cd mgmt/ui && npm run build)` before tarring. If npm isn't
+installed they print a loud WARN that the shipped UI bundle will
+be stale, and continue — better a known-broken artifact than a
+silent failure later.
+
+The check is `find mgmt/ui/src -newer mgmt/ui/build -print -quit`
+which exits as soon as it finds one file newer than the build dir,
+making it cheap to run every package.
+
+**Reference**: this scenario, commit pending.

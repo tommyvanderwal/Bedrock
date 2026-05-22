@@ -128,6 +128,21 @@ find "$REPO/installer/lib" -maxdepth 1 -type f \( -name "*.py" -o -name "*.sql" 
 
 # mgmt/ — same shape. Extracted to /opt/bedrock/. Includes the
 # Svelte UI build dir which is large but already minified.
+#
+# Before tarring, run `npm run build` if mgmt/ui/src/ is newer than
+# mgmt/ui/build/. The deployed dashboard serves mgmt/ui/build/; if
+# src/ has changed (endpoint renames, new pages, etc.) without a
+# rebuild, the shipped UI POSTs to old endpoints and gets 405s.
+if [ -d "$REPO/mgmt/ui/src" ] && \
+   [ -n "$(find "$REPO/mgmt/ui/src" -newer "$REPO/mgmt/ui/build" -print -quit 2>/dev/null)" ]; then
+    if command -v npm >/dev/null 2>&1; then
+        echo "[publish] mgmt/ui/src/ newer than ui/build/ — running npm build"
+        ( cd "$REPO/mgmt/ui" && npm run build ) 2>&1 | tail -5
+    else
+        echo "[publish] WARN: mgmt/ui/src/ is newer than ui/build/ but npm is not installed" >&2
+        echo "[publish]       The published UI bundle will be STALE." >&2
+    fi
+fi
 ( cd "$REPO" && tar czf "$STAGE/mgmt.tar.gz" \
     --exclude="__pycache__" --exclude="*.pyc" \
     --exclude="mgmt/ui/node_modules" \

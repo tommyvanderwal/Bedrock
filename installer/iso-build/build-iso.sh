@@ -116,8 +116,23 @@ refresh_payload() {
     cp "$INSTALLER/bedrock-redirect"      "$PAYLOAD_DIR/bedrock-redirect"
 
     # Rebuild mgmt.tar.gz if any mgmt/ source is newer than the tarball.
+    # The Svelte UI bundle under mgmt/ui/build/ is what the deployed
+    # dashboard actually serves; if mgmt/ui/src/ has changed since the
+    # last `npm run build`, the deployed UI will be stale. Run the UI
+    # build whenever src/ is newer than build/, before tarring.
     MGMT_DIR="$REPO_ROOT/mgmt"
+    UI_SRC="$MGMT_DIR/ui/src"
+    UI_BUILD="$MGMT_DIR/ui/build"
     if [ -d "$MGMT_DIR" ]; then
+        if [ -d "$UI_SRC" ] && [ -n "$(find "$UI_SRC" -newer "$UI_BUILD" -print -quit 2>/dev/null)" ]; then
+            if command -v npm >/dev/null 2>&1; then
+                echo "  mgmt/ui/src/ newer than ui/build/ — running npm build"
+                ( cd "$MGMT_DIR/ui" && npm run build ) 2>&1 | tail -5
+            else
+                echo "  WARN: mgmt/ui/src/ is newer than ui/build/ but npm is not installed" >&2
+                echo "        The shipped UI bundle will be STALE. Install Node.js to fix." >&2
+            fi
+        fi
         if [ ! -f "$INSTALLER/mgmt.tar.gz" ] || \
            [ -n "$(find "$MGMT_DIR" -newer "$INSTALLER/mgmt.tar.gz" -print -quit 2>/dev/null)" ]; then
             echo "  mgmt/ newer than mgmt.tar.gz — rebuilding"
