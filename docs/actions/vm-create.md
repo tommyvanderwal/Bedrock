@@ -63,7 +63,7 @@ priority post-create is fully live — no reboot — via the Settings page
 ### virtio-win.iso is auto-attached when any install ISO is used
 
 The dashboard create flow always adds a second SATA CDROM pointing at
-`/mnt/isos/virtio-win.iso` when the operator selects any install ISO:
+`/mnt/bedrock/iso/virtio-win.iso` when the operator selects any install ISO:
 
 ```
   if iso_path and (ISO_DIR / "virtio-win.iso").exists():
@@ -75,7 +75,10 @@ Windows Setup on Server 2022 already has inbox viostor+NetKVM, but for
 Server 2016 / 2012 / Win 7-8-10 the operator clicks **Load driver**
 during Setup's disk screen and points it at the virtio-win CDROM. Linux
 installers ignore the extra CDROM. The file itself is pre-fetched to
-`/opt/bedrock/iso/virtio-win.iso` by `bedrock init` — see
+`/opt/bedrock/iso/virtio-win.iso` at install time (kickstart payload),
+then `bedrock init`'s `seed_iso_library` step copies it into the
+filer namespace at `/mnt/bedrock/iso/virtio-win.iso` where it's
+visible cluster-wide — see
 [`iso-library.md`](iso-library.md#virtio-winiso--always-attached-never-selected).
 
 ### The VM auto-starts

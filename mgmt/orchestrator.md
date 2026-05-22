@@ -82,8 +82,10 @@ FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
      DRBD uses bedrock-net's chosen paths.
   6. `cluster_arbiter.converge()` — promote/demote singletons
      based on `state.json["role"]`.
-  7. `seaweedfs.ensure_iso_library_mount()` — re-render the
-     `/mnt/isos` FUSE mount unit when the master moved.
+  7. `seaweedfs.ensure_iso_library_mount()` — refresh the FUSE
+     mount of the filer namespace at `/mnt/bedrock` when the
+     master moved (the `/iso/` subtree surfaces uploaded ISOs at
+     `/mnt/bedrock/iso/` cluster-wide).
   8. Schedule `_reactor_diff(prev, cur, self_name)` on the event
      loop.
 

@@ -2409,7 +2409,7 @@ class VMCreateRequest(BaseModel):
     ram_mb: int = 2048
     disk_gb: int = 20        # size of the primary (boot) disk
     priority: str = "normal"  # low | normal | high
-    iso: Optional[str] = None  # filename in /opt/bedrock/iso, optional
+    iso: Optional[str] = None  # filename in /mnt/bedrock/iso/, optional
     # Workload type. Must satisfy workload.validate_type against current
     # cluster size — pet needs ≥2 nodes, vipet needs ≥3.
     vm_type: str = "cattle"  # cattle | pet | vipet

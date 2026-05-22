@@ -7,8 +7,14 @@ works on first try.
 **Triggered by:** operator on a bootstrapped node:
 
 ```bash
-bedrock join --witness <mgmt-host> [--yes]
+bedrock join [<node-ip>] [--yes]
 ```
+
+`<node-ip>` is the IP or hostname of *any current cluster node* (not
+necessarily the master). Omit it to auto-discover via mDNS on the
+LAN — the joiner will present a numbered list of candidate clusters
+if more than one answers. `--yes` skips the confirmation prompt and
+auto-picks the first reachable candidate.
 
 **Source:** `installer/bedrock:cmd_join`, `installer/lib/agent_install.py`,
 `installer/lib/discovery.py`, `installer/lib/exporters.py`.
@@ -23,12 +29,16 @@ bedrock join --witness <mgmt-host> [--yes]
 ## Sequence
 
 ```
-  T=0    bedrock join --witness <mgmt_host>
+  T=0    bedrock join [<node-ip>]
          │
-         │ if --witness not given:
-         │   discovery.find_witness()
-         │     try common IPs (.253 .252 .254) + first 50 of local /24
-         │     probe :9443/health (external witness) then :8080/cluster-info
+         │ if <node-ip> not given:
+         │   discovery.discover_clusters(timeout=2.5)   ← mDNS
+         │     listen on 224.0.0.251:5353 for bedrock.local TXT
+         │     records (cluster_uuid + cluster_name + node_name)
+         │   if no answers:
+         │     discovery.find_witness()                 ← legacy fallback
+         │       try common IPs (.253 .252 .254) + first 50 of /24
+         │       probe :8443/api/cluster
          │
   T+0.5s discovery.query_cluster(witness)
          │   GET http://<mgmt>:8080/cluster-info
@@ -165,7 +175,7 @@ new node as **Online** and its memory/load tiles populate.
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `No cluster found` | `--witness` not given and discovery failed | Give `--witness <ip>` explicitly. |
+| `No cluster found` | No mDNS answer and subnet-scan fallback found nothing | Pass the IP positionally: `bedrock join 192.168.x.y`. |
 | `registration failed: HTTP 500` | mgmt unreachable / cluster.json corrupt | `curl -v <mgmt>/api/cluster` to diagnose; restart `bedrock-mgmt`. |
 | registered but dashboard shows **Offline** | exporters didn't bind (firewall?) | `systemctl status node-exporter vm-exporter`; `ss -tlnp \| grep 9100`. |
 | live-migrate fails: `Host key verification failed` | ssh-keyscan didn't cover a peer (IP changed since) | Re-run `ssh-keyscan -H <peer> >> /root/.ssh/known_hosts` manually, or `bedrock status` which future-me can extend to re-sync. |

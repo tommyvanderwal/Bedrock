@@ -14,10 +14,16 @@ cluster-tier DRBD as Secondary.
 
 ## Trigger
 
-`bedrock join [--witness <master-host>]` CLI. The CLI first does
-mDNS discovery to find a reachable master, fetches its cluster info,
-displays this node's fingerprint for operator-approval, then calls
-`run_node_join()`.
+`bedrock join [<node-ip>]` CLI. `<node-ip>` is any current cluster
+member (not necessarily the master). Omit it to auto-discover via
+mDNS on the LAN. The CLI fetches cluster info from the chosen node,
+displays this node's fingerprint for operator-approval on the
+cluster dashboard, then calls `run_node_join()`.
+
+The `witness` keyword arg below is a legacy parameter name — it
+holds the IP/hostname the CLI dialled (master or any other cluster
+node), not the cluster witness (Echo) host. Renaming it is a
+follow-up cleanup that doesn't affect behaviour.
 
 Same `FileSagaBackend` at `/var/lib/bedrock/init-progress.json` as
 [`cluster_init`](cluster_init.md) — rqlite isn't this node's yet.

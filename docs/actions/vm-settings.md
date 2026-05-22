@@ -45,7 +45,7 @@ the `_vm_get_settings`, `_vm_set_resources`, `_vm_set_priority`,
 | Priority | `virsh schedinfo NAME --live --config cpu_shares=N` | **live** | Mapping: low=256, normal=1024, high=4096 (cgroup cpu.weight on v2, cpu.shares on v1). Written to both running VM and XML for next boot. |
 | HA (cattle ↔ pet ↔ ViPet) | Convert pipeline — [`vm-convert.md`](vm-convert.md) | **live** | Moved from the detail page to settings; logic is unchanged. |
 | CDROM eject | `virsh change-media NAME sda --eject --live --force` | **live** | Requires a CDROM slot to exist (created when the VM had an install ISO). |
-| CDROM insert | `virsh change-media NAME sda /mnt/isos/X --insert --live --force` | **live** | From any ISO in `/opt/bedrock/iso` (virtio-win hidden from dropdown). |
+| CDROM insert | `virsh change-media NAME sda /mnt/bedrock/iso/X --insert --live --force` | **live** | From any ISO in `/mnt/bedrock/iso` (SeaweedFS FUSE mount, same path on every node; virtio-win hidden from dropdown). |
 
 ## API endpoints
 

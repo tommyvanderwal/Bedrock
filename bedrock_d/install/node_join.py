@@ -6,8 +6,9 @@ no rqlite state before ``start_rqlited_joiner``.
 
 # Entry point: ``run_node_join(...)``
 
-The caller (``bedrock join``) supplies the master's mgmt URL and
-the witness host. The saga:
+The caller (``bedrock join``) supplies the IP/hostname of any
+current cluster node (positional arg or mDNS-discovered) and the
+cluster_info dict it fetched from there. The saga:
 
 1. Builds the saga ``ctx`` dict.
 2. Opens a ``FileSagaBackend`` at ``/var/lib/bedrock/init-progress.json``
@@ -46,10 +47,13 @@ INIT_PROGRESS_PATH = Path("/var/lib/bedrock/init-progress.json")
 
 @saga("node_join")
 class NodeJoin:
-    """`bedrock join --witness <host>` — joiner-side flow.
+    """`bedrock join [<node-ip>]` — joiner-side flow.
 
     ctx inputs (set by the caller / cmd_join):
-      - witness: str (master mgmt URL or hostname/IP)
+      - witness: str — legacy field name; holds the IP/hostname the
+                       CLI dialled to fetch cluster info (any current
+                       cluster node, not necessarily the master, and
+                       not the cluster witness/Echo host)
       - cluster_info: dict (the master's /cluster-info response,
                             including cluster_uuid + cluster_name +
                             mgmt_url + existing nodes list)

@@ -96,7 +96,8 @@ There is no OTA mechanism yet.
 | `/opt/bedrock/data/vm/` | VictoriaMetrics (on mgmt node) | 90 d retention |
 | `/opt/bedrock/data/vl/` | VictoriaLogs (on mgmt node) | 90 d retention |
 | `/opt/bedrock/scrape.yml` | `save_cluster()` → `write_scrape_config()` on register | regenerated every time |
-| `/opt/bedrock/iso/` | operator (via dashboard `/isos` or scp) | never auto-rotated |
+| `/mnt/bedrock/iso/` | operator (via dashboard `/isos` or scp through the FUSE mount) | never auto-rotated |
+| `/opt/bedrock/iso/` | `bedrock init` (virtio-win.iso staging only) | one-time seed into the filer via `seaweedfs.seed_iso_library` |
 | `/etc/bedrock/vm_inventory.json` | `_vm_create` and `_vm_delete` in mgmt | per-VM priority + creation metadata |
 | `/var/lib/bedrock/alpine.qcow2` | `_download_alpine_on_node()` in vm.py | cached per node, never rotated |
 | `/var/lib/bedrock-vg.img` | `_ensure_thin_pool()` (testbed only) | 20 GB loop file for synthetic VG |
@@ -105,12 +106,17 @@ There is no OTA mechanism yet.
 
 | Path | Node | Source | Mode |
 |---|---|---|---|
-| `/opt/bedrock/iso/` | mgmt | local directory | rw (writable by mgmt only) |
-| `/mnt/isos/` | mgmt | bind-mount of `/opt/bedrock/iso` | ro |
-| `/mnt/isos/` | compute | NFS automount of `<mgmt>:/opt/bedrock/iso` | ro, idle-timeout 5 min |
+| `/mnt/bedrock/` | every node | SeaweedFS FUSE mount (filer namespace) | rw |
+| `/mnt/bedrock/iso/` | every node | `/iso/` collection in the filer namespace | rw via the FUSE mount |
 
-Mount units: `/etc/systemd/system/mnt-isos.mount` (bind or NFS) and,
-on compute nodes, `/etc/systemd/system/mnt-isos.automount`.
+Backing: SeaweedFS volume servers + filer. Replication for `/iso/`
+is node-count-aware (000 at N=1, 001 at N≥2; see
+`installer/lib/seaweedfs.py::init_collections`).
+
+Mount unit: `/etc/systemd/system/bedrock-weed-mount.service` (FUSE
+mount via `weed mount -filer=… -dir=/mnt/bedrock`). No NFS server,
+no bind mount, no automount — every node mounts the same filer
+directly.
 
 ## Systemd units
 

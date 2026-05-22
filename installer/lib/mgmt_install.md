@@ -23,7 +23,8 @@ nothing. Steps, in order:
 5. **bedrock-net** daemon start + sysctls for routing.
 6. **SeaweedFS** install + master + volume start + filer + s3
    start. At N=1 the master subset is just `self`.
-7. **ISO library FUSE mount** at `/mnt/isos`.
+7. **ISO library FUSE mount** at `/mnt/bedrock` (filer namespace
+   surfaces ISOs at `/mnt/bedrock/iso/`).
 8. **Dashboard** via `dashboard_install.install_dashboard()`
    (mgmt service unit + Svelte UI).
 9. **Observability** via `observability.bootstrap_master()`

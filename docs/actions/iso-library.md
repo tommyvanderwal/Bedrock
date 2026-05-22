@@ -1,52 +1,54 @@
 # ISO library (upload, list, mount)
 
-Bedrock keeps install ISOs (Windows, Linux, anything bootable) on the
-mgmt node and makes them visible at an **identical path** on every
-cluster node via NFS auto-mount. VM creation references them by local
-file path — `virt-install --cdrom /mnt/isos/<name>.iso` works wherever
-the VM is being built.
+Bedrock keeps install ISOs (Windows, Linux, anything bootable) on
+the cluster-wide SeaweedFS volume servers, surfaced at an
+**identical path** on every node via the SeaweedFS FUSE mount.
+VM creation references them by local file path —
+`virt-install --cdrom /mnt/bedrock/iso/<name>.iso` works on
+whichever node is building the VM.
 
 ## Layout
 
 ```
-  mgmt node
-  ─────────
-  /opt/bedrock/iso/              ← the actual files live here
-        my-windows-server.iso
-        ubuntu-22.04.iso
-        alpine-3.21-standard.iso
-        README.md
-  /mnt/isos/       ── bind-mount (ro) ──► /opt/bedrock/iso
-  (same path, same view, no NFS loop)
+  every node
+  ──────────
+  /mnt/bedrock/             ← SeaweedFS FUSE mount, identical
+                              on every cluster node
+        iso/                ← /iso/ collection
+              my-windows-server.iso
+              ubuntu-22.04.iso
+              alpine-3.21-standard.iso
+              virtio-win.iso        ← always attached, never picked
+        scratch/            ← /scratch/ collection (no replication)
+        templates/          ← /templates/ collection
+        snapshots/          ← /snapshots/ collection
+        backups/            ← /backups/ collection (replication=002)
 
-  NFS server: :2049  →  exports /opt/bedrock/iso to
-                          192.168.2.0/24 (ro)
-                          100.X.Y.0/24 (ro)
-
-  compute nodes (bedrock-sim-2, bedrock-sim-3, …)
-  ──────────────────────────────────────────────
-  /mnt/isos/       ── NFS-automount ──► <mgmt-ip>:/opt/bedrock/iso
-  (systemd automount, on-demand; idle timeout 5 min)
+  SeaweedFS replication for /iso/ at N=1: 000 (single copy)
+  SeaweedFS replication for /iso/ at N≥2: 001 (two copies, different node)
+  See installer/lib/seaweedfs.py::init_collections.
 ```
 
-**The result**: every node resolves `/mnt/isos/foo.iso` to the same bytes.
-Bedrock's VM-create code uses `/mnt/isos/` exclusively, so future
-cross-node VM provisioning works without any path rewriting.
+Writes go through the local FUSE mount → filer → assigned volume
+servers per collection policy. Every node sees the same files;
+delete on any node removes cluster-wide. No NFS, no bind mount, no
+per-node sync step.
 
 ## `virtio-win.iso` — always attached, never selected
 
-When `bedrock init` runs, it fetches Red Hat's signed virtio-win ISO to
-`/opt/bedrock/iso/virtio-win.iso` (~750 MB, one-time). The mgmt node's
-`_vm_create` automatically attaches this ISO as a **second CDROM** (SATA
-bus) on every new VM that uses an install ISO. For Windows Setup it's
-the source of `viostor` (disk) and `NetKVM` (network) drivers — click
-"Load driver" during Setup and point it at the virtio-win CDROM. For
-Linux installs the extra CDROM is harmless and ignored.
+When `bedrock init` runs, it fetches Red Hat's signed virtio-win
+ISO into the ISO library (~750 MB, one-time). The mgmt node's
+`_vm_create` automatically attaches this ISO as a **second CDROM**
+(SATA bus) on every new VM that uses an install ISO. For Windows
+Setup it's the source of `viostor` (disk) and `NetKVM` (network)
+drivers — click "Load driver" during Setup and point it at the
+virtio-win CDROM. For Linux installs the extra CDROM is harmless
+and ignored.
 
-The driver ISO is hidden from the "New VM" install-ISO dropdown so no
-one accidentally boots off it. It stays visible on the `/isos` page
-alongside user-uploaded ISOs, where it can be deleted (the next `init`
-will re-fetch) or updated by replacing the file.
+The driver ISO is hidden from the "New VM" install-ISO dropdown so
+no one accidentally boots from it. It still appears in the `/isos`
+dashboard list alongside user-uploaded ISOs; deleting it just
+makes the next `bedrock init` re-fetch on its next run.
 
 ## Uploading an ISO
 
@@ -54,87 +56,76 @@ will re-fetch) or updated by replacing the file.
 
 1. Sidebar → `ISOs` (or direct URL `/isos`)
 2. Click `Choose .iso file`
-3. Progress bar shows upload %; on completion the list refreshes
+3. Progress bar shows upload %; the file streams in 1 MB chunks
+   through the dashboard API → FUSE → SeaweedFS → all nodes
 
 **Via shell** — equally valid for big files or scripted uploads:
 
 ```bash
-scp my-iso.iso root@<mgmt>:/opt/bedrock/iso/
+scp my-iso.iso root@<any-node>:/mnt/bedrock/iso/
 ```
 
-The dashboard lists both paths in the same table.
+Any node works; SeaweedFS replicates per the `/iso/` collection
+policy. The dashboard lists files written either way.
 
 ## Backend
 
 | Endpoint | Method | Body | Returns |
 |---|---|---|---|
 | `/api/isos` | GET | — | `[{name, size_bytes}, ...]` |
-| `/api/isos/upload` | POST | multipart/form-data with `file` field | `{status, name, size_bytes}` |
+| `/api/isos` | POST | multipart/form-data with `file` field | `{status, name, size_bytes}` |
 | `/api/isos/{name}` | DELETE | — | `{status, name}` |
 
-Uploads stream in 1 MB chunks straight to disk, so memory stays bounded
-even for multi-GB Windows ISOs. `python-multipart` is the one extra
-pip dependency this adds.
+Uploads stream in 1 MB chunks straight to the FUSE mount, so memory
+stays bounded even for multi-GB Windows ISOs. `python-multipart` is
+the one extra pip dependency this adds.
 
 Path traversal is blocked: the server always does `Path(name).name`
 before writing — `../../etc/passwd.iso` becomes `passwd.iso`.
 
-## systemd units (auto-generated)
+## How files reach every node
 
-On the mgmt node, `mnt-isos.mount`:
+There's no separate mount unit to manage. The SeaweedFS FUSE mount
+is part of every node's normal startup:
 
-```ini
-[Unit]
-Description=Bedrock ISO library (bind mount)
-
-[Mount]
-What=/opt/bedrock/iso
-Where=/mnt/isos
-Type=none
-Options=bind,ro
-
-[Install]
-WantedBy=multi-user.target
+```
+  systemd unit                what it does
+  ──────────────────────────  ──────────────────────────────────────
+  bedrock-weed-master         (3-Raft master subset only) — directory
+                              + volume assignment authority
+  bedrock-weed-volume         every node — stores volume bytes
+  bedrock-weed-filer          (current arbiter host) — POSIX
+                              namespace on top of volumes
+  bedrock-weed-s3             same — S3-compatible front-end
+  bedrock-weed-mount          every node — mounts the filer at
+                              /mnt/bedrock via FUSE
 ```
 
-On every compute node, `mnt-isos.mount` + `mnt-isos.automount`:
-
-```ini
-# mnt-isos.mount
-[Unit]
-Description=Bedrock ISO library (NFS)
-After=network-online.target
-Wants=network-online.target
-
-[Mount]
-What=<mgmt-ip>:/opt/bedrock/iso
-Where=/mnt/isos
-Type=nfs
-Options=ro,nolock,soft,_netdev
-
-# mnt-isos.automount
-[Automount]
-Where=/mnt/isos
-TimeoutIdleSec=300
-```
-
-Automount means: the NFS mount only happens when something actually
-touches `/mnt/isos`. After 5 minutes of inactivity it unmounts. If the
-mgmt node is briefly unreachable, a subsequent touch re-triggers the
-mount — no manual intervention.
+When a node loses connectivity, its local FUSE mount still
+responds to reads as long as it can reach a volume server holding
+the requested file. Writes block until a writable volume is
+available per replication policy — see L40 / lessons-log for what
+happens when replication can't be satisfied at the current cluster
+size.
 
 ## Failure modes
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `--cdrom /mnt/isos/foo.iso: No such file` on mgmt | Bind mount not up | `systemctl start mnt-isos.mount` |
-| same on a compute node | NFS automount blocked by firewall or mgmt down | `systemctl status mnt-isos.automount`; check `showmount -e <mgmt-ip>` |
-| `Permission denied` writing to `/mnt/isos` | Mount is read-only by design | Upload to `/opt/bedrock/iso/` on mgmt (via dashboard or scp), not to `/mnt/isos` |
-| ISO visible on mgmt but not compute | NFS export scope mismatches node's IP | Check `/etc/exports.d/bedrock-iso.exports`; the source subnets must cover every cluster node |
+| `--cdrom /mnt/bedrock/iso/foo.iso: No such file` | FUSE mount didn't come up (weed-mount unit failed, or filer unreachable) | `systemctl status bedrock-weed-mount`; `findmnt /mnt/bedrock`. Restart the mount unit. |
+| Upload hangs / `Input/output error` on close | Replication policy unsatisfiable at current N (e.g. `/iso/` pinned to 001 with N=1 nodes) | Re-run `init_collections` so replication matches cluster size — fixed in commit 7728fb1 |
+| File visible on one node but not another | Volume server on the file's home node is unreachable | `weed shell -master <ip>:9333` → `volume.list` to see volume placement |
+| Dashboard upload returns 405 Method Not Allowed | UI build is stale and POSTing to a renamed endpoint | Rebuild + republish mgmt.tar.gz — see L40, fixed by build-iso.sh + publish-to-s3.sh running `npm run build` |
 
 ## Related
 
-- [`vm-create.md`](vm-create.md) — how `--cdrom /mnt/isos/<name>` lands
-  in the virt-install command.
-- [`../reference/files.md`](../reference/files.md) — all paths Bedrock
-  writes on disk.
+- `docs/storage-architecture.md` — the broader SeaweedFS design
+  (collections, replication policies, volume layout).
+- `installer/lib/seaweedfs.py` — init / promote / demote helpers,
+  including `init_collections` which sets the per-prefix
+  replication.
+- `mgmt/routes_iso.py` — the three /api/isos endpoints, writing
+  through the FUSE mount at `/mnt/bedrock/iso/`.
+- `installer/lib/vm.py` and `mgmt/app.py::_vm_create` — how
+  `--cdrom /mnt/bedrock/iso/<name>` lands in the virt-install
+  command.

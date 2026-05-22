@@ -155,11 +155,14 @@ the off-the-shelf virt-v2v binary — no re-implementation needed.
 ### virtio-win driver ISO — always attached on install flow
 
 For the **new-VM-from-ISO** flow (not imports), the dashboard always
-attaches `/mnt/isos/virtio-win.iso` as a second SATA CDROM when the
-operator picks any install ISO. Pre-fetched by `bedrock init` to
-`/opt/bedrock/iso/virtio-win.iso` (750 MB, Red Hat-signed). Hidden
-from the install-ISO dropdown so it can't be selected as a boot
-source. See [`iso-library.md`](iso-library.md#virtio-winiso--always-attached-never-selected).
+attaches `/mnt/bedrock/iso/virtio-win.iso` as a second SATA CDROM
+when the operator picks any install ISO. Pre-staged by the install
+ISO at `/opt/bedrock/iso/virtio-win.iso` (750 MB, Red Hat-signed)
+and copied into the filer namespace by `bedrock init`'s
+`seed_iso_library` step so it appears at the cluster-wide path on
+every node. Hidden from the install-ISO dropdown so it can't be
+selected as a boot source. See
+[`iso-library.md`](iso-library.md#virtio-winiso--always-attached-never-selected).
 
 ### Verified with Windows Server 2022 Datacenter Eval
 

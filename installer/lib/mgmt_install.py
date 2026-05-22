@@ -104,10 +104,12 @@ def install_full(cluster_name: str, repo: str):
         _download(f"{repo}/binaries/victoria-logs", BINARIES / "victoria-logs")
         os.chmod(BINARIES / "victoria-logs", 0o755)
 
-    # 3. ISO library: master holds the canonical /opt/bedrock/iso tree,
-    #    SeaweedFS filer serves it cluster-wide; every node FUSE-mounts
-    #    the filer root at /mnt/bedrock (ISOs appear at /mnt/bedrock/iso/)
-    #    via seaweedfs.ensure_iso_library_mount().
+    # 3. ISO library: uploads write directly to /mnt/bedrock/iso/ (the
+    #    SeaweedFS FUSE mount on every node), so the filer is the
+    #    canonical store. /opt/bedrock/iso is kept as a staging area
+    #    for first-boot fixtures (e.g. virtio-win.iso fetched at
+    #    `bedrock init` time, then seed-copied into the filer by
+    #    seaweedfs.seed_iso_library — a one-time migration helper).
     iso_dir = BEDROCK_BASE / "iso"
     iso_dir.mkdir(parents=True, exist_ok=True)
     (iso_dir / "README.md").write_text(

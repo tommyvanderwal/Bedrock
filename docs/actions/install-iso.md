@@ -11,7 +11,9 @@ and naming convention.
 
 Same kickstart partitioning, same first-boot UX, same end state:
 Bedrock installed, services prepared, waiting for the operator to
-run `bedrock init` (new cluster) or `bedrock join HOST` (joiner).
+run `bedrock init` (new cluster) or `bedrock join` (joiner — mDNS-
+discovers existing clusters on the LAN; pass `bedrock join <ip>`
+explicitly if mDNS is blocked).
 
 **Triggered by:**
 

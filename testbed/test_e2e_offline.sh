@@ -381,27 +381,30 @@ done
 #     a single shared namespace via the filer.
 # ─────────────────────────────────────────────────────────────────
 step "5a. ISO library — mount + cross-node visibility"
+# SeaweedFS FUSE mount is at /mnt/bedrock on every node; the /iso/
+# subtree (where uploaded ISOs land) is /mnt/bedrock/iso/. Test the
+# parent mountpoint so a missing iso/ subdir doesn't false-fail.
 for i in 1 2 3 4; do
-    if sssh $i 'mountpoint -q /mnt/isos && grep -q "fuse.seaweedfs" /proc/mounts'; then
-        pass "sim-$i: /mnt/isos is a SeaweedFS FUSE mount"
+    if sssh $i 'mountpoint -q /mnt/bedrock && grep -q "fuse.seaweedfs" /proc/mounts'; then
+        pass "sim-$i: /mnt/bedrock is a SeaweedFS FUSE mount"
     else
-        mark_fail "sim-$i: /mnt/isos NOT mounted via SeaweedFS FUSE"
+        mark_fail "sim-$i: /mnt/bedrock NOT mounted via SeaweedFS FUSE"
     fi
 done
 # Place a marker on sim-1 and verify it shows up on all peers.
 MARKER_NAME="iso-test-$(date +%s).txt"
-sssh 1 "echo 'cross-node-iso-marker' > /mnt/isos/$MARKER_NAME && sync" \
-    || mark_fail "sim-1 couldn't write to /mnt/isos"
+sssh 1 "mkdir -p /mnt/bedrock/iso && echo 'cross-node-iso-marker' > /mnt/bedrock/iso/$MARKER_NAME && sync" \
+    || mark_fail "sim-1 couldn't write to /mnt/bedrock/iso"
 sleep 6
 for i in 1 2 3 4; do
-    got=$(sssh $i "cat /mnt/isos/$MARKER_NAME 2>/dev/null" || echo "")
+    got=$(sssh $i "cat /mnt/bedrock/iso/$MARKER_NAME 2>/dev/null" || echo "")
     if [ "$got" = "cross-node-iso-marker" ]; then
         pass "sim-$i sees the ISO-library marker"
     else
         mark_fail "sim-$i: marker missing or wrong (got: '${got:0:60}')"
     fi
 done
-sssh 1 "rm -f /mnt/isos/$MARKER_NAME"
+sssh 1 "rm -f /mnt/bedrock/iso/$MARKER_NAME"
 
 # ─────────────────────────────────────────────────────────────────
 # 5b. Storage promote — critical tier to DRBD-replicated. Bulk

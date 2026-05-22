@@ -26,11 +26,13 @@ pushes `Node X (...) registered with cluster` log event.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/api/isos` | — | `[{name, size_bytes}, ...]` |
-| POST | `/api/isos/upload` | multipart/form-data with `file` field | `{status, name, size_bytes}` |
+| POST | `/api/isos` | multipart/form-data with `file` field | `{status, name, size_bytes}` |
 | DELETE | `/api/isos/{name}` | — | `{status, name}` — 404 if not found |
 
-Uploads stream in 1 MB chunks directly to `/opt/bedrock/iso/` on the
-mgmt node; path traversal is blocked.
+Uploads stream in 1 MB chunks through the SeaweedFS FUSE mount to
+`/mnt/bedrock/iso/<name>.iso`, replicated per the `/iso/`
+collection policy (000 at N=1, 001 at N≥2). Path traversal is
+blocked by `Path(name).name`.
 
 ## Import library  (VMware / Hyper-V / qcow2 → Bedrock)
 
