@@ -1657,3 +1657,54 @@ a much bigger upstream conversation.
 
 Captured as a future upstream contribution; not a Bedrock v1.0
 deliverable.
+
+---
+
+**Key takeaways (closing the lesson):**
+
+1. **"TCP performance may be compromised" kernel warning on
+   thunderbolt-net is cosmetic** for our workload. TCP is not
+   compromised — it's the kernel hedging on driver limits that
+   don't bind on real cluster traffic.
+
+2. **The surprising Intel-vs-AMD gap is one vendor-ID check, not
+   silicon.** `drivers/thunderbolt/nhi.c:1169`:
+   ```c
+   if (nhi->pdev->vendor == PCI_VENDOR_ID_INTEL)
+       nhi->quirks |= QUIRK_AUTO_CLEAR_INT;
+   ```
+   Intel NHIs auto-clear the MSI-X status bit in hardware at IRQ
+   assert and re-arm immediately. AMD NHIs need a manual MMIO
+   clear in the hard-IRQ handler that serializes against re-arm.
+   Same wire, same driver — Intel ~10,000 packets/IRQ + ~25 Gbps,
+   AMD ~66 packets/IRQ + ~12 Gbps. The reason is a real AMD
+   silicon race condition with dual-MSI-X-clears (kernel comment
+   at `nhi.c:112-115`), so the conservative fallback path isn't
+   wrong — it just costs throughput.
+
+3. **AMD silicon CAN move faster; the NHI ring path can't reach
+   it.** Tunneled PCIe (NVMe-over-TB) hits 25-30 Gbps on the
+   same Pink Sardine controller. Different MSI-X policy,
+   different code path, no manual-clear roundtrip. So the
+   12 Gbps wall is a driver-policy artifact, not a hardware
+   ceiling.
+
+4. **Bedrock hardware-sizing rule: controller vendor decides
+   tier, not host CPU.** Any platform with a discrete Intel TB
+   chip (JHL8540 Maple Ridge, JHL9580 Barlow Ridge) gets the
+   Intel-tier performance regardless of CPU. AMD CPU on a board
+   with an Intel TB controller (ASUS ProArt X670E, Minisforum
+   MS-S1 Max) sidesteps the 12 Gbps wall entirely.
+
+5. **Bedrock code action: nothing further.** The 15 Gbps speed
+   bucket landed in `netd.py` is the honest cross-platform
+   midpoint. No auto-Jumbo, no GRO-off, no IRQ-pinning code —
+   none of those move TCP throughput on the measured workload.
+
+6. **Open upstream contribution** (deferred, not Bedrock scope):
+   3-line patch to `nhi.c:251` setting `RING_DESC_INTERRUPT` only
+   on every Nth descriptor lifts the AMD single-queue cap from
+   ~12 to ~25 Gbps. Single-stream and aggregate both benefit.
+   Path of least resistance for anyone with time to chase it.
+
+**Lesson closed.**
