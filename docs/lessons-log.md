@@ -1436,4 +1436,33 @@ on AMD; not worth the per-platform code path. If a multi-queue
 patch ever lands upstream (or Apple's RDMA-over-Thunderbolt gets
 a Linux counterpart), revisit.
 
+**Follow-up measurement that sharpens the picture (2026-05-22):**
+ran a CPU-frequency matrix on the same two AMD nodes to confirm
+the bottleneck layer:
+
+| Governor / freq cap | Throughput | Receiver CPU6 softirq | CPU idle |
+|---|---|---|---|
+| performance (~5 GHz) | 12.0 Gbps | 41.5% | 57.2% |
+| powersave (dynamic) | 11.9 Gbps | 42.0% | 56.6% |
+| powersave @ 1 GHz cap | 7.26 Gbps | 82.6% | 16.5% |
+
+At full clock the receiver core handling softirq is **not
+saturated** — it sits at 42%. The "single-CPU softirq bound"
+narrative is only partly right on this hardware. The actual
+ceiling at 5 GHz is the **AMD Pink Sardine NHI controller's DMA
+engine** delivering bytes from the USB4 fabric to host memory;
+softirq has headroom waiting for packets that don't arrive.
+
+The Intel-tuned-box story is different: there the NHI delivers
+~25 Gbps and softirq is genuinely the wall (98-99% on one core).
+Same driver, different silicon, different bottleneck — which is
+why Intel boxes respond to IRQ-pinning + qdisc tuning and AMD
+boxes don't.
+
+Implication for Bedrock: skip IRQ/qdisc tuning entirely. It
+helps on Intel by a few Gbps if you have a P-core to pin to, and
+does nothing on AMD. The per-platform code isn't worth the
+complexity for ≤2 Gbps of upside. Bedrock's mesh-link preference
+just needs an honest speed bucket — which is now 15000.
+
 **Reference**: this scenario, commit pending.
