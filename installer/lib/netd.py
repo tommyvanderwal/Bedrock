@@ -312,9 +312,58 @@ def get_mac(nic: str) -> str:
 def nic_speed_mbps(nic: str) -> int:
     """Best-effort link speed read. Returns 0 if unknown (virtio,
     USB-ethernet without a reliable speed report). Buckets are coarse
-    so the fold-deterministic invariant holds; we round on emit."""
+    so the fold-deterministic invariant holds; we round on emit.
+
+    Two special cases the raw /sys/class/net/<nic>/speed gets wrong:
+
+      * **Bridges** — Linux's bridge driver hardcodes the bridge's
+        reported speed to 10000 regardless of slave speed. The actual
+        physical-link rate is the min across non-virtual slaves
+        (vnet*/veth* are libvirt's per-VM taps, meaningless here).
+
+      * **Thunderbolt** — the thunderbolt-net driver doesn't populate
+        /sys/class/net/<nic>/speed at all. Kernel reads return -1 or
+        blank. Modern TB3 / TB4 / USB4 sustains ~20 Gbps over the
+        network driver; use that as a safe lower bound so the
+        mesh-link preference can pick it over a 1/2.5G ethernet.
+    """
+    base = Path(f"/sys/class/net/{nic}")
+
+    # Bridge: walk slaves, return min physical speed.
+    if (base / "bridge").is_dir():
+        brif = base / "brif"
+        if brif.is_dir():
+            speeds: list[int] = []
+            for slave in brif.iterdir():
+                name = slave.name
+                if name.startswith(("vnet", "veth", "tap", "macvtap")):
+                    continue
+                try:
+                    sp = int(
+                        Path(f"/sys/class/net/{name}/speed")
+                        .read_text().strip()
+                    )
+                    if sp > 0:
+                        speeds.append(sp)
+                except (OSError, ValueError):
+                    continue
+            if speeds:
+                return min(speeds)
+        # No physical slaves yet — fall through to kernel value.
+
+    # Thunderbolt-net: kernel doesn't expose speed. Use TB3 minimum.
     try:
-        speed = int(Path(f"/sys/class/net/{nic}/speed").read_text().strip())
+        drv_link = base / "device" / "driver"
+        if drv_link.is_symlink():
+            drv = (drv_link).resolve().name
+            if drv == "thunderbolt-net":
+                return 20000
+    except OSError:
+        pass
+
+    # Default path: read the kernel-reported speed.
+    try:
+        speed = int((base / "speed").read_text().strip())
         return max(0, speed)  # -1 means "unknown" on virtio sometimes
     except (OSError, ValueError):
         return 0
