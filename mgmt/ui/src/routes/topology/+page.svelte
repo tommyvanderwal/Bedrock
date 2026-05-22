@@ -182,9 +182,20 @@
 		yLabel: number;     // y for the label text
 		boxX: number;       // top-left of port rect
 		boxY: number;
+		boxW: number;       // width — sized to fit `labelText`
 		labelText: string;
 		kind: 'lan' | 'shared' | 'p2p' | 'switch';
 	};
+
+	// 9px monospace, letter-spacing -0.3px → ~5.2 px per char. Pad 5px
+	// each side so "thunderbolt0" doesn't crowd the box border. Minimum
+	// PORT_W so short names like "br0" still look like a port and not
+	// a blob.
+	function portBoxWidth(label: string): number {
+		const charW = 5.2;
+		const pad   = 10;
+		return Math.max(PORT_W, Math.ceil(label.length * charW) + pad);
+	}
 	let ports = $derived.by((): PortDef[] => {
 		const out: PortDef[] = [];
 		// Cluster-node ports: INSIDE the rectangle, vertically centred.
@@ -195,11 +206,17 @@
 			if (!p) continue;
 			const nics = nicsByNode.get(nodeName) ?? [];
 			if (nics.length === 0) continue;
-			const totalW = nics.length * PORT_W + (nics.length - 1) * PORT_GAP;
+			// Per-port widths sized to fit each NIC label (so
+			// "thunderbolt0" gets a box that contains its text, not
+			// one that the text overflows out of).
+			const widths = nics.map(portBoxWidth);
+			const totalW = widths.reduce((a, b) => a + b, 0)
+				+ (nics.length - 1) * PORT_GAP;
 			const startX = p.x + (NODE_W - totalW) / 2;
 			const portY = p.y + (NODE_H - PORT_H) / 2;     // vertically centred
+			let xOff = startX;
 			nics.forEach((nic, i) => {
-				const px = startX + i * (PORT_W + PORT_GAP);
+				const w = widths[i];
 				const kind = kindByNic.get(`${nodeName}|${nic}`)
 					?? (nic === 'br0' ? 'lan' : 'p2p');
 				out.push({
@@ -207,15 +224,17 @@
 					owner: 'node',
 					ownerId: nodeName,
 					nic,
-					x: px + PORT_W / 2,
+					x: xOff + w / 2,
 					ownerY: p.y,
 					ownerH: NODE_H,
 					yLabel: portY + PORT_H + 11,
-					boxX: px,
+					boxX: xOff,
 					boxY: portY,                     // INSIDE the rect
+					boxW: w,
 					labelText: nic,
 					kind,
 				});
+				xOff += w + PORT_GAP;
 			});
 		}
 		// Switch ports: ONE port per switch (representative). Multiple
@@ -234,6 +253,7 @@
 			if (!rep) rep = sw.connections[0].port_id || '?';
 			const portY = p.y + (SWITCH_H - PORT_H) / 2;
 			const portX = p.x + SWITCH_W / 2;
+			const sw_w = portBoxWidth(rep);
 			out.push({
 				id: `switch:${sw.device_key}`,
 				owner: 'switch',
@@ -243,8 +263,9 @@
 				ownerY: p.y,
 				ownerH: SWITCH_H,
 				yLabel: portY + PORT_H + 11,
-				boxX: portX - PORT_W / 2,
+				boxX: portX - sw_w / 2,
 				boxY: portY,
+				boxW: sw_w,
 				labelText: rep,
 				kind: 'switch',
 			});
@@ -888,7 +909,7 @@
 			<g class="port-group" class:dim={dim.port(port.id)}
 				class:hot={hoverPortId === port.id}>
 				<rect x={port.boxX} y={port.boxY}
-					width={PORT_W} height={PORT_H} rx="2"
+					width={port.boxW} height={PORT_H} rx="2"
 					class="port-rect port-{port.kind}"
 					onmouseenter={(e) => onPortEnter(e, port)}
 					onmouseleave={onLeave}/>
