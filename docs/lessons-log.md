@@ -1374,3 +1374,66 @@ which exits as soon as it finds one file newer than the build dir,
 making it cheap to run every package.
 
 **Reference**: this scenario, commit pending.
+
+---
+
+## L41 — Linux thunderbolt-net real ceiling is 10-25 Gbps; report 15 Gbps, not 25
+**Date**: 2026-05-22
+**Files**: `installer/lib/netd.py`
+**Scenario**: 2-physical-node Thunderbolt iperf3 matrix on Ryzen 7640HS / AlmaLinux 10.1
+
+**What we thought**: Thunderbolt 3 is a 40 Gbps wire; Thunderbolt 4
+the same; USB4 v2 / Thunderbolt 5 is 80 Gbps. Reporting `tb0` as
+~20 Gbps with a `25000` speed bucket in the topology view felt
+conservative.
+
+**What we found**: an iperf3 matrix on the two physical nodes
+(MTU 1500 vs 65520, GRO on vs off) hit a hard 12.0 Gbps wall on
+TCP across **every** combination — 4 streams × exactly 3.00 Gbps
+each. UDP scaled with MTU (5 Gbps → 12 Gbps) but receiver loss
+stayed at 35% beyond 8 Gbps. The "exactly 12.0 Gbps regardless
+of settings" pattern is the giveaway: it's a software ceiling,
+not a wire limit.
+
+Root cause is `thunderbolt-net`'s driver design: single RX queue,
+single NAPI instance, all receive softirq work serialized on one
+CPU. `ksoftirqd` pegs ~99% on the receiver. No RSS support. The
+kernel's "TCP performance may be compromised" warning at boot is
+the conservative version of this fact.
+
+Documented community ceilings:
+
+| Platform | Real-world Linux unidir |
+|---|---|
+| AMD Phoenix / Hawk Point (Ryzen 7040/8040 USB4) | ~11-12 Gbps |
+| AMD Strix Halo (Ryzen AI Max, USB4 v2 / TB5) | ~10 Gbps |
+| Intel Maple Ridge (TB4), untuned | 8-17 Gbps |
+| Intel Maple Ridge (TB4), IRQ-pinned + qdisc-tuned | 25-26 Gbps |
+| Intel Barlow Ridge (TB5) | no public Linux numbers yet |
+| macOS 26.2+ over the same hardware (native RDMA-over-TB) | 20-78 Gbps |
+
+The earlier "AMD negotiates at 2.5 GT/s" claim was wrong. Per
+Mario Limonciello's kernel patch series, the USB4 spec mandates
+that PCIe ports tunneling traffic over USB4 advertise Gen1
+2.5 GT/s — on both Intel and AMD. The real AMD/Intel gap is in
+the host controller's DMA engine + thunderbolt-net interaction,
+not link rate negotiation.
+
+**What we changed**:
+- `nic_speed_mbps("thunderbolt0")` now returns 15000 instead of
+  20000. 15 is the honest midpoint of the documented range.
+- `bucket_speed()` gained an explicit 15000 step between 10000
+  and 25000, so a thunderbolt-net link doesn't round up to "25G"
+  in the cluster_cables table and oversell the achievable
+  throughput. The mesh-link preference still picks tb0 over a
+  2.5G LAN bridge.
+- Docstrings updated to spell out the platform breakdown so the
+  next reader doesn't repeat the marketing-rate trap.
+
+**What we did NOT change**: no IRQ-pinning / qdisc / NAPI-thread
+tweaks. They add up to maybe 1-2 Gbps on Intel platforms and zero
+on AMD; not worth the per-platform code path. If a multi-queue
+patch ever lands upstream (or Apple's RDMA-over-Thunderbolt gets
+a Linux counterpart), revisit.
+
+**Reference**: this scenario, commit pending.

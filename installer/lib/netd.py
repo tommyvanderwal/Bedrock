@@ -323,9 +323,27 @@ def nic_speed_mbps(nic: str) -> int:
 
       * **Thunderbolt** — the thunderbolt-net driver doesn't populate
         /sys/class/net/<nic>/speed at all. Kernel reads return -1 or
-        blank. Modern TB3 / TB4 / USB4 sustains ~20 Gbps over the
-        network driver; use that as a safe lower bound so the
-        mesh-link preference can pick it over a 1/2.5G ethernet.
+        blank. Real-world Linux `thunderbolt-net` ceilings sit in the
+        ~10-25 Gbps range regardless of wire spec — the driver is
+        single-RX-queue / single-CPU-softirq bound:
+
+          AMD Phoenix/Hawk Point (Ryzen 7040/8040 USB4)    ~11-12 Gbps
+          AMD Strix Halo (Ryzen AI Max, USB4 v2 / TB5)     ~10 Gbps
+          Intel Maple Ridge (TB4), untuned                  8-17 Gbps
+          Intel Maple Ridge (TB4), IRQ+qdisc tuned         25-26 Gbps
+          Intel Barlow Ridge (TB5)                         no public Linux numbers yet
+
+        Wire rate (TB3=40G, TB4=40G, TB5=80G) is irrelevant to TCP;
+        the spec-mandated PCIe-tunnel virtual link advertises Gen1
+        2.5 GT/s on both Intel and AMD (this is correct, not a bug
+        — fixed in kernel 6.7). The throughput gap is in the AMD
+        USB4 controller's DMA engine + thunderbolt-net interaction,
+        not link negotiation.
+
+        15 Gbps is the honest midpoint: above any common ethernet,
+        below the optimistic TB-marketing numbers, within reach of
+        every documented Linux platform. The mesh-link preference
+        still picks Thunderbolt over a 2.5G LAN bridge.
     """
     base = Path(f"/sys/class/net/{nic}")
 
@@ -351,13 +369,15 @@ def nic_speed_mbps(nic: str) -> int:
                 return min(speeds)
         # No physical slaves yet — fall through to kernel value.
 
-    # Thunderbolt-net: kernel doesn't expose speed. Use TB3 minimum.
+    # Thunderbolt-net: kernel doesn't expose speed; report 15 Gbps —
+    # an honest Linux real-world midpoint (see docstring for the
+    # platform-by-platform breakdown).
     try:
         drv_link = base / "device" / "driver"
         if drv_link.is_symlink():
             drv = (drv_link).resolve().name
             if drv == "thunderbolt-net":
-                return 20000
+                return 15000
     except OSError:
         pass
 
@@ -371,11 +391,15 @@ def nic_speed_mbps(nic: str) -> int:
 
 def bucket_speed(mbps: int) -> int:
     """Round to a coarse bucket so jitter doesn't perturb the fold.
-    1000-or-less → 1000; 2500 → 2500; 10000 → 10000; etc.
+    Buckets cover the realistic NIC tiers we see in the field, with
+    a 15 Gbps step specifically for the Linux `thunderbolt-net`
+    ceiling (12-17 Gbps unidir across documented platforms). Without
+    that bucket, a TB link would round up to 25000 and oversell the
+    actual achievable throughput.
     Unknown (0) stays 0."""
     if mbps <= 0:
         return 0
-    for b in (1000, 2500, 10000, 25000, 40000, 100000):
+    for b in (1000, 2500, 10000, 15000, 25000, 40000, 100000):
         if mbps <= b:
             return b
     return 100000
