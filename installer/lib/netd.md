@@ -13,15 +13,15 @@ every Bedrock node runs. Three jobs in one process, one tick loop:
    AEAD-sealed slot), runs `lib.election.compute()` once per
    second over its own peer-liveness table + the rqlite snapshot,
    acts on the outcome: `set_mgmt_master(self)` on Leader-promote,
-   `write_fence_marker` + `cluster_arbiter.demote_arbiter_host()`
+   `set_no_quorum_marker` + `cluster_arbiter.demote_arbiter_host()`
    on NoQuorum. Each tick, `witness.set_own_slot(marker=drbdadm
    current-uuid, tag=TAG_LMS iff hosting AND no peer logged_up)`
    updates what this node will publish next. There is no
    "claim/bless" — see `docs/cluster-quorum-spec.md`.
-3. **Self-fence.** When NoQuorum persists past the streak holddown
-   (`NOQUORUM_HOLDDOWN_TICKS=5` ≈ 5 s), directly call
-   `cluster_arbiter.demote_arbiter_host()` so the master VIP +
-   arbiter rqlite + filer/s3 come down BEFORE qemu can write
+3. **Self-demote on NoQuorum.** When NoQuorum persists past the
+   streak holddown (`NOQUORUM_HOLDDOWN_TICKS=5` ≈ 5 s), directly
+   call `cluster_arbiter.demote_arbiter_host()` so the master VIP
+   + arbiter rqlite + filer/s3 come down BEFORE qemu can write
    stale data through the DRBD device. `cluster_arbiter.converge()`
    can't help here because rqlite is by definition unreachable in
    NoQuorum, so we bypass the rqlite-subscriber path.
@@ -30,7 +30,7 @@ Replaces the deleted `bedrock-rust` daemon. Reads `state.json` for
 the cluster_uuid + node_name + loopback_ip; reads `cluster.json`
 for the membership it should know about; reads `cluster.key`
 (32-byte AEAD key) for witness ChaCha20-Poly1305 encryption.
-Writes routes, `/run/bedrock-cluster.fence`, and
+Writes routes, `/run/bedrock-no-quorum`, and
 `cluster_info.mgmt_master` in rqlite.
 
 Higher-level mesh-design rationale (why a per-cluster CGNAT /24,
@@ -48,8 +48,8 @@ implementation reference.
 - `NOQUORUM_HOLDDOWN_TICKS = 5` — consecutive NoQuorum ticks
   before self-demote fires. Absorbs first-second startup transients.
 - `DOWN_HYSTERESIS_S = 10.0` — silent-this-long-before-LINK_DOWN.
-  Was 30 s; lowered to 10 s so the self-fence fires within a
-  90 s isolation test window.
+  Was 30 s; lowered to 10 s so self-demote on NoQuorum fires
+  within a 90 s isolation test window.
 - `UP_HYSTERESIS_S = 5.0` — link must be up this long before
   LINK_UP. Avoids declaring a flapping link "up" on every blip.
 - `METRIC_DIRECT_BASE = 10`, `METRIC_TRANSIT_BASE = 100`,
@@ -166,9 +166,9 @@ implementation reference.
      `mgmt_master`.
   4. Call `lib.election.compute(...)`.
   5. Log transitions.
-  6. Act on outcome: NoQuorum streak hold-down + write fence
-     marker + `demote_arbiter_host` (once per cycle via
-     `demoted_in_cycle` flag); Leader + `should_set_mgmt_master`
+  6. Act on outcome: NoQuorum streak hold-down + write the
+     no-quorum marker + `demote_arbiter_host` (once per cycle
+     via `demoted_in_cycle` flag); Leader + `should_set_mgmt_master`
      → `bs.set_mgmt_master(self_name)` to rqlite.
   7. Update our own witness slot: `_read_tier_critical_uuid()`
      gives the current DRBD generation marker;
@@ -181,12 +181,12 @@ implementation reference.
   Empty string when DRBD isn't up (N=1, pre-promote).
 - `_run_silent_capture(cmd) -> (rc, stdout, stderr)` — helper.
 
-### Self-fence
+### Self-demote on NoQuorum
 
-The self-fence path is part of `_election_tick`'s NoQuorum branch.
-Trigger: 5 consecutive NoQuorum ticks. Action: drop fence marker
-+ `cluster_arbiter.demote_arbiter_host()` once per cycle. Reset:
-`demoted_in_cycle` flag clears on any non-NoQuorum tick.
+The self-demote path is part of `_election_tick`'s NoQuorum branch.
+Trigger: 5 consecutive NoQuorum ticks. Action: drop the no-quorum
+marker + `cluster_arbiter.demote_arbiter_host()` once per cycle.
+Reset: `demoted_in_cycle` flag clears on any non-NoQuorum tick.
 
 ### Misc
 
@@ -208,7 +208,7 @@ Trigger: 5 consecutive NoQuorum ticks. Action: drop fence marker
 |---------|---------------|
 | ip route replace fails silently | `journalctl -u bedrock-net | grep emit_routes` — captures rc + stderr |
 | Master flaps Leader↔NoQuorum | `NOQUORUM_HOLDDOWN_TICKS` + `demoted_in_cycle` flag |
-| Self-fence too slow | `DOWN_HYSTERESIS_S` (10 s) + 5-tick streak ≈ 12-15 s total |
+| Self-demote too slow | `DOWN_HYSTERESIS_S` (10 s) + 5-tick streak ≈ 12-15 s total |
 | Joiner sees stale quorum count | `ever_seen_peers` not yet populated → joiner-grace ✓ |
 | Witness vote not counted | check `lib/witness.is_alive()`; reply must be ≤12 s old |
 | Slot writes silently dropped at Echo | AEAD verify-fail (wrong cluster_key) — Echo doesn't tell, packet is just gone |

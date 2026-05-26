@@ -13,7 +13,7 @@ Top-level layout:
 
     main thread (asyncio event loop)
       ├── FastAPI on :8443 (HTTPS, LAN) and :8001 (HTTP, loopback)
-      ├── orchestrator tasks: rqlite_subscriber, fence_responder,
+      ├── orchestrator tasks: rqlite_subscriber, no_quorum_responder,
       │   boot_orchestrator, converge_retry, backup_scheduler
       └── cert_refresh task (24 h interval)
     netd thread   — blocking mesh/election/witness loop
@@ -77,8 +77,8 @@ def main() -> int:
             # (e.g. serve the dashboard so the operator can diagnose).
             # Signal shutdown so the operator sees a clean exit rather
             # than a half-alive process. Per user direction: no
-            # fence-watchdog auto-reboot. They'll see this in
-            # journalctl and decide.
+            # auto-reboot watchdog. They'll see this in journalctl
+            # and decide.
 
     t_netd = threading.Thread(target=_netd_thread, name="bedrock-netd",
                               daemon=True)

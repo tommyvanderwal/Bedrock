@@ -7,8 +7,8 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
 
 ## Working conventions
 - One question at a time. Don't pile up multi-part asks.
-- Spell out state names in full (`LEADER`, `FOLLOWER`, `NOQUORUM`,
-  `FENCED`). Same in code identifiers and docs. Single-letter shorts
+- Spell out state names in full (`LEADER`, `FOLLOWER`, `NOQUORUM`).
+  Same in code identifiers and docs. Single-letter shorts
   save no space that matters and obscure meaning.
 - Background lists below stay persistent. Items only leave when
   resolved or explicitly retired.
@@ -66,7 +66,7 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   Reason: every node needs autonomous read access to cluster policy
   data — most concretely, per-VM `vm_type` (cattle / pet / vipet)
   determines correct local behavior during isolation. A cattle VM
-  must keep running on an isolated node; a pet VM must get fenced.
+  must keep running on an isolated node; a pet VM must get paused on NoQuorum.
   That policy lives in rqlite's `vms` table; the per-node rqlited
   replica is what makes the isolated node act correctly without a
   live cluster connection. Removing rqlite would just re-implement
@@ -516,13 +516,13 @@ command for the edge case.
               │   • state.json (own last election state)   │
               │   • local UUID history (field in state.json)│
               │   • rqlite UUID history table (if reachable)│
-              │   • /run/bedrock-cluster.fence marker      │
+              │   • /run/bedrock-no-quorum marker          │
               └─────────────────────┬─────────────────────┘
                                     │
                                     ▼
-                       ┌────────────────────────┐
-                       │  fence marker present? ├── yes ──► role = FENCED, done
-                       └────────────┬───────────┘
+                       ┌────────────────────────────┐
+                       │  no-quorum marker present? ├── yes ──► role = NOQUORUM, done
+                       └──────────────┬─────────────┘
                                     │ no
                                     ▼
                        ┌────────────────────────┐

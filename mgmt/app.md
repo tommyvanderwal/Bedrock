@@ -12,7 +12,7 @@
    `peer_auth.verify_request` on the receiver.
 3. **Embeds the orchestrator** — `start_all()` from
    `mgmt/orchestrator.py` is invoked from the FastAPI startup
-   hook, which spawns the rqlite_subscriber + fence_responder
+   hook, which spawns the rqlite_subscriber + no_quorum_responder
    + boot_orchestrator + backup_scheduler + converge_retry
    tasks on the running event loop.
 

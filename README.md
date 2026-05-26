@@ -36,7 +36,7 @@ a thin orchestrator on top.
 │   └── mgmt.tar.gz             ← packaged dashboard (FastAPI + Svelte build)
 ├── mgmt/                       ← dashboard service (runs in bedrock-d)
 │   ├── app.py                  ← FastAPI backend (REST + WebSocket) on :8443
-│   ├── orchestrator.py         ← calm reactor: rqlite subscriber, fence
+│   ├── orchestrator.py         ← calm reactor: rqlite subscriber, no-quorum
 │   │                              responder, boot orchestrator, target reconcile
 │   ├── backup.py               ← Kopia orchestration (LV snapshot + dd | kopia)
 │   ├── tasks.py                ← in-process task registry for long ops

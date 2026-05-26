@@ -287,18 +287,30 @@ class VmCreate:
     def step_register_vm(self, ctx):
         """Write the vms row (or update if exists). Mark state =
         'created' (NOT 'running' yet — start_if_requested handles
-        that)."""
+        that). Also records failover_order — the predetermined
+        primary/secondary/tertiary sequence the failover orchestrator
+        consults on a surviving node to decide whether it is next in
+        line after a dead primary. Cattle gets '[]' (no failover);
+        pet/vipet get ctx["peers"] verbatim — peers[0] is the
+        primary (= ctx["home"]), peers[1] is the secondary, peers[2]
+        is the tertiary for vipet."""
         from bedrock_d import state as _st
         import time as _t
+        if ctx["vm_type"] == "cattle":
+            failover_order = []
+        else:
+            failover_order = list(ctx["peers"])
         with _st.RqliteClient() as client:
             client.execute(
                 "INSERT OR REPLACE INTO vms "
                 "(vm_name, vm_type, host, ram_mb, disk_gb, state, "
-                " updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'created', ?)",
+                " failover_order, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'created', ?, ?)",
                 params=[ctx["vm_name"], ctx["vm_type"],
                         ctx["home"], int(ctx["ram_mb"]),
-                        int(ctx["disk_gb"]), int(_t.time())],
+                        int(ctx["disk_gb"]),
+                        json.dumps(failover_order),
+                        int(_t.time())],
             )
 
 

@@ -1731,16 +1731,10 @@ def node_reset_local() -> None:
     #    leaving them up means stale Raft state keeps probing for the
     #    previous cluster's voters and the next `bedrock init` can't
     #    elect a leader.
-    # Single unified daemon: bedrock-d (was bedrock-net + bedrock-mgmt).
-    # Older units (bedrock-mgmt, bedrock-net, bedrock-fence-watchdog,
-    # bedrock-mdns, bedrock-redirect, bedrock-cert-refresh) are kept
-    # in the stop list so a node installed from a pre-unification ISO
-    # still gets cleanly torn down on reset.
+    # Single unified daemon: bedrock-d.
     services = ("bedrock-d",
-                "bedrock-mgmt", "bedrock-net",
                 "bedrock-mdns", "bedrock-redirect",
                 "bedrock-cert-refresh.timer",
-                "bedrock-fence-watchdog.timer",
                 "bedrock-vm", "bedrock-vl",
                 "bedrock-vmagent", "bedrock-vlagent",
                 "bedrock-rqlited", "bedrock-rqlited-arbiter",

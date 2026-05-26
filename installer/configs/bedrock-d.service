@@ -15,8 +15,8 @@ Type=simple
 ExecStart=/usr/local/bin/bedrock-d
 # Restart policy: come back fast on crash. No StartLimit since we
 # want the operator to see crashes via journalctl, not have systemd
-# silently give up. fence-watchdog is intentionally absent (single-
-# process design; operator troubleshoots a stuck bedrock-d directly).
+# silently give up. No external watchdog (single-process design;
+# operator troubleshoots a stuck bedrock-d directly).
 Restart=on-failure
 RestartSec=3s
 # Stop semantics: SIGTERM → daemon sets stop_event → threads exit,

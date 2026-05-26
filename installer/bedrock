@@ -474,7 +474,7 @@ def _cmd_node_leave(target: str, reason: str):
             # pre-unification nodes.
             "systemctl stop bedrock-d bedrock-net bedrock-mgmt "
             "bedrock-rqlited bedrock-rqlited-arbiter 2>/dev/null; "
-            "rm -f /run/bedrock-cluster.fence; "
+            "rm -f /run/bedrock-no-quorum; "
             "true",
         ]).returncode
         if rc != 0:
@@ -500,7 +500,7 @@ def _cmd_node_maint(target: str, mode: str):
     print(f"  rev={rev} node_maintenance_set({target}, on={on})")
     print(f"  Rqlite committed; replication propagates to peers.")
     print(f"  Each node's orchestrator regenerates daemon.toml on revision change.")
-    print(f"  When you take {target} offline now, surviving nodes won't fence.")
+    print(f"  When you take {target} offline now, surviving nodes won't drop the no-quorum marker.")
 
 
 def cmd_vm(args):

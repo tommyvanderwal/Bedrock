@@ -10,7 +10,7 @@ canonical state to local-disk effects:
   every 5 s timer (so transient promote failures, e.g. DRBD
   primary refused while the isolated old master is still primary,
   get retried).
-- Watches `/run/bedrock-cluster.fence` and runs cleanup
+- Watches `/run/bedrock-no-quorum` and runs cleanup
   (pause VMs) when it appears; waits for quorum to return before
   clearing the marker.
 - Snapshot-diff reactor: on each revision transition,
@@ -19,20 +19,22 @@ canonical state to local-disk effects:
   side-effects.
 
 `start_all()` is the entry point called from `mgmt/app.py`'s
-FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
-`fence_responder`, `boot_orchestrator`, `backup_scheduler`,
-`converge_retry`.
+FastAPI startup hook. It spawns: `rqlite_subscriber`,
+`no_quorum_responder`, `boot_orchestrator`, `backup_scheduler`,
+`converge_retry`, `cluster_tier_watcher`, and the three
+`vm_failover` tasks.
 
 ## Constants
 
 - `CLUSTER_JSON = /etc/bedrock/cluster.json`,
   `STATE_JSON = /etc/bedrock/state.json`.
-- `FENCE_MARKER = /run/bedrock-cluster.fence` — written by netd's
+- `NO_QUORUM_MARKER = /run/bedrock-no-quorum` — written by netd's
   election layer on NoQuorum; cleared here after cleanup +
   quorum recovery.
-- `FENCE_CLEANUP_TIMEOUT_S = 30.0` — cap on
-  `_run_fence_cleanup`; the independent
-  `bedrock-fence-watchdog` timer reboots after 5 min.
+- `NO_QUORUM_CLEANUP_TIMEOUT_S = 30.0` — cap on
+  `_run_no_quorum_cleanup`. No external watchdog reboots the node
+  in alpha/beta; the operator troubleshoots a stuck cleanup
+  directly.
 
 ## Globals
 
@@ -54,7 +56,7 @@ FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
   --state-{running,paused} --name`.
 - `_vm_drbd_resource(vm_name) -> str | None` — parses `virsh
   dumpxml` for `/dev/drbdN`, maps to `/etc/drbd.d/*.res` to find
-  the resource name. Used by the unfence path to know which DRBD
+  the resource name. Used by the recover path to know which DRBD
   resource to drop to secondary when destroying a paused VM.
 - `_drbd_role(resource) -> str` — `Primary` / `Secondary` /
   `Unknown`.
@@ -94,22 +96,23 @@ FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
 - `boot_orchestrator()` — one-shot at mgmt startup. Calls
   `_wait_for_role(120s)` to wait until cluster.json has a settled
   `mgmt_master`. If timeout → role="unknown", logs and exits
-  (the watchdog will reboot). Else calls `_start_local_services()`
-  and sets `_SERVICES_STARTED = True`.
+  (operator can investigate via journal). Else calls
+  `_start_local_services()` and sets `_SERVICES_STARTED = True`.
 - `_wait_for_role(timeout_s) -> str` — poll cluster.json until
   `mgmt_master` is set. Returns "leader" if we are master,
-  "follower" otherwise. Returns "fenced" if the marker is
+  "follower" otherwise. Returns "noquorum" if the marker is
   present, "unknown" on timeout.
 - `_start_local_services()` — starts libvirtd, starts running
   VMs that the snapshot says belong here, runs
   `backup.configure_target_locally` for each registered
   backup_target so kopia is connected on boot.
 
-### ③ fence_responder
+### ③ no_quorum_responder
 
-- `fence_responder()` — watches `FENCE_MARKER` once per second.
-  On appearance:
-  1. `_run_fence_cleanup()` with FENCE_CLEANUP_TIMEOUT_S cap.
+- `no_quorum_responder()` — watches `NO_QUORUM_MARKER` once per
+  second. On appearance:
+  1. `_run_no_quorum_cleanup()` with NO_QUORUM_CLEANUP_TIMEOUT_S
+     cap.
   2. **Wait for quorum to return** via
      `_wait_for_role(120s)` — without this, the election
      re-flagged NoQuorum next tick and we'd flap.
@@ -117,9 +120,10 @@ FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
   4. `_reconcile_paused_vms()` — destroy stale paused copies
      of VMs the log says moved, resume the rest.
   5. `_start_local_services()` again.
-- `_run_fence_cleanup()` — for each running VM: `virsh suspend`.
-  Doesn't demote DRBD here (qemu's open FD would EBUSY); that's
-  done in `_reconcile_paused_vms` after destroying stale copies.
+- `_run_no_quorum_cleanup()` — for each running VM: `virsh
+  suspend`. Doesn't demote DRBD here (qemu's open FD would
+  EBUSY); that's done in `_reconcile_paused_vms` after destroying
+  stale copies.
 - `_reconcile_paused_vms()` — for each paused VM: if cluster
   state says it moved to another host, `virsh destroy` + `drbdadm
   secondary` the resource; if it's still ours, `virsh resume`.
@@ -166,6 +170,6 @@ FastAPI startup hook. It spawns four tasks: `rqlite_subscriber`,
   `_apply_revision` (revision-driven) AND `converge_retry` (5 s
   timer). Idempotent — a no-op when state is already correct,
   retries the failed step otherwise.
-- The fence marker is cleared ONLY by `fence_responder` after
-  cleanup + quorum return. netd's election keeps re-writing it
-  while NoQuorum persists.
+- The no-quorum marker is cleared ONLY by `no_quorum_responder`
+  after cleanup + quorum return. netd's election keeps re-writing
+  it while NoQuorum persists.

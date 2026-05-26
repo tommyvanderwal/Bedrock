@@ -8,7 +8,7 @@ Bedrock is the union of three pieces running on every node:
 
 1. **`bedrock-net`** — single Python daemon. Owns mesh routing,
    witness heartbeat, weighted-vote election, NoQuorum self-demote.
-   Reads cluster.json + state.json; writes routes, `/run/bedrock-cluster.fence`,
+   Reads cluster.json + state.json; writes routes, `/run/bedrock-no-quorum`,
    and (on election win) `cluster_info.mgmt_master` in rqlite.
 2. **`bedrock-rqlited`** — per-node rqlite voter holding the
    cluster's source-of-truth tables (nodes, tiers, mgmt_master,
@@ -219,8 +219,8 @@ seconds:
 5. The NoQuorum streak hold-down (5 ticks ≈ 5 s) avoids false
    positives.
 6. On the 5th NoQuorum tick:
-   - `lib/election.write_fence_marker()` writes
-     `/run/bedrock-cluster.fence`
+   - `lib/election.set_no_quorum_marker()` writes
+     `/run/bedrock-no-quorum`
    - `cluster_arbiter.demote_arbiter_host()` runs directly from
      bedrock-net (can't rely on the orchestrator's converge — rqlite
      is by definition unreachable in NoQuorum):
@@ -229,7 +229,7 @@ seconds:
      - `ip addr del 100.X.Y.254/32 dev lo` (release the master VIP)
      - `umount /var/lib/bedrock/cluster`
      - `drbdadm secondary tier-critical`
-7. `bedrock-mgmt`'s `fence_responder` notices the marker, pauses
+7. `bedrock-mgmt`'s `no_quorum_responder` notices the marker, pauses
    running VMs (so qemu doesn't keep writing to a now-secondary
    DRBD device), and waits for `_wait_for_role` to return a settled
    role before clearing the marker.
@@ -297,8 +297,8 @@ normally.
    per `cluster-quorum-spec.md` Scenario B.
 5. The old master's per-node rqlite re-joins Raft (already a Voter,
    just catches up the log).
-6. `orchestrator.fence_responder` waits for `_wait_for_role` to
-   return `follower`. Once it does, it clears the fence marker and
+6. `orchestrator.no_quorum_responder` waits for `_wait_for_role` to
+   return `follower`. Once it does, it clears the no-quorum marker and
    runs `_reconcile_paused_vms`: for each paused VM, if cluster.json
    says it's now on another host, `virsh destroy` the local stale
    copy + `drbdadm secondary` the per-VM DRBD resource; if it still
@@ -358,7 +358,7 @@ Issued from a node that is NOT the target. Steps in the CLI:
    so future leaves don't brick quorum at N/2 voters.
 3. Master regenerates its own state from the new snapshot.
 4. Master SSHes to the leaving node: `systemctl stop bedrock-net
-   bedrock-mgmt; rm -f /run/bedrock-cluster.fence`. The node stops
+   bedrock-mgmt; rm -f /run/bedrock-no-quorum`. The node stops
    broadcasting probes.
 5. Other peers' bedrock-net detects the down after `DOWN_HYSTERESIS_S`
    and `sweep_hysteresis` drops the Neighbour. The node is no
@@ -383,7 +383,7 @@ Issued from a node that is NOT the target. Steps in the CLI:
    mgmt+compute, `cluster_arbiter.converge()` triggers
    `promote_to_arbiter_host()`. Otherwise demote (no-op if
    already not hosting).
-5. `fence_responder` is idle (no marker present on a normal boot).
+5. `no_quorum_responder` is idle (no marker present on a normal boot).
 6. `_reconcile_paused_vms` runs once `_wait_for_role` returns a
    settled role.
 
@@ -416,7 +416,7 @@ Issued from a node that is NOT the target. Steps in the CLI:
   cluster; signs witness probes/heartbeats/claims.
 - `/etc/bedrock/installer.env` — `BEDROCK_REPO=file:///…` for
   offline-install re-runs.
-- `/run/bedrock-cluster.fence` — fence marker (NoQuorum-triggered).
+- `/run/bedrock-no-quorum` — no-quorum marker (NoQuorum-triggered).
 - `/var/lib/bedrock/local/<tier>` — per-node tier mount before
   promote.
 - `/var/lib/bedrock/cluster` — cluster-singleton root. At N=1

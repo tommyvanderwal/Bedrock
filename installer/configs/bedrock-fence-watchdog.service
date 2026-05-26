@@ -1,7 +1,0 @@
-[Unit]
-Description=Bedrock fence-watchdog — reboot if mgmt cleanup hung
-After=local-fs.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/bedrock-fence-watchdog

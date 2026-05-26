@@ -29,7 +29,7 @@ class BedrockState:
     """The single source of truth for in-process Bedrock state.
 
     Composed of subsystem state objects (netd.Daemon, mgmt snapshot
-    dicts) plus cross-cutting fields (fence marker, stop signal).
+    dicts) plus cross-cutting fields (no-quorum marker, stop signal).
 
     Construction order: state = BedrockState(stop_event=Event()),
     then subsystems attach their state on startup:
@@ -46,12 +46,13 @@ class BedrockState:
     self_loopback_ip: str = ""
     cluster_uuid: str = ""
 
-    # Fence marker semaphore. True = node is fenced (no quorum).
-    # netd's election sets True on NoQuorum + holddown; orchestrator's
-    # fence_responder sets False after cleanup completes AND quorum is
-    # back. The on-disk /run/bedrock-cluster.fence file is still
-    # written/cleared in lockstep so external debug tooling sees it.
-    fence_marker_present: bool = False
+    # No-quorum marker semaphore. True = node is in sticky no-quorum
+    # state. netd's election sets True on NoQuorum + holddown;
+    # orchestrator's no_quorum_responder sets False after cleanup
+    # completes AND quorum is back. The on-disk /run/bedrock-no-quorum
+    # file is written/cleared in lockstep so external debug tooling
+    # sees it.
+    no_quorum_marker_present: bool = False
 
     # ── netd-owned state ──────────────────────────────────────────
     # The Daemon object lives here. Single-writer = netd thread.
@@ -78,7 +79,7 @@ class BedrockState:
     last_log_idx: int = 0
     snapshot_lock: threading.RLock = field(default_factory=threading.RLock)
 
-    # boot_orchestrator + fence_responder rendezvous flag.
+    # boot_orchestrator + no_quorum_responder rendezvous flag.
     services_started: bool = False
 
     # ── per-task transient state (no lock needed; touched only by

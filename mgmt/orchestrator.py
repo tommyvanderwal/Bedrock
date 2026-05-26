@@ -14,7 +14,7 @@ hosting:
                           Critical-tier DRBD primary/mount/.254 VIP/
                           arbiter rqlite/filer are owned by
                           cluster_arbiter.converge().
-  ③ fence_responder      on fence marker (dropped by bedrock-net's
+  ③ no_quorum_responder  on no-quorum marker (dropped by netd's
                           election when this node loses quorum):
                           pause running VMs, then clear the marker
                           when election regains quorum + reconcile
@@ -28,12 +28,6 @@ hosting:
   ④ reactor              snapshot-diff-driven side-effects —
                           vm-host changed, backup_target appeared,
                           etc., once services are up.
-
-The 5-min fence-to-reboot watchdog lives outside this process, in
-/usr/local/bin/bedrock-fence-watchdog (a systemd timer). Its job is
-to reboot the node if the marker stays around > 5 min, independent
-of whether mgmt is alive — covers the "mgmt itself crashed during
-cleanup" case.
 """
 from __future__ import annotations
 
@@ -55,12 +49,12 @@ log = logging.getLogger("bedrock.orchestrator")
 
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON = Path("/etc/bedrock/state.json")
-FENCE_MARKER = Path("/run/bedrock-cluster.fence")
+NO_QUORUM_MARKER = Path("/run/bedrock-no-quorum")
 
 # Cleanup itself is fast — virsh suspend on local VMs is seconds.
-# This is the cap on the cleanup procedure only; the broader 5-min
-# fence-to-reboot cap is the independent watchdog timer.
-FENCE_CLEANUP_TIMEOUT_S = 30.0
+# This is the cap on the cleanup procedure only; the operator can
+# troubleshoot a stuck cleanup in alpha/beta (no auto-reboot).
+NO_QUORUM_CLEANUP_TIMEOUT_S = 30.0
 
 # Live in-memory snapshot, updated by rqlite_subscriber and read by
 # other tasks (and by the FastAPI handlers that want fresh state).
@@ -91,7 +85,7 @@ _STATE = None
 
 def attach_state(state) -> None:
     """Hook the unified daemon's shared state object so subscriber +
-    fence_responder + boot + converge_retry + backup all read/write
+    no_quorum_responder + boot + converge_retry + backup all read/write
     through it. Called once at bedrock-d startup."""
     global _STATE
     _STATE = state
@@ -325,9 +319,9 @@ async def boot_orchestrator():
     DRBD/libvirtd/VMs that should run on this node."""
     global _SERVICES_STARTED
     role = await _wait_for_role(timeout_s=120.0)
-    if role in ("noquorum", "fenced", "", "unknown"):
+    if role in ("noquorum", "", "unknown"):
         log.error("boot: role=%r — not starting local services; "
-                  "fence_responder or future state changes will trigger start",
+                  "no_quorum_responder or future state changes will trigger start",
                   role)
         return
     log.info("boot: role=%s; starting local services", role)
@@ -336,20 +330,20 @@ async def boot_orchestrator():
 
 
 async def _wait_for_role(timeout_s: float,
-                         ignore_fence: bool = False) -> str:
+                         ignore_marker: bool = False) -> str:
     """Poll cluster.json until we have a quorum-recorded mgmt_master.
     Returns 'leader' if we are master, 'follower' if a peer is, or
-    'fenced' / 'unknown' on timeout. cluster.json is written by the
+    'noquorum' / 'unknown' on timeout. cluster.json is written by the
     rqlite subscriber every tick from the canonical rqlite state, so
     this becomes 'follower' or 'leader' as soon as quorum is back.
 
-    `ignore_fence=True`: skip the FENCE_MARKER early-return. Used by
-    fence_responder — the caller will clear the marker once quorum
-    is back.
+    `ignore_marker=True`: skip the NO_QUORUM_MARKER early-return. Used
+    by no_quorum_responder — the caller will clear the marker once
+    quorum is back.
 
     Quorum-is-back signal: at least one peer is mesh-reachable AND
     cluster.json says master is alive (someone, possibly us). We do
-    NOT gate on last_election_outcome — the election returns FENCED
+    NOT gate on last_election_outcome — the election returns NO_QUORUM
     as long as the marker is present, which is circular (we're the
     ones holding the marker waiting for quorum to be back so we can
     clear it). Mesh peer-liveness is the only live, marker-
@@ -357,10 +351,10 @@ async def _wait_for_role(timeout_s: float,
     deadline = time.monotonic() + timeout_s
     self_name = _self_node_name()
     while time.monotonic() < deadline:
-        if not ignore_fence and FENCE_MARKER.exists():
-            return "fenced"
-        # Live mesh check (skips circular fence-outcome dependency).
-        if ignore_fence and _STATE is not None and _STATE.netd is not None:
+        if not ignore_marker and NO_QUORUM_MARKER.exists():
+            return "noquorum"
+        # Live mesh check (skips circular marker dependency).
+        if ignore_marker and _STATE is not None and _STATE.netd is not None:
             try:
                 with _STATE.netd_lock:
                     d = _STATE.netd
@@ -388,7 +382,7 @@ async def _wait_for_role(timeout_s: float,
 
 async def _start_local_services():
     """Bring this node's local services up to the state rqlite says
-    they should be in. Idempotent — safe at boot, after a fence
+    they should be in. Idempotent — safe at boot, after a no-quorum
     cycle, or when re-running because the log changed."""
     try:
         from lib import cluster_state as _cs
@@ -443,38 +437,38 @@ async def _start_local_services():
                         target_id, e)
 
 
-# ── ③ fence_responder ────────────────────────────────────────────────────
+# ── ③ no_quorum_responder ───────────────────────────────────────────────
 
-async def fence_responder():
-    """Watch /run/bedrock-cluster.fence. On appearance, run cleanup
-    (pause VMs) within FENCE_CLEANUP_TIMEOUT_S. Then poll for the
+async def no_quorum_responder():
+    """Watch /run/bedrock-no-quorum. On appearance, run cleanup
+    (pause VMs) within NO_QUORUM_CLEANUP_TIMEOUT_S. Then poll for the
     election to leave NoQuorum (cluster.json's mgmt_master becomes
     reachable from rqlite) BEFORE clearing the marker — otherwise the
     election re-flags NoQuorum on the next tick and we flap.
 
-    The independent bedrock-fence-watchdog timer reboots the node if
-    the marker stays around > 5 min — that covers the case where this
-    task itself crashes mid-cleanup or rejoin never completes."""
+    If this task crashes mid-cleanup or rejoin never completes, the
+    marker stays present and the operator can troubleshoot in
+    alpha/beta (no auto-reboot)."""
     global _SERVICES_STARTED
     while True:
         await asyncio.sleep(1)
-        if not FENCE_MARKER.exists():
+        if not NO_QUORUM_MARKER.exists():
             continue
 
-        log.error("fence: marker detected — entering cleanup")
+        log.error("no_quorum: marker detected — entering cleanup")
         try:
             await asyncio.wait_for(
-                _run_fence_cleanup(),
-                timeout=FENCE_CLEANUP_TIMEOUT_S,
+                _run_no_quorum_cleanup(),
+                timeout=NO_QUORUM_CLEANUP_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            log.error("fence: cleanup did not complete in %ds — leaving "
-                      "marker for the watchdog to reboot us",
-                      int(FENCE_CLEANUP_TIMEOUT_S))
+            log.error("no_quorum: cleanup did not complete in %ds — "
+                      "leaving marker for operator",
+                      int(NO_QUORUM_CLEANUP_TIMEOUT_S))
             return
         except Exception as e:
-            log.error("fence: cleanup raised %r — leaving marker for "
-                      "the watchdog", e)
+            log.error("no_quorum: cleanup raised %r — leaving marker "
+                      "for operator", e)
             return
 
         # Wait for the election to leave NoQuorum before unlinking the
@@ -482,17 +476,17 @@ async def fence_responder():
         # tick and we'd flap. _wait_for_role returns 'leader'/'follower'
         # once cluster.json has a recorded mgmt_master from rqlite (i.e.
         # the cluster has reformed quorum and a leader has been elected).
-        log.info("fence: cleanup done; waiting for quorum to return before "
-                 "clearing marker")
-        role = await _wait_for_role(timeout_s=120.0, ignore_fence=True)
+        log.info("no_quorum: cleanup done; waiting for quorum to return "
+                 "before clearing marker")
+        role = await _wait_for_role(timeout_s=120.0, ignore_marker=True)
         if role not in ("leader", "follower"):
-            log.warning("fence: still no quorum after 120s — leaving marker "
-                        "for watchdog reboot")
+            log.warning("no_quorum: still no quorum after 120s — leaving "
+                        "marker for operator")
             return
 
         try:
-            FENCE_MARKER.unlink()
-            log.info("fence: quorum back as %s; marker cleared", role)
+            NO_QUORUM_MARKER.unlink()
+            log.info("no_quorum: quorum back as %s; marker cleared", role)
         except FileNotFoundError:
             pass
 
@@ -502,12 +496,11 @@ async def fence_responder():
             await _start_local_services()
             _SERVICES_STARTED = True
         else:
-            log.warning("fence: post-unfence role=%r — services held until "
-                        "cluster recovers (watchdog will reboot if this "
-                        "stays past 5 min total since fence)", role)
+            log.warning("no_quorum: post-recovery role=%r — services "
+                        "held until cluster recovers", role)
 
 
-async def _run_fence_cleanup():
+async def _run_no_quorum_cleanup():
     """The minimum required to make this node not-dangerous to peers:
     virsh suspend every running VM (preserve state).
 
@@ -520,14 +513,14 @@ async def _run_fence_cleanup():
     writes were."""
     running = _running_vm_names()
     for vm in running:
-        log.info("fence: virsh suspend %s", vm)
+        log.info("no_quorum: virsh suspend %s", vm)
         subprocess.run(["virsh", "suspend", vm], check=False)
 
-    log.info("fence: cleanup complete (paused %d VMs)", len(running))
+    log.info("no_quorum: cleanup complete (paused %d VMs)", len(running))
 
 
 async def _reconcile_paused_vms():
-    """After unfence + log catch-up, decide for each paused VM:
+    """After quorum returns + log catch-up, decide for each paused VM:
 
       - log says VM moved (host != us) or destroyed → virsh destroy
         the local stale copy (qemu releases the DRBD FD), then
@@ -553,27 +546,27 @@ async def _reconcile_paused_vms():
         res = _vm_drbd_resource(vm_name)
 
         if vm is None:
-            log.warning("unfence: paused VM %s not in log — destroying stale copy",
+            log.warning("recover: paused VM %s not in log — destroying stale copy",
                         vm_name)
             subprocess.run(["virsh", "destroy", vm_name], check=False)
             if res:
-                log.info("unfence: drbdadm secondary %s "
+                log.info("recover: drbdadm secondary %s "
                          "(releasing for peer's primary)", res)
                 subprocess.run(["drbdadm", "secondary", res], check=False)
             continue
 
         if vm.get("host") != self_name:
-            log.info("unfence: VM %s now hosted on %s — destroying our paused copy",
+            log.info("recover: VM %s now hosted on %s — destroying our paused copy",
                      vm_name, vm.get("host"))
             subprocess.run(["virsh", "destroy", vm_name], check=False)
             if res:
-                log.info("unfence: drbdadm secondary %s "
+                log.info("recover: drbdadm secondary %s "
                          "(releasing for peer's primary)", res)
                 subprocess.run(["drbdadm", "secondary", res], check=False)
             continue
 
         if vm.get("state") == "running":
-            log.info("unfence: VM %s still ours per log — resuming", vm_name)
+            log.info("recover: VM %s still ours per log — resuming", vm_name)
             subprocess.run(["virsh", "resume", vm_name], check=False)
 
 
@@ -972,8 +965,8 @@ def start_all():
     SEPARATE threads — so without a real lock the idempotency guard
     races and every orchestrator task starts twice (visible as doubled
     `arbiter: promoting` / `boot: role=leader` log lines, two competing
-    rqlite_subscribers, and two fence_responders that clobber each
-    other's wait_for_role timing)."""
+    rqlite_subscribers, and two no_quorum_responders that clobber
+    each other's wait_for_role timing)."""
     global _TASKS_STARTED
     with _START_LOCK:
         if _TASKS_STARTED:
@@ -982,11 +975,19 @@ def start_all():
             return
         _TASKS_STARTED = True
     asyncio.create_task(rqlite_subscriber())
-    asyncio.create_task(fence_responder())
+    asyncio.create_task(no_quorum_responder())
     asyncio.create_task(boot_orchestrator())
     asyncio.create_task(backup_scheduler())
     asyncio.create_task(converge_retry())
     asyncio.create_task(cluster_tier_watcher())
-    log.info("orchestrator: tasks started (subscriber, fence_responder, "
+    # VM failover state machine — suspend-on-no-quorum,
+    # takeover-after-35s, kill-suspended-after-5min. Per-VM workload
+    # survival logic (Gap 2 from 2026-05-26 review).
+    try:
+        from bedrock_d.orchestrator import vm_failover as _vmf
+        _vmf.start_failover_tasks()
+    except Exception as e:
+        log.warning("orchestrator: vm_failover start failed: %s", e)
+    log.info("orchestrator: tasks started (subscriber, no_quorum_responder, "
              "boot, backup_scheduler, converge_retry, "
-             "cluster_tier_watcher)")
+             "cluster_tier_watcher, vm_failover x3)")

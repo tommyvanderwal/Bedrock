@@ -174,7 +174,7 @@ orchestration targets that observe rqlite changes via the
 
 The earlier "bedrock-rust hash-chained log" model was retired in the
 post-0.8-alpha rewrite. bedrock-rust itself was subsequently
-removed; its responsibilities (election, witness IO, self-fence)
+removed; its responsibilities (election, witness IO, self-demote on NoQuorum)
 moved into the netd thread inside `bedrock-d`. See
 [`daemon-unification.md`](daemon-unification.md) and
 [`cluster-quorum-spec.md`](cluster-quorum-spec.md).

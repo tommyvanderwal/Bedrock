@@ -120,10 +120,10 @@ PROBE_TTL   = 1                  # link-local only; never crosses routers
 PROBE_INTERVAL = 1.0             # seconds between probes per interface
 TICK_INTERVAL  = 0.25            # main loop tick
 ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
-# Number of consecutive NoQuorum ticks before we drop fence marker /
-# demote singletons. Bedrock-net's first ~5s after startup has
-# neighbours=0 → looks like NoQuorum until probes complete; without
-# this hold-down we'd self-fence on every restart.
+# Number of consecutive NoQuorum ticks before we drop the no-quorum
+# marker / demote singletons. Bedrock-net's first ~5s after startup
+# has neighbours=0 → looks like NoQuorum until probes complete;
+# without this hold-down we'd self-mark on every restart.
 NOQUORUM_HOLDDOWN_TICKS = 5
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
@@ -135,7 +135,7 @@ UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 # hysteresis (10 s); the user's spec calls 28 s with a small margin.
 LONE_MASTER_WATCHDOG_S = 28.0
 # Down hysteresis: enough to absorb a few missed probes but short
-# enough that the election self-fence fires within the 90 s
+# enough that the election self-marks NoQuorum within the 90 s
 # isolation window the e2e harness uses (was 30 s — left
 # sim-1's .254 hanging until ~T+45 s after the assertion).
 DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
@@ -896,9 +896,10 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
       - heartbeats / re-discovers the witness
       - on Leader transition + we're not currently mgmt_master: writes
         bs.set_mgmt_master(self) to rqlite (Raft enforces single-writer)
-      - on NoQuorum transition: drops the fence marker
-      - on transition back to Leader/Follower from Fenced: nothing
-        (orchestrator's fence_responder clears the marker after cleanup)
+      - on NoQuorum transition: drops the no-quorum marker
+      - on transition back to Leader/Follower from NoQuorum: nothing
+        (orchestrator's no_quorum_responder clears the marker after
+         cleanup)
     Returns the new outcome string (for logging on transition only)."""
     # 1. Witness IO (best-effort).
     try:
@@ -978,14 +979,14 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         # Hold-down: only treat NoQuorum as actionable after it has
         # persisted for HOLDDOWN_TICKS consecutive ticks (≈ 5 s).
         # Without this, every fresh start of bedrock-net spent ≥ a
-        # second with neighbours=0 → 10/11 votes → fence; the
+        # second with neighbours=0 → 10/11 votes → no-quorum mark; the
         # subsequent neighbour discovery flipped back to leader the
         # next tick, but the singletons had already been torn down
         # on the way through.
         d.noquorum_streak = getattr(d, "noquorum_streak", 0) + 1
         if d.noquorum_streak < NOQUORUM_HOLDDOWN_TICKS:
             return result.outcome.value
-        _election.write_fence_marker(result.reason)
+        _election.set_no_quorum_marker(result.reason)
         # If we were hosting the cluster singletons (.254 VIP, arbiter
         # rqlite, filer) at the moment quorum was lost, demote them
         # directly. cluster_arbiter.converge() can't help here — it
@@ -1391,11 +1392,11 @@ def run_daemon(shared_state=None):
                 # + orchestrator (saves them re-reading /run files).
                 if shared_state is not None and last_election_outcome:
                     shared_state.last_election_outcome = last_election_outcome
-                    # Mirror fence-marker file existence into shared
+                    # Mirror no-quorum marker file existence into shared
                     # state so cluster_arbiter.converge can read it
                     # without a stat() per tick.
-                    shared_state.fence_marker_present = (
-                        last_election_outcome == "fenced"
+                    shared_state.no_quorum_marker_present = (
+                        last_election_outcome == "noquorum"
                     )
             if now - last_status >= 30.0:
                 logged = sum(1 for n in d.neighbours.values() if n.logged_up)
@@ -1850,7 +1851,7 @@ def sweep_hysteresis(d: Daemon) -> None:
             # reached logged_up. Without this gate, ever_seen_peers
             # bumped on the very first one-way probe receipt, so
             # n_nodes jumped to 2 before logged_up was True →
-            # my_votes=10/11 → NoQuorum → fenced before the 5 s
+            # my_votes=10/11 → NoQuorum-marked before the 5 s
             # UP_HYSTERESIS_S handshake could complete. Particularly
             # bites startup right after a bedrock-d restart.
             d.ever_seen_peers.add(n.peer_node)

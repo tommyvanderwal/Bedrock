@@ -13,7 +13,7 @@ all state lives in one address space. No more file IPC, no more
 | `bedrock-mdns` | `installer/lib/mdns_responder.py` | mdns thread |
 | `bedrock-redirect` | `installer/lib/http_redirect.py` | second uvicorn instance (port 80) on same loop |
 | `bedrock-cert-refresh` | `installer/lib/cert_manager.py` | asyncio task (24h interval) |
-| `bedrock-fence-watchdog` | bash | **DROPPED** — operator can troubleshoot in alpha/beta |
+| `bedrock-fence-watchdog` | bash | **removed** — operator can troubleshoot in alpha/beta |
 
 ## Stays separate (third-party or external-by-design)
 
@@ -29,14 +29,14 @@ bedrock-d (single Python process)
 ├── BedrockState (shared in-memory object, locked where needed)
 ├── netd thread        — netd_loop(state, stop_event)
 │                         owns: Daemon (peer_liveness, neighbours, ws, …)
-│                         decides: election, witness, fence write
+│                         decides: election, witness, no-quorum marker write
 ├── mdns thread        — mdns_responder.run(state, stop_event)
 ├── asyncio event loop (main thread)
 │   ├── FastAPI / uvicorn on 8443 (HTTPS, LAN-reachable)
 │   ├── FastAPI / uvicorn on 8080 (HTTP, loopback) [bedrock CLI dials this]
 │   ├── HTTP redirect on port 80 (folded into FastAPI as catch-all)
 │   ├── rqlite_subscriber task
-│   ├── fence_responder task
+│   ├── no_quorum_responder task
 │   ├── boot_orchestrator task
 │   ├── converge_retry task
 │   ├── backup_scheduler task
@@ -61,7 +61,7 @@ class BedrockState:
     snapshot_lock: RLock                        # readers from FastAPI
 
     # cross-cutting (any subsystem writes/reads)
-    fence_marker_present: bool = False          # netd writes True, fence_responder writes False
+    no_quorum_marker_present: bool = False      # netd writes True, no_quorum_responder writes False
     self_node_name: str = ""
     self_loopback_ip: str = ""
 
@@ -76,7 +76,7 @@ copy-out before processing.
 
 - `/run/bedrock/mesh_neighbors.json`, `switch_neighbors.json`, `physical_topology.json` — these were netd→mgmt IPC. Now direct reads from `state.netd`.
 - `/etc/bedrock/cluster.json`, `/etc/bedrock/state.json` — KEPT as on-disk caches for the `bedrock` CLI + post-crash recovery, but the **authoritative** source is now `state.snapshot` and `state.netd` in RAM. The subscriber still writes these files for back-compat.
-- `/run/bedrock-cluster.fence` — KEPT (it's a useful debugging signal and the orchestrator's `fence_responder` still uses it). Becomes a write of `state.fence_marker_present = True` AND a file-write for visibility.
+- `/run/bedrock-no-quorum` — KEPT (it's a useful debugging signal and the orchestrator's `no_quorum_responder` still uses it). Becomes a write of `state.no_quorum_marker_present = True` AND a file-write for visibility.
 
 ## Steps — in order, each independently testable
 
@@ -85,14 +85,14 @@ copy-out before processing.
 3. **Refactor orchestrator** — replace `_SNAPSHOT`, `_PREV_SNAPSHOT`, `_LAST_LOG_IDX`, `_SERVICES_STARTED` globals with attributes on a `state` parameter. Each task function takes `state`. `start_all(state)` instead of `start_all()`.
 4. **Create `installer/bedrock-d`** entry script. Composes everything: state, netd thread, mdns thread, FastAPI startup hook calls `orchestrator.start_all(state)`, uvicorn runs.
 5. **Single systemd unit `bedrock-d.service`** — replaces `bedrock-net.service` + the implicit-via-dashboard_install `bedrock-mgmt.service`.
-6. **install.sh / iso-build** — drop separate `bedrock-net`/`bedrock-mdns`/`bedrock-redirect`/`bedrock-cert-refresh`/`bedrock-fence-watchdog` files + units; ship single `bedrock-d`.
+6. **install.sh / iso-build** — drop separate `bedrock-net`/`bedrock-mdns`/`bedrock-redirect`/`bedrock-cert-refresh` files + units; ship single `bedrock-d`.
 7. **`mgmt_install` + `agent_install`** — enable `bedrock-d.service` once.
 8. **e2e** — same `test_e2e_offline.sh` should pass with one daemon.
 
 ## Risk
 
 Single process means one crash takes everything down. Per user
-direction: no fence-watchdog, no auto-reboot. We'll troubleshoot
+direction: no watchdog, no auto-reboot. We'll troubleshoot
 crashes directly in alpha/beta. The kernel + systemd `Restart=on-failure`
 on `bedrock-d.service` is enough — if Python segfaults or `OOMKilled`,
 systemd restarts us.

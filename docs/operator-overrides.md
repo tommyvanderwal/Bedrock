@@ -19,7 +19,7 @@ lives in the per-command section below as it gets specified.
 | Re-key witness identity (new `cluster_uuid` / `cluster.key`) | Yes — full cleanup of stale witness state including ESP32-reboot worst-case | Drafted (this file) |
 | Seize master with stale data | Yes — irrecoverable up-to-date peer | Outline only |
 | Force `drbdadm invalidate` on a node | Yes — DRBD divergence resolution | Outline only |
-| Force-clear fence marker | Yes — operator override after misfire | Outline only |
+| Force-clear no-quorum marker | Yes — operator override after misfire | Outline only |
 | Force cluster to single-node mode | Yes — surviving solo node after permanent peer loss | Outline only |
 | Cancel an in-flight saga | Maybe — stuck join, stuck takeover | Not yet specified |
 | Demote current master on operator command | Yes — planned handoff outside maintenance flow | Not yet specified |
@@ -209,14 +209,14 @@ side wins.
 **Status.** Outline only. CLI is approximately:
 `bedrock storage invalidate --tier <name> --on <node> --in-favor-of <peer>`.
 
-## Override: Force-clear fence marker
+## Override: Force-clear no-quorum marker
 
-**When needed.** `/run/bedrock-cluster.fence` was created in
+**When needed.** `/run/bedrock-no-quorum` was created in
 error (test misfire, transient bug) and is now blocking
 recovery even though the cluster is healthy.
 
 **Status.** Outline only. CLI is approximately:
-`bedrock node unfence --node <name> --reason "<free-text>"`.
+`bedrock node clear-no-quorum --node <name> --reason "<free-text>"`.
 
 ## Override: Force cluster to single-node mode
 

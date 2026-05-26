@@ -476,7 +476,7 @@ The bitmap itself is tiny: at 64 KiB granularity, a 1 TB disk =
 
 The big win for QEMU bitmap: **no extra disk space.** The big
 catches: (a) it depends on QEMU running continuously between
-backups; a guest crash or host fence loses the bitmap state and
+backups; a guest crash or host NoQuorum self-demote loses the bitmap state and
 forces a full re-read; (b) the read is from the *live* disk, so
 it competes with the running guest's IO unless we also take a
 quick LV snapshot to read from.

@@ -436,7 +436,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # 5c. Isolation test — drop the current leader for 90s (past the
-#     witness/fence thresholds), observe failover, restore network,
+#     witness/no-quorum thresholds), observe failover, restore network,
 #     verify consistency.
 # ─────────────────────────────────────────────────────────────────
 step "5c. Isolation: drop sim-1 (current leader) for 90s"
@@ -510,15 +510,15 @@ else
     mark_fail "failover: filer NOT active on new master"
 fi
 
-# Check sim-1's own fence/services state — it should have self-fenced
+# Check sim-1's own quorum/services state — it should have self-marked NoQuorum
 note "--- sim-1 internal view during isolation ---"
-sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rqlited-arbiter bedrock-net 2>&1 | head -6; echo ---; test -f /run/bedrock-cluster.fence && echo "fence marker present" || echo "no fence marker"; ip -4 addr show lo 2>&1 | grep -E "100\\." | head -3' || note "sim-1 introspect failed"
+sssh 1 'systemctl is-active bedrock-rqlited bedrock-mgmt bedrock-weed-filer bedrock-rqlited-arbiter bedrock-net 2>&1 | head -6; echo ---; test -f /run/bedrock-no-quorum && echo "no-quorum marker present" || echo "no marker"; ip -4 addr show lo 2>&1 | grep -E "100\\." | head -3' || note "sim-1 introspect failed"
 
-# .254 must NOT be on sim-1's lo (released as part of self-fence)
+# .254 must NOT be on sim-1's lo (released as part of NoQuorum demote)
 if sssh 1 "ip -4 addr show lo | grep -q '$ARB_IP/' 2>/dev/null"; then
-    mark_fail "self-fence: arbiter VIP $ARB_IP still on sim-1's lo (should have been released)"
+    mark_fail "no_quorum demote: arbiter VIP $ARB_IP still on sim-1's lo (should have been released)"
 else
-    pass "self-fence: arbiter VIP $ARB_IP released from sim-1's lo"
+    pass "no_quorum demote: arbiter VIP $ARB_IP released from sim-1's lo"
 fi
 
 # Restore connectivity on sim-1
@@ -708,7 +708,7 @@ iptables -F INPUT
 iptables -F OUTPUT
 iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
-rm -f /run/bedrock-cluster.fence
+rm -f /run/bedrock-no-quorum
 echo restored
 '" || note "8c: restore returned non-zero"
 sleep 30
@@ -772,7 +772,7 @@ iptables -F INPUT
 iptables -F OUTPUT
 iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
-rm -f /run/bedrock-cluster.fence
+rm -f /run/bedrock-no-quorum
 echo restored
 '" || note "8e: restore returned non-zero"
 python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \

@@ -169,7 +169,7 @@ class NodeLeave:
             f"root@{host}",
             "systemctl stop bedrock-d bedrock-rqlited "
             "bedrock-rqlited-arbiter 2>/dev/null; "
-            "rm -f /run/bedrock-cluster.fence; true",
+            "rm -f /run/bedrock-no-quorum; true",
         ]
         rc = subprocess.run(cmd, capture_output=True, timeout=20)
         if rc.returncode != 0:

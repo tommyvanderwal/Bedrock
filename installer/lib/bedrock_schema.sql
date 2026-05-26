@@ -168,6 +168,14 @@ CREATE TABLE IF NOT EXISTS vms (
     last_backup_error TEXT,     -- JSON {ts_index, target_id, reason}
     last_restore      TEXT,     -- JSON {ts_index, kopia_snapshot_id, target_id, dest_node}
     last_restore_err  TEXT,     -- JSON {ts_index, kopia_snapshot_id, target_id, reason}
+    -- Predetermined failover sequence: JSON array of node_names in
+    -- priority order. Primary is the first entry (matches `host`
+    -- when not in a failover window). Secondary is index 1, tertiary
+    -- is index 2 for vipet VMs. Cattle VMs use '[]' (no failover —
+    -- local LV, no DRBD replication). The takeover protocol on a
+    -- surviving node consults this list to decide whether it is the
+    -- next failover target after a dead primary.
+    failover_order    TEXT NOT NULL DEFAULT '[]',
     updated_at        INTEGER NOT NULL
 );
 
@@ -285,8 +293,19 @@ CREATE TABLE IF NOT EXISTS drbd_resources (
     max_peers        INTEGER NOT NULL DEFAULT 7,
     -- JSON array of node_names that should host this resource.
     -- For cluster singleton: capped at 3. For per-VM: replica count
-    -- per VM type (cattle=0, pet=2, vipet=3).
+    -- per VM type (cattle=0, pet=2, vipet=3). Unordered set; the
+    -- failover priority order lives on vms.failover_order, not here.
     peers            TEXT NOT NULL DEFAULT '[]',
+    -- Last-known authoritative DRBD current-uuid for this resource,
+    -- recorded by the node that promoted DRBD to Primary. Written
+    -- via UPDATE level='strong' so quorum confirms before the VM is
+    -- started on the new primary. Read via SELECT level='strong'
+    -- in the pre-start safety check (is_safe_to_start_vm) to ensure
+    -- we are not about to start a VM whose disk data is behind the
+    -- cluster's last-known state. Updated on every successful
+    -- drbdadm primary transition.
+    current_uuid     TEXT NOT NULL DEFAULT '',
+    uuid_ts_set      INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
 );

@@ -182,7 +182,7 @@ them on purpose:
 | Loop                  | Where                              | Cadence | Job                                                        | What it CAN'T do                                                |
 |-----------------------|------------------------------------|---------|------------------------------------------------------------|------------------------------------------------------------------|
 | **Critical / netd**   | `installer/lib/netd.py` (thread in bedrock-d) | 1 s     | Mesh probes, election, takeover, self-demote, route emission. Must be deterministic and complete in seconds. | Complex resource decisions; reading multiple rqlite tables; sizing logic. |
-| **Calm / orchestrator** | `mgmt/orchestrator.py` (asyncio task in bedrock-d) | 10–30 s reconcile + revision-driven | Capacity planning; arbiter-set membership; weed-master Raft membership; thinpool growth; drbd_resources bookkeeping; VM placement decisions. Can read multiple rqlite tables, plan, choose, then act. | Anything on the failover-decision critical path — would risk blocking on resource enumeration when the cluster needs to fence in seconds. |
+| **Calm / orchestrator** | `mgmt/orchestrator.py` (asyncio task in bedrock-d) | 10–30 s reconcile + revision-driven | Capacity planning; arbiter-set membership; weed-master Raft membership; thinpool growth; drbd_resources bookkeeping; VM placement decisions. Can read multiple rqlite tables, plan, choose, then act. | Anything on the failover-decision critical path — would risk blocking on resource enumeration when the cluster needs to self-demote on NoQuorum in seconds. |
 
 The **takeover protocol** in `cluster-quorum-spec.md` runs entirely
 in the critical loop: witness + local commands, no rqlite, no

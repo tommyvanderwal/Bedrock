@@ -134,6 +134,12 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
 
     _ensure_thin_pool(home_host)
 
+    # Build the predetermined failover_order at create time. Index 0
+    # is the primary, 1 is the secondary, 2 is the tertiary (vipet).
+    # Cattle = [] (no failover, local LV only). This is the
+    # immutable-through-failure ordering the takeover protocol on
+    # surviving nodes consults to decide who is next in line.
+    failover_order: list[str] = []
     if vm_type == "cattle":
         # Single local LV + simple Alpine cloud image
         _create_cattle(home_host, name, ram, disk)
@@ -144,12 +150,14 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
             print("ERROR: need a peer node for pet VM")
             return 1
         _create_pet(home_host, nodes[peers[0]]["host"], home_node_name, peers[0], name, ram, disk)
+        failover_order = [home_node_name, peers[0]]
     elif vm_type == "vipet":
         peers = [n for n in nodes if n != home_node_name][:2]
         if len(peers) < 2:
             print("ERROR: need 2 peer nodes for vipet VM")
             return 1
         _create_vipet(nodes, home_node_name, peers, name, ram, disk)
+        failover_order = [home_node_name, peers[0], peers[1]]
     print(f"  VM {name} created. Status: bedrock vm list")
 
     # Persist the VM's existence + initial running state to rqlite so
@@ -162,6 +170,8 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
             name=name, vm_type=vm_type, host=home_node_name,
             ram_mb=int(ram), disk_gb=int(disk),
         )
+        if failover_order:
+            _bs.vm_set_failover_order(name=name, order=failover_order)
         _bs.vm_state_change(
             name=name, host=home_node_name, state="running",
         )

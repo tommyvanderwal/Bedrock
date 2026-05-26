@@ -697,7 +697,6 @@ def i_should_host_arbiter() -> bool:
          real-time decision based on peer_liveness + witness vote.
          Used by the unified bedrock-d daemon.
             "leader"   → True  (host)
-            "fenced"   → False (we're isolated; do not promote)
             "noquorum" → False (we lost quorum; demote in progress)
             "follower" → False (peer is master)
       2. Fallback to state.json["role"] for standalone / pre-
@@ -713,7 +712,7 @@ def i_should_host_arbiter() -> bool:
         outcome = (SHARED_STATE.last_election_outcome or "").lower()
         if outcome == "leader":
             return True
-        if outcome in ("fenced", "noquorum", "follower"):
+        if outcome in ("noquorum", "follower"):
             return False
         # outcome == "" / "init" → fall through to legacy path while
         # the daemon is still warming up.

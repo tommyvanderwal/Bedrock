@@ -511,7 +511,7 @@ chmod 700 /var/lib/bedrock/rqlite /var/lib/bedrock/cluster
 # DRBD + libvirtd are NOT auto-started at boot. The mgmt service's
 # orchestrator decides when it's safe (cluster contact established,
 # role is leader/follower) and starts them imperatively. This is the
-# fence-aware boot model documented in cluster-protocol-overview.md
+# quorum-aware boot model documented in cluster-protocol-overview.md
 # §"boot orchestration".
 systemctl disable drbd >/dev/null 2>&1 || true
 systemctl disable libvirtd >/dev/null 2>&1 || true
@@ -539,8 +539,9 @@ curl -fsSL "${BEDROCK_REPO}/configs/bedrock-vg-loop.service" \
 #   bedrock-redirect       — port-80 HTTP → HTTPS 302. Stateless.
 #
 # bedrock-d can `systemctl start/stop` them via the regular systemd
-# API if/when lifecycle coordination matters. No fence-watchdog
-# (per design: single-daemon design wants direct troubleshooting).
+# API if/when lifecycle coordination matters. No quorum-loss
+# watchdog (per design: single-daemon design wants direct
+# troubleshooting).
 log "Installing bedrock-cert-refresh..."
 curl -fsSL "${BEDROCK_REPO}/bedrock-cert-refresh" \
     -o /usr/local/bin/bedrock-cert-refresh

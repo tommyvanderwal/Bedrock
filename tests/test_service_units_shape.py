@@ -14,8 +14,7 @@ Exemptions:
   that boot on their own; not part of the cluster-decision path.
 - bedrock-vg-loop: pre-LVM-activation oneshot; legitimate
   multi-user.target dep.
-- bedrock-cert-refresh, bedrock-fence-watchdog: started by other
-  means (timer / orchestrator).
+- bedrock-cert-refresh: started by its own timer.
 """
 from __future__ import annotations
 

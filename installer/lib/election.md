@@ -24,15 +24,17 @@ doesn't go NoQuorum mid-join.
 
 ## Constants
 
-- `FENCE_MARKER = Path("/run/bedrock-cluster.fence")` — marker file
-  written when the election goes NoQuorum. `mgmt/orchestrator.fence_responder`
-  watches it and pauses local VMs; `bedrock-fence-watchdog` reboots
-  the node if it sticks > 5 min.
+- `NO_QUORUM_MARKER = Path("/run/bedrock-no-quorum")` — sticky
+  marker file. When present, `compute()` returns `NO_QUORUM`
+  regardless of vote tally, until `clear_no_quorum_marker()` is
+  called. Written when election goes NoQuorum + holddown;
+  `mgmt/orchestrator.no_quorum_responder` watches it and pauses
+  local VMs, then clears it after quorum returns.
 - `VOTES_PER_NODE = 10`, `VOTE_PER_WITNESS = 1` — vote weights.
 
 ## Enums + dataclasses
 
-- `Outcome` enum: `LEADER`, `FOLLOWER`, `NO_QUORUM`, `FENCED`.
+- `Outcome` enum: `LEADER`, `FOLLOWER`, `NO_QUORUM`.
 - `Election(outcome, my_votes, total_votes, majority,
   should_set_mgmt_master, reachable_peers, reason)` — frozen
   dataclass returned by `compute`.
@@ -45,14 +47,15 @@ doesn't go NoQuorum mid-join.
   malformed loopback can never accidentally be the "winner".
 - `compute(*, self_name, self_loopback, peer_liveness,
   node_loopbacks, witness_alive, current_mgmt_master,
-  fence_marker_path=FENCE_MARKER) -> Election` — the only public
-  entry point. Pure function: no I/O, no state, no time.
+  no_quorum_marker_path=NO_QUORUM_MARKER) -> Election` — the only
+  public entry point. Pure function: no I/O, no state, no time.
 
   Decision tree, in order:
-  1. **Fence override** — if `fence_marker_path` exists,
-     immediately return `FENCED`. The caller's orchestrator
-     `fence_responder` waits for quorum recovery before clearing
-     it.
+  1. **Sticky no-quorum override** — if `no_quorum_marker_path`
+     exists, immediately return `NO_QUORUM` with
+     `reason="no-quorum marker present (sticky)"`. The caller's
+     orchestrator `no_quorum_responder` waits for quorum recovery
+     before clearing it.
   2. **Build the member set.** Include only nodes that are both in
      `node_loopbacks` (i.e. registered in rqlite) AND keys in
      `peer_liveness` (i.e. bedrock-net has observed them at least
@@ -62,7 +65,7 @@ doesn't go NoQuorum mid-join.
      `majority = total // 2 + 1`. `my_votes = 10 ·
      count(reachable members) + (1 if witness_alive)`.
   4. **NoQuorum if `my_votes < majority`.** Caller (netd) writes
-     the fence marker + demotes singletons after a streak
+     the no-quorum marker + demotes singletons after a streak
      hold-down.
   5. **Already-master shortcut.** If `current_mgmt_master ==
      self_name` and we have quorum, return `LEADER,
@@ -81,10 +84,9 @@ doesn't go NoQuorum mid-join.
      `docs/cluster-quorum-spec.md` — election only decides
      Leader/Follower; the takeover protocol decides whether it's
      safe to flip `.254`.
-- `write_fence_marker(reason)` — drop `/run/bedrock-cluster.fence`
+- `set_no_quorum_marker(reason)` — drop `/run/bedrock-no-quorum`
   with the reason text. Best-effort: silently swallows OSError
-  (the watchdog timer will reboot us if the marker can't be
-  written, so we don't need to crash here).
-- `clear_fence_marker()` — unlink the marker, swallow
-  FileNotFoundError. Called by orchestrator's `fence_responder`
-  after cleanup + quorum return.
+  (we don't want to crash the election tick if /run is read-only).
+- `clear_no_quorum_marker()` — unlink the marker, swallow
+  FileNotFoundError. Called by orchestrator's
+  `no_quorum_responder` after cleanup + quorum return.

@@ -1581,9 +1581,9 @@ async def startup():
     # loopback) in SEPARATE threads, each with its own event loop —
     # both call this hook on the same `app`. Without a real lock the
     # `if _STARTUP_DONE` check + assign races and both threads proceed.
-    # That spawned two fence_responder tasks in v22, which clobbered
+    # That spawned two no_quorum_responder tasks in v22, which clobbered
     # the 120s wait_for_role (visible as "still no quorum after 120s"
-    # appearing within 0 seconds of "fence: cleanup done").
+    # appearing within 0 seconds of "no_quorum: cleanup done").
     with _STARTUP_LOCK:
         if _STARTUP_DONE:
             return
@@ -1610,18 +1610,18 @@ async def startup():
     write_scrape_config(cfg)
 
     # Boot the cluster-protocol orchestrator: log subscriber, boot
-    # service-starter, fence responder, reactor. Replaces the legacy
-    # standalone bedrock-watcher process.
+    # service-starter, no_quorum responder, reactor.
     #
     # Use sys.modules to share the SAME module instance as bedrock-d.
     # bedrock-d does `from mgmt import orchestrator` (creates
     # `mgmt.orchestrator`) and calls `orchestrator.attach_state(state)`
     # there. A plain `import orchestrator` here would create a SECOND
     # module object (because sys.path has /opt/bedrock/mgmt) with its
-    # own _STATE = None — so fence_responder's state.last_election_outcome
-    # gate never fires, marker flapping loop bites (observed v29–v31
-    # 5c regression: "fence: quorum back as leader; marker cleared"
-    # at 0 s after cleanup, repeats every 3 s).
+    # own _STATE = None — so no_quorum_responder's
+    # state.last_election_outcome gate never fires, marker flapping
+    # loop bites (observed v29–v31 5c regression: "no_quorum: quorum
+    # back as leader; marker cleared" at 0 s after cleanup, repeats
+    # every 3 s).
     import sys as _sys
     if "mgmt.orchestrator" in _sys.modules:
         orchestrator = _sys.modules["mgmt.orchestrator"]

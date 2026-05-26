@@ -220,7 +220,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         vm_rows = client.query(
             "SELECT vm_name, vm_type, host, ram_mb, disk_gb, state, "
             "intent_index, fail_reason, backup_schedule, "
-            "last_backup_error, last_restore, last_restore_err "
+            "last_backup_error, last_restore, last_restore_err, "
+            "failover_order "
             "FROM vms",
             level=level,
         )
@@ -232,6 +233,11 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "disk_gb": int(row.get("disk_gb") or 0),
                 "state":   row.get("state", "created"),
             }
+            try:
+                vm["failover_order"] = json.loads(
+                    row.get("failover_order") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                vm["failover_order"] = []
             if row.get("intent_index") is not None:
                 vm["intent_index"] = int(row["intent_index"])
             if row.get("fail_reason"):

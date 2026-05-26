@@ -674,6 +674,55 @@ def vm_created(name: str, vm_type: str, host: str, ram_mb: int,
         raise
 
 
+def vm_set_failover_order(name: str, order: list[str],
+                          client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Record this VM's predetermined failover sequence as a JSON
+    array of node_names. Order is meaningful: index 0 is the
+    primary, 1 is the secondary, 2 is the tertiary (vipet only).
+    Cattle VMs pass `[]`. Used by the failover orchestrator on a
+    surviving node to decide whether it's next in line after a
+    dead primary. Written at VM creation by the create saga; only
+    changed via an explicit operator-issued saga afterwards."""
+    import json as _json
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE vms SET failover_order = ?, updated_at = ? "
+            "WHERE vm_name = ?",
+            params=[_json.dumps(list(order)), _now(), name],
+        )
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def drbd_resource_uuid_set(resource_name: str, uuid: str,
+                           client: Optional[rqlite_client.RqliteClient] = None
+                           ) -> int:
+    """Record the post-promote DRBD current-uuid for a resource.
+    Called by a node that just ran `drbdadm primary` on this
+    resource, BEFORE starting any service (VM, filer) that uses
+    the underlying disk. The write goes through Raft normally
+    (single-statement transaction) so quorum confirms before the
+    function returns; callers that need strict linearizability
+    can chain a level='strong' SELECT afterwards. Updates
+    `uuid_ts_set` to now()."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE drbd_resources SET current_uuid = ?, "
+            "uuid_ts_set = ?, updated_at = ? WHERE name = ?",
+            params=[uuid, _now(), _now(), resource_name],
+        )
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
 def vm_create_failed(name: str, reason: str,
                      client: Optional[rqlite_client.RqliteClient] = None) -> int:
     c, owns = _client(client)

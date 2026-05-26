@@ -452,7 +452,7 @@ WantedBy=multi-user.target
         raise SystemExit(1)
 
     # bedrock-d unified daemon — mesh discovery, election, witness IO,
-    # rqlite_subscriber, fence_responder, boot_orchestrator, the
+    # rqlite_subscriber, no_quorum_responder, boot_orchestrator, the
     # dashboard, and cert refresh all live in this one process. systemd
     # unit was placed by install.sh; we just enable + start.
     print()

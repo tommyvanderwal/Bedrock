@@ -9,7 +9,7 @@ bedrock-d process (1 per node)
 ├── netd thread            — mesh probes, election, witness IO
 └── asyncio main loop
     ├── FastAPI (8443 HTTPS + 8080 loopback)
-    └── tasks: rqlite_subscriber, fence_responder,
+    └── tasks: rqlite_subscriber, no_quorum_responder,
                 boot_orchestrator, converge_retry, backup_scheduler
 ```
 
@@ -25,7 +25,7 @@ bedrock-cert-refresh, bedrock-mdns, bedrock-redirect — their own
 small systemd units. bedrock-d can lifecycle them via `systemctl`
 when needed.
 
-**No fence-watchdog**: single-daemon design means we troubleshoot
+**No watchdog**: single-daemon design means we troubleshoot
 a stuck bedrock-d directly via journalctl + systemctl restart.
 
 **Failure model**: if `bedrock-d` crashes, systemd `Restart=on-failure`
