@@ -43,8 +43,12 @@ def load_state():
 
 
 def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    # Use lib.state.save (atomic + empty-write trap) so a concurrent
+    # rqlite_setup --render-env can't see a partial file mid-rewrite.
+    # The plain write_text() this used to do raced with readers and
+    # bypassed the bootstrap_done/node_name guard.
+    from lib import state as _state_mod
+    _state_mod.save(state)
 
 
 def get_repo():

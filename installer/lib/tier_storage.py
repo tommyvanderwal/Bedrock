@@ -1863,7 +1863,12 @@ def node_reset_local() -> None:
         except json.JSONDecodeError:
             s = {}
         keep = {k: s[k] for k in ("hardware", "bootstrap_done") if k in s}
-        STATE_JSON.write_text(json.dumps(keep, indent=2))
+        # Go through lib.state.save for atomic + empty-write trap.
+        # The plain write_text this used to do raced with readers
+        # (rqlite_setup --render-env on every rqlited restart) and
+        # could produce a partial file.
+        from . import state as _state_mod
+        _state_mod.save(keep)
 
     # 11. Reload systemd
     run("systemctl daemon-reload 2>/dev/null", check=False)
