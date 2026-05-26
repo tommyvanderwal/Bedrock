@@ -86,14 +86,14 @@ def _now() -> float:
     return time.time()
 
 
+_STATE_JSON = Path("/etc/bedrock/state.json")
+
+
 def _self_node_name() -> str:
     try:
-        from lib import state
-    except ImportError:
-        import sys as _sys
-        _sys.path.insert(0, "/usr/local/lib/bedrock")
-        from lib import state  # type: ignore
-    return (state.load() or {}).get("node_name") or ""
+        return (json.loads(_STATE_JSON.read_text()) or {}).get("node_name") or ""
+    except Exception:
+        return ""
 
 
 def _load_suspended_record() -> dict[str, float]:
@@ -205,30 +205,52 @@ def _vm_disks(vm_name: str) -> list[str]:
 
 
 def _peers_observed_down(max_age_s: float) -> list[str]:
-    """Names of peers whose mesh heartbeat is older than `max_age_s`.
-    Reads from netd's shared state (the same data the election tick
-    uses), so detection is consistent with the rest of the cluster."""
+    """Names of peers that have been observed at some point but whose
+    newest mesh-neighbour `last_seen` is now older than `max_age_s`.
+
+    Reads from mgmt.orchestrator._STATE.netd — the unified daemon's
+    shared Daemon object — so the freshness view is exactly what the
+    election tick saw. A peer counts as "down" iff:
+      - it is in d.ever_seen_peers (we have positively observed it
+        in this lifetime), AND
+      - every Neighbour entry for it has last_seen older than the
+        threshold (or there are no entries at all because
+        sweep_hysteresis aged them out).
+
+    `last_seen` is set off of monotonic-now by netd, so we compare
+    against time.monotonic(). Self is never returned."""
     try:
-        from lib import state_shared
-    except ImportError:
-        import sys as _sys
-        _sys.path.insert(0, "/usr/local/lib/bedrock")
-        from lib import state_shared  # type: ignore
-    state = state_shared.get()
-    if state is None:
+        from mgmt import orchestrator as _orch
+    except Exception:
         return []
-    netd = getattr(state, "netd_state", None)
-    if netd is None:
+    state = getattr(_orch, "_STATE", None)
+    if state is None or state.netd is None:
         return []
-    # netd's peer-liveness table is keyed by node_name; each entry
-    # carries last_seen (monotonic). Compare to monotonic-now.
     now_mono = time.monotonic()
-    peers = getattr(netd, "peer_liveness", None) or {}
-    down = []
-    for name, info in peers.items():
-        last = getattr(info, "last_seen", 0.0)
-        if last > 0 and (now_mono - last) >= max_age_s:
-            down.append(name)
+    me = ""
+    try:
+        me = state.self_node_name or _self_node_name()
+    except Exception:
+        me = _self_node_name()
+    with state.netd_lock:
+        d = state.netd
+        ever = set(getattr(d, "ever_seen_peers", set()))
+        newest: dict[str, float] = {}
+        for n in getattr(d, "neighbours", {}).values():
+            peer = getattr(n, "peer_node", "")
+            if not peer or peer == me:
+                continue
+            ls = float(getattr(n, "last_seen", 0.0) or 0.0)
+            if ls > newest.get(peer, 0.0):
+                newest[peer] = ls
+    down: list[str] = []
+    for peer in ever:
+        if peer == me:
+            continue
+        latest = newest.get(peer, 0.0)
+        # No live neighbour entry at all, or the freshest one is stale.
+        if latest <= 0.0 or (now_mono - latest) >= max_age_s:
+            down.append(peer)
     return down
 
 
