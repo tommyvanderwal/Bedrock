@@ -172,6 +172,31 @@ def create_vm(state, name: str, vm_type: str, ram: int, disk: int):
         )
         if failover_order:
             _bs.vm_set_failover_order(name=name, order=failover_order)
+            # Register the DRBD resource row so the failover
+            # orchestrator's record_uuid_after_promote UPDATE has
+            # a target. Legacy pet/vipet path uses internal DRBD
+            # metadata (no separate meta LV); we record minimal
+            # decoration values (the columns drbd_resources reads
+            # in the failover path are name + current_uuid).
+            try:
+                from . import rqlite_client as _rc
+                import json as _json, time as _t
+                lv_name = f"vm-{name}-disk0"
+                with _rc.RqliteClient() as cli:
+                    cli.execute(
+                        "INSERT OR REPLACE INTO drbd_resources "
+                        "(name, minor, data_lv, meta_lv, thinpool, "
+                        " data_size_bytes, meta_size_bytes, max_peers, "
+                        " peers, created_at, updated_at) "
+                        "VALUES (?, 0, ?, '', 'thinpool', ?, 0, 7, "
+                        "        ?, ?, ?)",
+                        params=[lv_name, lv_name,
+                                int(disk) * 1024 * 1024 * 1024,
+                                _json.dumps(failover_order),
+                                int(_t.time()), int(_t.time())],
+                    )
+            except Exception as e:
+                print(f"  [state] drbd_resources register skipped: {e}")
         _bs.vm_state_change(
             name=name, host=home_node_name, state="running",
         )
