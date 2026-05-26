@@ -154,8 +154,16 @@ def compute(
 def set_no_quorum_marker(reason: str = "") -> None:
     """Drop the sticky no-quorum marker. Election will then return
     Outcome.NO_QUORUM regardless of current vote tally, until
-    clear_no_quorum_marker() is called."""
+    clear_no_quorum_marker() is called.
+
+    Idempotent: if the marker already exists, do nothing. The file's
+    mtime is the "when did this NoQuorum episode begin?" timestamp
+    that downstream code (vm_failover suspend timer) reads — a
+    per-tick rewrite would reset it and the suspend timer would
+    never expire."""
     try:
+        if NO_QUORUM_MARKER.exists():
+            return
         NO_QUORUM_MARKER.parent.mkdir(parents=True, exist_ok=True)
         NO_QUORUM_MARKER.write_text(reason or "election: no quorum\n")
     except OSError:

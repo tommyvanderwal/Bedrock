@@ -236,7 +236,7 @@ fi
 # ─────────────────────────────────────────────────────────────────
 step "6. Cleanup: destroy + undefine the pet VM"
 sssh 2 "virsh destroy $PET_NAME 2>/dev/null; virsh undefine $PET_NAME 2>/dev/null; \
-        bedrock vm destroy $PET_NAME 2>&1 | tail -3" || true
+        bedrock vm delete $PET_NAME 2>&1 | tail -3" || true
 
 echo
 if [ $ALL_PASS = 1 ]; then
