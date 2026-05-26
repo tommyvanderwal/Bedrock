@@ -123,6 +123,33 @@ else
     mark_fail "failover_order = '$ORDER' — expected sim-2 as peer"
 fi
 
+# Wait for DRBD initial sync to complete before partitioning the
+# network — otherwise sim-2's takeover would promote a partially
+# synced disk and the VM would fail to boot (or boot a stale image).
+note "wait up to 180s for DRBD vm-$PET_NAME-disk0 to be UpToDate on sim-1 + sim-2"
+DRBD_OK=0
+for t in $(seq 10 10 180); do
+    sleep 10
+    s1=$(sssh 1 "drbdadm status vm-$PET_NAME-disk0 2>/dev/null" || echo "")
+    s2=$(sssh 2 "drbdadm status vm-$PET_NAME-disk0 2>/dev/null" || echo "")
+    # Both sides report disk:UpToDate (the peer-disk line on Primary
+    # is what we care about); accept either UpToDate or Inconsistent
+    # → UpToDate transition done.
+    if echo "$s1" | grep -q "peer-disk:UpToDate" && \
+       echo "$s2" | grep -q "disk:UpToDate"; then
+        DRBD_OK=$t
+        break
+    fi
+done
+if [ $DRBD_OK -gt 0 ]; then
+    pass "DRBD vm-$PET_NAME-disk0 fully UpToDate on both sides at ${DRBD_OK}s"
+else
+    mark_fail "DRBD never reached UpToDate/UpToDate within 180s — takeover would promote stale data"
+    note "sim-1 drbdadm status:"; echo "$s1"
+    note "sim-2 drbdadm status:"; echo "$s2"
+    exit 1
+fi
+
 # Snapshot the pre-isolation DRBD UUID for the takeover assertion
 PRE_UUID=$(rqlite_query 1 "SELECT current_uuid FROM drbd_resources WHERE name=\\\"vm-$PET_NAME-disk0\\\"")
 note "pre-isolation drbd_resources.current_uuid for vm-$PET_NAME-disk0 = '$PRE_UUID'"
