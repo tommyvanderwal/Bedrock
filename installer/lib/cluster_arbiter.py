@@ -444,20 +444,42 @@ def _run_takeover_protocol() -> bool:
                   last_master_id, n)
         return False
 
-    # Step 1+2: inspect M's slot.
+    # Step 1+2: inspect M's slot. Per cluster-quorum-spec.md INV-7,
+    # tag.lms=1 NEVER times out. A stale slot with lms=1 means the
+    # previous master died without clearing its LMS — only the
+    # operator can clear it (see docs/operator-overrides.md).
     slot_m = _witness.read_slot(ws, last_master_id)
     if slot_m is None:
+        # INV-7 "missing slot = worst case assumed". A missing slot
+        # for a still-known cluster member might mean the witness
+        # rebooted and lost its map; we cannot rule out that the
+        # missing slot previously held tag.lms=1. Operator must
+        # decommission the node from the rqlite `nodes` table
+        # (which makes us ignore it entirely) or re-key the
+        # witness identity.
         log.error("arbiter: takeover REFUSED — last master "
-                  "node_id=%d has no slot at witness (cannot verify "
-                  "staleness)", last_master_id)
+                  "node_id=%d has no slot at witness. Per INV-7 a "
+                  "missing slot is treated as worst-case (could have "
+                  "held lms=1). Operator must decommission this "
+                  "node from the rqlite `nodes` table, or re-key "
+                  "the witness identity (see docs/operator-overrides.md).",
+                  last_master_id)
         return False
     if not slot_m.is_stale():
         log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
                  "(tag.lms=%s); cluster healthy elsewhere",
                  last_master_id, slot_m.lms)
         return False
-    log.info("arbiter: slot[%d] stale (tag.lms=%s); continuing",
-             last_master_id, slot_m.lms)
+    if slot_m.lms:
+        log.error("arbiter: takeover REFUSED — slot[%d] is stale "
+                  "but tag.lms=1. Previous master died without "
+                  "clearing LMS; LMS does not time out. Operator "
+                  "must clear via override before takeover can "
+                  "proceed (see docs/operator-overrides.md).",
+                  last_master_id)
+        return False
+    log.info("arbiter: slot[%d] stale and tag.lms=0; continuing",
+             last_master_id)
     # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
     local_uuid_step3 = _read_local_drbd_uuid()
     slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
@@ -599,10 +621,16 @@ def demote_arbiter_host() -> dict:
         _svc_stop(ARBITER_SVC)
         _umount()
         _drbd_secondary()
-    # Per spec: after self-demote, clear our lms bit so a survivor's
-    # takeover protocol sees this slot as normal (recovered). The
-    # netd tick already pushes this via set_own_slot — we just need
-    # to tell it the new tag. Best-effort: witness may be unreachable.
+    # Per cluster-quorum-spec.md INV-7: tag.lms=1 never times out.
+    # After self-demote we MUST clear our lms bit so a survivor's
+    # takeover protocol can proceed without operator intervention.
+    # The netd tick pushes the new tag via set_own_slot on its next
+    # heartbeat. This write only succeeds when the witness is
+    # reachable from us; if the witness is unreachable now, netd
+    # will keep retrying on every subsequent tick as long as we
+    # remain running. If we shut down or die before the write lands,
+    # the slot stays lms=1 and operator override is required to
+    # unstick the cluster (see docs/operator-overrides.md).
     if SHARED_STATE is not None and SHARED_STATE.netd_ws is not None:
         try:
             try:
@@ -615,7 +643,8 @@ def demote_arbiter_host() -> dict:
             marker = (_read_local_drbd_uuid() or "").encode("ascii")
             _witness.set_own_slot(ws, marker=marker, tag=0)
         except Exception as e:
-            log.warning("arbiter: post-demote slot clear failed: %s", e)
+            log.warning("arbiter: post-demote slot clear failed: %s "
+                        "(LMS may stick if we shut down before retry)", e)
     return arbiter_status()
 
 

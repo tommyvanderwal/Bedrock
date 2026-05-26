@@ -284,6 +284,17 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
             ep.last_reply_ms = now_ms
         ws.last_alive_at = time.monotonic()
         # Decode every slot blob in the reply.
+        # TODO(rqlite `nodes` table membership filter — required for
+        # the stuck-LMS decommission override per
+        # docs/operator-overrides.md and cluster-quorum-spec.md INV-7):
+        # drop any slot whose node_id is not currently a member of
+        # the cluster per rqlite's `nodes` table (the cluster-wide
+        # source of truth, locally readable via the per-node rqlited
+        # replica). Today ws has no membership-set field; needs a
+        # small refactor to plumb the current member-id set through
+        # netd's tick so this drain can filter. Until that lands,
+        # removed nodes' stale lms=1 slots still block takeover even
+        # after node leave.
         slots_blob = body.get("slots") or {}
         if isinstance(slots_blob, dict):
             new_cache: dict[int, Slot] = {}
