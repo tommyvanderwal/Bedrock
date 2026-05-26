@@ -370,7 +370,15 @@ async def _wait_for_role(timeout_s: float,
                 continue
         try:
             from lib import cluster_state as _cs
-            cluster = _cs.load_cluster()
+            # ignore_marker=True is used by no_quorum_responder after
+            # this node has been partitioned. The local rqlite replica
+            # may still show the pre-partition mgmt_master (stale by
+            # Raft replication lag) — force a Raft round-trip so we
+            # see who actually owns the cluster now. Without 'strong',
+            # _reconcile_paused_vms would virsh-resume the local VM
+            # against stale vms.host and we'd split-brain.
+            level = "strong" if ignore_marker else "none"
+            cluster = _cs.load_cluster(level=level)
         except Exception:
             cluster = {}
         master = cluster.get("mgmt_master") or ""
@@ -536,7 +544,12 @@ async def _reconcile_paused_vms():
     self_name = _self_node_name()
     try:
         from lib import cluster_state as _cs
-        cluster = _cs.load_cluster()
+        # Recovery-path decisions (resume VM here vs. destroy stale
+        # copy because a peer has taken over) must be made against
+        # the authoritative state, not the local replica which is
+        # still catching up from being partitioned. Force a Raft
+        # round-trip.
+        cluster = _cs.load_cluster(level="strong")
     except Exception:
         cluster = {}
     vms = cluster.get("vms", {}) or {}

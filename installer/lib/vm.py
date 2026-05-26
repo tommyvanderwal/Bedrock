@@ -40,10 +40,16 @@ def run_on(host: str, cmd: str, check=True):
 
 
 def _cluster() -> dict:
-    p = Path("/etc/bedrock/cluster.json")
-    if p.exists():
-        return json.loads(p.read_text())
-    return {"nodes": {}}
+    # Post the 2026-05-26 cluster.json removal, cluster state lives
+    # only in rqlite. cluster_state.load_cluster reads at level='none'
+    # so it works against a local replica even when the leader is
+    # unreachable. Returns the same dict-shape we used to read from
+    # disk.
+    try:
+        from . import cluster_state
+        return cluster_state.load_cluster()
+    except Exception:
+        return {"nodes": {}}
 
 
 # The CLI runs locally on the node; always dial the loopback HTTP listener

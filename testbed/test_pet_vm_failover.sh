@@ -68,12 +68,25 @@ vm_paused_on() {
 }
 
 rqlite_query() {
+    # Usage: rqlite_query <node-idx> <sql>
+    # Builds the JSON body locally (no shell-escape layering) and
+    # pipes it to curl on the remote via stdin. rqlite is HTTPS +
+    # mTLS post the 2026-05-26 TLS rollout.
     local node=$1 sql=$2
-    sssh "$node" "curl -fsSL 'http://127.0.0.1:4001/db/query?level=strong' \
-        -d '[\"$sql\"]' 2>/dev/null \
-        | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"results\"][0]; \
-                      vals=r.get(\"values\") or []; \
-                      print(vals[0][0] if vals else \"\")'"
+    local body
+    body=$(python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$sql")
+    local ip; ip=$(sim_ip "$node")
+    printf '%s' "$body" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=10 \
+        -o ControlMaster=auto -o ControlPath="$_CM_DIR/%r@%h:%p" -o ControlPersist=300 \
+        "root@${ip}" "curl -fsSL 'https://127.0.0.1:4001/db/query?level=strong' \
+            --cacert /etc/bedrock/ca.crt \
+            --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem \
+            --data-binary @- 2>/dev/null \
+        | python3 -c 'import sys,json
+r=json.load(sys.stdin)[\"results\"][0]
+vals=r.get(\"values\") or []
+print(vals[0][0] if vals else \"\")'"
 }
 
 # ──────────────────────────────────────────────
@@ -86,7 +99,7 @@ for i in 1 2 3 4; do
         exit 1
     fi
 done
-TIER_MODE=$(rqlite_query 1 'SELECT mode FROM tiers WHERE tier_name=\\\"critical\\\"')
+TIER_MODE=$(rqlite_query 1 "SELECT mode FROM tiers WHERE tier_name='critical'")
 if [ "$TIER_MODE" != "drbd" ]; then
     fail "critical tier mode = '$TIER_MODE' (need 'drbd'). Run test_e2e_offline.sh first."
     exit 1
@@ -96,6 +109,11 @@ pass "all 4 sims healthy + critical tier = drbd"
 step "1. Create pet VM '$PET_NAME' on sim-1"
 sssh 1 "bedrock vm create $PET_NAME --type pet --ram 512 --disk 2 2>&1 | tail -8" \
     || mark_fail "vm create returned non-zero"
+
+# `bedrock vm create` for pet/vipet only defines the VM via
+# `virsh define` (writes vms.state='running' to rqlite but doesn't
+# actually run virsh start). Start it explicitly here.
+sssh 1 "virsh start $PET_NAME 2>&1 | tail -3" || note "virsh start returned non-zero"
 
 note "wait up to 90s for VM to be running on sim-1"
 RUNNING_AT_BOOT=0
@@ -113,30 +131,43 @@ else
     exit 1
 fi
 
-# Confirm failover_order is what we expect (sim-1, sim-2) — pet VMs
-# get the home node + one peer per the VmCreate logic.
-ORDER=$(rqlite_query 1 "SELECT failover_order FROM vms WHERE vm_name=\\\"$PET_NAME\\\"")
+# Discover failover_order from rqlite, then resolve the peer node-name
+# to a sim index by matching the node's host IP against sim_ip(N).
+# We don't assume the peer is sim-2 — bedrock vm create picks the
+# first non-home node from rqlite's nodes table in whatever order
+# the rqlite snapshot happens to deliver.
+ORDER=$(rqlite_query 1 "SELECT failover_order FROM vms WHERE vm_name='$PET_NAME'")
 note "failover_order in rqlite: $ORDER"
-if echo "$ORDER" | grep -q "bedrock-sim-2"; then
-    pass "failover_order includes sim-2 (the takeover target)"
-else
-    mark_fail "failover_order = '$ORDER' — expected sim-2 as peer"
+PEER_NAME=$(echo "$ORDER" | python3 -c 'import json,sys; o=json.loads(sys.stdin.read()); print(o[1] if len(o) > 1 else "")')
+if [ -z "$PEER_NAME" ]; then
+    mark_fail "failover_order has no peer entry: '$ORDER'"
+    exit 1
 fi
+PEER_IP=$(rqlite_query 1 "SELECT host FROM nodes WHERE node_name='$PEER_NAME'")
+PEER_SIM=""
+for i in 1 2 3 4; do
+    [ "$(sim_ip $i)" = "$PEER_IP" ] && PEER_SIM=$i && break
+done
+if [ -z "$PEER_SIM" ]; then
+    mark_fail "couldn't resolve peer node '$PEER_NAME' (host=$PEER_IP) to a sim index"
+    exit 1
+fi
+pass "failover peer: $PEER_NAME (sim-$PEER_SIM at $PEER_IP)"
 
 # Wait for DRBD initial sync to complete before partitioning the
 # network — otherwise sim-2's takeover would promote a partially
 # synced disk and the VM would fail to boot (or boot a stale image).
-note "wait up to 180s for DRBD vm-$PET_NAME-disk0 to be UpToDate on sim-1 + sim-2"
+note "wait up to 180s for DRBD vm-$PET_NAME-disk0 to be UpToDate on sim-1 + sim-$PEER_SIM"
 DRBD_OK=0
 for t in $(seq 10 10 180); do
     sleep 10
     s1=$(sssh 1 "drbdadm status vm-$PET_NAME-disk0 2>/dev/null" || echo "")
-    s2=$(sssh 2 "drbdadm status vm-$PET_NAME-disk0 2>/dev/null" || echo "")
+    sP=$(sssh $PEER_SIM "drbdadm status vm-$PET_NAME-disk0 2>/dev/null" || echo "")
     # Both sides report disk:UpToDate (the peer-disk line on Primary
     # is what we care about); accept either UpToDate or Inconsistent
     # → UpToDate transition done.
     if echo "$s1" | grep -q "peer-disk:UpToDate" && \
-       echo "$s2" | grep -q "disk:UpToDate"; then
+       echo "$sP" | grep -q "disk:UpToDate"; then
         DRBD_OK=$t
         break
     fi
@@ -146,12 +177,12 @@ if [ $DRBD_OK -gt 0 ]; then
 else
     mark_fail "DRBD never reached UpToDate/UpToDate within 180s — takeover would promote stale data"
     note "sim-1 drbdadm status:"; echo "$s1"
-    note "sim-2 drbdadm status:"; echo "$s2"
+    note "sim-$PEER_SIM drbdadm status:"; echo "$sP"
     exit 1
 fi
 
 # Snapshot the pre-isolation DRBD UUID for the takeover assertion
-PRE_UUID=$(rqlite_query 1 "SELECT current_uuid FROM drbd_resources WHERE name=\\\"vm-$PET_NAME-disk0\\\"")
+PRE_UUID=$(rqlite_query 1 "SELECT current_uuid FROM drbd_resources WHERE name='vm-$PET_NAME-disk0'")
 note "pre-isolation drbd_resources.current_uuid for vm-$PET_NAME-disk0 = '$PRE_UUID'"
 
 # ─────────────────────────────────────────────────────────────────
@@ -189,40 +220,40 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────
-step "4. Watch for sim-2 to take over (T+35..70s)"
+step "4. Watch for sim-$PEER_SIM to take over (T+35..70s)"
 TAKEOVER_AT=0
 for t in 10 20 30 40 50 60 70; do
     sleep 10
-    if vm_running_on "$PET_NAME" 2; then
+    if vm_running_on "$PET_NAME" $PEER_SIM; then
         TAKEOVER_AT=$(($(date +%s) - ISOLATE_T0))
         break
     fi
 done
 if [ $TAKEOVER_AT -gt 0 ]; then
-    pass "sim-2 has pet VM RUNNING at T+${TAKEOVER_AT}s"
+    pass "sim-$PEER_SIM has pet VM RUNNING at T+${TAKEOVER_AT}s"
 else
-    mark_fail "sim-2 did NOT start pet VM within 70s — takeover_after_peer_down_task broken?"
+    mark_fail "sim-$PEER_SIM did NOT start pet VM within 70s — takeover_after_peer_down_task broken?"
 fi
 
 # DRBD-UUID write-after-promote: the cluster's recorded UUID should
-# now be different from PRE_UUID, because sim-2's drbdadm primary
+# now be different from PRE_UUID, because the peer's drbdadm primary
 # bumped it and record_uuid_after_promote wrote it to rqlite.
-POST_UUID=$(rqlite_query 2 "SELECT current_uuid FROM drbd_resources WHERE name=\\\"vm-$PET_NAME-disk0\\\"")
+POST_UUID=$(rqlite_query $PEER_SIM "SELECT current_uuid FROM drbd_resources WHERE name='vm-$PET_NAME-disk0'")
 note "post-takeover drbd_resources.current_uuid = '$POST_UUID'"
 if [ -n "$POST_UUID" ] && [ "$POST_UUID" != "$PRE_UUID" ]; then
-    pass "DRBD current_uuid recorded by sim-2 after promote ('$PRE_UUID' → '$POST_UUID')"
+    pass "DRBD current_uuid recorded by sim-$PEER_SIM after promote ('$PRE_UUID' → '$POST_UUID')"
 else
     mark_fail "DRBD current_uuid did NOT advance — record_uuid_after_promote silent fail"
 fi
 
-# vms.host in rqlite should now say sim-2 (set by _takeover_one's
+# vms.host in rqlite should now say PEER_NAME (set by _takeover_one's
 # vm_state_change call).
-NEW_HOST=$(rqlite_query 2 "SELECT host FROM vms WHERE vm_name=\\\"$PET_NAME\\\"")
+NEW_HOST=$(rqlite_query $PEER_SIM "SELECT host FROM vms WHERE vm_name='$PET_NAME'")
 note "vms.host = '$NEW_HOST'"
-if echo "$NEW_HOST" | grep -q "bedrock-sim-2"; then
-    pass "vms.host updated to sim-2"
+if [ "$NEW_HOST" = "$PEER_NAME" ]; then
+    pass "vms.host updated to $PEER_NAME (sim-$PEER_SIM)"
 else
-    mark_fail "vms.host = '$NEW_HOST' — expected bedrock-sim-2"
+    mark_fail "vms.host = '$NEW_HOST' — expected '$PEER_NAME'"
 fi
 
 # ─────────────────────────────────────────────────────────────────
@@ -243,16 +274,16 @@ note "wait 45s for sim-1 to rejoin + reconcile"
 sleep 45
 
 # After rejoin, sim-1 should NOT have the pet VM running. The
-# failover decision lives in rqlite; sim-1's recovery path should see
-# vms.host=sim-2 and either keep the local suspended copy frozen
-# (until the 5-min kill timer) or destroy it during reconcile.
+# failover decision lives in rqlite; sim-1's recovery path should
+# see vms.host=$PEER_NAME and either keep the local suspended copy
+# frozen (until the 5-min kill timer) or destroy it during
+# reconcile.
 #
-# Cumulative pass condition: VM is running on sim-2 AND not running
-# on sim-1.
-if vm_running_on "$PET_NAME" 2; then
-    pass "post-restore: pet VM still running on sim-2"
+# Cumulative pass condition: VM running on PEER_SIM AND not on sim-1.
+if vm_running_on "$PET_NAME" $PEER_SIM; then
+    pass "post-restore: pet VM still running on sim-$PEER_SIM"
 else
-    mark_fail "post-restore: pet VM dropped off sim-2"
+    mark_fail "post-restore: pet VM dropped off sim-$PEER_SIM"
 fi
 if vm_running_on "$PET_NAME" 1; then
     mark_fail "post-restore: pet VM ALSO running on sim-1 — split-brain"
@@ -262,7 +293,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 step "6. Cleanup: destroy + undefine the pet VM"
-sssh 2 "virsh destroy $PET_NAME 2>/dev/null; virsh undefine $PET_NAME 2>/dev/null; \
+sssh $PEER_SIM "virsh destroy $PET_NAME 2>/dev/null; virsh undefine $PET_NAME 2>/dev/null; \
         bedrock vm delete $PET_NAME 2>&1 | tail -3" || true
 
 echo

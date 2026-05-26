@@ -36,14 +36,20 @@ from . import rqlite_client, view_builder
 
 def load_cluster(
     client: Optional[rqlite_client.RqliteClient] = None,
+    level: str = "none",
 ) -> dict:
     """Return the cluster-wide state as a dict (cluster.json shape).
 
     `client` may be supplied to share a connection; otherwise a fresh
-    one is opened and closed for this call. Reads use level='none'
-    so the call succeeds even when the cluster has lost quorum, as
-    long as this node's local rqlite store is readable.
+    one is opened and closed for this call.
+
+    `level` defaults to 'none' (local replica, works without quorum,
+    can be stale by Raft replication lag). Pass `'strong'` after a
+    network partition heals to force a Raft-leader round-trip — the
+    no-quorum recovery path uses this so it doesn't make decisions
+    (resume the local paused VM vs. destroy it because the peer has
+    taken over) against a stale snapshot.
     """
     return view_builder._cluster_view(
-        view_builder.build_snapshot(client=client, level="none")
+        view_builder.build_snapshot(client=client, level=level)
     )
