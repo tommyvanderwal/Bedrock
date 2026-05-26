@@ -391,10 +391,18 @@ async def _wait_for_role(timeout_s: float,
 async def _start_local_services():
     """Bring this node's local services up to the state rqlite says
     they should be in. Idempotent — safe at boot, after a no-quorum
-    cycle, or when re-running because the log changed."""
+    cycle, or when re-running because the log changed.
+
+    Reads at level='strong'. We pay a Raft round-trip on every call
+    but the alternative (level='none' against the local replica) is
+    a real race: post-no-quorum we run RIGHT AFTER
+    _reconcile_paused_vms destroyed the local copy of a VM that the
+    peer has taken over, but the stale local replica still says
+    vms.host = self / state = running → virsh start →
+    split-brain."""
     try:
         from lib import cluster_state as _cs
-        cluster = _cs.load_cluster()
+        cluster = _cs.load_cluster(level="strong")
     except Exception:
         cluster = {}
     nodes = cluster.get("nodes", {}) or {}
