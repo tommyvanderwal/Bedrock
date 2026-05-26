@@ -479,13 +479,11 @@ async def no_quorum_responder():
             )
         except asyncio.TimeoutError:
             log.error("no_quorum: cleanup did not complete in %ds — "
-                      "leaving marker for operator",
-                      int(NO_QUORUM_CLEANUP_TIMEOUT_S))
-            return
+                      "will retry next tick", int(NO_QUORUM_CLEANUP_TIMEOUT_S))
+            continue
         except Exception as e:
-            log.error("no_quorum: cleanup raised %r — leaving marker "
-                      "for operator", e)
-            return
+            log.error("no_quorum: cleanup raised %r — will retry next tick", e)
+            continue
 
         # Wait for the election to leave NoQuorum before unlinking the
         # marker — otherwise election would re-create it on the next
@@ -496,9 +494,15 @@ async def no_quorum_responder():
                  "before clearing marker")
         role = await _wait_for_role(timeout_s=120.0, ignore_marker=True)
         if role not in ("leader", "follower"):
-            log.warning("no_quorum: still no quorum after 120s — leaving "
-                        "marker for operator")
-            return
+            # Long partitions are normal (peers may need to cold-boot,
+            # or the cluster may just not have reformed yet). DO NOT
+            # `return` — that would terminate this task and leave the
+            # marker and the VM paused indefinitely. Sleep briefly and
+            # loop back so the next iteration polls again.
+            log.warning("no_quorum: still no quorum after 120s — will "
+                        "retry next tick")
+            await asyncio.sleep(10)
+            continue
 
         try:
             NO_QUORUM_MARKER.unlink()
