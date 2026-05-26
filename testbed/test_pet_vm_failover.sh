@@ -191,12 +191,23 @@ WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 note "workstation IP allowlisted on sim-1's br0: $WS_IP"
 
 ISOLATE_T0=$(date +%s)
+# IMPORTANT: iptables alone is NOT enough on br0 — bridge-local
+# multicast delivery (peers' 239.7.7.7 probes) bypasses netfilter
+# and keeps n.last_seen advancing. Drop at the bridge layer with
+# ebtables too. See lesson_iptables_bridge_multicast.
 sssh 1 "bash -c '
 iptables-save > /tmp/iptables-pre-petfailover 2>/dev/null
 iptables -I OUTPUT -o br0 -j DROP
 iptables -I INPUT  -i br0 -j DROP
 iptables -I OUTPUT -o br0 -d $WS_IP -j ACCEPT
 iptables -I INPUT  -i br0 -s $WS_IP -j ACCEPT
+# ebtables: drop all bridge-local traffic except workstation MAC
+WS_MAC=\$(ip neigh show $WS_IP 2>/dev/null | awk '\''{print \$5}'\'' | head -1)
+ebtables -F FORWARD 2>/dev/null
+ebtables -F INPUT 2>/dev/null
+ebtables -A INPUT -p IPv4 --ip-src $WS_IP -j ACCEPT 2>/dev/null
+ebtables -A INPUT -p IPv4 -j DROP 2>/dev/null
+ebtables -A INPUT -p ARP -j ACCEPT 2>/dev/null
 for nic in enp2s0 enp3s0 enp4s0 enp5s0; do
     ip link set \$nic down 2>/dev/null
 done
@@ -266,6 +277,8 @@ iptables -F INPUT
 iptables -F OUTPUT
 iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
+ebtables -F INPUT 2>/dev/null
+ebtables -F FORWARD 2>/dev/null
 rm -f /run/bedrock-no-quorum
 echo restored
 '" || note "restore returned non-zero"

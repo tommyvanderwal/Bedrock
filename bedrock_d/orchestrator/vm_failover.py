@@ -61,7 +61,15 @@ log = logging.getLogger("bedrock.vm_failover")
 
 # Timing constants — load-bearing, match docs/cluster-quorum-spec.md
 # and the VM-failover design discussion. Bump cautiously.
-SUSPEND_AFTER_NO_QUORUM_S  = 20.0    # T+20: local node suspends pet/vipet
+#
+# Per Tommy's spec: suspend at T+20s wall-clock from partition. The
+# no-quorum marker drops ~10-15s after partition (DOWN_HYSTERESIS_S
+# + NOQUORUM_HOLDDOWN_TICKS), so threshold = 5s puts the suspend at
+# partition+15-20s. The no_quorum_responder in mgmt/orchestrator.py
+# also suspends every running VM at marker+1s — this vm_failover
+# task is the selective belt-and-suspenders for the pet/vipet case
+# specifically (no_quorum_responder is unconditional / cattle too).
+SUSPEND_AFTER_NO_QUORUM_S  = 5.0     # T+~20 wall-clock from partition
 TAKEOVER_AFTER_PEER_DOWN_S = 35.0    # T+35: surviving node promotes
                                      #       (5 s extra over T+30 lets DRBD
                                      #        in-flight writes settle before

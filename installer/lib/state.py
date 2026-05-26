@@ -19,6 +19,23 @@ def save(state: dict):
     # crash-looped forever with "cannot render env yet — node_name=''
     # loopback_ip=''"). Tempfile + rename is atomic; readers never see
     # a partial file.
+    #
+    # Defensive: refuse to write a state dict that lacks the
+    # bootstrap-essentials. A caller that loaded state.json (got an
+    # empty dict because the file was missing/0-bytes) and then
+    # save()'d the empty dict would persist the corruption. Better
+    # to raise loudly so the operator sees something is wrong than
+    # to silently turn a corrupt state.json into a corrupt-but-now-
+    # 2-byte state.json. Recurrence of this happened on sim-4
+    # 2026-05-26 during a sync-to-sims --restart cycle; the
+    # subsequent bedrock-rqlited crash-loop hid the original cause.
+    if not state.get("bootstrap_done") and not state.get("node_name"):
+        import sys as _sys
+        raise RuntimeError(
+            "state.save: refusing to write state without "
+            "bootstrap_done or node_name — would corrupt state.json. "
+            f"Caller stack: {_summarize_stack()}"
+        )
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     import os, tempfile
     fd, tmp_path = tempfile.mkstemp(
@@ -34,3 +51,13 @@ def save(state: dict):
         except OSError:
             pass
         raise
+
+
+def _summarize_stack() -> str:
+    """Caller-stack snippet for the empty-save trap. Three frames
+    above this helper's caller is usually enough to identify the
+    saga step / orchestrator path that mis-saved."""
+    import traceback
+    frames = traceback.extract_stack()[-5:-2]
+    return " <- ".join(f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}"
+                       for f in frames)
