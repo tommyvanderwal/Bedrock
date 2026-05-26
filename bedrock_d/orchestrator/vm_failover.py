@@ -145,21 +145,28 @@ def _virsh(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
         return 1, "", f"{type(e).__name__}: {e}"
 
 
-def _local_pet_vipet_vms() -> list[str]:
-    """List currently-running VMs on this node that are pet or vipet
-    (cattle skipped — they have no DRBD, no failover meaning, leave
-    them running). Queries rqlite for vm_type (level='none', works
-    without quorum)."""
+def _local_pet_vipet_vms(states: tuple = ("running",)) -> list[str]:
+    """List local VMs in the given libvirt state(s) that are pet or
+    vipet (cattle skipped — they have no DRBD, no failover meaning,
+    leave them alone). Queries rqlite for vm_type (level='none',
+    works without quorum).
+
+    `states` defaults to ('running',). Pass ('paused',) to find
+    already-suspended pet/vipet VMs for adoption into the
+    suspended-vms record."""
     try:
         from lib import rqlite_client
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import rqlite_client  # type: ignore
-    rc_v, out, _ = _virsh("list", "--name", "--state-running")
-    if rc_v != 0:
-        return []
-    running = [n.strip() for n in out.splitlines() if n.strip()]
+    names: list[str] = []
+    for st in states:
+        rc_v, out, _ = _virsh("list", "--name", f"--state-{st}")
+        if rc_v != 0:
+            continue
+        names.extend(n.strip() for n in out.splitlines() if n.strip())
+    running = list(dict.fromkeys(names))   # de-dup, preserve order
     if not running:
         return []
     placeholders = ",".join("?" * len(running))
@@ -288,9 +295,16 @@ def _rqlite_quorate() -> bool:
 
 async def suspend_on_no_quorum_task():
     """Every TICK_S: if the no-quorum marker is older than
-    SUSPEND_AFTER_NO_QUORUM_S and we have local pet/vipet VMs
-    running, virsh-suspend them and persist the suspend timestamp
-    for the kill timer."""
+    SUSPEND_AFTER_NO_QUORUM_S, ensure every local pet/vipet VM is
+    suspended AND recorded in suspended-vms.json (so the kill timer
+    can fire 5 min later).
+
+    Two-path adoption: mgmt/orchestrator's no_quorum_responder polls
+    the marker every 1s and virsh-suspends VMs as part of its
+    cleanup — that path wins the suspend race but does not write
+    to suspended-vms.json. This tick adopts already-paused pet/vipet
+    VMs into the record at the marker's mtime (close enough to the
+    actual suspend time for the kill timer to be accurate)."""
     log.info("vm_failover: suspend_on_no_quorum_task started "
              "(no-quorum-age threshold = %.1fs)",
              SUSPEND_AFTER_NO_QUORUM_S)
@@ -299,22 +313,25 @@ async def suspend_on_no_quorum_task():
         try:
             if not NO_QUORUM_MARKER.exists():
                 continue
-            marker_age = _now() - NO_QUORUM_MARKER.stat().st_mtime
+            marker_mtime = NO_QUORUM_MARKER.stat().st_mtime
+            marker_age = _now() - marker_mtime
             if marker_age < SUSPEND_AFTER_NO_QUORUM_S:
                 continue
             running = _local_pet_vipet_vms()
-            if not running:
-                continue
+            paused = _local_pet_vipet_vms(states=("paused",))
             record = _load_suspended_record()
+            dirty = False
+            # 1. Suspend any still-running pet/vipet VMs
             for vm in running:
                 if vm in record:
-                    continue   # already suspended
+                    continue
                 rc_v, _, err = _virsh("suspend", vm)
                 if rc_v == 0:
-                    record[vm] = _now()
+                    record[vm] = marker_mtime
+                    dirty = True
                     log.warning(
                         "vm_failover: suspended VM %r at no-quorum age "
-                        "%.1fs (kill at +%ds if no recovery)",
+                        "%.1fs (kill at marker+%ds if no recovery)",
                         vm, marker_age, KILL_AFTER_SUSPEND_S,
                     )
                 else:
@@ -322,7 +339,22 @@ async def suspend_on_no_quorum_task():
                         "vm_failover: failed to suspend VM %r: %s",
                         vm, err.strip(),
                     )
-            _save_suspended_record(record)
+            # 2. Adopt already-paused pet/vipet VMs into the record.
+            # mgmt/orchestrator's no_quorum_responder pauses them in
+            # its own cleanup pass — without this adoption step, the
+            # kill_suspended_after_5min_task never sees them.
+            for vm in paused:
+                if vm in record:
+                    continue
+                record[vm] = marker_mtime
+                dirty = True
+                log.warning(
+                    "vm_failover: adopted already-paused VM %r at "
+                    "no-quorum age %.1fs (kill at marker+%ds if no "
+                    "recovery)", vm, marker_age, KILL_AFTER_SUSPEND_S,
+                )
+            if dirty:
+                _save_suspended_record(record)
         except Exception as e:
             log.warning("vm_failover: suspend tick: %s", e)
 
