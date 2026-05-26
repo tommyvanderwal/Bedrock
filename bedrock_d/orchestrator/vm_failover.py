@@ -343,15 +343,22 @@ async def suspend_on_no_quorum_task():
             # mgmt/orchestrator's no_quorum_responder pauses them in
             # its own cleanup pass — without this adoption step, the
             # kill_suspended_after_5min_task never sees them.
+            # Use _now() (not marker_mtime) — the actual virsh-suspend
+            # happened at the most-recent marker reappearance, but
+            # bedrock-d may have just restarted onto a long-standing
+            # marker, in which case marker_mtime is much older than
+            # the actual suspend and using it would kill the VM
+            # immediately on adoption.
+            now = _now()
             for vm in paused:
                 if vm in record:
                     continue
-                record[vm] = marker_mtime
+                record[vm] = now
                 dirty = True
                 log.warning(
-                    "vm_failover: adopted already-paused VM %r at "
-                    "no-quorum age %.1fs (kill at marker+%ds if no "
-                    "recovery)", vm, marker_age, KILL_AFTER_SUSPEND_S,
+                    "vm_failover: adopted already-paused VM %r "
+                    "(kill at +%ds if no recovery)", vm,
+                    KILL_AFTER_SUSPEND_S,
                 )
             if dirty:
                 _save_suspended_record(record)
