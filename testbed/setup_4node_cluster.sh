@@ -71,56 +71,47 @@ step "1. Sync current repo code to sims + restart bedrock-d"
 "$TESTBED/sync-to-sims.sh" --restart 1 2 3 4
 
 # ─────────────────────────────────────────────────────────────────
-step "2. Start BedRock Echo stub (witness) on workstation"
-# Pull the cluster key from any of the sims (after init); for the
-# pre-init phase we let the echo run unauthenticated and update later.
-# For simplicity, kill any existing stub and start fresh.
+step "2. bedrock init on sim-1 (1-node cluster)"
+WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+note "workstation/witness IP: $WS_IP"
+
+# `bedrock init` only takes --name; witness goes through `bedrock
+# witness add` after the cluster is up + the echo stub is running.
+INIT_OUT=$(sssh 1 'set -o pipefail; bedrock init --name test-failover 2>&1' \
+    | tee /tmp/setup-init.log | tail -10)
+echo "$INIT_OUT"
+if echo "$INIT_OUT" | grep -qE "ERROR|FAIL|Traceback"; then
+    fail "bedrock init failed (see /tmp/setup-init.log)"; exit 1
+fi
+pass "sim-1 init done; waiting 10s for services"
+sleep 10
+
+# ─────────────────────────────────────────────────────────────────
+step "3. Start BedRock Echo stub on workstation with cluster.key from sim-1"
 pkill -f "bedrock_echo_stub" 2>/dev/null
 sleep 1
 ECHO_LOG=/tmp/bedrock-echo-stub.log
 > "$ECHO_LOG"
-# We don't have the cluster key yet — start the stub WITHOUT --cluster-key-hex
-# and it'll use a dummy key. After `bedrock init` writes the real
-# cluster.key on sim-1, we'll restart with the right key.
-python3 "$TESTBED/bedrock_echo_stub.py" --echo-id "testbed-echo" \
-    --verbose >"$ECHO_LOG" 2>&1 &
-ECHO_PID=$!
-sleep 2
-if kill -0 $ECHO_PID 2>/dev/null; then
-    pass "echo stub started (pid $ECHO_PID); will reload with real cluster key after init"
-else
-    fail "echo stub failed to start; see $ECHO_LOG"
-    exit 1
-fi
 
-# ─────────────────────────────────────────────────────────────────
-step "3. bedrock init on sim-1"
-WS_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-note "workstation/witness IP: $WS_IP"
-
-sssh 1 "bedrock init --witness $WS_IP --yes 2>&1 | tail -10" \
-    || { fail "bedrock init failed"; exit 1; }
-pass "sim-1 init done; waiting 10s for services"
-sleep 10
-
-# Restart the echo stub with the real cluster key now that init wrote it
-CLUSTER_KEY_HEX=$(sssh 1 'xxd -p -c 64 /etc/bedrock/cluster.key 2>/dev/null | head -1')
-if [ -n "$CLUSTER_KEY_HEX" ]; then
-    pkill -f "bedrock_echo_stub" 2>/dev/null
-    sleep 1
-    > "$ECHO_LOG"
-    python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
-        --echo-id "testbed-echo" --verbose >"$ECHO_LOG" 2>&1 &
-    ECHO_PID=$!
-    sleep 3
-    if kill -0 $ECHO_PID 2>/dev/null; then
-        pass "echo stub restarted with real cluster key (pid $ECHO_PID)"
-    else
-        fail "echo stub died after reload"; exit 1
-    fi
-else
+CLUSTER_KEY_HEX=$(sssh 1 'python3 -c "print(open(\"/etc/bedrock/cluster.key\",\"rb\").read().hex())" 2>/dev/null')
+if [ -z "$CLUSTER_KEY_HEX" ]; then
     fail "couldn't read cluster.key from sim-1"; exit 1
 fi
+python3 "$TESTBED/bedrock_echo_stub.py" --cluster-key-hex "$CLUSTER_KEY_HEX" \
+    --echo-id "testbed-echo" --verbose >"$ECHO_LOG" 2>&1 &
+ECHO_PID=$!
+sleep 3
+if kill -0 $ECHO_PID 2>/dev/null; then
+    pass "echo stub started with real cluster key (pid $ECHO_PID)"
+else
+    fail "echo stub died; see $ECHO_LOG"; exit 1
+fi
+
+# Register the workstation as a witness in rqlite. The pubkey field
+# isn't validated today (v0.1 uses the shared cluster_key for AEAD);
+# 64 zeros is a placeholder for the v0.2 per-witness-key model.
+sssh 1 "bedrock witness add testbed-echo ${WS_IP}:12321 $(printf '0%.0s' {1..64}) 2>&1 | tail -5" \
+    || note "witness add returned non-zero (may already exist; continuing)"
 
 api_token() {
     sssh "$1" 'curl -sS -X POST http://127.0.0.1:8080/api/login \
@@ -152,10 +143,12 @@ TOKEN=$(api_token 1)
 
 for i in 2 3 4; do
     step "4.$((i-1)) Join sim-$i → N=$i"
-    sssh $i "nohup bedrock join --witness $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
+    # bedrock join takes a positional node_ip (the IP of any current
+    # cluster member); --yes auto-confirms the join prompt.
+    sssh $i "nohup bedrock join $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
     sleep 5
     approve_pending_join "$IP1" "$TOKEN" || { fail "approve sim-$i failed"; exit 1; }
-    sleep 25
+    sleep 30
     NODES=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT COUNT(*) FROM nodes\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else 0)"')
     if [ "$NODES" = "$i" ]; then
         pass "cluster size = $NODES after sim-$i join"

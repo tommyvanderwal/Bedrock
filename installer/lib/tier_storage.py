@@ -1248,9 +1248,15 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
         ["drbdadm", "status", f"tier-{tier}"],
         capture_output=True, text=True,
     )
-    if rc_chk.returncode != 0 or "no resources" in (rc_chk.stderr or "").lower():
+    already_configured = (rc_chk.returncode == 0 and
+                          "no resources" not in (rc_chk.stderr or "").lower())
+    if not already_configured:
         run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
-    run(f"drbdadm up tier-{tier}")
+        run(f"drbdadm up tier-{tier}")
+    # drbdadm up on an already-up resource fails with "Minor or
+    # volume exists already" (rc=10). Skip when status confirms the
+    # resource is already configured; the promote step below is the
+    # one that actually does the work this idempotent retry needs.
     # ``drbdadm primary --force`` is idempotent — it's a no-op if
     # we're already Primary.
     run(f"drbdadm primary --force tier-{tier}")
