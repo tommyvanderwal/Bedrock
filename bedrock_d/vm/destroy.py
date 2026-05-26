@@ -145,11 +145,14 @@ class VmDestroy:
 
 
 def _peer_hosts(peer_names: list[str]) -> list[str]:
-    cluster = json.loads(Path("/etc/bedrock/cluster.json").read_text())
-    nodes = cluster.get("nodes", {})
-    out = []
-    for n in peer_names:
-        host = (nodes.get(n) or {}).get("host")
-        if host:
-            out.append(host)
-    return out
+    if not peer_names:
+        return []
+    from lib import rqlite_client
+    placeholders = ",".join("?" * len(peer_names))
+    with rqlite_client.RqliteClient() as _rc:
+        rows = _rc.query(
+            f"SELECT node_name, host FROM nodes WHERE node_name IN ({placeholders})",
+            params=peer_names, level="none",
+        )
+    hosts = {r["node_name"]: r["host"] for r in rows}
+    return [hosts[n] for n in peer_names if hosts.get(n)]

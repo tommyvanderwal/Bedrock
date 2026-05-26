@@ -96,13 +96,24 @@ def _run(cmd: list[str], check: bool = False, timeout: int = 30) -> tuple[int, s
 
 def arbiter_loopback_ip() -> str:
     """The arbiter's `100.X.Y.254/32` IP for this cluster. Reads
-    cluster_uuid from cluster.json and derives the deterministic
-    cluster prefix (same algorithm as for node loopback IPs)."""
+    cluster_uuid from local rqlite (level='none', works without
+    quorum) and derives the deterministic cluster prefix (same
+    algorithm as for node loopback IPs)."""
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
+        try:
+            from . import rqlite_client
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rqlite_client  # type: ignore
+        with rqlite_client.RqliteClient() as _rc:
+            row = _rc.query_one(
+                "SELECT cluster_uuid FROM cluster_info WHERE id = 1",
+                level="none",
+            )
+        uuid = (row or {}).get("cluster_uuid", "") or ""
     except Exception:
         return ""
-    uuid = cluster.get("cluster_uuid", "")
     if not uuid:
         return ""
     try:
@@ -141,14 +152,23 @@ def _drbd_resource_exists() -> bool:
 
 
 def _cluster_size() -> int:
-    """How many nodes are in the cluster snapshot. N=1 means we
-    can skip every DRBD step (no peer, no replication needed) and
-    just run the singleton services on the local FS."""
+    """How many nodes are in the cluster (per local rqlite, level='none').
+    N=1 means we can skip every DRBD step (no peer, no replication needed)
+    and just run the singleton services on the local FS."""
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
+        try:
+            from . import rqlite_client
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rqlite_client  # type: ignore
+        with rqlite_client.RqliteClient() as _rc:
+            row = _rc.query_one(
+                "SELECT COUNT(*) AS c FROM nodes", level="none",
+            )
+        return int((row or {}).get("c") or 0)
     except Exception:
         return 0
-    return len(cluster.get("nodes") or {})
 
 
 def _drbd_promote() -> None:
@@ -522,19 +542,28 @@ def _run_takeover_protocol() -> bool:
 
 
 def _last_known_master_node_id() -> "int | None":
-    """Read /etc/bedrock/cluster.json (local, stale-tolerant). Return
-    the node_id (last octet of loopback_ip) of the current mgmt_master,
-    or None if not yet set."""
+    """Read the current mgmt_master + its loopback from local rqlite
+    (level='none', works without quorum). Return the node_id (last
+    octet of loopback_ip), or None if no master is set."""
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
-    except (OSError, ValueError):
+        try:
+            from . import rqlite_client
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rqlite_client  # type: ignore
+        with rqlite_client.RqliteClient() as _rc:
+            row = _rc.query_one(
+                "SELECT n.loopback_ip FROM cluster_info ci "
+                "LEFT JOIN nodes n ON n.node_name = ci.mgmt_master "
+                "WHERE ci.id = 1",
+                level="none",
+            )
+    except Exception:
         return None
-    master_name = cluster.get("mgmt_master") or ""
-    if not master_name:
+    loop = (row or {}).get("loopback_ip") or ""
+    if not loop:
         return None
-    nodes = cluster.get("nodes") or {}
-    info = nodes.get(master_name) or {}
-    loop = info.get("loopback_ip") or ""
     try:
         return int(loop.rsplit(".", 1)[1])
     except (IndexError, ValueError):

@@ -359,10 +359,10 @@ def _cmd_cluster_rename(new_name: str) -> int:
 
 def _cmd_node_list():
     """Print nodes from the materialised snapshot."""
-    from lib import view_builder, state as _state
+    from lib import cluster_state, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
-    snapshot = view_builder.rebuild(this_node=self_name)
+    snapshot = cluster_state.load_cluster()
     nodes = snapshot.get("nodes", {}) or {}
     if not nodes:
         print("(no nodes registered yet)")
@@ -406,13 +406,13 @@ def _cmd_node_leave(target: str, reason: str):
             return 1
 
     print("[bedrock node leave] legacy procedural path (BEDROCK_INIT_SAGA=0)")
-    from lib import bedrock_state as bs, view_builder, state as _state
+    from lib import bedrock_state as bs, cluster_state, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
     if target == self_name:
         print(f"ERROR: cannot leave-from-self. Run `bedrock node leave {target}` from another node.")
         return 1
-    snapshot = view_builder.rebuild(this_node=self_name)
+    snapshot = cluster_state.load_cluster()
     target_info = (snapshot.get("nodes") or {}).get(target)
     if not target_info:
         print(f"  {target}: not in cluster snapshot — nothing to do")
@@ -605,10 +605,10 @@ def _propagate_daemon_config(reason: str) -> None:
     peer's bedrock-net election tick picks up the change on the next
     pass. We only wait briefly so a follow-up status command sees
     the propagated state."""
-    from lib import view_builder, state as _state
+    from lib import cluster_state, state as _state
     s = _state.load()
     self_name = s.get("node_name", "")
-    snapshot = view_builder.rebuild(this_node=self_name)
+    snapshot = cluster_state.load_cluster()
     print(f"  [{reason}] {self_name}: rqlite write replicated; peers converge on next tick")
     _wait_replicated(snapshot.get("log_index", 0))
 
@@ -854,13 +854,14 @@ def cmd_observability(args):
     mgmt_url = "http://127.0.0.1:8001"
 
     if args.action == "status":
-        # /cluster-info is public; read the cluster.json directly for
-        # the obs_backends field (not in /cluster-info today, by design
-        # — that endpoint is for discovery only).
+        # /cluster-info is public; read the cluster state from local
+        # rqlite for the obs_backends field (not in /cluster-info today,
+        # by design — that endpoint is for discovery only).
         try:
-            cfg = json.loads(Path("/etc/bedrock/cluster.json").read_text())
+            from lib import cluster_state
+            cfg = cluster_state.load_cluster()
         except Exception as e:
-            print(f"ERROR reading cluster.json: {e}")
+            print(f"ERROR reading cluster state: {e}")
             return 1
         obs = cfg.get("obs_backends") or {}
         nodes = cfg.get("nodes") or {}

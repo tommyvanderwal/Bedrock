@@ -22,7 +22,9 @@ CLUSTER_FILE = Path("/etc/bedrock/cluster.json")
 
 def _backend_hosts(kind: str) -> list[str]:
     try:
-        cluster = json.loads(CLUSTER_FILE.read_text())
+        import sys; sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import cluster_state
+        cluster = cluster_state.load_cluster()
     except Exception:
         return []
     backends = (cluster.get("obs_backends") or {}).get(kind) or []

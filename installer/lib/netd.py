@@ -933,10 +933,17 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         elif n.logged_up:
             peer_liveness[n.peer_node] = True
 
-    # 3. Cluster snapshot from cluster.json (lightweight read each tick).
+    # 3. Cluster snapshot from local rqlite (level='none' — works
+    #    without quorum). Lightweight read each tick.
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
-    except (OSError, ValueError):
+        try:
+            from . import cluster_state as _cs
+        except ImportError:
+            import sys as _sys2
+            _sys2.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import cluster_state as _cs  # type: ignore
+        cluster = _cs.load_cluster()
+    except Exception:
         return prev_outcome
     nodes = cluster.get("nodes") or {}
     if not nodes or d.my_node not in nodes:
@@ -1223,11 +1230,21 @@ def run_daemon(shared_state=None):
             if shared_state.stop_event.wait(2.0):
                 return  # shutdown requested while waiting
     if not my_loopback:
-        # Try cluster.json as fallback (post-init/join, before state.json refresh).
+        # Fall back to local rqlite (works without quorum) for our own
+        # loopback assignment if state.json hasn't been refreshed yet.
         try:
-            cluster = json.loads(CLUSTER_JSON.read_text())
-            n = (cluster.get("nodes") or {}).get(my_node) or {}
-            my_loopback = n.get("loopback_ip", "")
+            try:
+                from . import rqlite_client as _rc_mod
+            except ImportError:
+                import sys as _sys2
+                _sys2.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import rqlite_client as _rc_mod  # type: ignore
+            with _rc_mod.RqliteClient() as _rc:
+                row = _rc.query_one(
+                    "SELECT loopback_ip FROM nodes WHERE node_name = ?",
+                    params=[my_node], level="none",
+                )
+            my_loopback = (row or {}).get("loopback_ip", "")
         except Exception:
             pass
     if not my_loopback:
@@ -1452,9 +1469,18 @@ def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
     # Refresh loopback assignment if we couldn't on startup.
     if not d.my_loopback:
         try:
-            cluster = json.loads(CLUSTER_JSON.read_text())
-            n = (cluster.get("nodes") or {}).get(d.my_node) or {}
-            d.my_loopback = n.get("loopback_ip", "")
+            try:
+                from . import rqlite_client as _rc_mod
+            except ImportError:
+                import sys as _sys2
+                _sys2.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import rqlite_client as _rc_mod  # type: ignore
+            with _rc_mod.RqliteClient() as _rc:
+                row = _rc.query_one(
+                    "SELECT loopback_ip FROM nodes WHERE node_name = ?",
+                    params=[d.my_node], level="none",
+                )
+            d.my_loopback = (row or {}).get("loopback_ip", "")
             if d.my_loopback:
                 ensure_loopback_ip(d.my_loopback)
                 print(f"bedrock-net: loopback now {d.my_loopback}",
@@ -2141,14 +2167,23 @@ def _cluster_node_loopbacks(my_node: str) -> dict:
     membership-of-record, not routing-of-record, per the design
     invariants. Returns {} on any error."""
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
+        try:
+            from . import rqlite_client as _rc_mod
+        except ImportError:
+            import sys as _sys2
+            _sys2.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rqlite_client as _rc_mod  # type: ignore
+        with _rc_mod.RqliteClient() as _rc:
+            rows = _rc.query(
+                "SELECT node_name, loopback_ip FROM nodes WHERE node_name != ?",
+                params=[my_node], level="none",
+            )
     except Exception:
         return {}
     out: dict[str, str] = {}
-    for nm, n in (cluster.get("nodes") or {}).items():
-        if nm == my_node:
-            continue
-        lo = (n or {}).get("loopback_ip") or ""
+    for r in rows:
+        nm = r.get("node_name", "")
+        lo = r.get("loopback_ip") or ""
         if lo:
             out[nm] = lo
     return out
@@ -2958,14 +2993,24 @@ def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
     Master may be `my_node` itself — caller decides to skip in that case.
     """
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
+        try:
+            from . import rqlite_client as _rc_mod
+        except ImportError:
+            import sys as _sys2
+            _sys2.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import rqlite_client as _rc_mod  # type: ignore
+        with _rc_mod.RqliteClient() as _rc:
+            row = _rc.query_one(
+                "SELECT ci.mgmt_master, n.loopback_ip "
+                "FROM cluster_info ci "
+                "LEFT JOIN nodes n ON n.node_name = ci.mgmt_master "
+                "WHERE ci.id = 1",
+                level="none",
+            )
     except Exception:
         return ("", "")
-    master = cluster.get("mgmt_master") or ""
-    if not master:
-        return ("", "")
-    nodes = cluster.get("nodes") or {}
-    lo = (nodes.get(master) or {}).get("loopback_ip") or ""
+    master = (row or {}).get("mgmt_master") or ""
+    lo = (row or {}).get("loopback_ip") or ""
     return (master, lo)
 
 

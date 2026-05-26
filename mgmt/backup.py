@@ -80,10 +80,10 @@ DEFAULT_ENCRYPTION = "AES256-GCM-HMAC-SHA256"
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _read_cluster() -> dict:
-    if not CLUSTER_JSON.exists():
-        return {}
     try:
-        return json.loads(CLUSTER_JSON.read_text())
+        import sys; sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import cluster_state
+        return cluster_state.load_cluster()
     except Exception:
         return {}
 

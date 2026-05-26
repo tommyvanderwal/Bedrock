@@ -71,7 +71,8 @@ STATE_JSON = Path("/etc/bedrock/state.json")
 
 def _load_cluster() -> dict:
     try:
-        return json.loads(CLUSTER_JSON.read_text())
+        from lib import cluster_state
+        return cluster_state.load_cluster()
     except Exception:
         return {}
 

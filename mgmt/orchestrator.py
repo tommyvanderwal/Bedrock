@@ -228,10 +228,12 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
         _SNAPSHOT.update(new)
         _LAST_LOG_IDX = int(new.get("log_index", revision))
 
+    # state.json projection of this node's role + mgmt_url. cluster.json
+    # is no longer written — consumers query rqlite directly via
+    # cluster_state.load_cluster() (level='none'). state.json holds the
+    # per-node fields that need to survive cold-boot without rqlite:
+    # node identity + the derived role + master URL for that node.
     try:
-        CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
-        view_builder._atomic_write_json(
-            CLUSTER_JSON, view_builder._cluster_view(_SNAPSHOT))
         if self_name and self_name in (_SNAPSHOT.get("nodes") or {}):
             existing = {}
             if STATE_JSON.exists():
@@ -242,7 +244,7 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             existing.update(view_builder._state_view(_SNAPSHOT, self_name))
             view_builder._atomic_write_json(STATE_JSON, existing)
     except Exception as e:
-        log.warning("rqlite_subscriber: projection write at rev %d: %s",
+        log.warning("rqlite_subscriber: state.json projection at rev %d: %s",
                     revision, e)
 
     # Observability reconciler — converge local vmagent/vlagent and
@@ -373,8 +375,9 @@ async def _wait_for_role(timeout_s: float,
                 await asyncio.sleep(1)
                 continue
         try:
-            cluster = json.loads(CLUSTER_JSON.read_text())
-        except (OSError, ValueError):
+            from lib import cluster_state as _cs
+            cluster = _cs.load_cluster()
+        except Exception:
             cluster = {}
         master = cluster.get("mgmt_master") or ""
         if master:
@@ -384,10 +387,14 @@ async def _wait_for_role(timeout_s: float,
 
 
 async def _start_local_services():
-    """Bring this node's local services up to the state cluster.json
-    says they should be in. Idempotent — safe at boot, after a fence
+    """Bring this node's local services up to the state rqlite says
+    they should be in. Idempotent — safe at boot, after a fence
     cycle, or when re-running because the log changed."""
-    cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
+    try:
+        from lib import cluster_state as _cs
+        cluster = _cs.load_cluster()
+    except Exception:
+        cluster = {}
     nodes = cluster.get("nodes", {}) or {}
     vms = cluster.get("vms", {}) or {}
     self_name = _self_node_name()
@@ -534,7 +541,11 @@ async def _reconcile_paused_vms():
     time _wait_for_role returns a settled role (subscriber catches
     us up over the just-restored network)."""
     self_name = _self_node_name()
-    cluster = json.loads(CLUSTER_JSON.read_text()) if CLUSTER_JSON.exists() else {}
+    try:
+        from lib import cluster_state as _cs
+        cluster = _cs.load_cluster()
+    except Exception:
+        cluster = {}
     vms = cluster.get("vms", {}) or {}
 
     for vm_name in _paused_vm_names():
@@ -704,23 +715,28 @@ async def backup_scheduler():
 
 
 def _is_leader() -> bool:
-    """True iff cluster.json says we are mgmt_master."""
+    """True iff rqlite says we are mgmt_master (level='none', works
+    without quorum — falls back to False if local rqlite is down)."""
     try:
-        master = json.loads(CLUSTER_JSON.read_text()).get("mgmt_master") or ""
-    except (OSError, ValueError):
+        with rqlite_client.RqliteClient() as _rc:
+            row = _rc.query_one(
+                "SELECT mgmt_master FROM cluster_info WHERE id = 1",
+                level="none",
+            )
+        master = (row or {}).get("mgmt_master") or ""
+    except Exception:
         return False
     return master == _self_node_name()
 
 
 async def _scheduler_tick():
-    """Single pass: load cluster.json, evaluate every VM's schedule,
-    queue run_backup for the ones that are due."""
-    if not CLUSTER_JSON.exists():
-        return
+    """Single pass: load cluster state from local rqlite, evaluate every
+    VM's schedule, queue run_backup for the ones that are due."""
     try:
-        cluster = json.loads(CLUSTER_JSON.read_text())
+        from lib import cluster_state as _cs
+        cluster = _cs.load_cluster()
     except Exception as e:
-        log.warning("scheduler: cluster.json read failed: %s", e)
+        log.warning("scheduler: cluster_state load failed: %s", e)
         return
 
     import datetime as dt
@@ -849,14 +865,10 @@ async def cluster_tier_watcher():
     while True:
         await asyncio.sleep(10)
         try:
-            if not CLUSTER_JSON.exists():
-                continue
             try:
-                cluster = json.loads(CLUSTER_JSON.read_text())
-            except json.JSONDecodeError:
-                # cluster.json is mid-rewrite or corrupted. Skip this
-                # tick — the rqlite_subscriber will rewrite it from
-                # canonical state on the next revision advance.
+                from lib import cluster_state as _cs
+                cluster = _cs.load_cluster()
+            except Exception:
                 continue
             nodes = cluster.get("nodes") or {}
             master = cluster.get("mgmt_master") or ""

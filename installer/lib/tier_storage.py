@@ -265,30 +265,22 @@ def ssh(host: str, cmd: str, check: bool = True, timeout: int = 600) -> str:
 # ── State helpers ──────────────────────────────────────────────────────────
 
 def load_cluster() -> dict:
-    if CLUSTER_JSON.exists():
-        return json.loads(CLUSTER_JSON.read_text())
-    return {}
+    """Cluster-wide state. Delegates to cluster_state — the dict shape
+    is unchanged, but the source is rqlite (level='none', works without
+    quorum) instead of the legacy /etc/bedrock/cluster.json file."""
+    from . import cluster_state
+    return cluster_state.load_cluster()
 
 
 def save_cluster(c: dict) -> None:
-    # Atomic per-call tmp+rename. Plain write_text races with the
-    # orchestrator's view_builder writing the same path and can leave
-    # a 0-byte cluster.json on disk (v29 5c post-rejoin observed it).
-    CLUSTER_JSON.parent.mkdir(parents=True, exist_ok=True)
-    import os, tempfile
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{CLUSTER_JSON.name}.", suffix=".tmp",
-        dir=str(CLUSTER_JSON.parent))
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(c, indent=2))
-        os.replace(tmp_path, str(CLUSTER_JSON))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    """No-op since the cluster.json projection was removed.
+    Callers (this file, in 3 places) previously load_cluster +
+    modify-in-memory + save_cluster(c), then mirror to rqlite. The
+    rqlite mirror IS the canonical write now; the local file write
+    was redundant. Kept as a no-op shim so the callers don't have
+    to be touched in the migration pass — they can be cleaned up
+    later when the redundant load+modify pattern is removed."""
+    return
 
 
 def load_state() -> dict:

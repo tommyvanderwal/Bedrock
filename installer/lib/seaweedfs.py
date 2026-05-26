@@ -101,7 +101,8 @@ def ensure_install() -> None:
 
 def _read_cluster() -> dict:
     try:
-        return json.loads(CLUSTER_JSON.read_text())
+        from . import cluster_state
+        return cluster_state.load_cluster()
     except Exception:
         return {}
 

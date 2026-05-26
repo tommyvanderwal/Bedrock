@@ -306,24 +306,40 @@ class VmCreate:
 
 
 def _peer_hosts(peer_names: list[str]) -> list[str]:
-    """Look up LAN IPs for the given node names from cluster.json.
-    Used by every step that ssh's to a peer."""
-    cluster = json.loads(Path("/etc/bedrock/cluster.json").read_text())
-    nodes = cluster.get("nodes", {})
+    """Look up LAN IPs for the given node names from the rqlite nodes
+    table (level='none', works without quorum)."""
+    if not peer_names:
+        return []
+    from lib import rqlite_client
+    placeholders = ",".join("?" * len(peer_names))
+    with rqlite_client.RqliteClient() as _rc:
+        rows = _rc.query(
+            f"SELECT node_name, host FROM nodes WHERE node_name IN ({placeholders})",
+            params=peer_names, level="none",
+        )
+    hosts = {r["node_name"]: r["host"] for r in rows}
     out = []
     for n in peer_names:
-        host = (nodes.get(n) or {}).get("host")
-        if not host:
-            raise RuntimeError(f"node {n!r} has no host in cluster.json")
-        out.append(host)
+        h = hosts.get(n)
+        if not h:
+            raise RuntimeError(f"node {n!r} has no host in rqlite nodes table")
+        out.append(h)
     return out
 
 
 def _peer_metadata(peer_names: list[str]) -> list[_cfg.Peer]:
     """Build the Peer objects (with node_id assigned by position +
-    loopback_ip from cluster.json) for drbd_config.render."""
-    cluster = json.loads(Path("/etc/bedrock/cluster.json").read_text())
-    nodes = cluster.get("nodes", {})
+    loopback_ip looked up from rqlite) for drbd_config.render."""
+    if not peer_names:
+        return []
+    from lib import rqlite_client
+    placeholders = ",".join("?" * len(peer_names))
+    with rqlite_client.RqliteClient() as _rc:
+        rows = _rc.query(
+            f"SELECT node_name, host, loopback_ip FROM nodes WHERE node_name IN ({placeholders})",
+            params=peer_names, level="none",
+        )
+    nodes = {r["node_name"]: {"host": r["host"], "loopback_ip": r["loopback_ip"]} for r in rows}
     out = []
     for i, n in enumerate(peer_names):
         info = nodes.get(n) or {}

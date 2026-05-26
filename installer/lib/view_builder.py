@@ -384,39 +384,11 @@ def _state_view(v: dict, node_name: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# rebuild — refresh on-disk caches from rqlite
+# rebuild — DELETED. cluster.json projection layer was removed; every
+# consumer now queries rqlite directly via cluster_state.load_cluster()
+# (level='none', works without quorum). state.json projection is done
+# inline by mgmt/orchestrator.py:_apply_revision.
 # ─────────────────────────────────────────────────────────────────────
-
-
-def rebuild(cluster_json: Path = CLUSTER_JSON,
-            state_json: Path = STATE_JSON,
-            *,
-            this_node: str | None = None,
-            client: Optional[rqlite_client.RqliteClient] = None,
-            level: str = "weak") -> dict:
-    """Read rqlite, project, and rewrite cluster.json + state.json.
-
-    `this_node` projects the cluster-wide view onto state.json (each
-    node's state.json holds *its* role; cluster.json is identical on
-    every node).
-    """
-    view = build_snapshot(client=client, level=level)
-
-    cluster_json.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(cluster_json, _cluster_view(view))
-
-    if this_node and this_node in view["nodes"]:
-        state_json.parent.mkdir(parents=True, exist_ok=True)
-        existing: dict = {}
-        if state_json.exists():
-            try:
-                existing = json.loads(state_json.read_text())
-            except json.JSONDecodeError:
-                existing = {}
-        existing.update(_state_view(view, this_node))
-        _atomic_write_json(state_json, existing)
-
-    return view
 
 
 def _atomic_write_json(path: Path, obj: Any) -> None:

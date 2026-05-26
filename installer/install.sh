@@ -606,6 +606,7 @@ LIB_FILES=(
     bedrock_state.py
     bedrock_schema.sql
     view_builder.py
+    cluster_state.py
     cluster_arbiter.py
     seaweedfs.py
     dashboard_install.py

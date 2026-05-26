@@ -32,6 +32,7 @@ from lib import operator_auth as _op_auth      # noqa: E402
 from lib import join_handshake as _join_hs     # noqa: E402
 from lib import bedrock_state as _bs           # noqa: E402
 from lib import rqlite_client as _rqlite       # noqa: E402
+from lib import cluster_state as _cluster_state  # noqa: E402
 
 
 async def require_peer(request: Request) -> str:
@@ -123,37 +124,22 @@ import os as _os
 
 
 def load_cluster():
-    """Load cluster config from /etc/bedrock/cluster.json. Returns
-    {nodes: {}, ...} on missing/bad file — the watcher writes the
-    canonical cluster.json from the replicated log; if it isn't there
-    yet, the right answer is "no nodes known", not stale dev data."""
-    if CLUSTER_FILE.exists():
-        try:
-            return json.loads(CLUSTER_FILE.read_text())
-        except Exception as e:
-            log.warning("Failed to load %s: %s", CLUSTER_FILE, e)
-    return {"cluster_name": "bedrock", "nodes": {}}
+    """Cluster-wide state. Reads from the local rqlite replica via
+    cluster_state.load_cluster() — same dict shape as the historical
+    cluster.json projection, but sourced from rqlite at level='none'
+    so it works without quorum (the per-node Raft follower replica
+    is always readable when this node's rqlited is up)."""
+    try:
+        return _cluster_state.load_cluster()
+    except Exception as e:
+        log.warning("cluster_state.load_cluster failed: %s", e)
+        return {"cluster_name": "bedrock", "nodes": {}}
 
 
 def save_cluster(cluster: dict):
-    # Atomic write — plain write_text races with view_builder writing
-    # the same path and can leave a 0-byte file. See lesson_orchestrator
-    # _atomic_write.md.
-    CLUSTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    import os, tempfile
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{CLUSTER_FILE.name}.", suffix=".tmp",
-        dir=str(CLUSTER_FILE.parent))
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(cluster, indent=2))
-        os.replace(tmp_path, str(CLUSTER_FILE))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    """No-op since the cluster.json projection was removed. The only
+    side-effect kept is write_scrape_config(cluster), which produces
+    the Prometheus scrape config from the snapshot."""
     write_scrape_config(cluster)
 
 

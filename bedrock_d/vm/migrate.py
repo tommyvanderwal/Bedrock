@@ -67,13 +67,22 @@ class VmMigrate:
                 f"VM {ctx['vm_name']!r} already on {ctx['target']!r}")
         ctx["resource"] = resource
         ctx["source"] = v_rows[0]["host"]
-        # Resolve LAN IPs
-        cluster = json.loads(Path("/etc/bedrock/cluster.json").read_text())
-        nodes = cluster.get("nodes", {})
-        ctx["source_host"] = (nodes.get(ctx["source"]) or {}).get("host", "")
-        ctx["target_host"] = (nodes.get(ctx["target"]) or {}).get("host", "")
+        # Resolve LAN IPs — direct rqlite lookup of the two nodes we need.
+        from lib import rqlite_client
+        with rqlite_client.RqliteClient() as _rc:
+            rows = _rc.query(
+                "SELECT node_name, host FROM nodes WHERE node_name IN (?, ?)",
+                params=[ctx["source"], ctx["target"]],
+                level="none",
+            )
+        hosts = {r["node_name"]: r["host"] for r in rows}
+        ctx["source_host"] = hosts.get(ctx["source"], "")
+        ctx["target_host"] = hosts.get(ctx["target"], "")
         if not ctx["source_host"] or not ctx["target_host"]:
-            raise RuntimeError("source/target missing host in cluster.json")
+            raise RuntimeError(
+                f"source/target missing host in rqlite nodes table: "
+                f"{ctx['source']!r}={ctx['source_host']!r}, "
+                f"{ctx['target']!r}={ctx['target_host']!r}")
 
     @step("enable_dual_primary")
     def step_enable_dual(self, ctx):
