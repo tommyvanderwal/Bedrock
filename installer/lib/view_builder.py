@@ -188,7 +188,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         for row in client.query(
             "SELECT request_id, node_name, host, bedrock_pubkey, "
             "x25519_eph_pubkey, fingerprint, state, "
-            "master_eph_pubkey, ciphertext, nonce, reason "
+            "master_eph_pubkey, ciphertext, nonce, reason, "
+            "node_cert_pem, ca_cert_pem "
             "FROM join_requests",
             level=level,
         ):
@@ -204,6 +205,13 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 entry["master_eph_pubkey"] = row.get("master_eph_pubkey", "")
                 entry["ciphertext"] = row.get("ciphertext", "")
                 entry["nonce"] = row.get("nonce", "")
+                # Cluster CA + joiner's signed TLS cert (mTLS rollout
+                # 2026-05-25). Projected into cluster.json so
+                # /api/join/status — which reads from cluster.json,
+                # not directly from rqlite — can surface them to the
+                # joiner.
+                entry["node_cert_pem"] = row.get("node_cert_pem", "")
+                entry["ca_cert_pem"]   = row.get("ca_cert_pem", "")
             elif row["state"] == "rejected":
                 entry["reason"] = row.get("reason", "")
             out["join_requests"][row["request_id"]] = entry

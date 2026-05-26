@@ -1157,6 +1157,13 @@ def join_status(id: str):
             "mgmt_master":  master_name or "",
             "nodes":        list((cluster.get("nodes") or {}).keys()),
             "node_map":     node_map,
+            # Cluster CA + the joiner's CA-signed TLS cert. PEM-encoded.
+            # The joiner uses these to configure rqlited mTLS as part of
+            # its install. Filled by /api/join/approve via
+            # cluster_ca.sign_node_cert; default '' if approval came
+            # from a pre-TLS master that hasn't been re-installed yet.
+            "node_cert_pem": req.get("node_cert_pem", ""),
+            "ca_cert_pem":   req.get("ca_cert_pem", ""),
         })
     elif out["state"] == "rejected":
         out["reason"] = req.get("reason", "")
@@ -1269,6 +1276,22 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
     # joiner's bedrock-vm isn't up yet). The joiner's reactor writes
     # the unit file but `_can_start_vm_backend` keeps bedrock-vm
     # stopped until the seed populates the data dir.
+    # Sign the joiner's TLS cert with the cluster CA so the joiner
+    # can configure rqlited mTLS as part of its install. The joiner's
+    # raw Ed25519 pubkey came in pending["bedrock_pubkey"] (hex). CA
+    # key+cert live on the DRBD tier-critical mount (master only) per
+    # cluster_ca.py — failure here means we lost the master role
+    # mid-handshake and should surface to operator.
+    try:
+        from lib import cluster_ca as _ca
+        joiner_pub_raw = bytes.fromhex(pending["bedrock_pubkey"])
+        joiner_node_cert_pem = _ca.sign_node_cert(
+            joiner_pub_raw, pending["node_name"], next_loopback
+        ).decode("ascii")
+        ca_cert_pem = _ca.CA_CERT_DRBD.read_bytes().decode("ascii")
+    except Exception as e:
+        raise HTTPException(503, f"could not sign joiner cert: {e}")
+
     try:
         with _rqlite.RqliteClient() as _rc:
             _bs.node_register(
@@ -1294,6 +1317,8 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
                 master_eph_pubkey=master_pub_b64,
                 ciphertext=ciphertext_b64,
                 nonce=nonce_b64,
+                node_cert_pem=joiner_node_cert_pem,
+                ca_cert_pem=ca_cert_pem,
                 client=_rc,
             )
     except Exception as e:

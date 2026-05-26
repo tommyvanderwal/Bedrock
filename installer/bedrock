@@ -436,7 +436,10 @@ def _cmd_node_leave(target: str, reason: str):
             voter_id = target_lo[1]
             _sp_rm.run(
                 ["curl", "-fsSL", "-X", "DELETE",
-                 "http://127.0.0.1:4001/remove",
+                 "--cert", "/etc/bedrock/node.crt",
+                 "--key",  "/etc/bedrock/node.key.pem",
+                 "--cacert", "/etc/bedrock/ca.crt",
+                 "https://127.0.0.1:4001/remove",
                  "-d", _json_rm.dumps({"id": voter_id})],
                 capture_output=True, timeout=10,
             )

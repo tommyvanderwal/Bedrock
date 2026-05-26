@@ -458,17 +458,24 @@ def join_resolved(request_id: str, decision: str,
                   master_eph_pubkey: str = "",
                   ciphertext: str = "", nonce: str = "",
                   reason: str = "",
+                  node_cert_pem: str = "",
+                  ca_cert_pem: str = "",
                   client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """decision is 'approved' or 'rejected'."""
+    """decision is 'approved' or 'rejected'. node_cert_pem + ca_cert_pem
+    are the joiner's freshly-signed TLS cert + the cluster CA cert,
+    returned to the joiner via /api/join/status so it can configure
+    rqlited mTLS immediately."""
     c, owns = _client(client)
     try:
         c.execute(
             "UPDATE join_requests SET state = ?, "
             "master_eph_pubkey = ?, ciphertext = ?, nonce = ?, "
-            "reason = ?, resolved_at = ? "
+            "reason = ?, node_cert_pem = ?, ca_cert_pem = ?, "
+            "resolved_at = ? "
             "WHERE request_id = ?",
             params=[decision, master_eph_pubkey, ciphertext, nonce,
-                    reason, _now(), request_id],
+                    reason, node_cert_pem, ca_cert_pem,
+                    _now(), request_id],
         )
         return _bump_and_close(c, owns)
     except Exception:

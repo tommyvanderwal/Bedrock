@@ -1708,3 +1708,77 @@ deliverable.
    Path of least resistance for anyone with time to chase it.
 
 **Lesson closed.**
+
+---
+
+## L42 — httpx 0.28's `cert=` and `verify=` are silently dropped when a custom transport is provided
+**Date:** 2026-05-25
+**Files:** `installer/lib/rqlite_client.py`
+
+**What we thought:** to configure mTLS on httpx.Client, pass
+`cert=(crt, key)` and `verify=ca_path` to the Client constructor.
+That's the documented surface for client TLS.
+
+**What we found:** two subtle httpx 0.28 behaviours stacked:
+
+1. The `cert=(crt, key)` tuple did not reliably present the client
+   cert during the TLS handshake. rqlited responded with
+   `TLSV13_ALERT_CERTIFICATE_REQUIRED` even though the file paths
+   were correct and the same files worked fine via curl
+   (`--cert/--key/--cacert`).
+2. When the Client is constructed with a custom `transport=`, the
+   Client-level `verify=` and `cert=` arguments are **silently
+   dropped**. They only configure the *default* transport. Anyone
+   passing `transport=httpx.HTTPTransport(retries=0)` (which we do
+   to control retry behaviour) gets unverified-and-unauthenticated
+   TLS by default — exactly what we don't want.
+
+The combination meant the first fix attempt (build an SSLContext and
+pass `verify=ctx` on the Client) appeared to fail with the same
+"unable to get local issuer certificate" error.
+
+**What we changed:** build the `ssl.SSLContext` explicitly with
+`create_default_context(cafile=ca)` + `load_cert_chain(certfile,
+keyfile)`, then pass it to the **transport's** `verify=` argument
+(not the Client's):
+
+```python
+ctx = ssl.create_default_context(cafile=str(ca_crt))
+ctx.load_cert_chain(certfile=str(node_crt), keyfile=str(node_key))
+httpx.Client(
+    base_url=...,
+    transport=httpx.HTTPTransport(verify=ctx, retries=0),
+)
+```
+
+This single change made mTLS work end-to-end against rqlited.
+
+**Operational gotcha during the rollout:** the long-running
+`bedrock-d` daemon imports rqlite_client.py once at module load
+and caches its connection pool. After replacing the file on disk,
+we have to **restart bedrock-d** before the new code takes effect.
+This is true for any module-level state change.
+
+---
+
+## L43 — Long-running daemons need explicit restart after lib/ updates
+**Date:** 2026-05-25
+**Files:** general operational note
+
+**What we thought:** updating a `lib/*.py` file in
+`/usr/local/lib/bedrock/lib/` would take effect on the next
+RqliteClient construction.
+
+**What we found:** `bedrock-d` imports the modules once at process
+start. Subsequent file edits don't affect the running process. We
+saw stale module behaviour even after the file on disk had the
+correct content. Any rolling upgrade or hotfix that touches a
+lib module needs an accompanying `systemctl restart bedrock-d`.
+
+**What we changed:** noting it explicitly here. Long-term, the
+roll-out story for cluster-wide lib changes (e.g. the CA rotation
+case in `docs/operator-overrides.md`) needs to include a
+controlled-restart step.
+
+---
+

@@ -1044,12 +1044,30 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
             # populated leader=true yet during the arbiter-join
             # window. 3s timeout to ride out the brief Raft-elect
             # latency right after arbiter promotion.
+            # Use mTLS when the cert files exist (post-cluster_ca-init).
+            # On very-early-bootstrap before cluster_ca has run, the
+            # files are missing and we fall back to plain HTTP — at
+            # which point rqlited isn't running yet anyway so the
+            # probe was going to fail.
+            import ssl as _ssl
+            from pathlib import Path as _P
+            node_crt = "/etc/bedrock/node.crt"
+            node_key = "/etc/bedrock/node.key.pem"
+            ca_crt   = "/etc/bedrock/ca.crt"
+            if (_P(node_crt).exists() and _P(node_key).exists()
+                    and _P(ca_crt).exists()):
+                _scheme = "https"
+                _ctx = _ssl.create_default_context(cafile=ca_crt)
+                _ctx.load_cert_chain(certfile=node_crt, keyfile=node_key)
+            else:
+                _scheme = "http"
+                _ctx = None
             _req = _ur.Request(
-                "http://127.0.0.1:4001/db/query?level=strong",
+                f"{_scheme}://127.0.0.1:4001/db/query?level=strong",
                 data=b'["SELECT 1"]',
                 headers={"Content-Type": "application/json"},
             )
-            r = _ur.urlopen(_req, timeout=3)
+            r = _ur.urlopen(_req, timeout=3, context=_ctx) if _ctx else _ur.urlopen(_req, timeout=3)
             _rs = _jr.loads(r.read()) or {}
             # success shape: {"results": [{"columns": ["1"], "values": [[1]]}]}
             _r0 = (_rs.get("results") or [{}])[0]

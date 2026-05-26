@@ -430,7 +430,10 @@ def install(witness: str, cluster_info: dict, repo: str):
             _t.sleep(0.5)
             rc = subprocess.run(
                 ["curl", "-fsSL", "--max-time", "1",
-                 "http://127.0.0.1:4001/status"],
+                 "--cert", "/etc/bedrock/node.crt",
+                 "--key",  "/etc/bedrock/node.key.pem",
+                 "--cacert", "/etc/bedrock/ca.crt",
+                 "https://127.0.0.1:4001/status"],
                 capture_output=True,
             )
             if rc.returncode == 0:

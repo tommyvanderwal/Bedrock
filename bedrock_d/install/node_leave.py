@@ -120,7 +120,10 @@ class NodeLeave:
         # already-removed voter is a 200 OK no-op.
         rc = subprocess.run(
             ["curl", "-fsSL", "-X", "DELETE",
-             "http://127.0.0.1:4001/remove",
+             "--cert", "/etc/bedrock/node.crt",
+             "--key",  "/etc/bedrock/node.key.pem",
+             "--cacert", "/etc/bedrock/ca.crt",
+             "https://127.0.0.1:4001/remove",
              "-d", json.dumps({"id": voter_id})],
             capture_output=True, timeout=10,
         )

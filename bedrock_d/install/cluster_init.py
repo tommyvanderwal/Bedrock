@@ -400,6 +400,60 @@ class ClusterInit:
         from lib import tier_storage as _ts
         _ts.setup_n1(write_rqlite=False)
 
+    @step("bootstrap_cluster_ca")
+    def step_bootstrap_cluster_ca(self, ctx):
+        """Generate the cluster TLS CA + sign this master's per-node cert
+        + sign the arbiter cert. Must run BEFORE rqlited starts (rqlited
+        unit reads the cert files at process start; no hot-reload).
+
+        Files written:
+          /var/lib/bedrock/cluster/ca/ca.{key,crt}   — CA (master only)
+          /var/lib/bedrock/cluster/ca/arbiter.{key,key.pem,crt}
+                                                      — arbiter TLS
+          /etc/bedrock/ca.crt                         — replicated CA cert
+          /etc/bedrock/node.crt                       — master's node cert
+          /etc/bedrock/node.key.pem                   — PEM of master's seed
+
+        At N=1, /var/lib/bedrock/cluster is a plain dir on the root FS;
+        tier_storage.promote_local_to_drbd_master snapshots+restores its
+        contents during the N=1→N=2 promote, so the CA migrates onto the
+        DRBD volume automatically when storage promotes. Same paths
+        before and after.
+
+        Idempotent: cluster_ca.generate_ca / generate_arbiter_keypair_and_cert
+        both check for existing files. Master's node cert is re-signed on
+        every run (cheap; deterministic from the same key+SAN)."""
+        from lib import cluster_ca as _ca, peer_auth as _pa
+
+        # 1. Ensure /var/lib/bedrock/cluster exists (cluster_arbiter
+        #    promote_to_arbiter_host creates this on every promote tick,
+        #    but at init time we may be there first).
+        from pathlib import Path as _P
+        _P("/var/lib/bedrock/cluster").mkdir(parents=True, exist_ok=True)
+
+        # 2. Generate the CA (idempotent).
+        _ca.generate_ca(cluster_name=ctx["cluster_name"])
+
+        # 3. Ensure peer_auth keypair exists and sign this master's
+        #    per-node cert. peer_auth.ensure_node_key is lazy — calling
+        #    it here also covers any later step (e.g. seed_cluster_state)
+        #    that expects the keypair on disk.
+        priv_seed, pub_raw = _pa.ensure_node_key()
+        node_cert_pem = _ca.sign_node_cert(
+            pub_raw, ctx["node_name"], ctx["loopback_ip"])
+        _ca.install_node_cert(
+            node_cert_pem=node_cert_pem,
+            ca_cert_pem=_ca.CA_CERT_DRBD.read_bytes(),
+            node_seed=priv_seed,
+        )
+
+        # 4. Sign the arbiter cert. The arbiter's loopback IP is the
+        #    cluster prefix + .254 (matches cluster_arbiter.ARBITER_OCTET).
+        from lib import cluster_arbiter as _arb, cluster_addr as _caddr
+        prefix = _caddr.cluster_loopback_prefix(ctx["cluster_uuid"])
+        arbiter_ip = f"{prefix}.{_arb.ARBITER_OCTET}"
+        _ca.generate_arbiter_keypair_and_cert(arbiter_ip)
+
     # ─── rqlite ──────────────────────────────────────────────────────
 
     @step("render_rqlited_env")
@@ -430,7 +484,10 @@ class ClusterInit:
             time.sleep(0.5)
             rc = subprocess.run(
                 ["curl", "-fsSL", "--max-time", "1",
-                 "http://127.0.0.1:4001/status"],
+                 "--cert", "/etc/bedrock/node.crt",
+                 "--key",  "/etc/bedrock/node.key.pem",
+                 "--cacert", "/etc/bedrock/ca.crt",
+                 "https://127.0.0.1:4001/status"],
                 capture_output=True,
             )
             if rc.returncode != 0:

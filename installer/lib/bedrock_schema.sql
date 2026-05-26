@@ -142,6 +142,11 @@ CREATE TABLE IF NOT EXISTS join_requests (
     ciphertext           TEXT NOT NULL DEFAULT '',
     nonce                TEXT NOT NULL DEFAULT '',
     reason               TEXT NOT NULL DEFAULT '',
+    -- Joiner's TLS cert (CA-signed at /api/join/approve) and the
+    -- cluster CA cert. Both PEM-encoded. Returned to the joiner via
+    -- /api/join/status so it can configure rqlited mTLS immediately.
+    node_cert_pem        TEXT NOT NULL DEFAULT '',
+    ca_cert_pem          TEXT NOT NULL DEFAULT '',
     created_at           INTEGER NOT NULL,
     resolved_at          INTEGER
 );

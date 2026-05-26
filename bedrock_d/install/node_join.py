@@ -174,10 +174,38 @@ class NodeJoin:
             "mgmt_master":       approval.get("mgmt_master", ""),
             "loopback_ip":       approval.get("loopback_ip", ""),
             "cluster_key_hex":   cluster_key.hex(),
+            "node_cert_pem":     approval.get("node_cert_pem", ""),
+            "ca_cert_pem":       approval.get("ca_cert_pem", ""),
         }
         ctx["loopback_ip"]      = ctx["approval"]["loopback_ip"]
         ctx["master_loopback"]  = ctx["approval"]["master_loopback"]
         ctx["cluster_uuid"]     = ctx["cluster_info"].get("cluster_uuid")
+
+        # Install the CA-signed TLS cert + CA cert + PEM-format node key
+        # so the joiner's rqlited can come up with mTLS configured. The
+        # raw Ed25519 seed is already on disk via peer_auth.ensure_node_key
+        # (called during step_derive_identity); we just need to emit a
+        # PEM copy that rqlited / Go crypto/tls can read.
+        node_cert_pem = (ctx["approval"]["node_cert_pem"] or "").encode("ascii")
+        ca_cert_pem   = (ctx["approval"]["ca_cert_pem"]   or "").encode("ascii")
+        if node_cert_pem and ca_cert_pem:
+            from lib import cluster_ca as _cca, peer_auth as _pa2
+            seed, _ = _pa2.ensure_node_key()
+            _cca.install_node_cert(
+                node_cert_pem=node_cert_pem,
+                ca_cert_pem=ca_cert_pem,
+                node_seed=seed,
+            )
+            log.info("node_join: TLS cert installed (CA-signed, %d bytes)",
+                     len(node_cert_pem))
+        else:
+            # Pre-TLS master will return '' for both. Tolerated for
+            # backward-compat through the rolling upgrade window; rqlited
+            # then continues on plain HTTP. Logged so operators notice.
+            log.warning("node_join: master did not return TLS cert "
+                        "(node_cert_pem=%d, ca_cert_pem=%d bytes); "
+                        "rqlited will fall back to plain HTTP",
+                        len(node_cert_pem), len(ca_cert_pem))
 
     @step("write_state_json")
     def step_write_state_json(self, ctx):
@@ -357,7 +385,10 @@ class NodeJoin:
             time.sleep(0.5)
             rc = subprocess.run(
                 ["curl", "-fsSL", "--max-time", "1",
-                 "http://127.0.0.1:4001/status"],
+                 "--cert", "/etc/bedrock/node.crt",
+                 "--key",  "/etc/bedrock/node.key.pem",
+                 "--cacert", "/etc/bedrock/ca.crt",
+                 "https://127.0.0.1:4001/status"],
                 capture_output=True,
             )
             if rc.returncode != 0:

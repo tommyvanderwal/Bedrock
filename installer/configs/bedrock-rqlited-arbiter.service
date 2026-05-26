@@ -38,6 +38,16 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -raft-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
     -http-adv-addr "$BEDROCK_ARBITER_BIND_IP:4011" \
     -raft-adv-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
+    -raft-election-timeout 2s \
+    -raft-leader-lease-timeout 1s \
+    -http-cert /var/lib/bedrock/cluster/ca/arbiter.crt \
+    -http-key /var/lib/bedrock/cluster/ca/arbiter.key.pem \
+    -http-ca-cert /var/lib/bedrock/cluster/ca/ca.crt \
+    -http-verify-client \
+    -node-cert /var/lib/bedrock/cluster/ca/arbiter.crt \
+    -node-key /var/lib/bedrock/cluster/ca/arbiter.key.pem \
+    -node-ca-cert /var/lib/bedrock/cluster/ca/ca.crt \
+    -node-verify-client \
     $BEDROCK_ARBITER_JOIN_FLAG \
     $BEDROCK_ARBITER_BOOTSTRAP_FLAG \
     "$BEDROCK_ARBITER_DATA_DIR"'

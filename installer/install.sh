@@ -625,6 +625,7 @@ LIB_FILES=(
     witness.py
     state_shared.py
     workload.py
+    cluster_ca.py
 )
 for f in "${LIB_FILES[@]}"; do
     curl -fsSL -o "${LIB_DIR}/${f}" "${BEDROCK_REPO}/lib/${f}" \

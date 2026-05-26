@@ -91,7 +91,13 @@ def _check_httpx() -> None:
 class RqliteClient:
     """Sync HTTP client for rqlite. Reuses a single httpx.Client
     connection pool for the process lifetime. Thread-safe per
-    httpx.Client guarantees."""
+    httpx.Client guarantees.
+
+    TLS: if /etc/bedrock/{node.crt,node.key.pem,ca.crt} all exist,
+    dial https:// with mTLS using the per-node cert. Otherwise dial
+    http:// (used only at very-early-bootstrap moments before
+    cluster_ca has run; once cluster_ca runs the cert files exist
+    permanently and we'll always use TLS)."""
 
     def __init__(
         self,
@@ -100,12 +106,34 @@ class RqliteClient:
         timeout: float = DEFAULT_TIMEOUT_S,
     ):
         _check_httpx()
-        self._base = f"http://{host}:{port}"
-        self._client = httpx.Client(
-            base_url=self._base,
-            timeout=timeout,
-            transport=httpx.HTTPTransport(retries=0),  # we manage retries
-        )
+        from pathlib import Path as _P
+        node_crt = _P("/etc/bedrock/node.crt")
+        node_key = _P("/etc/bedrock/node.key.pem")
+        ca_crt   = _P("/etc/bedrock/ca.crt")
+        if node_crt.exists() and node_key.exists() and ca_crt.exists():
+            # httpx 0.28's `cert=` parameter doesn't reliably trigger
+            # mTLS client-cert presentation, and when a custom
+            # transport= is also provided, the Client-level verify=
+            # is silently ignored (verify only configures the default
+            # transport). Build an explicit ssl.SSLContext and pass
+            # it as the transport's verify=. Verified on 2026-05-25
+            # against rqlite v10 + httpx 0.28.1.
+            import ssl as _ssl
+            ctx = _ssl.create_default_context(cafile=str(ca_crt))
+            ctx.load_cert_chain(certfile=str(node_crt), keyfile=str(node_key))
+            self._base = f"https://{host}:{port}"
+            self._client = httpx.Client(
+                base_url=self._base,
+                timeout=timeout,
+                transport=httpx.HTTPTransport(verify=ctx, retries=0),
+            )
+        else:
+            self._base = f"http://{host}:{port}"
+            self._client = httpx.Client(
+                base_url=self._base,
+                timeout=timeout,
+                transport=httpx.HTTPTransport(retries=0),
+            )
 
     def close(self) -> None:
         self._client.close()

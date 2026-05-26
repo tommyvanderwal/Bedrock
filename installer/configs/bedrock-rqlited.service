@@ -43,6 +43,16 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -raft-addr 0.0.0.0:4002 \
     -http-adv-addr "$BEDROCK_RQLITED_BIND_IP:4001" \
     -raft-adv-addr "$BEDROCK_RQLITED_BIND_IP:4002" \
+    -raft-election-timeout 2s \
+    -raft-leader-lease-timeout 1s \
+    -http-cert /etc/bedrock/node.crt \
+    -http-key /etc/bedrock/node.key.pem \
+    -http-ca-cert /etc/bedrock/ca.crt \
+    -http-verify-client \
+    -node-cert /etc/bedrock/node.crt \
+    -node-key /etc/bedrock/node.key.pem \
+    -node-ca-cert /etc/bedrock/ca.crt \
+    -node-verify-client \
     $BEDROCK_RQLITED_JOIN_FLAG \
     $BEDROCK_RQLITED_BOOTSTRAP_FLAG \
     "$BEDROCK_RQLITED_DATA_DIR"'
