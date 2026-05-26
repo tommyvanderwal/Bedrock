@@ -296,22 +296,19 @@ def get_tier_state(tier: str) -> dict:
 
 
 def set_tier_state(tier: str, *, write_rqlite: bool = True, **kv) -> None:
-    """Write tier state to local cluster.json and (by default) to rqlite.
+    """Write tier state to rqlite (if up).
 
     Pass ``write_rqlite=False`` during bootstrap (``bedrock init`` /
-    ``bedrock join``) when rqlite isn't yet up. The init/join saga
-    has a later step that mirrors the local tier state into rqlite
-    AFTER rqlited has reached Leader. Calling this during bootstrap
-    with the default ``write_rqlite=True`` causes a chain of
-    ``ConnectError`` warnings that masked the real failure mode that
-    bit the 0.8-alpha e2e run.
+    ``bedrock join``) when rqlite isn't yet up — the call then
+    becomes a no-op and the init/join saga's ``mirror_tier_state``
+    step writes the canonical state to rqlite later, from disk
+    (mode='local', backend_path=LOCAL_ROOT/tier).
+
+    Before the cluster.json removal (2026-05-26) this function
+    maintained a local cluster.json projection that mirror_tier_state
+    later replayed into rqlite; with cluster.json gone, write_rqlite
+    is the only thing this function does.
     """
-    c = load_cluster()
-    c.setdefault("tiers", {})
-    cur = c["tiers"].setdefault(tier, {"mode": "local", "version": 1})
-    cur.update(kv)
-    cur["version"] = cur.get("version", 0) + 1
-    save_cluster(c)
     if not write_rqlite:
         return
     # Mirror to rqlite so view_builder sees the change on every node.
@@ -322,10 +319,10 @@ def set_tier_state(tier: str, *, write_rqlite: bool = True, **kv) -> None:
         from . import bedrock_state as _bs
         _bs.tier_state(
             tier=tier,
-            mode=cur.get("mode", "local"),
-            master=cur.get("master"),
-            peers=cur.get("peers"),
-            backend_path=cur.get("backend_path"),
+            mode=kv.get("mode", "local"),
+            master=kv.get("master"),
+            peers=kv.get("peers"),
+            backend_path=kv.get("backend_path"),
         )
     except Exception as e:
         # If we get here it's a real bug (network down mid-init or
@@ -786,22 +783,27 @@ def setup_n1(*, write_rqlite: bool = False) -> None:
 
 
 def mirror_tier_state_to_rqlite() -> None:
-    """Push every locally-known tier_state row into rqlite. Called
-    by the cluster_init / node_join saga AFTER rqlited has reached
-    Leader. Idempotent — bedrock_state.tier_state is INSERT OR
-    REPLACE."""
-    c = load_cluster()
-    tiers = c.get("tiers", {}) or {}
-    if not tiers:
-        return
+    """Push each local tier's state into rqlite. Called by the
+    cluster_init / node_join saga AFTER rqlited has reached Leader.
+
+    Before the cluster.json removal this read tier_state from the
+    on-disk projection that set_tier_state wrote during bootstrap.
+    With cluster.json gone, we infer the post-bootstrap state
+    directly from disk: every tier in TIERS is mounted local, with
+    backend_path = LOCAL_ROOT / tier. mode='local' is the universal
+    bootstrap state; later DRBD promotion writes mode='drbd' through
+    bedrock storage promote.
+
+    Idempotent — bedrock_state.tier_state is INSERT OR REPLACE."""
     from . import bedrock_state as _bs
-    for tier, cur in tiers.items():
+    for tier in TIERS:
+        backend_path = str(LOCAL_ROOT / tier)
         _bs.tier_state(
             tier=tier,
-            mode=cur.get("mode", "local"),
-            master=cur.get("master"),
-            peers=cur.get("peers"),
-            backend_path=cur.get("backend_path"),
+            mode="local",
+            master=None,
+            peers=None,
+            backend_path=backend_path,
         )
 
 
