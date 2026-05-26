@@ -1782,3 +1782,64 @@ controlled-restart step.
 
 ---
 
+## L44 — Testbed cloud-init `cloud-init eth0` NM connection wins eth0 over our bridge slave
+**Date:** 2026-05-26
+**Files:** `testbed/cloud-init/user-data.tmpl`
+
+**What we thought:** the `br0-eth0.nmconnection` file we write into
+`/etc/NetworkManager/system-connections/` reliably puts eth0 in as
+a slave of br0, so the VM comes up at the intended static
+`192.168.2.20N` we templated into br0. Every testbed sim works this
+way.
+
+**What we found:** the cloud-image VM startup is a two-phase race
+that the testbed loses non-deterministically. cloud-init also
+writes an auto-generated NM connection at
+`/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection`
+with `autoconnect-priority=120`. Our `br0-eth0.nmconnection` has no
+priority specified — NetworkManager treats that as priority 0. At
+NM start-up:
+
+- If cloud-init's `cloud-init eth0` activates first → eth0 grabs a
+  DHCP lease as a standalone interface (typically `192.168.2.62`
+  from the home router). `br0` is left with no slave, sits in
+  `NO-CARRIER state DOWN`, and `192.168.2.201` (the IP we wrote
+  into `br0`) is unreachable.
+- If our `br0-eth0` activates first → eth0 becomes the bridge
+  slave, br0 comes UP with `.201`, cloud-init's connection sits
+  inactive.
+
+This is racy. On a long-running session both outcomes are observed
+on the *same* VM after various restart cycles. The symptom from the
+host was an extremely confusing `192.168.2.201 dev br0 FAILED` ARP
+entry — neither flushable without root, and the cluster nodes could
+still reach each other over old ARP caches, so we mis-diagnosed the
+real fault for several hours as a Bedrock TLS issue.
+
+The diagnostic that finally cracked it:
+```
+sim-1$ ip -br addr show br0 eth0
+br0   DOWN    192.168.2.201/24     ← the IP we wanted, no carrier
+eth0  UP      192.168.2.62/24      ← DHCP-grabbed standalone
+sim-1$ nmcli -t -f NAME,DEVICE,STATE connection show
+cloud-init eth0:eth0:activated     ← won the race
+br0-eth0::                          ← couldn't claim eth0
+```
+
+**What we changed:** two-layer fix in
+`testbed/cloud-init/user-data.tmpl`:
+
+1. Added `autoconnect-priority=200` to both `br0.nmconnection` and
+   `br0-eth0.nmconnection` — beats cloud-init's 120, so the bridge
+   stack consistently wins the race at every boot.
+2. Added `nmcli con delete "cloud-init eth0" 2>/dev/null || true`
+   to the `runcmd:` block — removes the file at first-boot so the
+   competing connection doesn't even exist for subsequent NM
+   restarts. Belt-and-suspenders.
+
+**Impact on the dev workflow:** the symptom looked exactly like a
+cluster-internal mesh / TLS / sshd issue and we spent significant
+testbed validation time chasing it as a Bedrock bug. It is purely
+a testbed-cloud-init issue and only affects VMs spawned via
+`BEDROCK_TESTBED_USE_CLOUD_IMG=1`. Production installs (ISO path)
+don't go through cloud-init and aren't affected.

@@ -35,6 +35,10 @@ write_files:
       type=bridge
       interface-name=br0
       autoconnect=true
+      # See br0-eth0 comment below — same priority bump applied so
+      # the bridge wins over any cloud-init auto-generated DHCP
+      # connection.
+      autoconnect-priority=200
 
       [bridge]
       stp=false
@@ -59,6 +63,14 @@ write_files:
       master=br0
       slave-type=bridge
       autoconnect=true
+      # autoconnect-priority must beat cloud-init's auto-generated
+      # `cloud-init eth0` connection (priority 120). Without this,
+      # the race at NetworkManager startup non-deterministically
+      # picks cloud-init's DHCP-on-standalone-eth0 over our
+      # br0-eth0 bridge slave — eth0 ends up unmanaged by br0 and
+      # br0 sits NO-CARRIER with the intended static IP unreachable.
+      # See lessons-log L44 for the full RCA.
+      autoconnect-priority=200
 
   - path: /etc/NetworkManager/system-connections/bedrock-drbd.nmconnection
     permissions: '0600'
@@ -85,6 +97,13 @@ write_files:
 
 runcmd:
   - nmcli con delete "Wired connection 1" 2>/dev/null || true
+  # Delete cloud-init's own auto-generated DHCP-eth0 connection.
+  # It has autoconnect-priority=120 and competes with br0-eth0 for
+  # eth0. Without this delete, NetworkManager may activate it on
+  # boot ordering races and leave br0 NO-CARRIER. The autoconnect-
+  # priority=200 on br0-eth0 is the primary defence; this is the
+  # secondary one. See lessons-log L44.
+  - nmcli con delete "cloud-init eth0" 2>/dev/null || true
   - systemctl restart NetworkManager
   - sleep 2
   - nmcli con up br0 || true
