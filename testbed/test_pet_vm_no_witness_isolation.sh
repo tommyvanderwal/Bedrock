@@ -107,9 +107,9 @@ PET_NAME="pet-no-witness-test"
 
 # ─────────────────────────────────────────────────────────────────
 step "Pre: confirm cluster healthy + DRBD"
-TIER_MODE=$(rqlite_query 1 "SELECT mode FROM tiers WHERE tier_name='critical'")
+TIER_MODE=$(rqlite_query 1 "SELECT mode FROM tiers WHERE tier_name='cluster'")
 if [ "$TIER_MODE" != "drbd" ]; then
-    fail "critical tier mode = '$TIER_MODE' (need 'drbd')"; exit 1
+    fail "cluster singleton tier mode = '$TIER_MODE' (need 'drbd')"; exit 1
 fi
 pass "critical tier = drbd"
 

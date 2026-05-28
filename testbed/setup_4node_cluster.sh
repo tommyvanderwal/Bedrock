@@ -114,7 +114,7 @@ sssh 1 "bedrock witness add testbed-echo ${WS_IP}:12321 $(printf '0%.0s' {1..64}
     || note "witness add returned non-zero (may already exist; continuing)"
 
 api_token() {
-    sssh "$1" 'curl -sS -X POST http://127.0.0.1:8080/api/login \
+    sssh "$1" 'curl -sS -X POST http://127.0.0.1:8001/api/login \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"root\",\"password\":\"admin\"}"' \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))' 2>/dev/null
@@ -131,7 +131,7 @@ approve_pending_join() {
     if [ -z "$rid" ]; then fail "no pending join"; return 1; fi
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes -o ConnectTimeout=10 root@${master_ip} \
-        "curl -sS -X POST http://127.0.0.1:8080/api/join/approve \
+        "curl -sS -X POST http://127.0.0.1:8001/api/join/approve \
             -H 'Content-Type: application/json' \
             -H 'Authorization: Bearer ${token}' \
             -d '{\"request_id\":\"${rid}\"}'" >/dev/null
@@ -158,15 +158,15 @@ for i in 2 3 4; do
 done
 
 # ─────────────────────────────────────────────────────────────────
-step "5. bedrock storage promote (critical tier → DRBD)"
+step "5. bedrock storage promote (cluster singleton tier → DRBD)"
 sssh 1 'bedrock storage promote 2>&1 | tail -10' \
     || fail "storage promote returned non-zero (continuing)"
 sleep 10
-TIER_MODE=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mode FROM tiers WHERE tier_name=\\\"critical\\\"\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
+TIER_MODE=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mode FROM tiers WHERE tier_name=\\\"cluster\\\"\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 if [ "$TIER_MODE" = "drbd" ]; then
-    pass "critical tier mode = drbd; cluster is ready for failover testing"
+    pass "cluster singleton tier mode = drbd; ready for failover testing"
 else
-    fail "critical tier mode = '$TIER_MODE' (expected 'drbd')"
+    fail "cluster singleton tier mode = '$TIER_MODE' (expected 'drbd')"
 fi
 
 echo

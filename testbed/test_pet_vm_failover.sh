@@ -99,9 +99,9 @@ for i in 1 2 3 4; do
         exit 1
     fi
 done
-TIER_MODE=$(rqlite_query 1 "SELECT mode FROM tiers WHERE tier_name='critical'")
+TIER_MODE=$(rqlite_query 1 "SELECT mode FROM tiers WHERE tier_name='cluster'")
 if [ "$TIER_MODE" != "drbd" ]; then
-    fail "critical tier mode = '$TIER_MODE' (need 'drbd'). Run test_e2e_offline.sh first."
+    fail "cluster singleton tier mode = '$TIER_MODE' (need 'drbd'). Run setup_4node_cluster.sh first."
     exit 1
 fi
 pass "all 4 sims healthy + critical tier = drbd"
