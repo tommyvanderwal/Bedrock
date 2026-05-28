@@ -125,7 +125,7 @@ approve_pending_join() {
     local rid
     rid=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes -o ConnectTimeout=10 root@${master_ip} \
-        "curl -fsSL 'http://127.0.0.1:4001/db/query?level=strong' \
+        "curl -fsSL --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt 'https://127.0.0.1:4001/db/query?level=strong' \
             -d '[\"SELECT request_id FROM join_requests WHERE state=\\\"pending\\\" ORDER BY created_at DESC LIMIT 1\"]' 2>&1 \
         | python3 -c 'import sys,json; d=json.load(sys.stdin); r=d[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")'")
     if [ -z "$rid" ]; then fail "no pending join"; return 1; fi
@@ -149,7 +149,7 @@ for i in 2 3 4; do
     sleep 5
     approve_pending_join "$IP1" "$TOKEN" || { fail "approve sim-$i failed"; exit 1; }
     sleep 30
-    NODES=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT COUNT(*) FROM nodes\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else 0)"')
+    NODES=$(sssh 1 'curl -fsSL --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt "https://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT COUNT(*) FROM nodes\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else 0)"')
     if [ "$NODES" = "$i" ]; then
         pass "cluster size = $NODES after sim-$i join"
     else
@@ -162,7 +162,7 @@ step "5. bedrock storage promote (cluster singleton tier → DRBD)"
 sssh 1 'bedrock storage promote 2>&1 | tail -10' \
     || fail "storage promote returned non-zero (continuing)"
 sleep 10
-TIER_MODE=$(sssh 1 'curl -fsSL "http://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mode FROM tiers WHERE tier_name=\\\"cluster\\\"\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
+TIER_MODE=$(sssh 1 'curl -fsSL --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt "https://127.0.0.1:4001/db/query?level=strong" -d "[\"SELECT mode FROM tiers WHERE tier_name=\\\"cluster\\\"\"]" 2>/dev/null | python3 -c "import sys,json;r=json.load(sys.stdin)[\"results\"][0]; print(r[\"values\"][0][0] if r.get(\"values\") else \"\")"')
 if [ "$TIER_MODE" = "drbd" ]; then
     pass "cluster singleton tier mode = drbd; ready for failover testing"
 else
