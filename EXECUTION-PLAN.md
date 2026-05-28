@@ -10,9 +10,9 @@
 
 - **BAD-1 (quorum/election/witness/LMS):** IMPLEMENT for v1.0 — not defer. Full design
   locked below.
-- **BAD-2 / BAD-3 (bedrock_d rewrite + storage):** FINISH the rewrite; **bedrock-d owns
-  starting libvirt + DRBD resources at boot** (replaces the current "install.sh disables,
-  packages.py re-enables" mess). Detail pending (next).
+- **BAD-2 / BAD-3 (bedrock_d rewrite + storage):** FINISH the rewrite (full VM-lifecycle
+  saga cutover, CLI = thin HTTP client); per-resource storage (LV-tiers removed);
+  **bedrock-d owns starting libvirt + DRBD resources at boot.** Full design locked below.
 - **Work order:** fix the things we *know* will fail first; run the 1→2→3→4 deploy when
   Tommy says "run it" (to get real-world perspective on the rest); then RCA + fix the
   remainder. BAD-1 is first.
@@ -156,14 +156,83 @@ Q-01, Q-02, Q-03, Q-04, Q-05, Q-06, Q-07, ST-01, ST-02, D-01, D-02, D-03, D-04.
 
 ---
 
-## BAD-2 … BAD-8 — pending (worked next, one at a time)
+## BAD-2 / BAD-3 — Finish the rewrite + per-resource storage + bedrock-d boot ownership  ·  **LOCKED 2026-05-28** (one open sub-item)
 
-- **BAD-2 / BAD-3** — finish the `bedrock_d` rewrite; bedrock-d owns libvirt+DRBD boot;
-  resolve the per-tier vs per-resource storage layout + VG name + DRBD port collision.
-  *(decisions partially captured above; full detail next)*
+### Storage layering (per-resource; LV-"tiers" removed)
+One VG (resolved name) → one thinpool → these LV roles per node:
+| Role | LV(s) | Replication |
+|---|---|---|
+| **Cattle** VM disk | local thin LV (no meta) | none |
+| **Pet** VM disk | thin data + thin meta (external) | DRBD 2-way, per disk |
+| **ViPet** VM disk | thin data + thin meta (external) | DRBD 3-way across 3 nodes, per disk |
+| **Cluster singleton** (`cluster`) | thin data + thin meta | DRBD: N=1 local → N=2 2-way → N≥3 **3-way**; hosts arbiter rqlite + SeaweedFS filer/S3-IAM metadata |
+| **SeaweedFS volume** | one large local thin LV | none at LVM level — Seaweed replicates via collections (scratch=000, standard=001, critical=002) |
+
+- The legacy `tier-scratch`/`tier-bulk`/`tier-critical` LVs and `/bedrock/{scratch,bulk,critical}`
+  local mounts are **removed**. There is no standalone "tier" LV.
+- Singleton DRBD resource renamed **`tier-critical` → `cluster`** (`bedrock-data-cluster` /
+  `bedrock-meta-cluster`). "critical" is reserved for the SeaweedFS collection + the VM
+  HA-importance label only. (Closes SG-04.)
+- **Every** DRBD resource (singleton + per-VM) uses **one external meta LV** — the legacy
+  internal-meta path in `lib/vm.py` is removed. (Closes SG-07.)
+
+### VG name
+Always use the **resolved** VG name (never hardcode). Fresh install → create `bedrock-vg`;
+`install.sh`-on-existing-Alma → **adopt** the existing VG (e.g. `almalinux`). Fix
+`node_reset_local` and all `bedrock/…` / `bedrock-vg/…` hardcodes to the resolved name;
+docs use the resolved-name convention. (Closes SG-02, SG-10.)
+
+### DRBD ports
+One base. Singleton + per-VM resources in the documented **7700–7799** band; VM-minor→port
+mapping kept clear of 9333 (weed-master), 8333 (weed-s3), 8080 (weed-volume), 8443 (mgmt),
+4001/4002/4011/4012 (rqlite). (≈ ≤90 VM resources/node in-band; widen if needed.) (Closes SG-03.)
+
+### VM lifecycle — full saga cutover (in scope for v1.0)
+- CLI `bedrock vm *` becomes a **thin HTTP client** → POSTs to the master; no in-process
+  DRBD/SSH from the CLI's node.
+- `bedrock_d/vm/{create,destroy,grow,migrate}` sagas become the **single live path**;
+  dashboard `POST /api/vms` runs them.
+- Fold the **3 migrate implementations into one**: no `--undefinesource` for pet/vipet
+  (domain stays defined on every peer for failover); **record post-promote DRBD UUID**
+  (closes VM-02, VM-03).
+- **Multi-disk**: create + failover handle every disk of a VM, not just `disk0` (closes VM-04).
+- Delete `installer/lib/vm.py` create/migrate/delete and retire the `BEDROCK_INIT_SAGA=0`
+  legacy install bodies **once the saga path passes a clean testbed e2e** (closes T-13, I-07).
+- Acceptance: create cattle/pet/vipet, live-migrate, and **host-death failover** all work.
+
+### bedrock-d owns boot
+- systemd auto-starts **only** `bedrock-d`, `bedrock-rqlited(-arbiter)`, `weed-*`, obs stack.
+  **Not** libvirtd, **not** drbd as auto-actors. Remove `enable --now libvirtd` from
+  `packages.py` (keep the `install.sh` disable); fix the 8080 bootstrap-bind collision (T-05).
+- bedrock-d boot orchestrator: establish role/quorum (BAD-1) → read up-to-date rqlite cluster
+  state → bring up the DRBD resources this node should host → start `libvirtd` → start VMs
+  for its role. **Nothing acts before quorum.** (Closes I-02.)
+
+### Also folded in
+- TRIM/discard: installer asserts `thin_pool_discards=passdown` + DRBD discard options (SG-06).
+- Tidy the bidirectional `installer/lib`↔`bedrock_d` import shims + the
+  `bedrock_d/orchestrator/__init__` docstring as the cutover lands (T-08, T-10).
+
+### Open sub-item
+- **Arbiter-set self-heal at N≥4.** When one of the 3 singleton-hosting nodes dies
+  permanently, does a replacement node **auto-promote** into the 3-way `cluster` DRBD set,
+  or is that operator-driven / post-v1.0? (`tier_critical_membership` + the calm-orchestrator
+  promotion are unimplemented today — SG-05.)
+
+### Findings this closes
+T-01, T-02, T-05, T-08, T-10, T-13, SG-01, SG-02, SG-03, SG-04, SG-06, SG-07, SG-10,
+I-02, I-07, VM-02, VM-03, VM-04.
+
+---
+
+## BAD-6 / BAD-7 / BAD-8 — pending (worked next, one at a time)
+
 - **BAD-4** — folded into BAD-1 (netd LMS race).
 - **BAD-5** — folded into BAD-1 (witness membership filter).
-- **BAD-6** — wire saga power-loss resume at boot.
-- **BAD-7** — VM-failover correctness (node_leave crash, resumed-VM-killed, migrate UUID,
-  multi-disk).
-- **BAD-8** — boot/runtime safety (libvirtd; kopia; stale reference docs).
+- **BAD-6** — wire saga power-loss resume at boot (`resume_in_flight` + retry surface).
+- **BAD-7** — remaining VM-failover correctness: node_leave saga crash on deleted
+  `view_builder.rebuild` (SA-01), resumed-VM-still-killed-at-T+5min (VM-01). *(migrate UUID,
+  multi-disk, 3-impl fold are absorbed into the BAD-2/3 cutover.)*
+- **BAD-8** — remaining boot/runtime safety + doc reality: kopia never installed (I-01),
+  stale reference docs ports/api/files (I-03, I-04, I-05), broken `post-alpha-rewrite-notes.md`
+  citations (T-12), tests red + testbed stale flags (TE-*).
