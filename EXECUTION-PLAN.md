@@ -213,14 +213,26 @@ mapping kept clear of 9333 (weed-master), 8333 (weed-s3), 8080 (weed-volume), 84
 - Tidy the bidirectional `installer/lib`↔`bedrock_d` import shims + the
   `bedrock_d/orchestrator/__init__` docstring as the cutover lands (T-08, T-10).
 
-### Open sub-item
-- **Arbiter-set self-heal at N≥4.** When one of the 3 singleton-hosting nodes dies
-  permanently, does a replacement node **auto-promote** into the 3-way `cluster` DRBD set,
-  or is that operator-driven / post-v1.0? (`tier_critical_membership` + the calm-orchestrator
-  promotion are unimplemented today — SG-05.)
+### Self-heal & replica repair after permanent host loss  ·  **LOCKED** (automatic, 65-min calm-down, 80% gate)
+A node gone for **65 min** (default; **configurable**, set ~1 min in tests) is treated as
+permanently lost and triggers automatic replica repair — **one resource at a time**, in this
+strict order:
+1. **Arbiter / `cluster` singleton first** — small + critical → restore the 3-way set on the
+   next free eligible node (size negligible vs the gate).
+2. **Pets running single** → restore the 2nd replica, ordered by resource-claim priority
+   **high → medium → low**.
+3. **ViPets at 2-way** → restore the 3rd replica, same **high → medium → low** order.
+
+**Disk-space gate (hard invariant): never let a target node exceed 80% disk usage.** Before
+starting each DRBD resource on a target, size it by the **actual thin-LV usage** on a node
+that currently holds it (real allocated blocks, *not* the advertised/provisioned max), and
+skip/defer that resource if it would push the target over 80%. If no target fits, the
+resource stays degraded and the dashboard flags it — never act unsafely; operator adds
+capacity/node. Implement via the `tier_critical_membership` table + a calm-orchestrator
+repair loop with one shared, configurable calm-down knob. (Closes SG-05.)
 
 ### Findings this closes
-T-01, T-02, T-05, T-08, T-10, T-13, SG-01, SG-02, SG-03, SG-04, SG-06, SG-07, SG-10,
+T-01, T-02, T-05, T-08, T-10, T-13, SG-01, SG-02, SG-03, SG-04, SG-05, SG-06, SG-07, SG-10,
 I-02, I-07, VM-02, VM-03, VM-04.
 
 ---
