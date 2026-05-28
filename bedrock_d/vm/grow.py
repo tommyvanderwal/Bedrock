@@ -6,8 +6,9 @@ resize`` on every peer. DRBD recalculates bitmap requirements
 in-place; the data device stays attached the whole time.
 
 ctx inputs:
-  - vm_name:  str
-  - new_gb:   int  (new total disk size, MUST be > current)
+  - vm_name:    str
+  - new_gb:     int  (new total disk size, MUST be > current)
+  - disk_index: int  (which disk to grow; default 0 = the boot disk)
 
 ctx fills:
   - resource: str
@@ -37,9 +38,11 @@ class VmGrow:
 
     @step("load_current_size")
     def step_load(self, ctx):
-        """Read the drbd_resources row to learn current size + peers."""
+        """Read the drbd_resources row to learn current size + peers.
+        ``disk_index`` selects which disk (default 0 = boot disk)."""
         from bedrock_d import state as _st
-        resource = f"vm-{ctx['vm_name']}-disk0"
+        idx = int(ctx.get("disk_index", 0))
+        resource = f"vm-{ctx['vm_name']}-disk{idx}"
         with _st.RqliteClient() as client:
             rows = client.query(
                 "SELECT data_size_bytes, peers FROM drbd_resources "

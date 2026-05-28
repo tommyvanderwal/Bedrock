@@ -508,19 +508,69 @@ def _cmd_node_maint(target: str, mode: str):
 
 
 def cmd_vm(args):
-    """VM subcommands — delegates to lib/vm.py."""
-    from lib import vm as vm_mod
-    state = load_state()
+    """VM subcommands — thin HTTP client.
+
+    Every mutating verb POSTs to the local mgmt API on 127.0.0.1:8001,
+    which runs the corresponding bedrock_d VM saga ON THE MASTER (the
+    node that holds the DRBD/arbiter authority). No DRBD/SSH runs from
+    the CLI's node — the CLI only carries operator intent."""
+    import json as _json
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    mgmt_url = "http://127.0.0.1:8001"
 
     if args.action == "list":
-        vm_mod.list_vms(state)
-    elif args.action == "create":
-        vm_mod.create_vm(state, name=args.name, vm_type=args.type,
-                         ram=args.ram, disk=args.disk)
+        try:
+            r = _ur.urlopen(mgmt_url + "/api/cluster", timeout=5)
+            data = _json.loads(r.read())
+        except Exception as e:
+            print(f"ERROR: cannot reach mgmt API: {e}")
+            return 1
+        vms = data.get("vms", {})
+        if not vms:
+            print("(no VMs)")
+            return 0
+        print(f"{'NAME':<20} {'STATE':<10} {'NODE':<30} {'DRBD':<20}")
+        for name, vm in vms.items():
+            print(f"{name:<20} {vm['state']:<10} "
+                  f"{vm.get('running_on','-') or '-':<30} "
+                  f"{vm.get('drbd_resource','-') or '-':<20}")
+        return 0
+
+    def _post(path, body, method="POST"):
+        data = _json.dumps(body or {}).encode()
+        req = _ur.Request(mgmt_url + path, data=data, method=method,
+                          headers={"Content-Type": "application/json"})
+        try:
+            r = _ur.urlopen(req, timeout=300)
+            return _json.loads(r.read())
+        except _ue.HTTPError as e:
+            print(f"ERROR: {e.code} {e.read().decode(errors='replace')[:300]}")
+            return None
+
+    if args.action == "create":
+        resp = _post("/api/vms", {
+            "name": args.name, "vm_type": args.type,
+            "vcpus": args.vcpus, "ram_mb": args.ram, "disk_gb": args.disk,
+        })
+        if resp is None:
+            return 1
+        print(f"Create {args.type} VM {args.name}: {resp.get('state', resp)}")
+        return 0 if resp.get("state") in (None, "completed") else 1
     elif args.action == "migrate":
-        vm_mod.migrate_vm(state, name=args.name, target=args.to)
+        resp = _post(f"/api/vms/{args.name}/migrate",
+                     {"target_node": args.to} if args.to else {})
+        if resp is None:
+            return 1
+        print(f"Migrate {args.name}: {resp.get('state', resp)}")
+        return 0 if resp.get("state") in (None, "completed") else 1
     elif args.action == "delete":
-        vm_mod.delete_vm(state, name=args.name)
+        resp = _post(f"/api/vms/{args.name}", {}, method="DELETE")
+        if resp is None:
+            return 1
+        print(f"Delete {args.name}: {resp.get('state', resp)}")
+        return 0 if resp.get("state") in (None, "completed") else 1
 
 
 def cmd_witness(args):
@@ -636,22 +686,18 @@ def cmd_storage(args):
             print(f"  {name:<12} mgmt={info.get('host','-'):<16} "
                   f"loopback={info.get('loopback_ip','-')}")
         print()
-        print("Tiers (mountpoint /bedrock/<tier>):")
-        for tier in ("scratch", "bulk", "critical"):
-            t = tiers.get(tier, {"mode": "?"})
-            link = f"/bedrock/{tier}"
-            try:
-                target = os.readlink(link)
-            except OSError:
-                target = "<missing>"
-            print(f"  {tier:<10} mode={t.get('mode','?'):<14} -> {target}")
+        c = tiers.get(tier_storage.CLUSTER_RESOURCE, {"mode": "?"})
+        print(f"Cluster singleton ({tier_storage.CLUSTER_MOUNT}): "
+              f"mode={c.get('mode','?')}")
+        print(f"SeaweedFS volume LV: {tier_storage.WEED_VOLUME_LV} -> "
+              f"{tier_storage.WEED_VOLUME_MOUNT}")
         return
 
     if args.action == "promote":
-        # Promote the critical tier from local-LV to DRBD-replicated.
-        # Requires N>=2 (at least one peer in the cluster). Idempotent
-        # on the critical tier; bulk stays SeaweedFS, scratch stays
-        # local LV.
+        # Promote the cluster singleton from local-LV to DRBD-replicated.
+        # Requires N>=2 (at least one peer in the cluster). Idempotent;
+        # the SeaweedFS volume LV stays local (SeaweedFS replicates via
+        # collections).
         cluster = tier_storage.load_cluster()
         nodes = cluster.get("nodes", {})
         state_local = load_state()
@@ -663,12 +709,12 @@ def cmd_storage(args):
                   "`bedrock join` first.")
             return 1
         # First promote: pick the first peer to seed the DRBD pair.
-        # Additional peers can be added later via `bedrock storage
-        # add-peer` (TBD) once two-peer DRBD is verified.
+        # Additional peers can be added later via promote_cluster_to_3way
+        # once two-peer DRBD is verified.
         peer_name, peer_info = peers[0]
         peer_lo = peer_info.get("loopback_ip", "")
         peer_mgmt = peer_info.get("host", "")
-        print("Promoting critical tier to DRBD:")
+        print("Promoting cluster singleton to DRBD:")
         print(f"  master: {self_name} ({self_lo})")
         print(f"  peer:   {peer_name} ({peer_lo})")
 
@@ -702,7 +748,7 @@ def cmd_storage(args):
         synced = False
         while _t_sync.monotonic() < deadline:
             out = _sp_sync.run(
-                ["drbdadm", "status", "tier-critical"],
+                ["drbdadm", "status", tier_storage.CLUSTER_RESOURCE],
                 capture_output=True, text=True
             ).stdout
             # Both sides must report disk:UpToDate (one local, one peer)
@@ -720,7 +766,7 @@ def cmd_storage(args):
         # markers are durable on the DRBD volume (not just in the
         # filer's RAM cache).
         _sp_sync.run(["sync"], check=False, timeout=10)
-        print("Critical-tier promotion complete.")
+        print("Cluster-singleton promotion complete.")
         return
 
     if args.action == "_peer-promote":
@@ -733,17 +779,17 @@ def cmd_storage(args):
         return
 
     if args.action == "demote":
-        # Demote critical tier from DRBD-replicated back to local LV.
-        # Run on the last surviving node, or on a master that is about
-        # to leave a multi-node cluster behind. Safe to call when the
-        # tier is already local — it's a no-op.
+        # Demote the cluster singleton from DRBD-replicated back to local
+        # LV. Run on the last surviving node, or on a master about to
+        # leave a multi-node cluster behind. Safe to call when already
+        # local — it's a no-op.
         cluster = tier_storage.load_cluster()
-        t = cluster.get("tiers", {}).get("critical", {})
+        t = cluster.get("tiers", {}).get(tier_storage.CLUSTER_RESOURCE, {})
         if t.get("mode") != "drbd":
-            print(f"critical tier mode={t.get('mode','?')} — nothing to demote.")
+            print(f"cluster singleton mode={t.get('mode','?')} — nothing to demote.")
             return 0
-        print("Demoting critical tier: DRBD → local LV...")
-        ok = tier_storage.drbd_demote_to_local("critical")
+        print("Demoting cluster singleton: DRBD → local LV...")
+        ok = tier_storage.drbd_demote_to_local()
         if not ok:
             print("  drbd_demote_to_local returned False (preconditions not met).")
             return 1
@@ -982,6 +1028,7 @@ def main():
     p_vm_create = p_vm_sub.add_parser("create")
     p_vm_create.add_argument("name")
     p_vm_create.add_argument("--type", choices=["cattle", "pet", "vipet"], default="cattle")
+    p_vm_create.add_argument("--vcpus", type=int, default=2)
     p_vm_create.add_argument("--ram", type=int, default=1024)
     p_vm_create.add_argument("--disk", type=int, default=10)
     p_vm_migrate = p_vm_sub.add_parser("migrate")

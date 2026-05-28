@@ -1,10 +1,14 @@
-"""Cluster-tier DRBD lifecycle sagas.
+"""Cluster-singleton DRBD lifecycle sagas.
 
-The cluster-tier is the DRBD-replicated volume that backs
+The cluster singleton is the DRBD-replicated volume that backs
 ``/var/lib/bedrock/cluster`` — home of the rqlite-arbiter data dir,
 SeaweedFS filer's leveldb3, and S3 IAM database. One pair of LVs
 (``bedrock-data-cluster`` + ``bedrock-meta-cluster``) per node;
 DRBD glues them into a synchronous mirror with the master writable.
+
+The rqlite ``tiers`` row + the DRBD resource are both keyed ``cluster``
+(renamed from the legacy ``critical``; "critical" is now only the
+SeaweedFS 002 collection + the VM HA-importance label — SG-04).
 
 This module owns the **transition** sagas — the saga executor runs
 them once per cluster-size jump:
@@ -16,13 +20,13 @@ them once per cluster-size jump:
   steps that already completed no-op.
 
 - ``cluster_tier_join_peer`` runs on a joiner once the master's
-  promote saga has finished (cluster.json shows
-  ``tiers.critical.mode == "drbd"``). The peer creates its own LV
+  promote saga has finished (rqlite shows
+  ``tiers.cluster.mode == "drbd"``). The peer creates its own LV
   pair, joins as DRBD Secondary, and waits for the initial sync to
   carry the master's data over.
 
 For larger transitions (N=2 → N=3, peer removal, etc.) see the
-``tier_storage.promote_critical_to_3way`` / ``drbd_remove_peer``
+``tier_storage.promote_cluster_to_3way`` / ``drbd_remove_peer``
 helpers — those run in the calm orchestrator's reconcile loop, not
 as join-time sagas.
 
@@ -40,12 +44,14 @@ captures a point-in-time view without copying blocks. The recipe a
 backup driver follows is:
 
   fsfreeze --freeze /var/lib/bedrock/cluster
-  lvcreate --snapshot -n cluster-snap-<ts> bedrock-vg/bedrock-data-cluster
+  lvcreate --snapshot -n cluster-snap-<ts> <VG>/bedrock-data-cluster
   fsfreeze --unfreeze /var/lib/bedrock/cluster
-  mount -o ro,nouuid /dev/bedrock-vg/cluster-snap-<ts> /mnt/snap-<ts>
+  mount -o ro,nouuid /dev/<VG>/cluster-snap-<ts> /mnt/snap-<ts>
   kopia snapshot create /mnt/snap-<ts>
   umount /mnt/snap-<ts>
-  lvremove bedrock-vg/cluster-snap-<ts>
+  lvremove <VG>/cluster-snap-<ts>
+
+(<VG> is the resolved VG name — never hardcode 'bedrock'/'bedrock-vg'.)
 
 DRBD is **unaware** of the snapshot — it's mirroring at the block
 layer below LVM. As long as we don't move the data LV onto a thick
@@ -92,8 +98,12 @@ def _self_loopback() -> str:
         return ""
 
 
-def _critical_tier_mode(cluster: dict) -> str:
-    return ((cluster.get("tiers") or {}).get("critical") or {}).get("mode", "local")
+# The cluster-singleton tier key in rqlite + the DRBD resource name.
+CLUSTER_TIER = "cluster"
+
+
+def _cluster_tier_mode(cluster: dict) -> str:
+    return ((cluster.get("tiers") or {}).get(CLUSTER_TIER) or {}).get("mode", "local")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -104,8 +114,8 @@ def _critical_tier_mode(cluster: dict) -> str:
 @saga("cluster_tier_promote_master")
 class ClusterTierPromoteMaster:
     """Run on the mgmt-master once cluster size N≥2 to convert the
-    local critical-tier LV into a DRBD primary that will be mirrored
-    to peers as they join.
+    local cluster-singleton data into a DRBD primary that will be
+    mirrored to peers as they join.
 
     The saga is launched by the orchestrator's
     ``cluster_tier_watcher`` task — see ``mgmt/orchestrator.py``.
@@ -122,7 +132,8 @@ class ClusterTierPromoteMaster:
 
     @step("check_preconditions")
     def step_check_preconditions(self, ctx):
-        """Confirm we're still the master and critical is still local.
+        """Confirm we're still the master and the cluster tier is still
+        local.
 
         If either condition has flipped (because of a failover during
         the saga's lifetime), bail out gracefully — the new master's
@@ -132,11 +143,11 @@ class ClusterTierPromoteMaster:
         self_name = _self_node_name()
         if master != self_name:
             raise RuntimeError(
-                f"no longer mgmt_master (cluster.json names {master!r}, "
+                f"no longer mgmt_master (rqlite names {master!r}, "
                 f"self={self_name!r}); aborting promote")
-        mode = _critical_tier_mode(cluster)
+        mode = _cluster_tier_mode(cluster)
         if mode == "drbd":
-            log.info("cluster_tier: critical already in DRBD mode — "
+            log.info("cluster_tier: cluster tier already in DRBD mode — "
                      "this saga is a no-op")
             ctx["_already_drbd"] = True
             return
@@ -155,9 +166,9 @@ class ClusterTierPromoteMaster:
     @step("promote_local_to_drbd")
     def step_promote_local_to_drbd(self, ctx):
         """The big move: stop singletons, snapshot the leveldb3 dir,
-        umount local LV, create meta LV, write .res, create-md,
+        create the data+meta LV pair, write .res, create-md,
         drbdadm up + primary, mount DRBD device, restore snapshot,
-        update fstab, swap symlink, restart singletons.
+        update fstab, restart singletons.
 
         All wrapped in ``tier_storage.transition_to_n2_master`` —
         this step is a thin wrapper so step-resume granularity matches
@@ -179,19 +190,19 @@ class ClusterTierPromoteMaster:
 
     @step("record_tier_state_rqlite")
     def step_record_tier_state_rqlite(self, ctx):
-        """``transition_to_n2_master`` updates cluster.json locally;
-        mirror to rqlite so every node's view_builder fold sees the
-        new mode. set_tier_state with default write_rqlite=True does
+        """``transition_to_n2_master`` already wrote the cluster tier's
+        rqlite row; re-affirm it so every node's view_builder fold sees
+        the new mode. set_tier_state with default write_rqlite=True does
         this when the caller is the mgmt_master — which we are."""
         if ctx.get("_already_drbd"):
             return
         from lib import tier_storage as _ts
         cluster = _load_cluster()
-        cur = (cluster.get("tiers") or {}).get("critical") or {}
+        cur = (cluster.get("tiers") or {}).get(CLUSTER_TIER) or {}
         # set_tier_state is idempotent (INSERT OR REPLACE in rqlite)
         # and write_rqlite=True (default) fires the rqlite mirror.
         _ts.set_tier_state(
-            "critical",
+            CLUSTER_TIER,
             mode=cur.get("mode", "drbd"),
             master=cur.get("master"),
             peers=cur.get("peers"),
@@ -210,8 +221,8 @@ class ClusterTierJoinPeer:
     """Run on a joiner after the master's promote saga has finished.
 
     The joiner's node_join saga submits this saga as a follow-up
-    step, blocking until it completes. The saga polls cluster.json
-    for ``tiers.critical.mode == "drbd"`` before proceeding (the
+    step, blocking until it completes. The saga polls rqlite
+    for ``tiers.cluster.mode == "drbd"`` before proceeding (the
     master must have promoted first; otherwise the secondary has no
     primary to sync from).
 
@@ -225,28 +236,28 @@ class ClusterTierJoinPeer:
 
     @step("wait_master_drbd")
     def step_wait_master_drbd(self, ctx):
-        """Poll cluster.json every 2 s for the master's promote to
-        reach the ``mode=drbd`` state. Times out after
-        ``wait_timeout_s`` seconds — if the master never gets there
-        the saga fails loudly so the operator notices."""
+        """Poll rqlite every 2 s for the master's promote to reach the
+        ``mode=drbd`` state. Times out after ``wait_timeout_s`` seconds
+        — if the master never gets there the saga fails loudly so the
+        operator notices."""
         timeout = int(ctx.get("wait_timeout_s") or 120)
         deadline = time.monotonic() + timeout
         last_mode = "?"
         while time.monotonic() < deadline:
             cluster = _load_cluster()
-            mode = _critical_tier_mode(cluster)
+            mode = _cluster_tier_mode(cluster)
             last_mode = mode
             if mode == "drbd":
                 # Carry the peer list forward to the next step so we
-                # don't have to re-read cluster.json there.
+                # don't have to re-read rqlite there.
                 ctx["_peers"] = (
-                    (cluster.get("tiers") or {}).get("critical") or {}
+                    (cluster.get("tiers") or {}).get(CLUSTER_TIER) or {}
                 ).get("peers") or []
                 ctx["_master"] = cluster.get("mgmt_master") or ""
                 return
             time.sleep(2)
         raise RuntimeError(
-            f"timeout: master never promoted critical tier to DRBD "
+            f"timeout: master never promoted cluster tier to DRBD "
             f"after {timeout}s (last mode={last_mode!r})")
 
     @step("join_as_secondary")

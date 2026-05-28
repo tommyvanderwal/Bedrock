@@ -9,14 +9,12 @@ disk at ``/dev/bedrock/bedrock-meta-<r>``.
 This module emits the config text. Saga steps write it to disk
 on each peer + run ``drbdadm create-md --max-peers=7``.
 
-# Why a separate module
+# Single source of DRBD .res text
 
-The CLI flow (legacy ``installer/lib/vm.py``) writes its own
-internal-metadata configs. New code goes through this module to
-guarantee the locked-design shape. Old VMs stay on their internal
-meta layout until they're recreated; the two shapes coexist fine
-at the kernel level (different resources just have different
-.res files).
+Every per-VM DRBD resource is rendered here (the legacy
+internal-metadata path in ``installer/lib/vm.py`` is gone — SG-07).
+External metadata on a separate thin LV per resource is the one
+locked shape.
 """
 from __future__ import annotations
 
@@ -25,15 +23,26 @@ from dataclasses import dataclass
 from .lvm import data_lv_for, meta_lv_for, VG_NAME
 
 
-# Per-VM DRBD ports start at 7700 + minor (per the storage doc).
-# Cluster-singleton has minor 1101 → port 8801.
-DRBD_PORT_BASE = 7700
+# All DRBD resource ports live in the documented 7700-7799 band
+# (docs/storage-architecture.md port map). The cluster singleton and
+# every per-VM disk use the SAME formula: port = 7700 + (minor - 1100).
+# DRBD minors are laid out so this maps cleanly into the band:
+#   - cluster singleton: minor 1101            → port 7701
+#   - per-VM disks:       minors 1102..1189     → ports 7702..7789
+# That keeps ~87 VM-disk resources per node in-band and clear of every
+# reserved port (9333 weed-master, 8333 weed-s3, 8080 weed-volume,
+# 8443 mgmt, 4001/4002/4011/4012 rqlite — none of which fall in the
+# band) and clear of the netd mesh UDP ports 7732 (probe), 7733
+# (advert) and 7734 (node-to-node election heartbeat, netd.HB_PORT)
+# — those minors, 1132/1133/1134, are skipped by the VM minor allocator.
+DRBD_PORT_BASE   = 7700
+DRBD_MINOR_BASE  = 1100   # minor 1100 would map to the band base, 7700
 
 
 def drbd_port_for(minor: int) -> int:
-    """Port allocation: 7700 + minor. Saga's allocate_minor step
-    picks an unused minor; the port follows."""
-    return DRBD_PORT_BASE + minor
+    """Map a DRBD minor to its port in the 7700-7799 band. Same formula
+    for the cluster singleton (minor 1101) and per-VM disks (1102+)."""
+    return DRBD_PORT_BASE + (minor - DRBD_MINOR_BASE)
 
 
 @dataclass(frozen=True)

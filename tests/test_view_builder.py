@@ -82,11 +82,13 @@ class TestBuildSnapshot(unittest.TestCase):
                 {"node_name": "sim-1", "host": "192.168.2.201",
                  "loopback_ip": "100.42.42.1",
                  "role": "mgmt+compute", "pubkey": "k1",
-                 "bedrock_pubkey": "bk1", "maintenance": 0},
+                 "bedrock_pubkey": "bk1", "maintenance": 0,
+                 "state": "active"},
                 {"node_name": "sim-2", "host": "192.168.2.202",
                  "loopback_ip": "100.42.42.2",
                  "role": "compute", "pubkey": "k2",
-                 "bedrock_pubkey": "bk2", "maintenance": 1},
+                 "bedrock_pubkey": "bk2", "maintenance": 1,
+                 "state": "joining"},
             ],
             "FROM tiers": [
                 {"tier_name": "scratch", "mode": "drbd-nfs",
@@ -185,12 +187,18 @@ class TestBuildSnapshot(unittest.TestCase):
         self.assertEqual(snap["mgmt_master"], "sim-1")
         self.assertEqual(snap["log_index"], 42)
 
-        # nodes — sim-2 maintenance=1 makes it on
+        # nodes — maintenance + state are ALWAYS carried now (C1): the
+        # election denominator reads them every tick, so the node dict
+        # must expose both unconditionally (was: maintenance only when
+        # truthy). sim-2 is maintenance=1 + state=joining; sim-1 is the
+        # active master.
         self.assertIn("sim-1", snap["nodes"])
         self.assertIn("sim-2", snap["nodes"])
         self.assertEqual(snap["nodes"]["sim-1"]["loopback_ip"], "100.42.42.1")
-        self.assertTrue(snap["nodes"]["sim-2"].get("maintenance"))
-        self.assertNotIn("maintenance", snap["nodes"]["sim-1"])  # not set
+        self.assertTrue(snap["nodes"]["sim-2"]["maintenance"])
+        self.assertFalse(snap["nodes"]["sim-1"]["maintenance"])
+        self.assertEqual(snap["nodes"]["sim-1"]["state"], "active")
+        self.assertEqual(snap["nodes"]["sim-2"]["state"], "joining")
 
         # tiers — peers JSON-decoded, drbd_node_ids merged from tier_drbd_node_ids
         scratch = snap["tiers"]["scratch"]

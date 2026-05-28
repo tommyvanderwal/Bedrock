@@ -104,9 +104,9 @@ mgmt endpoint. The functions below are grouped by concern.
 ### VMs
 
 - `GET /api/vms` — list.
-- `POST /api/vms` — create. Delegates to `installer/lib/vm.py`.
-- `DELETE /api/vms/{name}` — delete.
-- `POST /api/vms/{name}/migrate` — live migrate.
+- `POST /api/vms` — create. Runs the `vm_create` saga (`bedrock_d/vm/create.py`) on the master.
+- `DELETE /api/vms/{name}` — delete. Runs the `vm_destroy` saga.
+- `POST /api/vms/{name}/migrate` — live migrate. Runs the `vm_migrate` saga.
 - WebSocket `/api/vms/{name}/console` — proxies to novnc.
 
 ### ISOs

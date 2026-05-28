@@ -28,8 +28,26 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-# Constants from docs/storage-architecture.md
-VG_NAME              = "bedrock"
+# Constants from docs/storage-architecture.md.
+#
+# VG_NAME is the RESOLVED volume-group name — never hardcode 'bedrock'.
+# A fresh install creates 'bedrock-vg'; install.sh-on-existing-Alma
+# adopts whatever VG the OS installer made (often 'almalinux'). We
+# resolve it once at import via tier_storage.detect_vg(), which reads
+# /etc/bedrock/storage.json (written at bootstrap) and falls back to
+# 'bedrock' off-node (e.g. in the test environment, where the LV-name
+# contract stays /dev/bedrock/...).
+def _resolved_vg() -> str:
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import tier_storage as _ts
+        return _ts.detect_vg()
+    except Exception:
+        return "bedrock"
+
+
+VG_NAME              = _resolved_vg()
 THINPOOL             = "thinpool"
 DEFAULT_MAX_PEERS    = 7
 

@@ -478,5 +478,6 @@ def install(witness: str, cluster_info: dict, repo: str):
     print()
     print(f"  Joined cluster {s['cluster_name']} as node {s['node_id']}.")
     print(f"  Dashboard: https://{mgmt_ip}:8443  or  {s['mgmt_url']}")
-    print(f"  Storage:   /bedrock/{{scratch,bulk,critical}} (local LVs)")
+    print(f"  Storage:   cluster singleton + SeaweedFS volume LV "
+          f"(per-resource model)")
     print(f"  Promote to N>=2 from any node:  bedrock storage promote")

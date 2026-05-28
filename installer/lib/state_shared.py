@@ -64,11 +64,13 @@ class BedrockState:
     # logging and by the dashboard for an at-a-glance status.
     last_election_outcome: str = ""
 
-    # The netd WitnessState (sock + discovered Echo endpoints +
-    # blessed_* fields). Published by netd.run_daemon so cluster_arbiter
-    # can fire witness claims at the moment of promotion (rather than
-    # the slower netd-election path that waits for cluster.json to
-    # reflect the new mgmt_master).
+    # The netd WitnessState (sock + discovered Echo endpoints + the
+    # passive slot cache + own_marker/own_tag). Published by
+    # netd.run_daemon so cluster_arbiter's takeover protocol can read
+    # peers' slots and set its own LMS slot at the moment of promotion
+    # (readback-confirmed) without waiting for the slower netd-election
+    # path. cluster_arbiter OWNS own_tag (LMS); netd only refreshes
+    # own_marker each tick (Q-01/BAD-4).
     netd_ws: Optional[Any] = None
 
     # ── orchestrator-owned state (rqlite_subscriber etc.) ─────────

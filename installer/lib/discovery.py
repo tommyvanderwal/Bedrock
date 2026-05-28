@@ -33,7 +33,11 @@ COMMON_WITNESS_IPS = [
 ]
 WITNESS_PORT     = 9443
 MGMT_PORT_HTTPS  = 8443
-MGMT_PORT_HTTP   = 8080
+# Cert-less bootstrap HTTP listener (mgmt serve_main's no-cert branch).
+# NOT 8080 — that belongs to weed-volume; the bootstrap window binds a
+# dedicated LAN port so a joiner can fetch /cluster-info before the
+# first TLS cert lands. Must match serve_main's bootstrap port. (T-05.)
+MGMT_PORT_HTTP   = 8444
 MDNS_GROUP       = "224.0.0.251"
 MDNS_PORT        = 5353
 MDNS_NAME        = b"bedrock.local"
@@ -321,8 +325,9 @@ def find_witness() -> Optional[str]:
 
 
 def query_cluster(host: str) -> Optional[dict]:
-    """Fetch /cluster-info from the master. Tries HTTPS 8443, then
-    HTTP 8080, then a legacy witness path as last resort."""
+    """Fetch /cluster-info from the master. Tries HTTPS 8443, then the
+    cert-less bootstrap HTTP port, then a legacy witness path as a last
+    resort."""
     for port, scheme in ((MGMT_PORT_HTTPS, "https"),
                          (MGMT_PORT_HTTP, "http")):
         try:

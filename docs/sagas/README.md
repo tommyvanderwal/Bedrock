@@ -32,6 +32,7 @@ and [`docs/storage-architecture.md`](../storage-architecture.md#everything-goes-
 | [`vm_destroy`](vm_destroy.md) | `bedrock_d/vm/destroy.py` | `DELETE /api/vms/{name}` | n/a — terminal |
 | [`vm_grow`](vm_grow.md) | `bedrock_d/vm/grow.py` | `POST /api/vms/{name}/grow` | manual (shrink not supported online) |
 | [`vm_migrate`](vm_migrate.md) | `bedrock_d/vm/migrate.py` | `POST /api/vms/{name}/migrate` | run again pointing back at the source node |
+| [`replica_repair`](replica_repair.md) | `bedrock_d/orchestrator/replica_repair.py` | orchestrator `self_heal` calm loop | manual (`tier_storage.drbd_remove_peer`) |
 
 ## Per-saga doc structure
 

@@ -606,7 +606,6 @@ LIB_FILES=(
     state.py
     mgmt_install.py
     agent_install.py
-    vm.py
     workload.py
     tier_storage.py
     daemon_setup.py

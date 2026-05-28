@@ -63,9 +63,9 @@ log = logging.getLogger("bedrock.vm_failover")
 # and the VM-failover design discussion. Bump cautiously.
 #
 # Per Tommy's spec: suspend at T+20s wall-clock from partition. The
-# no-quorum marker drops ~10-15s after partition (DOWN_HYSTERESIS_S
-# + NOQUORUM_HOLDDOWN_TICKS), so threshold = 5s puts the suspend at
-# partition+15-20s. The no_quorum_responder in mgmt/orchestrator.py
+# no-quorum marker drops ~9s after partition (netd's single
+# SELF_DEMOTE_MISSES detector), so threshold = 5s puts the suspend at
+# partition+~14s. The no_quorum_responder in mgmt/orchestrator.py
 # also suspends every running VM at marker+1s — this vm_failover
 # task is the selective belt-and-suspenders for the pet/vipet case
 # specifically (no_quorum_responder is unconditional / cattle too).
@@ -130,6 +130,34 @@ def _save_suspended_record(record: dict[str, float]) -> None:
     tmp = SUSPENDED_VMS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(record, indent=2))
     os.replace(tmp, SUSPENDED_VMS_FILE)
+
+
+def drop_suspended(vm_names: list[str]) -> None:
+    """Remove ``vm_names`` from the suspended-vms record (VM-01).
+
+    Called by the recovery path (mgmt/orchestrator._reconcile_paused_vms)
+    the moment it ``virsh resume``s a VM on quorum-return: a VM that came
+    back inside the 5-min window is healthy and must NOT be killed by
+    kill_suspended_after_5min_task. No-op for names not in the record."""
+    if not vm_names:
+        return
+    record = _load_suspended_record()
+    changed = False
+    for vm in vm_names:
+        if record.pop(vm, None) is not None:
+            changed = True
+            log.info("vm_failover: dropped resumed VM %r from suspended "
+                     "record (no longer eligible for the 5-min kill)", vm)
+    if changed:
+        _save_suspended_record(record)
+
+
+def _virsh_domstate(vm_name: str) -> str:
+    """Return the libvirt domain state ('running', 'paused', 'shut off',
+    …) or '' if the lookup fails. Used by the kill task to re-check a
+    VM's live state before destroying it."""
+    rc, out, _ = _virsh("domstate", vm_name)
+    return out.strip() if rc == 0 else ""
 
 
 def _virsh(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
@@ -213,10 +241,25 @@ def _vms_on_dead_peer(dead_peer: str, me: str) -> list[dict]:
 
 
 def _vm_disks(vm_name: str) -> list[str]:
-    """Return the DRBD resource names backing this VM. Today there
-    is exactly one disk per VM (`vm-<name>-disk0`); the convention
-    is hard-wired in vm.py / create.py."""
-    return [f"vm-{vm_name}-disk0"]
+    """Return EVERY DRBD resource name backing this VM, so the takeover
+    sequence promotes + UUID-checks all of them (VM-04 — multi-disk).
+    Reads drbd_resources (level='none'; works without a fresh leader).
+    Falls back to the single-disk convention if the table is empty so
+    a legacy single-disk VM still fails over."""
+    try:
+        from lib import rqlite_client
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import rqlite_client  # type: ignore
+    with rqlite_client.RqliteClient() as rc:
+        rows = rc.query(
+            "SELECT name FROM drbd_resources WHERE name LIKE ? "
+            "ORDER BY name",
+            params=[f"vm-{vm_name}-disk%"], level="none",
+        )
+    names = [r["name"] for r in rows]
+    return names or [f"vm-{vm_name}-disk0"]
 
 
 def _peers_observed_down(max_age_s: float) -> list[str]:
@@ -551,6 +594,21 @@ async def kill_suspended_after_5min_task():
             if not to_kill:
                 continue
             for vm in to_kill:
+                # Belt-and-suspenders for VM-01: a VM resumed on
+                # quorum-return should already be gone from the record,
+                # but if the resume path missed it (e.g. resumed by an
+                # operator out-of-band), re-check the live state and
+                # NEVER destroy a VM that is no longer 'paused'. Just
+                # evict the stale record entry.
+                domstate = _virsh_domstate(vm)
+                if domstate and domstate != "paused":
+                    log.info(
+                        "vm_failover: VM %r is %r (not paused) at kill "
+                        "time — recovered; dropping from record without "
+                        "destroying", vm, domstate,
+                    )
+                    record.pop(vm, None)
+                    continue
                 rc_v, _, err = _virsh("destroy", vm)
                 if rc_v == 0:
                     log.warning(

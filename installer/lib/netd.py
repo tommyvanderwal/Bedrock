@@ -120,24 +120,37 @@ PROBE_TTL   = 1                  # link-local only; never crosses routers
 PROBE_INTERVAL = 1.0             # seconds between probes per interface
 TICK_INTERVAL  = 0.25            # main loop tick
 ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
-# Number of consecutive NoQuorum ticks before we drop the no-quorum
-# marker / demote singletons. Bedrock-net's first ~5s after startup
-# has neighbours=0 → looks like NoQuorum until probes complete;
-# without this hold-down we'd self-mark on every restart.
-NOQUORUM_HOLDDOWN_TICKS = 5
+
+# Node-to-node election heartbeat (protocol 4) — DISTINCT from the
+# mesh discovery probe (protocol 1). The discovery probe answers
+# "which loopback is reachable on which NIC"; the election heartbeat
+# answers "who do I believe is master, am I transitioning, what is my
+# advertised arbiter-DRBD UUID, and which candidate am I acking". It is
+# unicast once-per-peer to each peer's loopback (like the routing
+# advertisement, protocol 3) so it rides whatever path the kernel
+# routes to that loopback. One signed+sealed message per peer per tick.
+HB_PORT = 7734                   # complements PROBE_PORT=7732, ADV_PORT=7733
+
+# BAD-1 single leader-loss detector. Replaces the old triad
+# (DOWN_HYSTERESIS_S-driven election liveness + NOQUORUM_HOLDDOWN_TICKS
+# + the disabled LONE_MASTER_WATCHDOG_S): the election now tracks
+# consecutive missed election-heartbeats from the believed master.
+#  * Survivor promotes at MASTER_LOSS_MISSES (~10 s).
+#  * An old master that has itself lost quorum self-demotes at
+#    SELF_DEMOTE_MISSES (~9 s) — 1 s before survivors promote so the
+#    .254 / arbiter rqlite is released first (INV-1 margin).
+# At 1 election tick/s these counts are seconds. 10 consecutive misses
+# tolerates 1-2 stragglers without a false failover.
+MASTER_LOSS_MISSES = 10
+SELF_DEMOTE_MISSES = 9
 
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
-# INV-4 watchdog: if I'm hosting singletons and have seen NEITHER a
-# peer nor a witness reply for this many seconds, demote unconditionally.
-# Belt for the NoQuorum streak path: covers the edge case where vote math
-# briefly stays "leader" because the witness flaps faster than the 5-tick
-# holddown. 28 s gives ~2× the witness freshness (12 s) + ~2× peer down
-# hysteresis (10 s); the user's spec calls 28 s with a small margin.
-LONE_MASTER_WATCHDOG_S = 28.0
 # Down hysteresis: enough to absorb a few missed probes but short
 # enough that the election self-marks NoQuorum within the 90 s
 # isolation window the e2e harness uses (was 30 s — left
 # sim-1's .254 hanging until ~T+45 s after the assertion).
+# This drives mesh LINK_DOWN / routing only; leader-loss detection is
+# now the MASTER_LOSS_MISSES heartbeat counter above.
 DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 
@@ -270,6 +283,70 @@ def decode_advertisement(buf: bytes, *, key: bytes) -> Optional[dict]:
                 return None
         if not isinstance(body["paths"], list):
             return None
+        return body
+    except Exception:
+        return None
+
+
+HB_VERSION = 1
+
+def encode_heartbeat(*, cluster_uuid: str, node: str, ts: float,
+                     believed_master: str, transitioning: bool,
+                     arbiter_uuid: str, ack_target: str,
+                     key: bytes) -> bytes:
+    """Sign-then-pack a node-to-node election heartbeat (protocol 4).
+
+    Fields (BAD-1):
+      * believed_master — who the sender currently believes is mgmt
+        master ("" if none / lost).
+      * transitioning — True iff the sender has lost the master and is
+        advertising ITSELF as master-to-be.
+      * arbiter_uuid — the sender's `cluster`-singleton DRBD current-UUID
+        (eligibility proof a voter classifies against its own history).
+      * ack_target — the candidate the sender is acking as master-to-be
+        ("" = not acking anyone). A peer grants its 100 votes to the
+        candidate named here.
+
+    Same wrap layout as the discovery probe / advertisement so receivers
+    reuse the HMAC verification flow."""
+    body = msgpack.packb({
+        "cluster_uuid":     cluster_uuid,
+        "node":             node,
+        "ts":               float(ts),
+        "believed_master":  believed_master or "",
+        "transitioning":    bool(transitioning),
+        "arbiter_uuid":     arbiter_uuid or "",
+        "ack_target":       ack_target or "",
+    }, use_bin_type=True)
+    sig = hmac.new(key, body, hashlib.sha256).digest()
+    return msgpack.packb({"v": HB_VERSION, "body": body, "sig": sig},
+                          use_bin_type=True)
+
+
+def decode_heartbeat(buf: bytes, *, key: bytes) -> Optional[dict]:
+    """Verify an election heartbeat and return the body dict, or None on
+    any signature / schema failure. Silent on failure for the same
+    reason decode_probe is."""
+    try:
+        wrap = msgpack.unpackb(buf, raw=False)
+        if not isinstance(wrap, dict):
+            return None
+        if wrap.get("v") != HB_VERSION:
+            return None
+        body_bytes = wrap.get("body")
+        sig = wrap.get("sig")
+        if not body_bytes or not sig:
+            return None
+        expected = hmac.new(key, body_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        body = msgpack.unpackb(body_bytes, raw=False)
+        if not isinstance(body, dict):
+            return None
+        for k in ("cluster_uuid", "node", "ts", "believed_master",
+                  "transitioning", "arbiter_uuid", "ack_target"):
+            if k not in body:
+                return None
         return body
     except Exception:
         return None
@@ -618,6 +695,29 @@ class Daemon:
     adv_seq: int = 0
     adv_table: dict = field(default_factory=dict)
     best_transit_paths: dict = field(default_factory=dict)
+    # ── Election heartbeat state (protocol 4 — BAD-1) ─────────────
+    # hb_send_sock — one UDP socket, kernel picks egress NIC via the
+    #   /32 route to each peer's loopback (one heartbeat per peer).
+    # hb_recv_sock — one UDP socket bound to 0.0.0.0:HB_PORT.
+    # peer_hb — last decoded election heartbeat per peer node, keyed by
+    #   node name → {believed_master, transitioning, arbiter_uuid,
+    #   ack_target, seen_at_monotonic}.
+    # peer_acks — derived from peer_hb each election tick: dict[node, bool],
+    #   True iff that peer's ack_target == my_node (it acked us as
+    #   master-to-be). Consumed by election.compute.
+    # missed_master_beats — consecutive election ticks with no heartbeat
+    #   from the believed master (the single leader-loss detector).
+    # what we publish in our own outgoing heartbeat (set each tick by
+    #   the election):
+    hb_send_sock: Optional[socket.socket] = None
+    hb_recv_sock: Optional[socket.socket] = None
+    peer_hb: dict = field(default_factory=dict)
+    peer_acks: dict = field(default_factory=dict)
+    missed_master_beats: int = 0
+    hb_believed_master: str = ""
+    hb_transitioning: bool = False
+    hb_arbiter_uuid: str = ""
+    hb_ack_target: str = ""
     # L2 switch/router neighbour discovery (LLDP, CDP, MNDP). Per-NIC
     # raw sockets are opened on NIC bringup and closed on teardown.
     # switch_neighbors is keyed by (my_nic, protocol) → dict, where
@@ -699,6 +799,32 @@ def open_adv_send_socket() -> socket.socket:
     peer's loopback. One advertisement per peer regardless of how
     many physical links exist (the "one per peer not per link"
     design invariant from docs/06-mesh-network.md)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
+    return s
+
+
+def open_hb_recv_socket() -> socket.socket:
+    """Single non-blocking UDP socket bound to 0.0.0.0:HB_PORT for
+    incoming election heartbeats (protocol 4). Like the advertisement
+    socket: plain unicast, the heartbeat body identifies its sender so
+    no IP_PKTINFO is needed."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+        pass
+    s.bind(("", HB_PORT))
+    s.setblocking(False)
+    return s
+
+
+def open_hb_send_socket() -> socket.socket:
+    """Single non-blocking UDP socket for outgoing election heartbeats.
+    No NIC bind — the kernel picks egress via the cluster /32 route to
+    the peer's loopback (one heartbeat per peer, mirroring the
+    advertisement send socket)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(False)
     return s
@@ -891,12 +1017,60 @@ def ensure_loopback_ip(loopback_ip: str) -> None:
                        capture_output=True, text=True)
 
 
+def _failover_ack_target(d, node_loopbacks: dict, peer_liveness: dict) -> str:
+    """Who THIS node votes for once the master is lost.
+
+    The candidate set = self + every reachable peer that has advertised
+    (in its election heartbeat) that it is `transitioning` (claiming
+    master-to-be). We vote for the LOWEST-loopback-octet candidate whose
+    advertised arbiter-DRBD UUID is eligible against our own local 7-day
+    history (lib.state.classify_arbiter_uuid): a superseded UUID is
+    REFUSED (the split-brain guard — a stale candidate can never win our
+    vote even on node count), current/unseen is votable.
+
+    Returns the chosen candidate's node name, or "" if no candidate is
+    eligible (we abstain — the cluster stays NoQuorum until an
+    up-to-date node appears or the operator runs `seize`)."""
+    try:
+        try:
+            from . import state as _lstate
+        except ImportError:
+            from lib import state as _lstate  # type: ignore
+    except Exception:
+        return ""
+
+    def _octet(name: str) -> int:
+        try:
+            return int(node_loopbacks.get(name, "").rsplit(".", 1)[1])
+        except (IndexError, ValueError):
+            return 9999
+
+    # Self is always a candidate (we are transitioning if we end up
+    # picking ourselves). Peers are candidates only if they advertise
+    # transitioning=True.
+    candidates: dict[str, str] = {d.my_node: d.hb_arbiter_uuid}
+    for peer, hb in d.peer_hb.items():
+        if not peer_liveness.get(peer):
+            continue
+        if hb.get("transitioning"):
+            candidates[peer] = hb.get("arbiter_uuid") or ""
+
+    for name in sorted(candidates, key=lambda n: (_octet(n), n)):
+        if _lstate.is_uuid_eligible(candidates[name]):
+            return name
+    return ""
+
+
 def _election_tick(d, ws, _witness, _election, prev_outcome):
     """One election tick. Side-effects:
       - heartbeats / re-discovers the witness
-      - on Leader transition + we're not currently mgmt_master: writes
-        bs.set_mgmt_master(self) to rqlite (Raft enforces single-writer)
-      - on NoQuorum transition: drops the no-quorum marker
+      - on Leader outcome: DRIVES cluster_arbiter.promote_to_arbiter_host()
+        (the base layer drives the promote; the arbiter writes
+        mgmt_master to rqlite as a RESULT, only after the arbiter rqlite
+        is back — H5/INV-6) and ensures the LMS bit when last-standing
+        (H6). netd no longer writes mgmt_master itself.
+      - on NoQuorum: after the self-demote streak, drops the no-quorum
+        marker + demotes the singletons if we were hosting
       - on transition back to Leader/Follower from NoQuorum: nothing
         (orchestrator's no_quorum_responder clears the marker after
          cleanup)
@@ -950,21 +1124,169 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     if not nodes or d.my_node not in nodes:
         # Not yet bootstrapped; nothing to elect.
         return prev_outcome
-    node_loopbacks = {name: (info or {}).get("loopback_ip", "")
-                      for name, info in nodes.items()}
+
+    # The election denominator counts ACTIVE nodes only (C1): a node is
+    # 'active' once it has finished its join saga (node_set_active) and
+    # not in maintenance. A mid-join 'joining' node is excluded so the
+    # master can't be tipped into NoQuorum while a peer is joining; a
+    # drained ('maintenance') node likewise drops out of the tally.
+    # Self is ALWAYS kept (cluster_init self-registers active, and we
+    # must never vote ourselves out of our own denominator).
+    def _is_active(name: str, info: dict) -> bool:
+        if name == d.my_node:
+            return True
+        info = info or {}
+        return (info.get("state", "active") == "active"
+                and not info.get("maintenance"))
+
+    active_nodes = {name: (info or {})
+                    for name, info in nodes.items()
+                    if _is_active(name, info)}
+    node_loopbacks = {name: info.get("loopback_ip", "")
+                      for name, info in active_nodes.items()}
     current_master = cluster.get("mgmt_master") or None
 
-    # 4. Decide. The election is mesh-only now; the witness slot
-    # arbitration (UUID match, tag.lms, readback) is handled in
-    # cluster_arbiter.promote_to_arbiter_host() per the spec.
+    # Plumb the active-member id set onto the witness so drain_replies
+    # drops decommissioned/joining/drained nodes' slots and is_valid()
+    # can certify the witness only when it holds a slot for every active
+    # node (cluster-quorum-spec witness-validity + INV-7 path b). The
+    # member set mirrors the election denominator (active nodes only).
+    # node_id = last octet of loopback_ip (lib.rqlite_setup convention).
+    member_ids: set[int] = set()
+    for info in active_nodes.values():
+        loop = info.get("loopback_ip", "")
+        try:
+            member_ids.add(int(loop.rsplit(".", 1)[1]))
+        except (IndexError, ValueError):
+            pass
+    ws.member_ids = member_ids or None
+    n_configured_witnesses = len(cluster.get("witnesses") or {})
+    # M10 multi-witness: count CONFIGURED witnesses that are INDIVIDUALLY
+    # valid+confirmed (capped at n_configured), not a hard-coded 0/1.
+    # Single-witness testbed still yields 0/1; multiple valid witnesses
+    # each contribute +1 to the tally.
+    n_valid_witnesses = _witness.count_valid_confirmed(
+        ws, n_configured_witnesses)
+
+    # 3b. Local arbiter-DRBD UUID — the eligibility proof we advertise
+    # AND the input we fold into our own 7-day history (so a voter on
+    # THIS node can classify a candidate's advertised UUID against what
+    # we've actually observed). Read once per tick.
+    my_arbiter_uuid = _read_cluster_uuid()
+    if my_arbiter_uuid:
+        try:
+            try:
+                from . import state as _lstate
+            except ImportError:
+                from lib import state as _lstate  # type: ignore
+            _lstate.record_arbiter_uuid(my_arbiter_uuid)
+        except Exception as e:
+            sys.stderr.write(f"bedrock-net: uuid-history record error: {e!r}\n")
+
+    # 3c. Election heartbeat liveness from peers (protocol 4). A peer
+    # heartbeat is "fresh" only within a tight window (~1.5 beats) — a
+    # peer we heard from just now. The single leader-loss detector counts
+    # consecutive ticks with NO fresh heartbeat from the believed master;
+    # at MASTER_LOSS_MISSES (~10 s) the survivor promotes and at one less
+    # (~9 s) the old master self-demotes (NoQuorum), giving the INV-1
+    # release-before-promote margin.
+    now_mono = time.monotonic()
+    fresh_s = ELECTION_INTERVAL_S * 1.5
+
+    def _hb_fresh(node: str) -> bool:
+        hb = d.peer_hb.get(node)
+        return bool(hb and (now_mono - hb.get("seen_at_monotonic", 0.0)) <= fresh_s)
+
+    if current_master and current_master != d.my_node:
+        if _hb_fresh(current_master):
+            d.missed_master_beats = 0
+        else:
+            d.missed_master_beats += 1
+    else:
+        # We are master, or no master is set — nothing to miss.
+        d.missed_master_beats = 0
+
+    # Peer reachability for the election folds in fresh election
+    # heartbeats: a peer we still hear an HB from is reachable for vote
+    # purposes even if its mesh link briefly flapped. A peer whose
+    # heartbeat has gone silent drops out of the tally within the same
+    # ~1.5 s window the master-loss detector uses.
+    for peer in d.peer_hb:
+        if _hb_fresh(peer):
+            peer_liveness[peer] = True
+
+    # 3d. Build the ack map from peers' heartbeats: a peer acks US iff
+    # its (fresh) ack_target names this node. compute() only consults
+    # acks once the master is gone, so a stale ack while a master is
+    # alive is harmless.
+    peer_acks: dict[str, bool] = {}
+    for peer, hb in d.peer_hb.items():
+        if not _hb_fresh(peer):
+            continue
+        if hb.get("ack_target") == d.my_node:
+            peer_acks[peer] = True
+    d.peer_acks = peer_acks
+
+    # Leader-loss is gated by the missed-beat detector: a master that is
+    # still beating is followed; only after MASTER_LOSS_MISSES do we
+    # treat it as gone and let a candidate promote.
+    master_lost = (
+        current_master is not None
+        and current_master != d.my_node
+        and d.missed_master_beats >= MASTER_LOSS_MISSES
+    )
+    # Until the 10-miss detector fires, keep the master "alive" in the
+    # liveness map so compute() follows it through a brief mesh-link
+    # flap (the single detector — not logged_up — owns leader-loss).
+    if current_master and current_master != d.my_node and not master_lost:
+        peer_liveness[current_master] = True
+
+    # 4. Decide. The election tallies node acks + valid witnesses; the
+    # witness slot arbitration (UUID match, tag.lms, readback) is
+    # handled in cluster_arbiter.promote_to_arbiter_host() per the spec.
     result = _election.compute(
         self_name=d.my_node,
         self_loopback=d.my_loopback,
         peer_liveness=peer_liveness,
         node_loopbacks=node_loopbacks,
-        witness_alive=_witness.is_alive(ws),
-        current_mgmt_master=current_master,
+        # Hide the master from compute() only once the 10-miss detector
+        # has fired — so a brief 1-2 tick straggle never demotes it.
+        current_mgmt_master=(None if master_lost else current_master),
+        n_configured_witnesses=n_configured_witnesses,
+        n_valid_witnesses=n_valid_witnesses,
+        peer_acks=peer_acks,
     )
+
+    # 4b. Publish our own election-heartbeat fields for the next
+    # hb_send_round so peers see our stance.
+    #   believed_master — who we currently follow ("" if mid-failover).
+    #   transitioning   — we have lost the master AND are advertising
+    #                     ourselves as master-to-be (the lowest-octet
+    #                     eligible contender among the reachable set).
+    #   ack_target      — the contender we vote for (ourselves if we ARE
+    #                     the lowest-octet eligible contender, else the
+    #                     contender we defer to). This is computed
+    #                     independently of compute()'s quorum gate so the
+    #                     vote can BOOTSTRAP: peers ack the prospective
+    #                     winner before it has reached quorum.
+    d.hb_arbiter_uuid = my_arbiter_uuid or ""
+    if master_lost:
+        ack_target = _failover_ack_target(d, node_loopbacks, peer_liveness)
+        d.hb_believed_master = ""
+        d.hb_transitioning = (ack_target == d.my_node)
+        d.hb_ack_target = ack_target
+    elif result.outcome == _election.Outcome.LEADER:
+        d.hb_believed_master = d.my_node
+        d.hb_transitioning = False
+        d.hb_ack_target = ""
+    elif result.outcome == _election.Outcome.FOLLOWER:
+        d.hb_believed_master = current_master or ""
+        d.hb_transitioning = False
+        d.hb_ack_target = ""
+    else:  # NoQuorum — advertise nothing definitive.
+        d.hb_believed_master = ""
+        d.hb_transitioning = False
+        d.hb_ack_target = ""
 
     # 5. Log transitions.
     if prev_outcome != result.outcome.value:
@@ -974,17 +1296,34 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
             f"votes={result.my_votes}/{result.majority} of {result.total_votes})\n"
         )
 
+    # 5b. Persist who we believe is master (survives reboot; cold boot
+    # reads it before rqlite quorum exists — see lib/state.py).
+    believed = (d.my_node if result.outcome == _election.Outcome.LEADER
+                else (current_master if result.outcome == _election.Outcome.FOLLOWER
+                      and not master_lost else None))
+    if believed != getattr(d, "_persisted_believed_master", "<unset>"):
+        try:
+            try:
+                from . import state as _lstate
+            except ImportError:
+                from lib import state as _lstate  # type: ignore
+            _lstate.set_believed_master(believed)
+            d._persisted_believed_master = believed
+        except Exception as e:
+            sys.stderr.write(f"bedrock-net: believed-master persist error: {e!r}\n")
+
     # 6. Act on outcome.
     if result.outcome == _election.Outcome.NO_QUORUM:
-        # Hold-down: only treat NoQuorum as actionable after it has
-        # persisted for HOLDDOWN_TICKS consecutive ticks (≈ 5 s).
-        # Without this, every fresh start of bedrock-net spent ≥ a
-        # second with neighbours=0 → 10/11 votes → no-quorum mark; the
-        # subsequent neighbour discovery flipped back to leader the
-        # next tick, but the singletons had already been torn down
-        # on the way through.
-        d.noquorum_streak = getattr(d, "noquorum_streak", 0) + 1
-        if d.noquorum_streak < NOQUORUM_HOLDDOWN_TICKS:
+        # Single self-demote detector (replaces NOQUORUM_HOLDDOWN_TICKS +
+        # the disabled LONE_MASTER_WATCHDOG_S). Count consecutive
+        # NoQuorum ticks; an old master that has lost quorum self-demotes
+        # at SELF_DEMOTE_MISSES (~9 s) — 1 s before a survivor promotes
+        # at MASTER_LOSS_MISSES (~10 s), so .254 / arbiter rqlite is
+        # released first (INV-1 margin). The same counter also rides out
+        # the ~5 s startup window (neighbours=0 looks like NoQuorum) so a
+        # fresh daemon doesn't self-mark on every restart.
+        d.noquorum_master_ticks = getattr(d, "noquorum_master_ticks", 0) + 1
+        if d.noquorum_master_ticks < SELF_DEMOTE_MISSES:
             return result.outcome.value
         _election.set_no_quorum_marker(result.reason)
         # If we were hosting the cluster singletons (.254 VIP, arbiter
@@ -995,9 +1334,9 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         # in NoQuorum. Without this, an isolated master keeps the
         # singletons up and would serve stale data to a still-attached
         # peer (the operator's workstation, in the e2e isolation test).
-        # `demoted_in_cycle` flag fires the demote ONCE per NoQuorum
-        # episode (not every tick — a noop replay does no harm but
-        # the log churn is misleading).
+        # `demoted_in_cycle` fires the demote ONCE per NoQuorum episode
+        # (not every tick — a noop replay does no harm but the log
+        # churn is misleading). The arbiter owns the LMS clear on demote.
         if not getattr(d, "demoted_in_cycle", False):
             try:
                 try:
@@ -1026,136 +1365,63 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
                 sys.stderr.write(
                     f"bedrock-net: NoQuorum self-demote failed: {e!r}\n"
                 )
-    elif result.should_set_mgmt_master:
-        # Probe rqlite once before attempting the write — saves 4
-        # retries × 1s = 4 s of pointless backoff when rqlited is still
-        # mid-election (the case right after a bedrock-d restart or a
-        # cluster-wide push_sources). If rqlite has no leader yet we
-        # log it cheaply and the next election tick will try again.
-        _rqlite_ready = False
-        try:
-            import urllib.request as _ur, json as _jr
-            # rqlite v10's /status doesn't expose a `leader` field on
-            # the raft section — the keys are: state, term, last_contact,
-            # num_peers, latest_configuration, voter, etc. There's no
-            # store.raft.leader nor store.raft.leader_addr. The
-            # authoritative "is there a leader" answer comes from /nodes
-            # which lists every voter with leader=true on the current
-            # leader. We dial that — fast, transparent-forwarding-aware,
-            # and works regardless of whether the local node is the
-            # leader or just a follower.
-            # Probe writability directly: a trivial query through
-            # /db/query?level=strong forces a Raft read-after-write
-            # round-trip that only succeeds if a quorum-elected leader
-            # is reachable. Avoids the v26 false-negative where the
-            # local rqlited reported state=Leader but /nodes hadn't
-            # populated leader=true yet during the arbiter-join
-            # window. 3s timeout to ride out the brief Raft-elect
-            # latency right after arbiter promotion.
-            # Use mTLS when the cert files exist (post-cluster_ca-init).
-            # On very-early-bootstrap before cluster_ca has run, the
-            # files are missing and we fall back to plain HTTP — at
-            # which point rqlited isn't running yet anyway so the
-            # probe was going to fail.
-            import ssl as _ssl
-            from pathlib import Path as _P
-            node_crt = "/etc/bedrock/node.crt"
-            node_key = "/etc/bedrock/node.key.pem"
-            ca_crt   = "/etc/bedrock/ca.crt"
-            if (_P(node_crt).exists() and _P(node_key).exists()
-                    and _P(ca_crt).exists()):
-                _scheme = "https"
-                _ctx = _ssl.create_default_context(cafile=ca_crt)
-                _ctx.load_cert_chain(certfile=node_crt, keyfile=node_key)
-            else:
-                _scheme = "http"
-                _ctx = None
-            _req = _ur.Request(
-                f"{_scheme}://127.0.0.1:4001/db/query?level=strong",
-                data=b'["SELECT 1"]',
-                headers={"Content-Type": "application/json"},
-            )
-            r = _ur.urlopen(_req, timeout=3, context=_ctx) if _ctx else _ur.urlopen(_req, timeout=3)
-            _rs = _jr.loads(r.read()) or {}
-            # success shape: {"results": [{"columns": ["1"], "values": [[1]]}]}
-            _r0 = (_rs.get("results") or [{}])[0]
-            if "error" not in _r0 and _r0.get("values"):
-                _rqlite_ready = True
-        except Exception:
-            _rqlite_ready = False
-        if not _rqlite_ready:
-            sys.stderr.write(
-                "bedrock-net: set_mgmt_master deferred — rqlite has no "
-                "leader yet (will retry next tick)\n"
-            )
-        else:
-            try:
-                try:
-                    from . import bedrock_state as _bs
-                except ImportError:
-                    from lib import bedrock_state as _bs  # type: ignore
-                rev = _bs.set_mgmt_master(d.my_node)
-                sys.stderr.write(
-                    f"bedrock-net: election promoted self to mgmt_master "
-                    f"(rqlite rev={rev})\n"
-                )
-            except Exception as e:
-                sys.stderr.write(
-                    f"bedrock-net: set_mgmt_master failed: {e!r} "
-                    f"(will retry next tick)\n"
-                )
-
-    # Reset NoQuorum streak + demote-once flag when we leave the
-    # NoQuorum state. Without the demote_in_cycle reset, an isolated
-    # master that briefly recovers and then re-isolates would skip the
-    # second demote, leaving .254 + arbiter rqlite live on a node that
-    # no longer has quorum.
-    if result.outcome != _election.Outcome.NO_QUORUM:
-        d.noquorum_streak = 0
-        d.demoted_in_cycle = False
-
-    # INV-4 (lone-master watchdog) intentionally NOT implemented here:
-    # NoQuorum self-demote at 5-tick streak (~5 s) already covers the
-    # scenario at a much tighter bound than the spec's 28 s. The
-    # watchdog only adds value as a belt against vote-math edge cases
-    # (witness flapping faster than holddown keeps `witness_alive=True`
-    # while peer is gone). Re-introduce if such an edge case appears.
-
-    # Refresh own witness slot every tick.
-    # - marker = local DRBD current-uuid (always)
-    # - tag.lms = (I am hosting arbiter AND no peer is logged_up).
-    #   This is the steady-state rule. cluster_arbiter sets tag
-    #   inside the takeover protocol; we re-affirm it here so it
-    #   reflects current reality once netd takes over the loop.
-    try:
-        uuid_hex = _read_tier_critical_uuid()
-        marker = uuid_hex.encode("ascii") if uuid_hex else b""
-        any_peer_up = any(
-            getattr(n, "logged_up", False) for n in d.neighbours.values()
-        )
-        # Detect "I am hosting" via local arbiter_status, NOT via
-        # cluster.json — rqlite-free, matches the spec's INV-6.
+    elif result.outcome == _election.Outcome.LEADER:
+        # H5 / INV-6 two-tier ordering: netd (the base layer) DRIVES the
+        # promote; mgmt_master is written by the arbiter as a RESULT, only
+        # after the arbiter rqlite is back. We no longer write
+        # set_mgmt_master here directly (the old backwards trigger — netd
+        # wrote it first, the orchestrator then promoted off the rqlite
+        # role). The promote needs NO rqlite (witness + local only), so
+        # there's no deadlock: promote_to_arbiter_host runs the takeover
+        # protocol, brings up DRBD primary + .254 + arbiter rqlite +
+        # filer, then writes mgmt_master once arbiter_status() confirms
+        # hosting. Idempotent — on an already-hosting node it's a no-op.
         try:
             try:
                 from . import cluster_arbiter as _ca
             except ImportError:
                 from lib import cluster_arbiter as _ca  # type: ignore
-            st = _ca.arbiter_status()
-            am_hosting = bool(st.get("service_active")
-                              or st.get("ip_present"))
-        except Exception:
-            am_hosting = False
-        lms_bit = _witness.TAG_LMS if (am_hosting and not any_peer_up) else 0
-        ws.own_marker = marker
-        ws.own_tag = lms_bit
+            _ca.promote_to_arbiter_host()
+            # H6 (LMS Scenario B): an already-hosting master that has lost
+            # its peer but keeps the witness must SET its own LMS bit so a
+            # later peer takeover is properly guarded. The arbiter owns
+            # the bit (not netd's per-tick recompute); this is idempotent
+            # and only flips 0→1 when we're genuinely last-standing.
+            _ca.ensure_lms_if_last_standing(ws)
+        except Exception as e:
+            sys.stderr.write(
+                f"bedrock-net: arbiter promote/lms tick failed: {e!r} "
+                f"(will retry next tick)\n"
+            )
+
+    # Reset NoQuorum counter + demote-once flag when we leave the
+    # NoQuorum state. Without the demote_in_cycle reset, an isolated
+    # master that briefly recovers and then re-isolates would skip the
+    # second demote, leaving .254 + arbiter rqlite live on a node that
+    # no longer has quorum.
+    if result.outcome != _election.Outcome.NO_QUORUM:
+        d.noquorum_master_ticks = 0
+        d.demoted_in_cycle = False
+
+    # Publish our own witness slot MARKER every tick (the current DRBD
+    # generation), but NEVER flip the LMS tag from a steady-state
+    # heuristic (Q-01 / BAD-4). The LMS bit is an explicit local
+    # DECISION owned solely by cluster_arbiter: set on go-solo, cleared
+    # on self-demote. Recomputing it here every tick raced the takeover
+    # step-5 readback and could clear an LMS bit the protocol meant to
+    # hold. netd only refreshes the marker and leaves ws.own_tag exactly
+    # as the arbiter last set it.
+    try:
+        uuid_hex = my_arbiter_uuid
+        ws.own_marker = uuid_hex.encode("ascii") if uuid_hex else b""
     except Exception as e:
         sys.stderr.write(f"bedrock-net: own-slot publish error: {e!r}\n")
 
     return result.outcome.value
 
 
-def _read_tier_critical_uuid() -> str:
-    """Read the current-UUID of the tier-critical DRBD resource.
+def _read_cluster_uuid() -> str:
+    """Read the current-UUID of the `cluster` singleton DRBD resource.
 
     DRBD9 stores live UUIDs in the kernel's debugfs at
     ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``.
@@ -1167,9 +1433,17 @@ def _read_tier_critical_uuid() -> str:
     yet attached — in that case the witness slot stays empty and
     the takeover protocol's UUID check no-ops.
 
+    Resource name is sourced from cluster_arbiter.TIER_RESOURCE so it
+    stays in lockstep with the singleton rename.
+
     Returns "" if neither source has the UUID."""
+    try:
+        from . import cluster_arbiter as _ca
+    except ImportError:
+        from lib import cluster_arbiter as _ca  # type: ignore
+    resource = _ca.TIER_RESOURCE
     debugfs = (
-        "/sys/kernel/debug/drbd/resources/tier-critical/volumes/0/"
+        f"/sys/kernel/debug/drbd/resources/{resource}/volumes/0/"
         "data_gen_id"
     )
     try:
@@ -1181,7 +1455,7 @@ def _read_tier_critical_uuid() -> str:
     except OSError:
         pass
     # Fallback for down/unattached resources.
-    rc, out, _ = _run_silent_capture(["drbdadm", "dump-md", "tier-critical"])
+    rc, out, _ = _run_silent_capture(["drbdadm", "dump-md", resource])
     if rc != 0:
         return ""
     for line in out.splitlines():
@@ -1278,6 +1552,8 @@ def run_daemon(shared_state=None):
     d.recv_sock.settimeout(0.05)
     d.adv_recv_sock = open_adv_recv_socket()
     d.adv_send_sock = open_adv_send_socket()
+    d.hb_recv_sock = open_hb_recv_socket()
+    d.hb_send_sock = open_hb_send_socket()
     try:
         d.mndp_sock = l2disc.open_mndp_socket()
     except OSError as e:
@@ -1294,11 +1570,13 @@ def run_daemon(shared_state=None):
     # ── Election + witness ────────────────────────────────────────
     # Bedrock-net is the only Python process that sees the live peer
     # liveness table (Neighbour.logged_up), so the election lives here
-    # rather than as a sibling daemon. The election only *proposes*
-    # `bs.set_mgmt_master(self)`; rqlite Raft is the actual writer of
-    # record. Witness state is best-effort — no witness on the LAN
-    # just means 2-node clusters can't auto-failover (split-brain
-    # prevention), which is the correct behaviour.
+    # rather than as a sibling daemon. On a Leader outcome netd DRIVES
+    # cluster_arbiter.promote_to_arbiter_host(); the arbiter writes
+    # `bs.set_mgmt_master(self)` to rqlite as a RESULT, only after the
+    # arbiter rqlite is back (H5/INV-6 two-tier ordering — netd no longer
+    # writes mgmt_master itself). Witness state is best-effort — no
+    # witness on the LAN just means 2-node clusters can't auto-failover
+    # (split-brain prevention), which is the correct behaviour.
     try:
         from . import witness as _witness, election as _election
     except ImportError:
@@ -1383,10 +1661,16 @@ def run_daemon(shared_state=None):
             if now - last_route_emit >= 1.0:
                 emit_routes(d)
                 last_route_emit = now
+            # Protocol 4: node-to-node election heartbeat. Drain every
+            # tick (cheap, non-blocking) so the missed-beat detector and
+            # ack map are fresh; the election tick (1 Hz) then sends our
+            # own heartbeat carrying the stance it just decided.
+            hb_drain(d)
             # ── Election + witness tick ────────────────────────────
             if now - last_election_at >= ELECTION_INTERVAL_S:
                 last_election_outcome = _election_tick(
                     d, ws, _witness, _election, last_election_outcome)
+                hb_send_round(d, now)
                 last_election_at = now
                 # Publish outcome onto shared state for the dashboard
                 # + orchestrator (saves them re-reading /run files).
@@ -2325,6 +2609,69 @@ def process_advertisement(d: Daemon, body: dict, sender_addr: str,
         "paths":       body["paths"],
     }
     return True
+
+
+def hb_send_round(d: Daemon, now_ts: float) -> None:
+    """Send one signed election heartbeat (protocol 4) to every known
+    cluster peer per cycle. Target set mirrors adv_send_round: direct
+    neighbours we have a loopback for, plus every node in rqlite's
+    `nodes` map (so a master we've lost the link to still hears our
+    transition advertisement once a transit/backup route exists)."""
+    if d.hb_send_sock is None:
+        return
+    buf = encode_heartbeat(
+        cluster_uuid=d.cluster_uuid,
+        node=d.my_node,
+        ts=now_ts,
+        believed_master=d.hb_believed_master,
+        transitioning=d.hb_transitioning,
+        arbiter_uuid=d.hb_arbiter_uuid,
+        ack_target=d.hb_ack_target,
+        key=d.cluster_key,
+    )
+    targets: dict[str, str] = {}
+    for n in d.neighbours.values():
+        if n.peer_loopback and n.peer_node != d.my_node:
+            targets[n.peer_node] = n.peer_loopback
+    for nm, lo in _cluster_node_loopbacks(d.my_node).items():
+        targets.setdefault(nm, lo)
+    for peer_node, peer_lo in targets.items():
+        try:
+            d.hb_send_sock.sendto(buf, (peer_lo, HB_PORT))
+        except OSError:
+            # No route yet (peer down / transit not installed). Silent;
+            # next cycle retries.
+            pass
+
+
+def hb_drain(d: Daemon) -> None:
+    """Drain incoming election heartbeats into d.peer_hb. Updates the
+    per-peer last-heartbeat record (with monotonic receive time, used by
+    the missed-beat detector)."""
+    if d.hb_recv_sock is None:
+        return
+    while True:
+        try:
+            buf, src = d.hb_recv_sock.recvfrom(65536)
+        except (BlockingIOError, socket.timeout):
+            break
+        except OSError:
+            break
+        body = decode_heartbeat(buf, key=d.cluster_key)
+        if not body:
+            continue
+        if body.get("cluster_uuid") != d.cluster_uuid:
+            continue
+        peer = body.get("node") or ""
+        if not peer or peer == d.my_node:
+            continue
+        d.peer_hb[peer] = {
+            "believed_master":  body.get("believed_master") or "",
+            "transitioning":    bool(body.get("transitioning")),
+            "arbiter_uuid":     body.get("arbiter_uuid") or "",
+            "ack_target":       body.get("ack_target") or "",
+            "seen_at_monotonic": time.monotonic(),
+        }
 
 
 def recompute_best_transit_paths(d: Daemon, now_ts: float) -> None:

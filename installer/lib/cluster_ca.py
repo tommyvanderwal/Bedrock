@@ -1,9 +1,9 @@
 """Cluster CA — issues TLS certs for rqlite mTLS.
 
-One CA per cluster. CA private key lives on the DRBD ``tier-critical``
-volume so it follows the master role (only the current master can sign
-new joiner certs). CA public cert is distributed to every node so all
-rqlited instances can verify each other's certs.
+One CA per cluster. CA private key lives on the DRBD ``cluster``
+singleton volume so it follows the master role (only the current master
+can sign new joiner certs). CA public cert is distributed to every node
+so all rqlited instances can verify each other's certs.
 
 Why a single cluster CA (and not a per-node trust list):
 
@@ -98,9 +98,10 @@ def generate_ca(cluster_name: str = "bedrock") -> None:
     cert. Writes to CA_KEY and CA_CERT_DRBD. Idempotent: if both files
     already exist and parse cleanly, no-op.
 
-    Caller responsibility: the DRBD tier-critical mount must already
-    exist at /var/lib/bedrock/cluster (cluster_arbiter promote_to_arbiter
-    sequence does this before cluster_init reaches this step).
+    Caller responsibility: the DRBD `cluster` singleton mount must
+    already exist at /var/lib/bedrock/cluster (cluster_arbiter
+    promote_to_arbiter sequence does this before cluster_init reaches
+    this step).
     """
     if CA_KEY.exists() and CA_CERT_DRBD.exists():
         # Cheap sanity check that the existing CA parses.

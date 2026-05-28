@@ -49,6 +49,12 @@ EXPECTED_STEPS = [
     # cluster_tier_promote_master saga to flip mode=drbd, then joins
     # as DRBD Secondary. N=1 path is a no-op.
     "cluster_tier_join_peer",
+    # Final lifecycle flip: now that rqlited has joined Raft and
+    # bedrock-d is up, mark our rqlite nodes.state 'active' so we count
+    # toward the election denominator (C1). The master registered us
+    # 'joining' at approval to keep us out of its denominator during
+    # the join; this is where we self-activate.
+    "activate_node",
 ]
 
 

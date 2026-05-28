@@ -105,7 +105,8 @@ def main() -> int:
              "attached; starting uvicorn")
 
     # mgmt/app.py's existing __main__ block handles cert detection +
-    # dual 8080/8443 listeners. We call its same logic here.
+    # the LAN listener (8443 with cert, 8444 bootstrap without) plus the
+    # 8001 loopback listener. We call its same logic here.
     mgmt_app.serve_main()
     return 0
 

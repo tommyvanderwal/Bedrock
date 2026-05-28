@@ -48,7 +48,10 @@ MAGIC = b"BREC"
 NONCE_LEN = 12        # ChaCha20Poly1305 nonce
 WITNESS_FRESHNESS_S = 12.0     # reply-freshness for "witness reachable" vote
 DISCOVERY_REPROBE_S = 30.0     # re-broadcast probe cadence after staleness
-SLOT_STALE_MS       = 15_000   # per docs/cluster-quorum-spec.md
+SLOT_STALE_MS       = 10_000   # master-slot-stale threshold (EXECUTION-PLAN
+                               # BAD-1: a survivor treats the master's slot
+                               # as gone after >10 s, matching the 10-missed-
+                               # heartbeat leader-loss detector in netd)
 NODE_ID_MIN         = 1
 NODE_ID_MAX         = 250
 
@@ -87,6 +90,14 @@ class EchoEndpoint:
     addr: tuple[str, int]
     echo_id: str
     last_reply_ms: int = 0
+    # Per-witness decoded slot cache from THIS endpoint's most recent
+    # reply (M10 multi-witness). Each configured witness is validated
+    # INDIVIDUALLY (a slot for every active node + our own readback) so
+    # that, with multiple witnesses configured, each valid+confirmed one
+    # contributes +1 to the tally. The merged ws.slots (latest reply,
+    # any witness) is kept for the single-witness takeover read path.
+    slots: dict = field(default_factory=dict)
+    last_reply_monotonic: float = 0.0
 
 
 @dataclass
@@ -109,6 +120,15 @@ class WitnessState:
     own_marker: bytes = b""
     own_kind: int = MARKER_KIND_DRBD_ARBITER_UUID
     own_tag: int = 0   # bit 0 = lms
+
+    # Current active-node member set (node_ids), refreshed each netd
+    # tick from rqlite's `nodes` table via cluster_state.load_cluster().
+    # drain_replies drops any slot whose node_id is NOT in this set so
+    # a decommissioned node's stale slot stops counting (the primary
+    # stuck-LMS escape, cluster-quorum-spec INV-7 path b). A witness is
+    # only `is_valid` when it holds a slot for *every* member here.
+    # None = "membership not yet known" — no filtering, no validity.
+    member_ids: Optional[set[int]] = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -283,18 +303,15 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
             ep.addr = src
             ep.last_reply_ms = now_ms
         ws.last_alive_at = time.monotonic()
-        # Decode every slot blob in the reply.
-        # TODO(rqlite `nodes` table membership filter — required for
-        # the stuck-LMS decommission override per
-        # docs/operator-overrides.md and cluster-quorum-spec.md INV-7):
-        # drop any slot whose node_id is not currently a member of
-        # the cluster per rqlite's `nodes` table (the cluster-wide
-        # source of truth, locally readable via the per-node rqlited
-        # replica). Today ws has no membership-set field; needs a
-        # small refactor to plumb the current member-id set through
-        # netd's tick so this drain can filter. Until that lands,
-        # removed nodes' stale lms=1 slots still block takeover even
-        # after node leave.
+        # Decode every slot blob in the reply, dropping any slot whose
+        # node_id is not a current cluster member (rqlite `nodes`
+        # table, plumbed onto ws.member_ids each netd tick). This is
+        # the primary stuck-LMS escape from cluster-quorum-spec INV-7
+        # path (b): `bedrock node leave` removes the node from rqlite,
+        # so its stale lms=1 slot stops counting and a takeover can
+        # proceed. member_ids=None means membership isn't known yet
+        # (early boot) — don't filter, but the witness also can't be
+        # `is_valid` without it.
         slots_blob = body.get("slots") or {}
         if isinstance(slots_blob, dict):
             new_cache: dict[int, Slot] = {}
@@ -303,10 +320,16 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
                     nid = int(nid_raw)
                 except (TypeError, ValueError):
                     continue
+                if ws.member_ids is not None and nid not in ws.member_ids:
+                    continue
                 slot = _decode_slot(ws.cluster_key, blob)
                 if slot is not None and slot.node_id == nid:
                     new_cache[nid] = slot
-            # Atomic-ish swap; election tick reads from ws.slots.
+            # Per-witness cache for individual validity (M10), plus the
+            # merged latest-reply cache the single-witness takeover path
+            # reads. Atomic-ish swap; election tick reads from ws.slots.
+            ep.slots = new_cache
+            ep.last_reply_monotonic = time.monotonic()
             ws.slots = new_cache
 
 
@@ -315,6 +338,84 @@ def is_alive(ws: WitnessState) -> bool:
     if ws.last_alive_at == 0.0:
         return False
     return (time.monotonic() - ws.last_alive_at) <= WITNESS_FRESHNESS_S
+
+
+def _slots_valid(ws: WitnessState, slots: dict) -> bool:
+    """Validity check over a specific slot cache (one witness's, or the
+    merged one): holds a slot for EVERY active member. Requires the
+    membership set to be known + non-empty."""
+    if not ws.member_ids:
+        return False
+    return all(nid in slots for nid in ws.member_ids)
+
+
+def _slots_confirmed(ws: WitnessState, slots: dict,
+                     now_local_ms: Optional[int] = None) -> bool:
+    """Confirmation check over a specific slot cache: our own slot is
+    present, carries our current marker, and is fresh (readback proof)."""
+    own = slots.get(int(ws.my_node_id))
+    if own is None:
+        return False
+    if ws.own_marker and own.marker != ws.own_marker:
+        return False
+    return not own.is_stale(now_local_ms)
+
+
+def is_valid(ws: WitnessState) -> bool:
+    """A witness is VALID (eligible to add to the vote tally) only if it
+    currently holds a slot for EVERY active node in the cluster
+    (cluster-quorum-spec witness-validity rule). Entries may be
+    stale/hours-old — fine — but a *missing* member's slot ⇒ the witness
+    can't testify to that node ⇒ invalid ⇒ contributes 0 votes.
+
+    Validity requires the membership set to be known *and* non-empty;
+    until netd plumbs ws.member_ids from rqlite we cannot certify the
+    witness, so it counts 0 (biases toward "do not fail over").
+
+    This is the merged-cache (single-witness) view; count_valid_confirmed
+    is the per-witness multi-witness tally."""
+    return _slots_valid(ws, ws.slots)
+
+
+def is_confirmed(ws: WitnessState,
+                 now_local_ms: Optional[int] = None) -> bool:
+    """A witness is CONFIRMED for the candidate's own takeover use when
+    the candidate wrote its own slot here and read it back this cycle —
+    i.e. our slot is present with our current marker and a fresh
+    ts_writer. This is the readback proof the takeover step-5 relies on,
+    surfaced as a predicate so the election can fold it into the tally
+    (only valid+confirmed witnesses add +1)."""
+    return _slots_confirmed(ws, ws.slots, now_local_ms)
+
+
+def count_valid_confirmed(ws: WitnessState, n_configured: int,
+                          now_local_ms: Optional[int] = None) -> int:
+    """M10 multi-witness tally: how many CONFIGURED witnesses are
+    INDIVIDUALLY valid+confirmed right now, capped at n_configured.
+
+    Each discovered Echo endpoint keeps its own slot cache (ep.slots),
+    validated independently: it must hold a slot for every active member
+    AND reflect our own readback. A witness whose last reply has gone
+    stale (beyond the freshness window) is not counted. The cap ensures
+    we never tally more valid witnesses than the cluster has configured
+    (a rogue/extra Echo answering can't inflate the vote).
+
+    For the single-witness testbed this yields 0 or 1, matching the old
+    `1 if (is_valid and is_confirmed) else 0`. With multiple configured
+    witnesses, each valid+confirmed one now contributes correctly to the
+    tally (and all configured ones still count in the denominator, via
+    n_configured passed to election.compute separately)."""
+    if n_configured <= 0 or not ws.member_ids:
+        return 0
+    now_mono = time.monotonic()
+    count = 0
+    for ep in ws.discovered.values():
+        if (now_mono - ep.last_reply_monotonic) > WITNESS_FRESHNESS_S:
+            continue
+        if (_slots_valid(ws, ep.slots)
+                and _slots_confirmed(ws, ep.slots, now_local_ms)):
+            count += 1
+    return min(count, n_configured)
 
 
 def needs_reprobe(ws: WitnessState) -> bool:
@@ -331,9 +432,9 @@ def set_own_slot(ws: WitnessState, *, marker: bytes,
     """Update what THIS node will publish on its next heartbeat.
 
     Caller responsibility: every 1 s, set `marker` to the current
-    `drbdadm current-uuid tier-critical` and `tag` to `TAG_LMS` if
-    operating last-man-standing, else 0. heartbeat_all picks these up
-    on the next tick."""
+    DRBD current-UUID of the `cluster` singleton resource and `tag` to
+    `TAG_LMS` if operating last-man-standing, else 0. heartbeat_all
+    picks these up on the next tick."""
     ws.own_marker = bytes(marker)
     ws.own_tag = int(tag) & 0xFF
     ws.own_kind = int(kind) & 0xFF

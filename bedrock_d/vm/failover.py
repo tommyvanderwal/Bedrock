@@ -79,8 +79,8 @@ def read_local_drbd_uuid(resource_name: str) -> str:
 
     Primary source: debugfs (works while DRBD is UP). Fallback:
     `drbdadm dump-md` (works when DRBD is detached). Mirrors the
-    same logic cluster_arbiter._read_local_drbd_uuid uses for
-    tier-critical."""
+    same logic cluster_arbiter._read_local_drbd_uuid uses for the
+    `cluster` singleton."""
     debugfs = (
         f"/sys/kernel/debug/drbd/resources/{resource_name}"
         f"/volumes/0/data_gen_id"

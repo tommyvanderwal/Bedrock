@@ -132,8 +132,13 @@ def install_base():
     run("modprobe drbd 2>/dev/null || true", check=False)
     run("echo drbd > /etc/modules-load.d/drbd.conf", check=False)
 
-    # Enable libvirtd
-    run("systemctl enable --now libvirtd >/dev/null 2>&1")
+    # libvirtd is NOT enabled/started here. systemd auto-starts only
+    # bedrock-d, bedrock-rqlited(-arbiter), weed-*, and the obs stack;
+    # libvirtd (and DRBD as an auto-actor) come up imperatively from
+    # bedrock-d's boot orchestrator AFTER role/quorum is established, so
+    # no VM or DRBD resource acts before quorum. install.sh disables both
+    # units; we must not re-enable libvirtd here. (BAD-2/3 boot ownership,
+    # finding I-02.)
 
     # Enable cockpit for web console access on port 9090
     run("systemctl enable --now cockpit.socket >/dev/null 2>&1", check=False)

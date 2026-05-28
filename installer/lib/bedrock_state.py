@@ -147,23 +147,55 @@ def set_mgmt_master(node_name: str,
 def node_register(node_name: str, host: str,
                   role: str = "compute", pubkey: str = "",
                   bedrock_pubkey: str = "",
+                  state: str = "active",
                   client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Upsert a node. Keeps the existing row's loopback_ip across
     re-registers (loopback is allocated separately by mgmt at join
-    approval; this helper is for keeping host/role/pubkey current)."""
+    approval; this helper is for keeping host/role/pubkey current).
+
+    `state` is the lifecycle gate the election denominator reads
+    (cluster-quorum-spec / EXECUTION-PLAN C1): a node registered as
+    'joining' is excluded from the active-node count until it
+    self-activates (node_set_active) at the end of its join saga, so a
+    mid-join node never tips the master into NoQuorum. cluster_init
+    self-registers the master 'active' (the default). On re-register
+    the existing state is PRESERVED (not reset to the default) — a
+    re-register of an already-active node must not demote it to
+    'joining'."""
     c, owns = _client(client)
     try:
         c.execute(
             "INSERT INTO nodes(node_name, host, role, pubkey, "
-            "bedrock_pubkey, loopback_ip, maintenance, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, '', 0, ?) "
+            "bedrock_pubkey, loopback_ip, maintenance, state, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, '', 0, ?, ?) "
             "ON CONFLICT(node_name) DO UPDATE SET "
             "host = excluded.host, role = excluded.role, "
             "pubkey = excluded.pubkey, "
             "bedrock_pubkey = excluded.bedrock_pubkey, "
             "updated_at = excluded.updated_at",
             params=[node_name, host, role, pubkey,
-                    bedrock_pubkey, _now()],
+                    bedrock_pubkey, state, _now()],
+        )
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def node_set_active(node_name: str,
+                    client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Flip a node's lifecycle state to 'active'. Called by the join
+    saga's final step once rqlited has joined Raft + bedrock-d is up,
+    so the node now counts toward the election denominator (C1).
+    Idempotent — UPDATE to 'active' on an already-active node is a
+    no-op write."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE nodes SET state = 'active', updated_at = ? "
+            "WHERE node_name = ?",
+            params=[_now(), node_name],
         )
         return _bump_and_close(c, owns)
     except Exception:
@@ -690,6 +722,27 @@ def vm_set_failover_order(name: str, order: list[str],
             "UPDATE vms SET failover_order = ?, updated_at = ? "
             "WHERE vm_name = ?",
             params=[_json.dumps(list(order)), _now(), name],
+        )
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def vm_set_priority(name: str, priority: str,
+                    client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Record this VM's HA-importance ('low'|'normal'|'high'). The
+    self-heal repair loop reads this to order replica restoration
+    after a permanent host loss (high before normal before low).
+    Set at create time and whenever the operator changes priority."""
+    if priority not in ("low", "normal", "high"):
+        priority = "normal"
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE vms SET priority = ?, updated_at = ? WHERE vm_name = ?",
+            params=[priority, _now(), name],
         )
         return _bump_and_close(c, owns)
     except Exception:

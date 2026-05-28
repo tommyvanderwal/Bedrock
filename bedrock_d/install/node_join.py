@@ -456,31 +456,29 @@ class NodeJoin:
     @step("cluster_tier_join_peer")
     def step_cluster_tier_join_peer(self, ctx):
         """Wait for the master's cluster_tier_promote_master saga to
-        flip ``tiers.critical.mode`` to ``drbd`` in rqlite (projected
-        to cluster.json by the local subscriber), then join the DRBD
-        secondary so the initial sync carries the master's filer
+        flip ``tiers.cluster.mode`` to ``drbd`` in rqlite, then join the
+        DRBD secondary so the initial sync carries the master's filer
         leveldb3 + arbiter rqlite data over.
 
         At N=1 this step is a no-op (no peer; tier stays local until
-        a 2nd node joins). At N>=2 it polls cluster.json then runs
-        ``tier_storage.transition_to_n2_peer``.
+        a 2nd node joins). At N>=2 it polls rqlite (NOT the removed
+        cluster.json) for the renamed ``cluster`` tier key, then runs
+        ``tier_storage.transition_to_n2_peer``. Mirrors
+        ``cluster_tier.ClusterTierJoinPeer``; the join-as-secondary
+        logic itself lives once in ``tier_storage.transition_to_n2_peer``.
 
         Idempotent: ``transition_to_n2_peer`` checks for existing
         LVs/config before creating, and DRBD ``up`` on an already-up
         resource is a noop. A resumed saga that hit a transient
         timeout earlier just polls again."""
         import time as _t
-        from pathlib import Path as _Path
-        import json as _json
-        cluster_path = _Path("/etc/bedrock/cluster.json")
+        from lib import cluster_state as _cs
+        from bedrock_d.install.cluster_tier import CLUSTER_TIER as _CT
 
         def _state():
-            try:
-                c = _json.loads(cluster_path.read_text())
-                return c, ((c.get("tiers") or {})
-                           .get("critical") or {}).get("mode", "local")
-            except Exception:
-                return {}, "?"
+            c = _cs.load_cluster()
+            return c, ((c.get("tiers") or {})
+                       .get(_CT) or {}).get("mode", "local")
 
         cluster, mode = _state()
         if len(cluster.get("nodes") or {}) < 2:
@@ -496,16 +494,15 @@ class NodeJoin:
             _t.sleep(2)
         if mode != "drbd":
             raise RuntimeError(
-                f"cluster_tier_join_peer: master never promoted "
-                f"critical tier to DRBD after {timeout_s}s "
+                f"cluster_tier_join_peer: master never promoted the "
+                f"'{_CT}' tier to DRBD after {timeout_s}s "
                 f"(last mode={mode!r}). Check the "
                 f"cluster_tier_promote_master saga on the master.")
 
         from lib import tier_storage as _ts
-        from pathlib import Path as _P
         # Build peer list (master + every recorded peer + self).
         nodes = cluster.get("nodes") or {}
-        tier = (cluster.get("tiers") or {}).get("critical") or {}
+        tier = (cluster.get("tiers") or {}).get(_CT) or {}
         peer_names = tier.get("peers") or []
         master_name = cluster.get("mgmt_master") or ""
         master_lo = (nodes.get(master_name) or {}).get("loopback_ip", "")
@@ -523,6 +520,24 @@ class NodeJoin:
             master={"name": master_name, "loopback_ip": master_lo},
             peers=peers,
         )
+
+    @step("activate_node")
+    def step_activate_node(self, ctx):
+        """Final step: flip our rqlite `nodes.state` from 'joining' to
+        'active' now that rqlited has joined Raft (start_rqlited_joiner)
+        and bedrock-d is up. The master registered us 'joining' at
+        approval so we stayed out of its election denominator during the
+        join (C1); from here on we count as an active node. We are now a
+        Raft voter, so this write commits.
+
+        Idempotent — node_set_active UPDATE to 'active' is a no-op once
+        we're already active (a resumed/re-run saga just rewrites the
+        same value)."""
+        from bedrock_d import state as _st
+        node_name = ctx.get("node_name") or _local_node_name()
+        with _st.RqliteClient() as _rc:
+            _st.node_set_active(node_name, client=_rc)
+        log.info("node_join: activated %s (state=active)", node_name)
 
 
 # ───────────────────────────────────────────────────────────────────

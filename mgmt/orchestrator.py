@@ -9,10 +9,13 @@ hosting:
                           rebuild snapshot from rqlite, project to
                           cluster.json + state.json, run the
                           snapshot-diff reactor.
-  ② boot_orchestrator    on startup: wait for clear cluster role,
-                          then start libvirtd + VMs that belong here.
-                          Critical-tier DRBD primary/mount/.254 VIP/
-                          arbiter rqlite/filer are owned by
+  ② boot_orchestrator    on startup: wait for clear cluster role
+                          (quorum established by netd's election),
+                          then bring up the per-VM DRBD resources this
+                          node hosts, start libvirtd, and start the VMs
+                          that belong here. Nothing acts before quorum.
+                          The `cluster` singleton's DRBD primary/mount/
+                          .254 VIP/arbiter rqlite/filer are owned by
                           cluster_arbiter.converge().
   ③ no_quorum_responder  on no-quorum marker (dropped by netd's
                           election when this node loses quorum):
@@ -154,6 +157,35 @@ def _drbd_role(resource: str) -> str:
     if r.returncode != 0:
         return "Unknown"
     return (r.stdout or "").strip().split("/")[0] or "Unknown"
+
+
+def _vm_drbd_resources(vm_name: str) -> list[str]:
+    """Configured DRBD resources backing this VM, from /etc/drbd.d.
+
+    A VM's disks are written as `vm-<name>-disk<N>.res` (see the
+    vm_create saga's write_drbd_config step + bedrock_d/vm/drbd_config
+    res_file_path). Cattle VMs sit on a local LV with no `.res` file →
+    empty list, and nothing to bring up. Returns every disk so
+    multi-disk VMs are handled, not just disk0."""
+    prefix = f"vm-{vm_name}-disk"
+    resources = []
+    for cfg in sorted(Path("/etc/drbd.d").glob(f"{prefix}*.res")):
+        m = re.search(r"resource\s+(\S+)\s*\{", cfg.read_text() or "")
+        if m:
+            resources.append(m.group(1))
+    return resources
+
+
+def _bring_up_vm_drbd(vm_name: str) -> None:
+    """`drbdadm up` every DRBD resource backing this VM so /dev/drbdN
+    exists before libvirtd opens it. Idempotent — `drbdadm up` on an
+    already-up resource is a harmless no-op. Promote is NOT done here:
+    per-VM primary/secondary is decided by the vm_failover / create
+    paths, not by the cold-boot reconcile (which would risk dual-primary
+    if a peer already holds the VM)."""
+    for res in _vm_drbd_resources(vm_name):
+        log.info("services: drbdadm up %s (for VM %s)", res, vm_name)
+        subprocess.run(["drbdadm", "up", res], check=False)
 
 
 def get_snapshot() -> dict:
@@ -405,23 +437,30 @@ async def _start_local_services():
         cluster = _cs.load_cluster(level="strong")
     except Exception:
         cluster = {}
-    nodes = cluster.get("nodes", {}) or {}
     vms = cluster.get("vms", {}) or {}
     self_name = _self_node_name()
 
-    # DRBD primary/secondary + mount + arbiter rqlite + .254 VIP for the
-    # critical tier is owned by cluster_arbiter.converge(), driven from
-    # the rqlite subscriber on every revision tick. Nothing to do here.
+    # The `cluster` singleton (arbiter rqlite + filer/s3 + .254 VIP +
+    # its DRBD primary/mount) is owned by cluster_arbiter.converge(),
+    # driven from the rqlite subscriber + converge_retry. Per-VM DRBD
+    # resources are ours to bring up: at boot nothing has run `drbdadm
+    # up` yet (the units are disabled — quorum-aware boot, finding I-02),
+    # so /dev/drbdN won't exist until we do it here, and libvirtd would
+    # fail to open the VM's backing device.
+    ours = [n for n, vm in vms.items()
+            if vm.get("host") == self_name and vm.get("state") == "running"]
+    for vm_name in ours:
+        _bring_up_vm_drbd(vm_name)
 
+    # libvirtd only after the DRBD devices its VMs need are up.
     log.info("services: starting libvirtd")
     subprocess.run(["systemctl", "start", "libvirtd"], check=False)
     await asyncio.sleep(2)
 
     # Start VMs the log says belong here.
-    for vm_name, vm in vms.items():
-        if vm.get("host") == self_name and vm.get("state") == "running":
-            log.info("services: virsh start %s", vm_name)
-            subprocess.run(["virsh", "start", vm_name], check=False)
+    for vm_name in ours:
+        log.info("services: virsh start %s", vm_name)
+        subprocess.run(["virsh", "start", vm_name], check=False)
 
     # Reconcile backup targets. Reactor only runs on NEW log entries
     # while the node is up; entries seen during catch-up don't trigger
@@ -566,6 +605,11 @@ async def _reconcile_paused_vms():
         cluster = {}
     vms = cluster.get("vms", {}) or {}
 
+    # VMs we resume here must be dropped from the vm_failover suspended
+    # record so the 5-min kill timer doesn't destroy a VM that recovered
+    # inside the window (VM-01).
+    resumed: list[str] = []
+
     for vm_name in _paused_vm_names():
         vm = vms.get(vm_name)
         res = _vm_drbd_resource(vm_name)
@@ -593,6 +637,15 @@ async def _reconcile_paused_vms():
         if vm.get("state") == "running":
             log.info("recover: VM %s still ours per log — resuming", vm_name)
             subprocess.run(["virsh", "resume", vm_name], check=False)
+            resumed.append(vm_name)
+
+    if resumed:
+        try:
+            from bedrock_d.orchestrator import vm_failover as _vmf
+            _vmf.drop_suspended(resumed)
+        except Exception as e:
+            log.warning("recover: could not clear suspended record for "
+                        "resumed VMs %s: %s", resumed, e)
 
 
 # ── ④ reactor — snapshot-diff driven ─────────────────────────────────────
@@ -895,7 +948,7 @@ async def cluster_tier_watcher():
             if len(nodes) < 2:
                 continue                       # still N=1
             tier_mode = ((cluster.get("tiers") or {})
-                         .get("critical") or {}).get("mode", "local")
+                         .get("cluster") or {}).get("mode", "local")
             if tier_mode == "drbd":
                 continue                       # already done
             # Pick the first peer (lowest-octet) that isn't us. The
@@ -913,7 +966,7 @@ async def cluster_tier_watcher():
                 continue                       # already submitted
             log.info(
                 "cluster_tier_watcher: cluster reached N=%d, "
-                "critical=local, master=self — submitting "
+                "cluster-tier=local, master=self — submitting "
                 "cluster_tier_promote_master(peer=%s)",
                 len(nodes), peer_name)
             try:
@@ -977,6 +1030,87 @@ async def converge_retry():
         await asyncio.sleep(5)
 
 
+# Cluster-tier sagas mutate the singleton DRBD topology and the .254
+# arbiter — they may only run on the node currently holding the master
+# role. The boot resume sweep skips them unless this node is the leader,
+# so a half-finished promote isn't resumed on the wrong node.
+_LEADER_ONLY_SAGA_KINDS = frozenset({
+    "cluster_tier_promote_master",
+    "cluster_tier_join_peer",
+    "cluster_rename",
+    "replica_repair",   # self-heal: mutates singleton/DRBD topology on the master
+})
+
+
+async def saga_resume():
+    """BAD-6 / SA-02: resume in-flight runtime sagas once at bedrock-d
+    boot. A crash mid vm_create / cluster_tier_promote / cluster_rename
+    leaves an ``in_progress`` operations row that nothing else picks
+    back up — this delivers BEDROCK.md's "power-loss recoverable on
+    boot" guarantee for the rqlite-backed runtime sagas.
+
+    Gating, per the locked plan:
+      - run only after rqlite is reachable (we can read inflight rows),
+        and after this node has a settled role (quorum reformed);
+      - leader-only saga kinds (cluster-tier / rename) are skipped
+        unless this node is the current mgmt-master, so a half-finished
+        promote resumes on the .254 holder, not a follower.
+
+    The install bootstrap sagas (cluster_init/node_join/node_leave) use
+    a separate FileSagaBackend and resume via their own install path —
+    they are deliberately out of scope here."""
+    role = await _wait_for_role(timeout_s=120.0)
+    if role in ("noquorum", "", "unknown"):
+        log.info("saga_resume: role=%r at boot — skipping resume sweep "
+                 "(no settled quorum; runtime sagas resume on the node "
+                 "that owns them once quorum is back)", role)
+        return
+    self_name = _self_node_name()
+    am_leader = role == "leader"
+    try:
+        from bedrock_d.orchestrator.sagas import SagaExecutor
+        from bedrock_d.orchestrator.sagas.rqlite_backend import (
+            RqliteSagaBackend,
+        )
+        from bedrock_d import state as _st
+        # Importing registers every runtime saga kind in SAGAS so the
+        # executor can match an inflight row's `kind`.
+        from bedrock_d.vm import create, destroy, grow, migrate  # noqa: F401
+        from bedrock_d.install import cluster_tier  # noqa: F401
+        from bedrock_d.cluster import rename as _rename  # noqa: F401
+        from bedrock_d.orchestrator import replica_repair  # noqa: F401
+        backend = RqliteSagaBackend(_st.RqliteClient())
+        ex = SagaExecutor(backend=backend, this_node=self_name)
+    except Exception as e:
+        log.warning("saga_resume: executor init failed: %s", e)
+        return
+
+    try:
+        inflight = backend.list_inflight_for(self_name)
+    except Exception as e:
+        log.warning("saga_resume: could not list inflight ops: %s", e)
+        return
+
+    resumed = 0
+    for op in inflight:
+        kind = op.get("kind", "")
+        if kind in _LEADER_ONLY_SAGA_KINDS and not am_leader:
+            log.info("saga_resume: skipping op=%s kind=%s — leader-only "
+                     "and this node is a follower", op.get("id"), kind)
+            continue
+        log.warning("saga_resume: resuming in-flight op=%s kind=%s "
+                    "(state=%s)", op.get("id"), kind, op.get("state"))
+        try:
+            res = await asyncio.to_thread(ex.execute_one, op["id"])
+            resumed += 1
+            log.info("saga_resume: op=%s finished state=%s last_step=%s",
+                     op.get("id"), res.state.value, res.last_step)
+        except Exception as e:
+            log.warning("saga_resume: op=%s raised %r", op.get("id"), e)
+    log.info("saga_resume: resume sweep done (%d of %d inflight ops "
+             "resumed on this node)", resumed, len(inflight))
+
+
 _TASKS_STARTED: bool = False
 import threading as _t
 _START_LOCK = _t.Lock()
@@ -986,7 +1120,7 @@ def start_all():
     """Spawn the orchestrator's tasks on the running event loop. Called
     from FastAPI's startup hook in mgmt/app.py. Under the unified
     bedrock-d daemon, the FastAPI startup hook fires once per uvicorn
-    instance — and we run TWO uvicorns (8443 HTTPS + 8080 loopback) in
+    instance — and we run TWO uvicorns (8443 HTTPS + 8001 loopback) in
     SEPARATE threads — so without a real lock the idempotency guard
     races and every orchestrator task starts twice (visible as doubled
     `arbiter: promoting` / `boot: role=leader` log lines, two competing
@@ -1005,6 +1139,15 @@ def start_all():
     asyncio.create_task(backup_scheduler())
     asyncio.create_task(converge_retry())
     asyncio.create_task(cluster_tier_watcher())
+    asyncio.create_task(saga_resume())
+    # Self-heal: leader-only calm loop that rebuilds redundancy after a
+    # permanent host loss (SG-05), one resource at a time, under the 80%
+    # disk gate.
+    try:
+        from bedrock_d.orchestrator import self_heal as _sh
+        asyncio.create_task(_sh.self_heal_task())
+    except Exception as e:
+        log.warning("orchestrator: self_heal start failed: %s", e)
     # VM failover state machine — suspend-on-no-quorum,
     # takeover-after-35s, kill-suspended-after-5min. Per-VM workload
     # survival logic (Gap 2 from 2026-05-26 review).
@@ -1015,4 +1158,4 @@ def start_all():
         log.warning("orchestrator: vm_failover start failed: %s", e)
     log.info("orchestrator: tasks started (subscriber, no_quorum_responder, "
              "boot, backup_scheduler, converge_retry, "
-             "cluster_tier_watcher, vm_failover x3)")
+             "cluster_tier_watcher, saga_resume, self_heal, vm_failover x3)")

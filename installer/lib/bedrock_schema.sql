@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     pubkey           TEXT NOT NULL DEFAULT '',          -- SSH ed25519
     bedrock_pubkey   TEXT NOT NULL DEFAULT '',          -- inter-node API signing
     maintenance      INTEGER NOT NULL DEFAULT 0,        -- bool 0/1
+    state            TEXT NOT NULL DEFAULT 'active',     -- 'joining' | 'active'
     updated_at       INTEGER NOT NULL
 );
 
@@ -176,6 +177,11 @@ CREATE TABLE IF NOT EXISTS vms (
     -- surviving node consults this list to decide whether it is the
     -- next failover target after a dead primary.
     failover_order    TEXT NOT NULL DEFAULT '[]',
+    -- HA-importance / resource-claim used by the self-heal repair loop
+    -- to order replica restoration after a permanent host loss:
+    -- 'high' replicas are rebuilt before 'normal' before 'low'.
+    -- Set at create time; 'normal' for VMs created before this column.
+    priority          TEXT NOT NULL DEFAULT 'normal',
     updated_at        INTEGER NOT NULL
 );
 
@@ -310,7 +316,7 @@ CREATE TABLE IF NOT EXISTS drbd_resources (
     updated_at       INTEGER NOT NULL
 );
 
--- Membership of the 3-peer tier-critical set. The calm
+-- Membership of the 3-peer cluster-singleton set. The calm
 -- orchestrator owns this table; on a node leave/join it picks
 -- replacements deliberately (resource-aware) and schedules
 -- drbdadm new-peer / detach operations via the operations table.
@@ -344,7 +350,7 @@ CREATE TABLE IF NOT EXISTS seaweed_master_membership (
 CREATE TABLE IF NOT EXISTS operations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL,         -- e.g. "drbd_resource_create",
-                                         --      "tier_critical_promote",
+                                         --      "cluster_tier_promote",
                                          --      "weed_master_reshuffle",
                                          --      "node_leave"
     target_node   TEXT,                  -- node that runs this; NULL = any

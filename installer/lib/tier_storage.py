@@ -1,8 +1,8 @@
-"""Bedrock storage tiers — scratch / bulk / critical.
+"""Bedrock per-resource storage — the `cluster` singleton + weed-volume LV.
 
 See `tier_storage.md` (next to this file) for the full operational spec:
   - what each function does, contracts and invariants
-  - where state lives (cluster.json, /etc/drbd.d, /etc/fstab, kernel)
+  - where state lives (rqlite, /etc/drbd.d, /etc/fstab, kernel)
   - the WHY behind each design choice
   - the documented sources for every external behavior
   - known issues and queued fixes
@@ -14,44 +14,44 @@ operation must preserve, with crash-safety reasoning.
 For the journey of decisions and corrections that led here (wrong turns,
 misdiagnoses, lessons learned), see ../../docs/lessons-log.md.
 
-Quick model:
-  /bedrock/<tier> is the stable mountpoint on every node, always valid.
-  Backend behind the symlink only changes on the **critical** tier as
-  the cluster grows; scratch and bulk stay where they are.
+Storage model (per-resource; the legacy scratch/bulk/critical LV-tiers
+are gone — see docs/storage-architecture.md):
 
-  scratch  : per-node ephemeral, always local thin LV
-  bulk     : SeaweedFS volumes (master+volume on every node, RF
-             managed by SeaweedFS itself); /bedrock/bulk points at
-             the FUSE-mounted filer subtree
-  critical : N=1 → local thin LV; N≥2 → DRBD-replicated XFS, mounted
-             only on the mgmt-master (filer's leveldb3 metadata DB
-             and other cluster singletons live here)
+  cluster singleton : N=1 → local thin LV; N≥2 → DRBD-replicated XFS,
+                      mounted only on the mgmt-master. Hosts the
+                      arbiter rqlite data, SeaweedFS filer's leveldb3,
+                      and the S3 IAM database — one DRBD failover hands
+                      them all off together. DRBD resource name is
+                      `cluster` (`bedrock-data-cluster` / `bedrock-meta-cluster`).
+  weed-volume LV    : one large local thin LV (`bedrock-weed-volume`)
+                      mkfs+mounted at SeaweedFS' volume dir. No DRBD —
+                      SeaweedFS replicates bytes via its collections
+                      (scratch=000, standard=001, critical=002).
 
-External DRBD metadata is essential: it makes local-LV → DRBD-replicated
-promotion zero-copy (the data LV's XFS is preserved byte-for-byte).
+Per-VM disks (cattle local LV / pet 2-way DRBD / vipet 3-way DRBD) are
+owned by the VM-lifecycle sagas (bedrock_d/vm/*), not this module.
+
+External DRBD metadata is essential and used by EVERY DRBD resource
+(singleton + per-VM): it makes local-LV → DRBD-replicated promotion
+zero-copy (the data LV's XFS is preserved byte-for-byte) and keeps the
+DRBD device the same size as the data LV.
 
 Entry points (growth path):
   setup_n1()                          — single-node setup; idempotent
   transition_to_n2_master(...)        — N=1 -> N=2 master side
-                                        (DRBD primary on critical tier)
+                                        (DRBD primary on the cluster resource)
   transition_to_n2_peer(...)          — N=1 -> N=2 peer side
-                                        (DRBD secondary on critical tier)
-  promote_critical_to_3way(...)       — N=2 -> N=3 critical promote
+                                        (DRBD secondary on the cluster resource)
+  promote_cluster_to_3way(...)        — N=2 -> N=3 cluster promote
 
 Entry points (shrink / role-move path):
   drbd_remove_peer(...)               — online DRBD peer removal
                                         (LINBIT-blessed adjust flow)
 
 Entry points (final-collapse to single-node path):
-  drbd_demote_to_local(tier)          — turn a stand-alone DRBD resource
-                                        back into a plain local LV
+  drbd_demote_to_local()              — turn the stand-alone cluster DRBD
+                                        resource back into a plain local LV
                                         (XFS preserved by external meta)
-
-The scratch tier is always local LVM (per-node ephemeral). The bulk
-tier is SeaweedFS-distributed (volume server on every node, no DRBD).
-Only the critical tier follows the mgmt-master via DRBD — that's
-where the filer's leveldb3 metadata DB and other cluster singletons
-live (per docs/post-alpha-rewrite-notes.md D-07/D-10).
 
 Called from:
   mgmt_install.install_full() -> setup_n1()
@@ -80,13 +80,21 @@ from pathlib import Path
 # to /etc/bedrock/storage.json at bootstrap time so every subsequent
 # bedrock command + the mgmt service all agree on it.
 #
-# A `bedrock` VG name is preferred when no VG exists yet (greenfield
-# install), and ensure_vg() will create that name only as a last
-# resort. We don't auto-rename existing VGs — that requires grub +
-# initramfs regeneration and a reboot.
+# A fresh (greenfield) install creates the VG as `bedrock-vg`
+# (FRESH_VG) — matching docs/storage-architecture.md and
+# bedrock_d/vm/lvm.py. We don't auto-rename existing VGs — that
+# requires grub + initramfs regeneration and a reboot — so an
+# install.sh-on-existing-Alma run ADOPTS whatever VG the OS installer
+# made (often `almalinux`) rather than creating `bedrock-vg`.
+#
+# DEFAULT_VG is the resolution FALLBACK only: the name detect_vg()
+# returns when nothing else is known (no storage.json, no VG present —
+# e.g. off-node in the test environment, where the LV-name contract is
+# /dev/bedrock/...). It is NOT the fresh-create name; that is FRESH_VG.
 THINPOOL = "thinpool"
 STORAGE_JSON = Path("/etc/bedrock/storage.json")
 DEFAULT_VG = "bedrock"
+FRESH_VG = "bedrock-vg"
 
 # Candidate raw disks for the bedrock VG when greenfield-creating one
 # (no usable VG present). On real-lab nodes the OS install already
@@ -117,9 +125,12 @@ def detect_vg() -> str:
 
       1. /etc/bedrock/storage.json {"vg": "..."} — written at bootstrap.
       2. A single VG already present (typical post-AlmaLinux install).
-      3. The literal name `bedrock` if multiple VGs exist (operator
-         must have made a choice; we won't second-guess them).
-      4. Fallback: `bedrock` for first-ever bootstrap.
+      3. A bedrock-owned name if multiple VGs exist — prefer the
+         fresh-create name `bedrock-vg`, then the legacy `bedrock`
+         (operator must have made a choice; we won't second-guess them).
+      4. Fallback: `bedrock` for first-ever bootstrap (resolution
+         fallback only — a fresh install CREATES `bedrock-vg`, see
+         ensure_vg()).
     """
     cfg = _read_storage_json()
     if cfg.get("vg"):
@@ -134,6 +145,8 @@ def detect_vg() -> str:
         vgs = []
     if len(vgs) == 1:
         return vgs[0]
+    if FRESH_VG in vgs:
+        return FRESH_VG
     if DEFAULT_VG in vgs:
         return DEFAULT_VG
     return DEFAULT_VG
@@ -144,29 +157,33 @@ def detect_vg() -> str:
 # rebuilt mid-bootstrap.
 VG = detect_vg()
 
-# Tier sizes (testbed defaults — operator can override per-node by setting
-# /etc/bedrock/tier-sizes.json before init/join).
-TIER_SIZE_GB = {
-    "scratch":  20,
-    "bulk":     30,
-    "critical":  5,
-}
-DRBD_META_SIZE_MB = 32   # external metadata is tiny; per-resource
+# Cluster-singleton sizes (testbed defaults — operator can override
+# per-node by setting /etc/bedrock/tier-sizes.json before init/join).
+CLUSTER_SIZE_GB    = 5     # arbiter rqlite + filer leveldb3 + S3 IAM
+WEED_VOLUME_SIZE_GB = 30   # local SeaweedFS volume store
+DRBD_META_SIZE_MB  = 32    # external metadata is tiny; per-resource
 
-# Mountpoint trees
-LOCAL_ROOT  = Path("/var/lib/bedrock/local")    # /var/lib/bedrock/local/<tier>
-MOUNTS_ROOT = Path("/var/lib/bedrock/mounts")   # /var/lib/bedrock/mounts/<tier>-drbd
-PUBLIC_ROOT = Path("/bedrock")                  # /bedrock/<tier>  (the stable abstraction)
+# The cluster singleton DRBD resource. Renamed from the legacy
+# `tier-critical` (SG-04): "critical" now means ONLY the SeaweedFS
+# 002 collection + the VM HA-importance label. The resource name
+# `cluster` matches bedrock_d/install/cluster_tier.py and
+# cluster_arbiter.TIER_RESOURCE.
+CLUSTER_RESOURCE = "cluster"
+# DRBD minor for the singleton — /dev/drbd1101 per storage-architecture.md.
+# Per-VM disk minors live at 1102+ (allocated by the VM sagas) so every
+# resource's port lands in the 7700-7799 band (see drbd_config.drbd_port_for).
+CLUSTER_MINOR = 1101
 
-TIERS = ("scratch", "bulk", "critical")
+# The local SeaweedFS volume LV (no DRBD — SeaweedFS replicates via
+# collections). mkfs+mounted at the weed-volume -dir.
+WEED_VOLUME_LV    = "bedrock-weed-volume"
+WEED_VOLUME_MOUNT = Path("/var/lib/bedrock/seaweedfs/volumes")
 
-# DRBD resource minor numbers — kept above VM minors (which start at 1000).
-# Tier resources start at 1100 to leave a comfortable gap.
-DRBD_MINORS = {
-    "critical": 1101,
-}
+# The cluster-singleton DRBD volume mounts here on the arbiter-host;
+# matches cluster_arbiter.MOUNT_POINT. The filer leveldb3 + arbiter
+# rqlite data live under it so they follow the master via DRBD handoff.
+CLUSTER_MOUNT = Path("/var/lib/bedrock/cluster")
 
-CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 STATE_JSON   = Path("/etc/bedrock/state.json")
 
 
@@ -302,7 +319,7 @@ def set_tier_state(tier: str, *, write_rqlite: bool = True, **kv) -> None:
     ``bedrock join``) when rqlite isn't yet up — the call then
     becomes a no-op and the init/join saga's ``mirror_tier_state``
     step writes the canonical state to rqlite later, from disk
-    (mode='local', backend_path=LOCAL_ROOT/tier).
+    (mode='local', backend_path=CLUSTER_MOUNT).
 
     Before the cluster.json removal (2026-05-26) this function
     maintained a local cluster.json projection that mirror_tier_state
@@ -330,6 +347,44 @@ def set_tier_state(tier: str, *, write_rqlite: bool = True, **kv) -> None:
         # caller — operator gets to see it and decide.
         print(f"  ERROR: tier_state rqlite-mirror failed for {tier!r}: {e}",
               flush=True)
+
+
+# ── Canonical LV names + DRBD port (one source of truth) ────────────────────
+#
+# LV names and the minor->port mapping live in bedrock_d.vm.drbd_config so
+# the cluster singleton and every per-VM disk share ONE formula. We import
+# them here (via the sys.path shim that puts the repo root on the path on a
+# node) rather than re-deriving, so a future port-band change is one edit.
+
+def _drbd_helpers():
+    try:
+        from bedrock_d.vm import drbd_config as _cfg, lvm as _lvm
+    except ImportError:
+        import sys as _sys
+        # On a node the repo root holding bedrock_d/ is on sys.path via the
+        # daemon entry point; add the common install root defensively.
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from bedrock_d.vm import drbd_config as _cfg, lvm as _lvm  # type: ignore
+    return _cfg, _lvm
+
+
+def data_lv_for(resource: str) -> str:
+    """Canonical data LV name, e.g. cluster -> bedrock-data-cluster."""
+    _cfg, _lvm = _drbd_helpers()
+    return _lvm.lv_names_for(resource).data_lv
+
+
+def meta_lv_for(resource: str) -> str:
+    """Canonical external-meta LV name, e.g. cluster -> bedrock-meta-cluster."""
+    _cfg, _lvm = _drbd_helpers()
+    return _lvm.lv_names_for(resource).meta_lv
+
+
+def drbd_port_for(minor: int) -> int:
+    """Port in the 7700-7799 band for this DRBD minor (singleton + per-VM
+    share the formula). Delegates to drbd_config.drbd_port_for."""
+    _cfg, _lvm = _drbd_helpers()
+    return _cfg.drbd_port_for(minor)
 
 
 # ── Atomic symlink swap (POSIX rename) ─────────────────────────────────────
@@ -502,9 +557,10 @@ def ensure_vg() -> None:
     grub + initramfs + reboot dance that's not worth the cosmetic gain.
 
     Greenfield branch: if NO VG exists on the system at all (operator
-    booted a fresh kernel-only image, no LVM done), we look for an
-    unused separate data disk and pvcreate+vgcreate `bedrock` on it.
-    Legacy testbed path; kept for back-compat.
+    booted a fresh kernel-only image, no LVM done), we carve a PV from
+    the boot-disk tail (or a separate data disk) and vgcreate the fresh
+    name `bedrock-vg` (FRESH_VG) on it. (install.sh-on-existing-Alma
+    never reaches this branch — it adopts the existing VG above.)
     """
     global VG
     if vg_exists():
@@ -545,10 +601,13 @@ def ensure_vg() -> None:
         print(f"  [tier] Greenfield: creating PV+VG on separate disk {pv}")
         run(f"wipefs -af {pv}", check=False)
     run(f"pvcreate -ff -y {pv}")
-    run(f"vgcreate {DEFAULT_VG} {pv}")
+    # Fresh install creates `bedrock-vg` (FRESH_VG), not the resolution
+    # fallback name. install.sh-on-existing-Alma adopts its OS VG above
+    # and never reaches here.
+    run(f"vgcreate {FRESH_VG} {pv}")
     # Update the resolved VG name (the function-level `global VG`
     # declaration at the top of ensure_vg covers this assignment).
-    VG = DEFAULT_VG
+    VG = FRESH_VG
     cfg = _read_storage_json()
     cfg["vg"] = VG
     _write_storage_json(cfg)
@@ -557,9 +616,12 @@ def ensure_vg() -> None:
 def _ensure_vg_headroom(min_mb: int = 1024) -> None:
     """If the VG has less than `min_mb` MB of free space (typical when
     kickstart used `--grow` to give the thinpool 100% of disk), attach
-    a sparse loop-backed PV and `vgextend` so thick LVs outside the
-    pool (tier-{critical,bulk}-meta) can be created. Idempotent: if
-    the helper PV is already attached, nothing happens."""
+    a sparse loop-backed PV and `vgextend` so the thin pool has room to
+    grow its own metadata (lvextend the pool's _tmeta). All DRBD
+    external-meta LVs are now thin (in-pool, see ensure_meta_lv), so
+    they no longer need free VG space; this headroom is purely for the
+    thin pool's metadata. Idempotent: if the helper PV is already
+    attached, nothing happens."""
     # Pre-flight: if we previously created a loop-backed PV but the
     # loopback association is gone (reboot wipes losetup), reattach
     # it so vgs/vgreduce/lvcreate don't choke on the missing PV.
@@ -594,8 +656,8 @@ def _ensure_vg_headroom(min_mb: int = 1024) -> None:
         return
     extra_img = Path(f"/var/lib/bedrock-vg-extra.img")
     # Sparse file — only the bytes we actually write get allocated on
-    # disk. 4 GiB headroom is plenty for every tier-*-meta and any
-    # operator headroom we'd reasonably want at install time.
+    # disk. 4 GiB headroom is plenty for thin-pool metadata growth and
+    # any operator headroom we'd reasonably want at install time.
     size_mb = max(min_mb * 4, 4096)
     if not extra_img.exists():
         print(f"  [tier] VG has {free_mb:.0f}M free (< {min_mb}M); "
@@ -631,10 +693,9 @@ def ensure_thinpool() -> None:
     ensure_vg()
     if thinpool_exists():
         # The kickstart-supplied thinpool may have taken 100% of VG
-        # via `logvol --grow` — no room left for the thick meta LVs
-        # (tier-critical-meta etc.) the DRBD promote path needs.
-        # Reduce-thinpool is unsupported on every LVM version we
-        # target, so add a loop-backed PV to grow the VG instead.
+        # via `logvol --grow` — no room left for the thin-pool's own
+        # metadata growth. Reduce-thinpool is unsupported on every LVM
+        # version we target, so add a loop-backed PV to grow the VG.
         _ensure_vg_headroom(min_mb=1024)
         return
 
@@ -673,7 +734,8 @@ def ensure_thinpool() -> None:
     except ValueError:
         free_mb = 0.0
 
-    needed_mb = sum(TIER_SIZE_GB.values()) * 1024 + 1024  # tiers + 1 GB slack
+    # cluster singleton + weed-volume LVs + 1 GB slack.
+    needed_mb = (CLUSTER_SIZE_GB + WEED_VOLUME_SIZE_GB) * 1024 + 1024
     if free_mb < needed_mb:
         raise RuntimeError(
             f"Not enough free space in VG {VG}: {free_mb:.0f}MB free, "
@@ -681,16 +743,15 @@ def ensure_thinpool() -> None:
             f"root LV (≤16 GB), or `lvremove` unused LVs in {VG} before "
             f"re-running bedrock bootstrap.")
 
-    # 3. Create thin pool with most free space, but leave a reserve
-    #    of 512 MB for LVM thin-pool metadata growth and ~256 MB for
-    #    the future thick tier-meta LVs (each 32 MB, max 4 of them at
-    #    1 per DRBD resource; we keep 256 MB headroom). Without this
-    #    reserve, `bedrock storage promote` fails to lvcreate
-    #    tier-critical-meta with "VG has insufficient free space".
+    # 3. Create thin pool with most free space, but leave a reserve of
+    #    512 MB for LVM thin-pool metadata growth and ~256 MB of VG
+    #    headroom. The DRBD external-meta LVs are now thin (in-pool), so
+    #    they no longer need free VG space; the reserve keeps the pool's
+    #    own metadata from wedging at 100%-allocated.
     headroom_mb = 512 + 256
     pool_size_mb = int(free_mb - headroom_mb)
     print(f"  [tier] Creating thin pool {VG}/{THINPOOL} ({pool_size_mb} MB, "
-          f"{headroom_mb} MB held back for thin-pool meta + DRBD meta LVs)")
+          f"{headroom_mb} MB held back for thin-pool metadata)")
     run(f"lvcreate -L {pool_size_mb}M -T {VG}/{THINPOOL} -y")
 
 
@@ -702,10 +763,15 @@ def ensure_thin_lv(lv: str, size_gb: int) -> None:
 
 
 def ensure_meta_lv(lv: str, size_mb: int = DRBD_META_SIZE_MB) -> None:
-    """Create a thick meta LV (small) for DRBD external metadata."""
+    """Create a thin external-metadata LV in the pool for one DRBD
+    resource. Thin (in-pool), matching bedrock_d/vm/lvm.lvcreate_pair so
+    the cluster singleton and per-VM disks use ONE external-meta scheme.
+    Thin meta consumes blocks only as DRBD dirties bitmap bits, so the
+    virtual size is cheap; the thinpool reserve in ensure_thinpool keeps
+    a metadata floor."""
     if lv_exists(lv):
         return
-    run(f"lvcreate -L {size_mb}M -n {lv} {VG} -y")
+    run(f"lvcreate -V {size_mb}M -T {VG}/{THINPOOL} -n {lv} -y")
 
 
 def ensure_xfs(device: str, label: str) -> None:
@@ -741,13 +807,25 @@ def umount_quiet(mount: str) -> None:
 
 # ── N=1: local-only setup ──────────────────────────────────────────────────
 
+def ensure_weed_volume_lv() -> None:
+    """Create + mount the local SeaweedFS volume LV. One large local thin
+    LV (no DRBD — SeaweedFS replicates bytes via its collections). XFS,
+    mounted at the weed-volume -dir. Idempotent."""
+    device = f"/dev/{VG}/{WEED_VOLUME_LV}"
+    ensure_thin_lv(WEED_VOLUME_LV, WEED_VOLUME_SIZE_GB)
+    ensure_xfs(device, "weed-volume")  # XFS label max 12 chars
+    ensure_mounted(device, str(WEED_VOLUME_MOUNT))
+
+
 def setup_n1(*, write_rqlite: bool = False) -> None:
-    """Single-node tier setup. Creates LVs, mounts them, points
-    /bedrock/<tier> at the local mount. Idempotent.
+    """Single-node storage setup. At N=1 the cluster singleton lives on
+    the local root FS at /var/lib/bedrock/cluster (promoted to DRBD on
+    the N=1→N=2 transition); the SeaweedFS volume store gets its own
+    local LV. Idempotent.
 
     During ``bedrock init`` this is called BEFORE rqlite is up, so
     ``write_rqlite`` defaults to False. The cluster_init flow has a
-    later step that mirrors the local tier state into rqlite after
+    later step that mirrors the singleton's tier state into rqlite after
     rqlited reaches Leader (see ``mirror_tier_state_to_rqlite``).
 
     Called from outside init (e.g. ``bedrock storage init``)
@@ -756,55 +834,41 @@ def setup_n1(*, write_rqlite: bool = False) -> None:
     print("  [tier] Ensuring thin pool...")
     ensure_thinpool()
 
-    LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
-    MOUNTS_ROOT.mkdir(parents=True, exist_ok=True)
-    PUBLIC_ROOT.mkdir(parents=True, exist_ok=True)
+    # SeaweedFS volume store — one large local LV, no DRBD.
+    ensure_weed_volume_lv()
+    print(f"  [tier] {WEED_VOLUME_LV:<22} {WEED_VOLUME_SIZE_GB:>3}G -> "
+          f"{WEED_VOLUME_MOUNT}")
 
-    for tier in TIERS:
-        lv = f"tier-{tier}"
-        size = TIER_SIZE_GB[tier]
-        local_mount = LOCAL_ROOT / tier
-        device = f"/dev/{VG}/{lv}"
+    # Cluster singleton at N=1 is just a directory on the root FS; the
+    # arbiter rqlite + filer leveldb3 + S3 IAM write into it directly,
+    # and promote_local_to_drbd_master snapshots+restores it onto the
+    # DRBD volume on the N=1→N=2 transition (XFS preserved byte-for-byte
+    # by external metadata). Record mode='local'.
+    CLUSTER_MOUNT.mkdir(parents=True, exist_ok=True)
+    set_tier_state(CLUSTER_RESOURCE, mode="local", master=None,
+                   backend_path=str(CLUSTER_MOUNT),
+                   write_rqlite=write_rqlite)
 
-        ensure_thin_lv(lv, size)
-        ensure_xfs(device, tier)  # XFS labels max 12 chars; tier names are short
-        ensure_mounted(device, str(local_mount))
-
-        # /bedrock/<tier> -> /var/lib/bedrock/local/<tier>
-        atomic_symlink(str(local_mount), PUBLIC_ROOT / tier)
-
-        set_tier_state(tier, mode="local", master=None,
-                       backend_path=str(local_mount),
-                       write_rqlite=write_rqlite)
-
-        print(f"  [tier] {tier:<10} {size:>3}G -> {local_mount}")
-
-    print("  [tier] N=1 setup complete: /bedrock/{scratch,bulk,critical} ready")
+    print("  [tier] N=1 setup complete: cluster singleton local at "
+          f"{CLUSTER_MOUNT}, weed-volume LV mounted")
 
 
 def mirror_tier_state_to_rqlite() -> None:
-    """Push each local tier's state into rqlite. Called by the
+    """Push the cluster singleton's state into rqlite. Called by the
     cluster_init / node_join saga AFTER rqlited has reached Leader.
 
-    Before the cluster.json removal this read tier_state from the
-    on-disk projection that set_tier_state wrote during bootstrap.
-    With cluster.json gone, we infer the post-bootstrap state
-    directly from disk: every tier in TIERS is mounted local, with
-    backend_path = LOCAL_ROOT / tier. mode='local' is the universal
-    bootstrap state; later DRBD promotion writes mode='drbd' through
-    bedrock storage promote.
+    The post-bootstrap state is always mode='local' with backend_path
+    = CLUSTER_MOUNT; later DRBD promotion (N=1→N=2) writes mode='drbd'.
 
     Idempotent — bedrock_state.tier_state is INSERT OR REPLACE."""
     from . import bedrock_state as _bs
-    for tier in TIERS:
-        backend_path = str(LOCAL_ROOT / tier)
-        _bs.tier_state(
-            tier=tier,
-            mode="local",
-            master=None,
-            peers=None,
-            backend_path=backend_path,
-        )
+    _bs.tier_state(
+        tier=CLUSTER_RESOURCE,
+        mode="local",
+        master=None,
+        peers=None,
+        backend_path=str(CLUSTER_MOUNT),
+    )
 
 
 # ── DRBD resource config ───────────────────────────────────────────────────
@@ -813,8 +877,8 @@ def mirror_tier_state_to_rqlite() -> None:
 #
 # DRBD node-ids are *permanent* for the lifetime of a resource (see invariant
 # #3 in tier_storage.md). We persist {peer_name: node_id} per resource in
-# /etc/bedrock/cluster.json under tiers.<tier>.drbd_node_ids so that adding,
-# removing, or rewriting peers never renumbers existing peers' IDs.
+# rqlite (the tier_drbd_node_ids table, folded into tiers.<resource>.drbd_node_ids)
+# so that adding, removing, or rewriting peers never renumbers existing peers' IDs.
 
 def get_drbd_node_id(resource: str, peer_name: str) -> int:
     """Return the persistent node-id for `peer_name` in this resource.
@@ -887,9 +951,14 @@ def render_drbd_res(resource: str, minor: int,
                     peers: list[dict]) -> str:
     """Render a DRBD resource file. peers = [{name, loopback_ip}, ...].
 
-    Node-ids are PERSISTED (not renumbered): each peer gets its sticky
-    id from cluster.json, allocated on first sight of that peer.
+    Uses EXTERNAL metadata (a separate meta LV per resource) and a port
+    in the 7700-7799 band — the same shape every Bedrock DRBD resource
+    uses (singleton + per-VM). Node-ids are PERSISTED (not renumbered):
+    each peer gets its sticky id allocated on first sight of that peer.
     """
+    data_lv = data_lv_for(resource)
+    meta_lv = meta_lv_for(resource)
+    port = drbd_port_for(minor)
     on_blocks = []
     peer_ids = {}  # for the connection-block render below
     for p in peers:
@@ -899,9 +968,9 @@ def render_drbd_res(resource: str, minor: int,
             f'  on {p["name"]} {{\n'
             f'    node-id   {nid};\n'
             f'    device    /dev/drbd{minor};\n'
-            f'    disk      /dev/{VG}/tier-{resource};\n'
-            f'    meta-disk /dev/{VG}/tier-{resource}-meta;\n'
-            f'    address   {p["loopback_ip"]}:{7000 + minor};\n'
+            f'    disk      /dev/{VG}/{data_lv};\n'
+            f'    meta-disk /dev/{VG}/{meta_lv};\n'
+            f'    address   {p["loopback_ip"]}:{port};\n'
             f'  }}\n'
         )
 
@@ -911,16 +980,20 @@ def render_drbd_res(resource: str, minor: int,
         for j in range(i + 1, len(peers)):
             conn_blocks.append(
                 f'  connection {{\n'
-                f'    host {peers[i]["name"]} address {peers[i]["loopback_ip"]}:{7000+minor};\n'
-                f'    host {peers[j]["name"]} address {peers[j]["loopback_ip"]}:{7000+minor};\n'
+                f'    host {peers[i]["name"]} address {peers[i]["loopback_ip"]}:{port};\n'
+                f'    host {peers[j]["name"]} address {peers[j]["loopback_ip"]}:{port};\n'
                 f'  }}\n'
             )
 
     body = (
-        f'resource tier-{resource} {{\n'
+        f'resource {resource} {{\n'
         f'  protocol C;\n'
         f'  options {{ on-no-quorum suspend-io; }}\n'
-        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; }}\n'
+        # rs-discard-granularity + discard-zeroes-if-aligned let DRBD
+        # pass TRIM/discard down through to the thin LV (SG-06), so a
+        # `fstrim` on the mounted FS reclaims pool blocks on every peer.
+        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; '
+        f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
@@ -934,13 +1007,22 @@ def render_drbd_res(resource: str, minor: int,
     return body
 
 
+def _minor_for(resource: str) -> int:
+    """DRBD minor for a tier_storage-managed resource. This module owns
+    only the cluster singleton; per-VM minors are owned by the VM sagas."""
+    if resource == CLUSTER_RESOURCE:
+        return CLUSTER_MINOR
+    raise KeyError(f"tier_storage manages only {CLUSTER_RESOURCE!r}, "
+                   f"not {resource!r}")
+
+
 def write_drbd_resource(resource: str, peers: list[dict]) -> None:
-    """Write /etc/drbd.d/tier-<resource>.res based on peer list.
+    """Write /etc/drbd.d/<resource>.res based on peer list.
     Honors persistent node-id assignments (see get_drbd_node_id).
     """
-    minor = DRBD_MINORS[resource]
+    minor = _minor_for(resource)
     Path("/etc/drbd.d").mkdir(parents=True, exist_ok=True)
-    p = Path(f"/etc/drbd.d/tier-{resource}.res")
+    p = Path(f"/etc/drbd.d/{resource}.res")
     p.write_text(render_drbd_res(resource, minor, peers))
 
 
@@ -1012,6 +1094,9 @@ def render_drbd_res_mesh(resource: str, minor: int,
       peers — [{name, loopback_ip}, ...]
       snapshot — view_builder.fold output, must include `paths`
     """
+    data_lv = data_lv_for(resource)
+    meta_lv = meta_lv_for(resource)
+    port = drbd_port_for(minor)
     on_blocks = []
     peer_ids: dict[str, int] = {}
     for p in peers:
@@ -1026,13 +1111,11 @@ def render_drbd_res_mesh(resource: str, minor: int,
             f'  on {p["name"]} {{\n'
             f'    node-id   {nid};\n'
             f'    device    /dev/drbd{minor};\n'
-            f'    disk      /dev/{VG}/tier-{resource};\n'
-            f'    meta-disk /dev/{VG}/tier-{resource}-meta;\n'
-            f'    address   {anchor_addr}:{7000 + minor};\n'
+            f'    disk      /dev/{VG}/{data_lv};\n'
+            f'    meta-disk /dev/{VG}/{meta_lv};\n'
+            f'    address   {anchor_addr}:{port};\n'
             f'  }}\n'
         )
-
-    port = 7000 + minor
 
     conn_blocks = []
     for i in range(len(peers)):
@@ -1096,10 +1179,11 @@ def render_drbd_res_mesh(resource: str, minor: int,
             )
 
     body = (
-        f'resource tier-{resource} {{\n'
+        f'resource {resource} {{\n'
         f'  protocol C;\n'
         f'  options {{ on-no-quorum suspend-io; }}\n'
-        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; }}\n'
+        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; '
+        f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
@@ -1114,18 +1198,18 @@ def render_drbd_res_mesh(resource: str, minor: int,
 
 
 def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
-    """Regenerate /etc/drbd.d/tier-*.res files for every tier whose
-    cluster.json mode is currently DRBD-backed (i.e. 'drbd' /
-    'drbd-3way') AND a resource file already exists. Idempotent
-    — silently no-ops in N=1 (no DRBD configured) or for tiers that
-    don't have an existing .res file. After a successful rewrite,
-    runs `drbdadm adjust tier-<resource>` so the running daemon picks
-    up the new path blocks without disrupting in-flight replication.
+    """Regenerate the cluster singleton's /etc/drbd.d/<resource>.res when
+    its rqlite mode is DRBD-backed (i.e. 'drbd' / 'drbd-3way') AND a
+    resource file already exists. Idempotent — silently no-ops in N=1
+    (no DRBD configured) or when the .res file is absent. After a
+    successful rewrite, runs `drbdadm adjust <resource>` so the running
+    daemon picks up the new path blocks without disrupting in-flight
+    replication.
 
     Called from the orchestrator subscriber on path-table changes.
-    The cost of a no-op call is one stat() per tier file, negligible.
+    The cost of a no-op call is one stat(), negligible.
 
-    Returns True if any resource file was actually rewritten.
+    Returns True if the resource file was actually rewritten.
     """
     drbd_dir = Path("/etc/drbd.d")
     if not drbd_dir.exists():
@@ -1141,54 +1225,51 @@ def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
         peers.append({
             "name": name,
             "loopback_ip": n.get("loopback_ip", ""),
-            "loopback_ip": n.get("loopback_ip", ""),
         })
 
     DRBD_MODES = {"drbd", "drbd-3way"}
-    rewritten = False
-    for resource, minor in DRBD_MINORS.items():
-        res_path = drbd_dir / f"tier-{resource}.res"
-        if not res_path.exists():
-            continue  # tier not promoted to DRBD on this node, skip
-        tier_state = tiers.get(resource) or {}
-        if (tier_state.get("mode") or "") not in DRBD_MODES:
-            continue  # tier was demoted; leave the file alone for now
+    resource = CLUSTER_RESOURCE
+    minor = CLUSTER_MINOR
+    res_path = drbd_dir / f"{resource}.res"
+    if not res_path.exists():
+        return False  # singleton not promoted to DRBD on this node
+    tier_state = tiers.get(resource) or {}
+    if (tier_state.get("mode") or "") not in DRBD_MODES:
+        return False  # demoted; leave the file alone for now
 
-        new_body = render_drbd_res_mesh(resource, minor, peers, snapshot)
-        try:
-            old_body = res_path.read_text()
-        except OSError:
-            old_body = ""
-        if new_body == old_body:
-            continue  # no change, no adjust needed
+    new_body = render_drbd_res_mesh(resource, minor, peers, snapshot)
+    try:
+        old_body = res_path.read_text()
+    except OSError:
+        old_body = ""
+    if new_body == old_body:
+        return False  # no change, no adjust needed
 
-        res_path.write_text(new_body)
-        rewritten = True
-        # Apply the new config to the running daemon. drbdadm adjust
-        # is supposed to be idempotent; if it fails (resource not
-        # currently up, etc.) we just log and move on — the next
-        # adjust attempt at promote/demote/peer-add will succeed.
-        try:
-            subprocess.run(
-                ["drbdadm", "adjust", f"tier-{resource}"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except Exception:
-            pass
-    return rewritten
+    res_path.write_text(new_body)
+    # Apply the new config to the running daemon. drbdadm adjust is
+    # idempotent; if it fails (resource not currently up, etc.) we just
+    # move on — the next adjust at promote/demote/peer-add will succeed.
+    try:
+        subprocess.run(
+            ["drbdadm", "adjust", resource],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        pass
+    return True
 
 
 # ── Local LV → DRBD migration (preserves filesystem via external metadata) ──
 
-def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
-    """On the master, convert a local-mounted LV into a DRBD primary that
-    still contains the same XFS/data — uses external metadata so the on-disk
-    filesystem layout is unchanged.
+def promote_local_to_drbd_master(resource: str, peers: list[dict]) -> None:
+    """On the master, convert the cluster singleton's local data into a
+    DRBD primary that holds the same XFS/data — external metadata keeps
+    the DRBD device the same size as the data LV.
 
-    Critical-tier subtlety: at N=1, /var/lib/bedrock/cluster is just a
-    regular directory on the root FS containing filer's leveldb3 +
-    arbiter rqlite data. Mounting the DRBD device over the same path
-    hides those files. Preserve them by:
+    At N=1 /var/lib/bedrock/cluster is just a regular directory on the
+    root FS containing the arbiter rqlite + filer leveldb3 + S3 IAM
+    data. Mounting the DRBD device over the same path hides those files,
+    so we preserve them by:
       1. Stop services that hold the singleton dir open (filer, s3,
          arbiter rqlite)
       2. Snapshot the directory contents to a tmp path
@@ -1196,27 +1277,28 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
       4. Restore the snapshot into the DRBD volume
       5. Restart services
     """
-    assert tier == "critical", tier
-    minor = DRBD_MINORS[tier]
-    local_mount = str(LOCAL_ROOT / tier)
-    # critical-tier DRBD volume mounts at /var/lib/bedrock/cluster
-    # (the cluster-singleton root, matches cluster_arbiter.MOUNT_POINT).
-    # That's where the filer's leveldb3 + arbiter rqlite data live so
-    # they follow the master role via DRBD primary/secondary handoff.
-    drbd_mount = "/var/lib/bedrock/cluster"
+    assert resource == CLUSTER_RESOURCE, resource
+    minor = _minor_for(resource)
+    # The DRBD volume mounts at /var/lib/bedrock/cluster (matches
+    # cluster_arbiter.MOUNT_POINT) — where the filer leveldb3 + arbiter
+    # rqlite data live so they follow the master role via DRBD handoff.
+    drbd_mount = str(CLUSTER_MOUNT)
     drbd_dev = f"/dev/drbd{minor}"
 
-    # 1. Create the meta LV (tiny, thick) — lives outside the thin pool so
-    #    DRBD never sees ENOSPC on metadata writes.
-    ensure_meta_lv(f"tier-{tier}-meta")
+    # 1. Create the data + meta LV pair. The meta LV is thin external
+    #    metadata (one per resource, like every Bedrock DRBD resource);
+    #    the data LV is a fresh thin LV the snapshot is restored into.
+    ensure_thin_lv(data_lv_for(resource), CLUSTER_SIZE_GB)
+    ensure_meta_lv(meta_lv_for(resource),
+                   _cluster_meta_size_mb())
 
     # 2. Write the resource config (mesh of all peers)
-    write_drbd_resource(tier, peers)
+    write_drbd_resource(resource, peers)
 
-    # 3. Snapshot the existing /var/lib/bedrock/cluster contents (filer
-    #    leveldb3 + anything else the singletons wrote at N=1) before
-    #    mounting the DRBD device over the same path. Stop the
-    #    singletons first so files are quiescent.
+    # 3. Snapshot the existing /var/lib/bedrock/cluster contents (arbiter
+    #    rqlite + filer leveldb3 + anything else the singletons wrote at
+    #    N=1) before mounting the DRBD device over the same path. Stop
+    #    the singletons first so files are quiescent.
     singleton_units = ("bedrock-weed-s3", "bedrock-weed-filer",
                        "bedrock-rqlited-arbiter")
     for unit in singleton_units:
@@ -1232,9 +1314,9 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
         run(f"cp -a {drbd_mount}/. {snap_dir}/")
         run("sync", check=False)
 
-    # 4. Unmount local — but only if it's currently mounted there
-    if run_ok(f"mountpoint -q {local_mount}"):
-        run(f"umount {local_mount}")
+    # 4. Unmount the singleton dir if it happened to be its own mount.
+    if run_ok(f"mountpoint -q {drbd_mount}"):
+        run(f"umount {drbd_mount}")
 
     # 5. Initialize DRBD metadata + bring up the resource as primary
     #    --force, BUT skip create-md if the resource is already
@@ -1245,24 +1327,30 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
     #    ``drbdadm status`` — anything other than "no resources
     #    defined!" means the resource exists.
     rc_chk = subprocess.run(
-        ["drbdadm", "status", f"tier-{tier}"],
+        ["drbdadm", "status", resource],
         capture_output=True, text=True,
     )
     already_configured = (rc_chk.returncode == 0 and
                           "no resources" not in (rc_chk.stderr or "").lower())
     if not already_configured:
-        run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
-        run(f"drbdadm up tier-{tier}")
+        run(f"drbdadm create-md {resource} --force --max-peers=7")
+        run(f"drbdadm up {resource}")
     # drbdadm up on an already-up resource fails with "Minor or
     # volume exists already" (rc=10). Skip when status confirms the
     # resource is already configured; the promote step below is the
     # one that actually does the work this idempotent retry needs.
     # ``drbdadm primary --force`` is idempotent — it's a no-op if
     # we're already Primary.
-    run(f"drbdadm primary --force tier-{tier}")
+    run(f"drbdadm primary --force {resource}")
 
     # 6. Mount the DRBD device — fresh empty XFS at first promote.
     Path(drbd_mount).mkdir(parents=True, exist_ok=True)
+    if run_ok(f"blkid -s TYPE -o value {drbd_dev} 2>/dev/null"):
+        fstype = run(f"blkid -s TYPE -o value {drbd_dev}", check=False)
+    else:
+        fstype = ""
+    if fstype != "xfs":
+        run(f"mkfs.xfs -f {drbd_dev}")
     run(f"mount -t xfs {drbd_dev} {drbd_mount}")
 
     # 7. Restore the singleton-dir snapshot INTO the DRBD volume so the
@@ -1272,21 +1360,14 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
         run("sync", check=False)
         run(f"rm -rf {snap_dir}", check=False)
 
-    # 8. Replace fstab line: local mount -> DRBD mount
+    # 8. fstab line for the DRBD mount (idempotent — drop any prior one).
     fstab = Path("/etc/fstab")
     text = fstab.read_text() if fstab.exists() else ""
-    new_lines = []
-    for line in text.splitlines():
-        if local_mount in line and "tier-" in line:
-            continue  # drop old local-LV line
-        new_lines.append(line)
+    new_lines = [l for l in text.splitlines() if drbd_mount not in l]
     new_lines.append(f"{drbd_dev} {drbd_mount} xfs defaults,discard,nofail,_netdev 0 0")
     fstab.write_text("\n".join(new_lines).rstrip() + "\n")
 
-    # 9. Atomic symlink swap: /bedrock/<tier> -> drbd mount
-    atomic_symlink(drbd_mount, PUBLIC_ROOT / tier)
-
-    # 10. Restart the singletons so they pick up the restored data.
+    # 9. Restart the singletons so they pick up the restored data.
     #     cluster_arbiter.converge() on the next subscriber tick will
     #     re-apply the full set anyway, but starting them inline keeps
     #     the test happy without a 5s extra wait.
@@ -1294,28 +1375,37 @@ def promote_local_to_drbd_master(tier: str, peers: list[dict]) -> None:
         run(f"systemctl start {unit}.service 2>/dev/null", check=False)
 
 
-def join_drbd_peer(tier: str, peers: list[dict]) -> None:
-    """On a peer (not the source of data): create the LV (if needed), write
-    DRBD config, bring up as Secondary so it can resync from the primary.
+def _cluster_meta_size_mb() -> int:
+    """External-meta LV size for the cluster singleton, using the same
+    DRBD9 formula every resource uses (header + AL + max_peers bitmap)."""
+    _cfg, _lvm = _drbd_helpers()
+    return _lvm.meta_size_mb_for(CLUSTER_SIZE_GB)
+
+
+def join_drbd_peer(resource: str, peers: list[dict]) -> None:
+    """On a peer (not the source of data): create the LV pair (if needed),
+    write DRBD config, bring up as Secondary so it can resync from the
+    primary.
 
     Idempotent: drbdadm up on an already-up resource emits
     "Minor or volume exists already" — that's success for our purposes
     (the attach + peer-connect did succeed; the redundant
     drbdsetup new-minor is the noisy fail).
     """
-    minor = DRBD_MINORS[tier]
-    lv = f"tier-{tier}"
-    size = TIER_SIZE_GB[tier]
+    tier = resource
+    minor = _minor_for(resource)
+    lv = data_lv_for(resource)
+    size = CLUSTER_SIZE_GB
 
     ensure_thin_lv(lv, size)
-    ensure_meta_lv(f"tier-{tier}-meta")
-    write_drbd_resource(tier, peers)
+    ensure_meta_lv(meta_lv_for(resource), _cluster_meta_size_mb())
+    write_drbd_resource(resource, peers)
     # create-md can fail if metadata already exists from a previous
     # attempt; --force overwrites. Either succeeds.
-    run(f"drbdadm create-md tier-{tier} --force --max-peers=7")
+    run(f"drbdadm create-md {resource} --force --max-peers=7")
     # drbdadm up: if already up, swallow the "exists already" error.
     r = subprocess.run(
-        f"drbdadm up tier-{tier}",
+        f"drbdadm up {resource}",
         shell=True, capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -1323,26 +1413,25 @@ def join_drbd_peer(tier: str, peers: list[dict]) -> None:
         combined = (r.stdout or "") + (r.stderr or "")
         if "exists already" not in combined and "in use" not in combined:
             raise RuntimeError(
-                f"command failed (rc={r.returncode}): drbdadm up tier-{tier}\n"
+                f"command failed (rc={r.returncode}): drbdadm up {resource}\n"
                 f"  stdout: {r.stdout}\n  stderr: {r.stderr}"
             )
     # Don't promote — the master is primary. Initial sync starts automatically.
 
 
-# ── N=1 → N=2 critical-tier promotion ──────────────────────────────────────
+# ── N=1 → N=2 cluster-singleton promotion ───────────────────────────────────
 
 def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
     """Master-side N=1 -> N=2 transition.
 
-    Only the **critical** tier gets DRBD-replicated — it hosts the
-    filer's leveldb3 + any other cluster singleton metadata, and
-    the mgmt-master role moves it via cluster_arbiter. Bulk is
-    served by SeaweedFS volumes (one per node, RF managed by
-    SeaweedFS); scratch is per-node local LVM.
+    The cluster singleton (`cluster` DRBD resource) gets DRBD-replicated
+    — it hosts the arbiter rqlite + filer leveldb3 + S3 IAM, and the
+    mgmt-master role moves it via cluster_arbiter. The SeaweedFS volume
+    store stays a local LV (SeaweedFS replicates bytes via collections).
 
     peer = {"name": "...", "loopback_ip": "..."}
     """
-    print("  [tier] N=2 master transition: promote critical tier to DRBD primary")
+    print("  [tier] N=2 master transition: promote cluster singleton to DRBD primary")
 
     self_state = load_state()
     self_name = self_state.get("node_name", "node1")
@@ -1351,8 +1440,8 @@ def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
         peer,
     ]
 
-    promote_local_to_drbd_master("critical", peers)
-    set_tier_state("critical", mode="drbd", master=self_name,
+    promote_local_to_drbd_master(CLUSTER_RESOURCE, peers)
+    set_tier_state(CLUSTER_RESOURCE, mode="drbd", master=self_name,
                    peers=[p["name"] for p in peers])
 
     return {"peers": peers}
@@ -1360,27 +1449,16 @@ def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
 
 def transition_to_n2_peer(self_loopback_ip: str, master: dict,
                             peers: list[dict]) -> None:
-    """Peer-side N=1 -> N=2 transition: unmount local critical LV, join
-    DRBD as Secondary so the initial sync from master overwrites our
-    XFS. Called after setup_n1() on the joiner.
+    """Peer-side N=1 -> N=2 transition: join the cluster-singleton DRBD
+    as Secondary so the initial sync from master carries the data over.
+    Called after setup_n1() on the joiner.
     """
-    print("  [tier] N=2 peer transition: unmount local critical, join DRBD secondary")
-    local_mount = LOCAL_ROOT / "critical"
-    if run_ok(f"mountpoint -q {local_mount}"):
-        run(f"umount {local_mount}", check=False)
-    fstab = Path("/etc/fstab")
-    if fstab.exists():
-        new = []
-        for line in fstab.read_text().splitlines():
-            if str(local_mount) in line and "tier-" in line:
-                continue
-            new.append(line)
-        fstab.write_text("\n".join(new).rstrip() + "\n")
-    join_drbd_peer("critical", peers)
+    print("  [tier] N=2 peer transition: join cluster-singleton DRBD secondary")
+    join_drbd_peer(CLUSTER_RESOURCE, peers)
 
 
-def promote_critical_to_3way(third_peer: dict) -> None:
-    """Add a third peer to the critical DRBD resource.
+def promote_cluster_to_3way(third_peer: dict) -> None:
+    """Add a third peer to the cluster-singleton DRBD resource.
 
     Run on the master. Assumes the resource was created with --max-peers=7
     so adding a peer is just a config update + drbdadm adjust + new node
@@ -1395,8 +1473,8 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     new .res to every node that participates in the resource.)
     """
     # Update resource config to include third peer
-    state_critical = get_tier_state("critical")
-    existing_peer_names = state_critical.get("peers", [])
+    state_cluster = get_tier_state(CLUSTER_RESOURCE)
+    existing_peer_names = state_cluster.get("peers", [])
     cluster = load_cluster()
     nodes = cluster.get("nodes", {})
     peers = []
@@ -1405,9 +1483,10 @@ def promote_critical_to_3way(third_peer: dict) -> None:
         peers.append({"name": name, "loopback_ip": node.get("loopback_ip", "")})
 
     # Local: write new config + adjust kernel.
-    write_drbd_resource("critical", peers)
-    new_res = Path(f"/etc/drbd.d/tier-critical.res").read_text()
-    run("drbdadm adjust tier-critical")
+    write_drbd_resource(CLUSTER_RESOURCE, peers)
+    res_file = f"/etc/drbd.d/{CLUSTER_RESOURCE}.res"
+    new_res = Path(res_file).read_text()
+    run(f"drbdadm adjust {CLUSTER_RESOURCE}")
 
     # Distribute identical config to every existing peer (the new
     # third peer's join_drbd_peer will write its own; we don't need
@@ -1416,16 +1495,16 @@ def promote_critical_to_3way(third_peer: dict) -> None:
     import base64
     b = base64.b64encode(new_res.encode()).decode()
     for peer_name in existing_peer_names:
-        if peer_name == nodes.get(state_critical.get("master", ""), {}).get("name", ""):
+        if peer_name == nodes.get(state_cluster.get("master", ""), {}).get("name", ""):
             continue   # master already adjusted above
         peer_host = nodes.get(peer_name, {}).get("host")
         if not peer_host:
             continue
         ssh(peer_host,
-            f"echo {b} | base64 -d > /etc/drbd.d/tier-critical.res")
-        ssh(peer_host, "drbdadm adjust tier-critical", check=False)
+            f"echo {b} | base64 -d > {res_file}")
+        ssh(peer_host, f"drbdadm adjust {CLUSTER_RESOURCE}", check=False)
 
-    set_tier_state("critical", mode="drbd",
+    set_tier_state(CLUSTER_RESOURCE, mode="drbd",
                     peers=[p["name"] for p in peers])
 
 
@@ -1453,29 +1532,27 @@ def drbd_remove_peer(
     drbdadm adjust is unreliable shrinking full-mesh resources).
 
     Args:
-        resource:         FULL DRBD resource name. For tier resources
-                          can be just the short name "bulk" if
-                          `bedrock_resource=True` (default), in which
-                          case "tier-bulk" is the actual resource name.
-                          For VM resources pass the full name like
-                          "vm-web1-disk0" with `bedrock_resource=False`.
+        resource:         DRBD resource name. For the cluster singleton
+                          pass "cluster" with `bedrock_resource=True`
+                          (default). For VM resources pass the full name
+                          like "vm-web1-disk0" with `bedrock_resource=False`.
         leaving_peer_name: peer's hostname as it appears in the .res
         surviving_hosts:  list of mgmt-LAN hosts (or any reachable IP)
                           to SSH into for the per-node operations
         surviving_peers:  list of {"name": ..., "loopback_ip": ...} for the
                           peers that REMAIN. Required if
                           `bedrock_resource=True` so we can render the
-                          new tier config. Optional otherwise.
+                          new singleton config. Optional otherwise.
         new_res_text:     Pre-rendered .res file content to distribute.
                           If provided, overrides the auto-rendering for
-                          tier resources. For VM resources, callers
-                          render their own config and pass it here.
+                          bedrock-managed resources. For VM resources,
+                          callers render their own config and pass it here.
                           If None and `bedrock_resource=False`, no
                           on-disk config update happens (caller is
                           responsible).
-        bedrock_resource: True for tier-X resources (auto-render via
-                          render_drbd_res); False for VM disks or
-                          other non-tier DRBD resources.
+        bedrock_resource: True for the cluster singleton (auto-render via
+                          render_drbd_res); False for VM disks or other
+                          resources whose config the caller manages.
 
     Crash-safety: when an on-disk config is provided, it's distributed
     BEFORE the kernel-state mutation so a power loss leaves persistent
@@ -1484,9 +1561,9 @@ def drbd_remove_peer(
     See tier_storage.md "drbd_remove_peer" for the command-by-command
     breakdown and source citations.
     """
-    # Resolve the actual DRBD resource name for kernel commands and
-    # the .res filename. For tier resources, "bulk" → "tier-bulk".
-    full_res = f"tier-{resource}" if bedrock_resource else resource
+    # The resource name is the DRBD resource name verbatim (no prefix —
+    # the cluster singleton is "cluster", VM disks are "vm-*-diskN").
+    full_res = resource
 
     print(f"  [tier] drbd_remove_peer({full_res}, leaving={leaving_peer_name})")
 
@@ -1495,7 +1572,7 @@ def drbd_remove_peer(
         if surviving_peers is None:
             raise ValueError(
                 "drbd_remove_peer(bedrock_resource=True) requires "
-                "surviving_peers to render the new tier config.")
+                "surviving_peers to render the new singleton config.")
         # render_drbd_res honors persistent node-ids (invariant #3).
         write_drbd_resource(resource, surviving_peers)
         new_res_text = Path(f"/etc/drbd.d/{full_res}.res").read_text()
@@ -1587,22 +1664,21 @@ def drbd_remove_peer(
         print(f"  [tier] drbd_remove_peer({full_res}): done.")
 
 
-def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
-    """Demote a stand-alone DRBD resource on this node back to a plain
-    local LV mount.
+def drbd_demote_to_local(remove_meta: bool = False) -> bool:
+    """Demote the stand-alone cluster-singleton DRBD resource on this
+    node back to a plain local LV mount at /var/lib/bedrock/cluster.
 
-    Pre: tier is a tier-<tier> DRBD resource currently UP on this node
-    with no other peers connected. The data LV's XFS is preserved
-    (external metadata never touched it).
+    Pre: the `cluster` DRBD resource is currently UP on this node with
+    no other peers connected. The data LV's XFS is preserved (external
+    metadata never touched it).
 
     Effects:
-      1. Remove /etc/drbd.d/tier-<tier>.res so boot won't auto-up
+      1. Remove /etc/drbd.d/cluster.res so boot won't auto-up
       2. Update /etc/fstab: replace DRBD-mount line with local-LV line
-      3. drbdsetup down tier-<tier> (resource leaves kernel state)
-      4. mount /dev/<vg>/tier-<tier> at /var/lib/bedrock/local/<tier>
-      5. atomic_symlink /bedrock/<tier> → /var/lib/bedrock/local/<tier>
-      6. set_tier_state(<tier>, mode="local")
-      7. (optional) lvremove tier-<tier>-meta
+      3. drbdadm down cluster (resource leaves kernel state)
+      4. mount /dev/<vg>/bedrock-data-cluster at CLUSTER_MOUNT
+      5. set_tier_state(cluster, mode="local")
+      6. (optional) lvremove bedrock-meta-cluster
 
     Crash-safety: persistent state is mutated *before* the kernel-side
     drbdadm down. A reboot mid-flight finds .res gone + fstab pointing
@@ -1613,14 +1689,13 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
     (e.g. resource still has peers — caller should drbd_remove_peer
     first).
     """
-    print(f"  [tier] drbd_demote_to_local({tier})")
+    res = CLUSTER_RESOURCE
+    print(f"  [tier] drbd_demote_to_local({res})")
 
-    res = f"tier-{tier}"
-    minor = DRBD_MINORS[tier]
+    minor = _minor_for(res)
     drbd_dev = f"/dev/drbd{minor}"
-    drbd_mount = MOUNTS_ROOT / f"{tier}-drbd"
-    local_mount = LOCAL_ROOT / tier
-    data_lv = f"/dev/{VG}/tier-{tier}"
+    mount = str(CLUSTER_MOUNT)
+    data_lv = f"/dev/{VG}/{data_lv_for(res)}"
 
     # 0. Pre-conditions: resource exists, no other peers connected
     state = run(f"drbdsetup status {res} 2>&1", check=False)
@@ -1628,7 +1703,7 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
         print(f"  [tier] {res} not in kernel state — already down. "
               f"Proceeding to local-LV mount only.")
     elif "role:" in state:
-        # Crude: any "<peer-name> role:" line means a peer is connected
+        # Crude: any "<peer-name> role:" line means a peer is connected.
         # If there are no peer-role lines, only the local _this_host
         # line, we're stand-alone.
         peer_lines = [l for l in state.splitlines()
@@ -1645,59 +1720,51 @@ def drbd_demote_to_local(tier: str, remove_meta: bool = False) -> bool:
     #    del-minor→del-resource) using the .res file. Skipping this
     #    and using drbdsetup directly leaves the LV chained to a
     #    half-torn-down DRBD device. (See lessons-log L21.)
-    if run_ok(f"mountpoint -q {drbd_mount}"):
-        run(f"umount {drbd_mount}", check=False)
+    if run_ok(f"mountpoint -q {mount}"):
+        run(f"umount {mount}", check=False)
     run(f"drbdadm down {res}", check=False)
 
-    # 3. NOW move .res aside. The crash window between (2) and (3) is
-    #    very brief, and even if a reboot lands here drbd-utils won't
-    #    re-up because the resource is already-down at boot.
+    # 2. NOW move .res aside. The crash window here is very brief, and
+    #    even if a reboot lands here drbd-utils won't re-up because the
+    #    resource is already-down at boot.
     res_file = Path(f"/etc/drbd.d/{res}.res")
     backup_file = Path(f"/etc/drbd.d/{res}.res.demoted")
     if res_file.exists():
         res_file.rename(backup_file)
 
-    # 4. Update fstab: drop the DRBD-mount line, add the local-LV line
+    # 3. Update fstab: drop the DRBD-mount line, add the local-LV line.
     fstab = Path("/etc/fstab")
     text = fstab.read_text() if fstab.exists() else ""
-    new_lines = []
-    for line in text.splitlines():
-        if str(drbd_mount) in line:
-            continue   # drop the DRBD line
-        if str(local_mount) in line and "tier-" in line:
-            continue   # drop any pre-existing local-LV line for this tier
-        new_lines.append(line)
+    new_lines = [l for l in text.splitlines()
+                 if mount not in l and data_lv not in l]
     new_lines.append(
-        f"{data_lv} {local_mount} xfs "
+        f"{data_lv} {mount} xfs "
         "defaults,discard,nofail,x-systemd.device-timeout=10s 0 0"
     )
     fstab.write_text("\n".join(new_lines).rstrip() + "\n")
 
-    # 5. Mount the local LV (it has the same XFS we ran the cluster on,
+    # 4. Mount the local LV (it has the same XFS the cluster ran on,
     #    byte-for-byte preserved by external-metadata semantics).
-    Path(local_mount).mkdir(parents=True, exist_ok=True)
-    if not run_ok(f"mountpoint -q {local_mount}"):
-        run(f"mount {local_mount}")
+    Path(mount).mkdir(parents=True, exist_ok=True)
+    if not run_ok(f"mountpoint -q {mount}"):
+        run(f"mount {mount}")
 
-    # 6. Swap the public symlink atomically
-    atomic_symlink(str(local_mount), PUBLIC_ROOT / tier)
-
-    # 7. Persist in cluster.json
-    set_tier_state(tier, mode="local",
+    # 5. Persist in rqlite.
+    set_tier_state(res, mode="local",
                    master=None,
-                   backend_path=str(local_mount))
+                   backend_path=mount)
 
-    # 8. Optional cleanup of the meta LV. Default: keep it, in case the
+    # 6. Optional cleanup of the meta LV. Default: keep it, in case the
     #    operator wants to re-promote later. Removing it requires the
     #    resource to be fully down (it is now).
     if remove_meta:
-        run(f"lvremove -f {VG}/tier-{tier}-meta", check=False)
+        run(f"lvremove -f {VG}/{meta_lv_for(res)}", check=False)
 
     # Backup .res can be removed too (it's no longer a resource)
     if backup_file.exists():
         backup_file.unlink()
 
-    print(f"  [tier] {tier}: now local LV at {local_mount}")
+    print(f"  [tier] {res}: now local LV at {mount}")
     return True
 
 
@@ -1710,13 +1777,13 @@ def node_reset_local() -> None:
 
     What this clears:
       - Stops bedrock services (mgmt/vm/vl/weed-*)
-      - Tears down DRBD resources + removes /etc/drbd.d/tier-*.res
+      - Tears down DRBD resources + removes /etc/drbd.d/*.res
       - Unmounts everything bedrock-related (FUSE mounts, DRBD, local LVs)
       - Drops fstab entries for bedrock mounts
-      - Removes tier LVs from the bedrock VG (data goes away — operator
-        already accepted this by running remove-peer)
-      - Removes /bedrock/* symlinks and /opt/bedrock/{mgmt,iso,data}
-      - Drops /etc/bedrock/cluster.json
+      - Removes the cluster + weed-volume LVs from the resolved VG
+        (data goes away — operator already accepted this by running
+        remove-peer)
+      - Removes /opt/bedrock/{mgmt,iso,data}
       - Truncates /etc/bedrock/state.json to {hardware, bootstrap_done}
 
     What this preserves:
@@ -1758,12 +1825,14 @@ def node_reset_local() -> None:
     # StartLimitInterval cooldown.
     run(f"systemctl reset-failed {' '.join(services)} 2>/dev/null", check=False)
 
-    # 2. DRBD resources down + .res cleanup. Best-effort.
-    for tier in ("critical",):
-        run(f"drbdadm down tier-{tier} 2>/dev/null", check=False)
-        run(f"drbdsetup down tier-{tier} 2>/dev/null", check=False)
-    run("rm -f /etc/drbd.d/tier-*.res /etc/drbd.d/tier-*.res.removed-* "
-        "2>/dev/null", check=False)
+    # 2. DRBD resources down + .res cleanup. Best-effort. The cluster
+    #    singleton is resource `cluster`; per-VM disks are `vm-*`. We
+    #    drop every configured resource via `drbdadm down all`.
+    run("drbdadm down all 2>/dev/null", check=False)
+    run(f"drbdadm down {CLUSTER_RESOURCE} 2>/dev/null", check=False)
+    run(f"drbdsetup down {CLUSTER_RESOURCE} 2>/dev/null", check=False)
+    run("rm -f /etc/drbd.d/*.res /etc/drbd.d/*.res.removed-* "
+        "/etc/drbd.d/*.res.demoted 2>/dev/null", check=False)
 
     # 3. Unmount anything bedrock-touched. Two passes (normal then lazy)
     #    to handle any stuck handles per L16.
@@ -1771,11 +1840,8 @@ def node_reset_local() -> None:
     #    must come FIRST and BEFORE drbdadm down (which would otherwise
     #    refuse because the device is "open" by the mount).
     mounts = (
-        "/var/lib/bedrock/cluster",
-        "/var/lib/bedrock/mounts/critical-drbd",
-        "/var/lib/bedrock/local/scratch",
-        "/var/lib/bedrock/local/bulk",
-        "/var/lib/bedrock/local/critical",
+        str(CLUSTER_MOUNT),
+        str(WEED_VOLUME_MOUNT),
         "/var/lib/bedrock/seaweedfs",
         "/mnt/bedrock",
         "/mnt/isos",  # legacy path; kept in cleanup list during transition
@@ -1789,17 +1855,16 @@ def node_reset_local() -> None:
     # umount → drbdadm down → rm .res. Without the second drbdadm down,
     # /dev/drbd1101 stays attached and the next create-md fails with
     # "Device '1101' is configured".
-    for tier in ("critical",):
-        run(f"drbdadm down tier-{tier} 2>/dev/null", check=False)
-        run(f"drbdsetup down tier-{tier} 2>/dev/null", check=False)
-        run(f"drbdsetup detach {tier} 2>/dev/null", check=False)
-        run(f"drbdsetup del-resource tier-{tier} 2>/dev/null", check=False)
+    run(f"drbdadm down {CLUSTER_RESOURCE} 2>/dev/null", check=False)
+    run(f"drbdsetup down {CLUSTER_RESOURCE} 2>/dev/null", check=False)
+    run(f"drbdsetup detach {CLUSTER_RESOURCE} 2>/dev/null", check=False)
+    run(f"drbdsetup del-resource {CLUSTER_RESOURCE} 2>/dev/null", check=False)
 
     # 4. Drop fstab lines for anything bedrock-related.
     fstab = Path("/etc/fstab")
     if fstab.exists():
-        tokens = ("/var/lib/bedrock", "tier-", "/mnt/bedrock",
-                  "/mnt/isos", " /bedrock/")
+        tokens = ("/var/lib/bedrock", "bedrock-data-", "bedrock-meta-",
+                  WEED_VOLUME_LV, "/mnt/bedrock", "/mnt/isos")
         new = [l for l in fstab.read_text().splitlines()
                if not any(t in l for t in tokens)]
         fstab.write_text("\n".join(new).rstrip() + "\n")
@@ -1831,19 +1896,23 @@ def node_reset_local() -> None:
     # Mesh daemon runtime state — peer list, witness state.
     run("rm -rf /run/bedrock 2>/dev/null", check=False)
 
-    # 6. Tier LVs. Lvremove fails harmlessly if the LV is already gone.
-    for lv in ("tier-scratch", "tier-bulk", "tier-critical",
-               "tier-critical-meta"):
-        run(f"lvremove -fy bedrock/{lv} 2>/dev/null", check=False)
-
-    # 8. /bedrock/* symlinks
-    for tier in TIERS:
-        link = PUBLIC_ROOT / tier
-        try:
-            if link.is_symlink() or link.exists():
-                link.unlink()
-        except OSError:
-            pass
+    # 6. Bedrock LVs in the RESOLVED VG (never hardcode 'bedrock').
+    #    Lvremove fails harmlessly if the LV is already gone. The cluster
+    #    singleton pair + the weed-volume LV + every per-VM data/meta LV
+    #    (bedrock-data-vm-*/bedrock-meta-vm-*) go away — the operator
+    #    accepted this by running remove-peer.
+    fixed_lvs = (data_lv_for(CLUSTER_RESOURCE), meta_lv_for(CLUSTER_RESOURCE),
+                 WEED_VOLUME_LV)
+    for lv in fixed_lvs:
+        run(f"lvremove -fy {VG}/{lv} 2>/dev/null", check=False)
+    # Per-VM LVs: enumerate by name pattern, then lvremove each.
+    vm_lvs = run(
+        f"lvs --noheadings -o lv_name {VG} 2>/dev/null | "
+        f"grep -E '^\\s*bedrock-(data|meta)-vm-' || true", check=False)
+    for lv in vm_lvs.split():
+        lv = lv.strip()
+        if lv:
+            run(f"lvremove -fy {VG}/{lv} 2>/dev/null", check=False)
 
     # 9. Mgmt-side /opt/bedrock/* subdirs that came from mgmt_install
     for sub in ("mgmt", "iso", "data", "vm", "vl"):
@@ -1854,9 +1923,9 @@ def node_reset_local() -> None:
         "/etc/systemd/system/mnt-isos.{mount,automount} 2>/dev/null",
         check=False)
 
-    # 10. cluster.json gone; state.json truncated to bootstrap-only
-    if CLUSTER_JSON.exists():
-        CLUSTER_JSON.unlink()
+    # 10. state.json truncated to bootstrap-only (cluster.json was
+    #     removed cluster-wide in 2026-05-26; state.json is the only
+    #     local cluster-related file now).
     if STATE_JSON.exists():
         try:
             s = json.loads(STATE_JSON.read_text())

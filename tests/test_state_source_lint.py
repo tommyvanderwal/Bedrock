@@ -37,7 +37,6 @@ ALLOWED = {
     "installer/lib/operator_auth.py",
     "installer/lib/join_handshake.py",
     "installer/lib/tier_storage.py",
-    "installer/lib/vm.py",
     # mgmt is a peer of bedrock_d at the moment; treat as legacy
     # until Stage 8 splits it.
     "mgmt/app.py",
@@ -48,6 +47,12 @@ ALLOWED = {
     # via lib.rqlite_client through the sys.path shim today; they move
     # onto bedrock_d.state when the cutover lands and this list shrinks.
     "bedrock_d/orchestrator/vm_failover.py",
+    # Self-heal repair loop + its replica_repair saga: same in-flight
+    # cutover band as vm_failover — read cluster state + drive DRBD
+    # replica restoration via lib.rqlite_client/bedrock_state through
+    # the shim today; move onto bedrock_d.state when the cutover lands.
+    "bedrock_d/orchestrator/self_heal.py",
+    "bedrock_d/orchestrator/replica_repair.py",
     "bedrock_d/vm/create.py",
     "bedrock_d/vm/destroy.py",
     "bedrock_d/vm/grow.py",

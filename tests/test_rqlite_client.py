@@ -289,13 +289,26 @@ class TestApplySchema(unittest.TestCase):
         finally:
             os.unlink(tmp_path)
 
-        # Two CREATE TABLE statements + the INSERT OR IGNORE meta row
-        self.assertEqual(client.execute.call_count, 2)
+        # Contract: apply_schema runs (1) the statement batch as ONE
+        # transactional execute, (2) the INSERT OR IGNORE meta row, then
+        # (3+) one additive ALTER TABLE per column that CREATE TABLE IF
+        # NOT EXISTS can't add to a pre-existing table. Today: vms.priority
+        # (self-heal) and nodes.state (C1 election-denominator lifecycle).
+        # With a mock client the PRAGMA check reports each column absent,
+        # so every ALTER is issued — so call_count = 2 + (#migrations).
+        self.assertEqual(client.execute.call_count, 4)
         first_call_args = client.execute.call_args_list[0]
         statements = first_call_args.args[0]
         self.assertEqual(len(statements), 2)
         self.assertIn("CREATE TABLE a", statements[0])
         self.assertIn("CREATE TABLE b", statements[1])
+        # The trailing executes are the additive column migrations.
+        alter_sqls = [client.execute.call_args_list[i].args[0]
+                      for i in (2, 3)]
+        self.assertTrue(any("ALTER TABLE vms ADD COLUMN priority" in s
+                            for s in alter_sqls))
+        self.assertTrue(any("ALTER TABLE nodes ADD COLUMN state" in s
+                            for s in alter_sqls))
 
 
 class TestAsyncClient(unittest.IsolatedAsyncioTestCase):

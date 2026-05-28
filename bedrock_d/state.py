@@ -65,6 +65,7 @@ from lib.rqlite_client import (  # noqa: F401, E402
 from lib.bedrock_state import (  # noqa: F401, E402
     cluster_init,
     node_register,
+    node_set_active,
     node_loopback,
     node_unregister,
     node_maintenance,
@@ -98,7 +99,8 @@ __all__ = [
     "RqliteError", "RqliteRowError",
     "apply_schema", "bump_revision",
     # cluster-state mutators
-    "cluster_init", "node_register", "node_loopback", "node_unregister",
+    "cluster_init", "node_register", "node_set_active", "node_loopback",
+    "node_unregister",
     "node_maintenance", "operator_set", "obs_backends_set",
     "set_cluster_name", "set_mgmt_master", "tier_state",
     "drbd_node_id_assigned", "drbd_node_id_freed",

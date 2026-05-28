@@ -187,9 +187,16 @@ refresh_payload() {
         cp "$INSTALLER/binaries/vm_exporter.py" "$PAYLOAD_DIR/binaries/vm_exporter.py"
     fi
 
-    # Lib + configs.
-    cp "$INSTALLER/lib/"*.py   "$PAYLOAD_DIR/lib/"
-    cp "$INSTALLER/lib/"*.sql  "$PAYLOAD_DIR/lib/" 2>/dev/null || true
+    # Lib + configs. MIRROR-WITH-DELETE the lib dir: the payload is
+    # staged additively across builds (and reused under
+    # --skip-payload-refresh), so a plain `cp` lets files DELETED from
+    # installer/lib (e.g. the removed lib/vm.py) survive as stale
+    # orphans in the payload. rsync --delete prunes anything no longer
+    # present under installer/lib so the offline ISO can never ship a
+    # lib/*.py that no longer exists in source. (lesson_iso_payload_drift)
+    rsync -a --delete \
+        --include='*.py' --include='*.sql' --exclude='*' \
+        "$INSTALLER/lib/"  "$PAYLOAD_DIR/lib/"
     cp -r "$INSTALLER/configs/"*  "$PAYLOAD_DIR/configs/" 2>/dev/null || true
 
     # ELRepo + DRBD RPMs.
@@ -251,8 +258,36 @@ refresh_payload() {
     echo "  payload total: $(du -sh "$PAYLOAD_DIR" | cut -f1)"
 }
 
-if [ "$VARIANT" != "net" ] && [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
-    refresh_payload
+# Fail loudly if the staged payload still carries pre-cutover / deleted
+# artifacts. Runs whether or not refresh_payload ran (so a reused cached
+# payload under --skip-payload-refresh can't smuggle stale orphans onto
+# the disc either). (lesson_iso_payload_drift)
+assert_payload_clean() {
+    local errs=0
+    if [ -e "$PAYLOAD_DIR/lib/vm.py" ]; then
+        echo "ERROR: $PAYLOAD_DIR/lib/vm.py is a removed legacy module" \
+             "(internal-meta, hardcoded VG) — stale payload orphan." >&2
+        errs=1
+    fi
+    if [ -f "$PAYLOAD_DIR/bedrock" ] && \
+       grep -Eq 'from lib import vm|vm_mod' "$PAYLOAD_DIR/bedrock"; then
+        echo "ERROR: $PAYLOAD_DIR/bedrock is the pre-cutover in-process CLI" \
+             "(imports lib.vm) — stale payload orphan; expected the thin" \
+             "HTTP-client bedrock from $INSTALLER/bedrock." >&2
+        errs=1
+    fi
+    if [ "$errs" -ne 0 ]; then
+        echo "Refusing to build offline ISO from a drifted payload." \
+             "Re-run without --skip-payload-refresh to restage from source." >&2
+        exit 3
+    fi
+}
+
+if [ "$VARIANT" != "net" ]; then
+    if [ "$SKIP_PAYLOAD_REFRESH" -eq 0 ]; then
+        refresh_payload
+    fi
+    assert_payload_clean
 fi
 
 # ── ISO build function ────────────────────────────────────────────

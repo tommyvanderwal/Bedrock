@@ -27,7 +27,7 @@ Plaintext fields (msgpack):
 }
 ```
 
-`ts_writer` is the **node's own clock**. Readers use their **own** clock for freshness: `now_local_ms - ts_writer_ms ≥ 15_000` → stale. Cluster nodes are NTP-synced (chronyd); the 15 s threshold absorbs ≤ 5 s drift plus 14 missed ticks.
+`ts_writer` is the **node's own clock**. Readers use their **own** clock for freshness: `now_local_ms - ts_writer_ms ≥ 10_000` → stale. Cluster nodes are NTP-synced (chronyd); the 10 s threshold pairs with the 10-missed-heartbeat leader-loss detector (`netd.MASTER_LOSS_MISSES = 10`) so the witness declares the master's slot gone at the same moment a survivor concludes leader-loss. Implemented as `witness.SLOT_STALE_MS = 10_000`.
 
 `tag` as a bitflag (not a string) lets us add future flags (e.g. maintenance, draining) without a wire bump. Today only bit 0 = `lms` is defined.
 
@@ -75,7 +75,7 @@ The reader decrypts the envelope (proves cluster membership), then decrypts each
 ## Slot lifecycle
 - Each node writes its own slot every **1 s** with current `(ts_writer, tag, marker)`.
 - The witness REPLACES on every accepted write. No history.
-- A slot is **stale** (from the reader's POV) when `now_local_ms - slot.ts_writer ≥ 15 s`. 14 missed ticks + 1 grace. Stale does NOT mean cleared — see INV-7 for `tag.lms`.
+- A slot is **stale** (from the reader's POV) when `now_local_ms - slot.ts_writer ≥ 10 s`. 10 missed 1 s writes, pairing with the 10-missed-beat leader-loss detector (`netd.MASTER_LOSS_MISSES = 10`). Stale does NOT mean cleared — see INV-7 for `tag.lms`.
 - The witness **retains** an unrefreshed slot for **72 h** before it may drop the entry from its own store. This is the witness's storage-cleanup policy, not a cluster-side LMS-clear mechanism — see INV-7.
 - **Cluster-side membership filter**: a reader silently ignores any returned slot whose `node_id` does not correspond to a node currently present in this reader's local rqlited's `nodes` table (the cluster-wide source of truth, locally readable on every node via Raft-replicated rqlite). This is what makes "decommission the dead node" — a routine operator action that removes the row from the `nodes` table — also undo a stuck LMS belonging to that dead node, without ever touching the witness. The witness may still have the entry until 72 h aging; the cluster just doesn't care.
 
@@ -86,7 +86,7 @@ P is a node whose local election (mesh peer-liveness only) says it should become
 
 1. **Identify the dying master M.** Use the in-process record of "who was last writing the arbiter slot" from prior witness replies. (At cold boot with no record, M is unknown and step 2 examines the arbiter slot whoever owns it.)
 2. **Inspect M's slot in the most recent witness reply:**
-   - Stale `(age ≥ 15 s)` AND `tag.lms == 0` → M died without going solo. Continue to step 3.
+   - Stale `(age ≥ 10 s)` AND `tag.lms == 0` → M died without going solo. Continue to step 3.
    - Stale AND `tag.lms == 1`                 → M went solo and never cleared the LMS bit. **REFUSE takeover.** LMS does not time out — see INV-7. Operator must clear M's LMS via the explicit override command (see `docs/operator-overrides.md`) before any peer can claim.
    - Fresh AND `tag.lms == 0`                 → M is alive, the mesh is just flapping locally. P stays follower.
    - Fresh AND `tag.lms == 1`                 → M is the legitimate last-man-standing. P stays follower.
@@ -154,7 +154,7 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 - **INV-4** — `ts_writer` from the writer is the freshness reference; reader uses its own clock for comparison. No witness clock involved.
 - **INV-5** — UUID comparison for takeover is **exact equality**, never `≥`. Local newer-than-slot means we crashed mid-write OR we are looking at our own slot (the protocol skips that). Local older-than-slot means the cluster advanced without us — refuse.
 - **INV-6** — the arbiter takeover protocol uses ONLY witness + local commands. No rqlite call is on the takeover critical path. rqlite is the service being recovered.
-- **INV-7** — **`tag.lms = 1` never times out, and a missing slot is treated as worst-case.** The 15 s staleness rule and the 72 h witness-retention rule do not clear LMS; they only change interpretation. The only paths to a cluster state where a previously-set LMS no longer blocks takeover:
+- **INV-7** — **`tag.lms = 1` never times out, and a missing slot is treated as worst-case.** The 10 s staleness rule and the 72 h witness-retention rule do not clear LMS; they only change interpretation. The only paths to a cluster state where a previously-set LMS no longer blocks takeover:
   - (a) The slot owner is alive and successfully writes `tag.lms = 0` to the witness (requires both online simultaneously).
   - (b) The operator decommissions the slot owner (`bedrock node leave …` / equivalent removes it from the rqlite `nodes` table — the cluster-wide source of truth). Surviving nodes then *ignore* any witness slot for that removed node-id because it is no longer a known cluster member. The witness still stores the slot until 72 h retention drops it, but nobody reads it.
   - (c) The operator re-keys the cluster's witness identity (new `cluster_uuid` and/or new `cluster.key`). Old encrypted slot payloads can no longer be decrypted by any cluster member; the slot map re-populates from current members' heartbeats within a few seconds. On a fileshare-backend witness this is equivalent to deleting the slot files.
@@ -166,7 +166,7 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 ## Why no witness clock (and why the writer's clock works)
 - A witness that generates timestamps must have an accurate clock. ESP32 + battery-backed RTC + drift handling on a small appliance is significant complexity for one job.
 - Cluster nodes already NTP-sync (chronyd in every install). Drift between cluster members on a healthy LAN is sub-second.
-- Reader uses its own clock. `now_local - slot.ts_writer ≥ 15 s` absorbs the worst plausible per-node skew with margin.
+- Reader uses its own clock. `now_local - slot.ts_writer ≥ 10 s` absorbs the worst plausible per-node skew with margin.
 - Replay protection comes from AEAD nonces, not from timestamps. A stale-but-valid slot is fine: it just looks correctly old.
 
 ## Backends
@@ -180,10 +180,10 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 | event | value | rationale |
 |---|---|---|
 | slot refresh interval | 1 s | matches election tick |
-| stale threshold | 15 s | 14 ticks + 1 grace, absorbs LAN flaps + NTP skew |
+| stale threshold | 10 s | 10 missed 1 s writes; **pairs with the 10-missed-beat leader-loss detector** (`netd.MASTER_LOSS_MISSES = 10`) so the witness declares the master gone exactly when a survivor concludes leader-loss. Implemented as `witness.SLOT_STALE_MS = 10_000`. |
 | takeover-readback retries | 3 | covers transient UDP loss; 4 s total |
 | cold-boot witness wait | 5 s | bounded; healthy witness replies in < 100 ms |
-| NoQuorum self-demote streak | 5 ticks (≈ 5 s) | shorter than stale threshold so demote precedes peer takeover |
+| NoQuorum self-demote streak | 5 ticks (≈ 5 s) | shorter than the stale threshold so demote precedes peer takeover |
 | AEAD nonce size | 12 bytes (96 bits) | ChaCha20-Poly1305 default |
 | Poly1305 auth tag | 16 bytes | standard |
 

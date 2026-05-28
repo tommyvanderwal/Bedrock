@@ -74,6 +74,7 @@ def register_routes(app: FastAPI, *,
         from bedrock_d.install import node_leave  # noqa: F401
         from bedrock_d.install import cluster_tier  # noqa: F401
         from bedrock_d.cluster import rename as _cluster_rename  # noqa: F401
+        from bedrock_d.orchestrator import replica_repair  # noqa: F401
 
     @app.post("/api/operations")
     def api_op_submit(req: OpSubmit,
@@ -111,6 +112,33 @@ def register_routes(app: FastAPI, *,
         return {
             "op_id":     op_id,
             "kind":      req.kind,
+            "state":     result.state.value,
+            "last_step": result.last_step,
+            "error":     result.error,
+        }
+
+    @app.post("/api/operations/{op_id}/retry")
+    def api_op_retry(op_id: int,
+                     _user: str = Depends(require_operator)):
+        """Explicitly re-run a failed (or stuck) saga (SA-02/SA-07).
+
+        Resets the op to ``in_progress`` and runs from the first
+        not-``done`` step — steps that previously succeeded stay
+        ``done`` and are skipped. This is the HTTP surface the docs
+        reference for "the operator can retry". An already-completed
+        op is returned unchanged."""
+        _load_all_vm_sagas()
+        try:
+            ex = _executor()
+        except Exception as e:
+            log.exception("operations: executor init failed")
+            raise HTTPException(503, f"saga executor unavailable: {e}")
+        try:
+            result = ex.retry(int(op_id))
+        except KeyError:
+            raise HTTPException(404, f"no operation with id {op_id}")
+        return {
+            "op_id":     op_id,
             "state":     result.state.value,
             "last_step": result.last_step,
             "error":     result.error,

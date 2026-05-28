@@ -15,8 +15,8 @@ makes the sequence visible and resumable.
 # What this saga does NOT do
 
 Cluster-DRBD membership re-shuffling (when the leaver was carrying
-the tier-critical resource and we now need to promote another node
-into the 3-peer set) is owned by the **calm orchestrator** — it's a
+the `cluster` singleton resource and we now need to promote another
+node into the 3-peer set) is owned by the **calm orchestrator** — it's a
 deliberate resource-aware decision, not a critical-path operation.
 node_leave logs that the cluster-DRBD set may now be below design
 redundancy; the orchestrator picks it up on its next reconcile.

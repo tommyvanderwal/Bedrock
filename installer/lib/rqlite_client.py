@@ -552,6 +552,34 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
         "VALUES (1, 0, 1, ?)",
         params=[int(time.time())],
     )
+    # Additive column migrations for clusters created before a column
+    # was introduced. CREATE TABLE IF NOT EXISTS won't add a column to
+    # an existing table, so each newer column is ADDed here, ignoring
+    # the "duplicate column name" error when it already exists.
+    _add_column_if_missing(client, "vms", "priority",
+                           "TEXT NOT NULL DEFAULT 'normal'")
+    # nodes.state: lifecycle gate for the election denominator (C1).
+    # Existing nodes default to 'active' so a schema re-apply on a
+    # running cluster doesn't suddenly drop everyone from the denominator.
+    _add_column_if_missing(client, "nodes", "state",
+                           "TEXT NOT NULL DEFAULT 'active'")
+
+
+def _add_column_if_missing(client: RqliteClient, table: str, column: str,
+                           coldef: str) -> None:
+    """Idempotent ``ALTER TABLE ADD COLUMN``. Checks the live schema
+    via PRAGMA table_info first so a re-run (or a fresh cluster that
+    already has the column from CREATE TABLE) is a clean no-op rather
+    than relying on swallowing the duplicate-column error."""
+    try:
+        cols = client.query(f"PRAGMA table_info({table})")
+        if any((c.get("name") == column) for c in cols):
+            return
+        client.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+    except Exception:
+        # Best-effort: a concurrent applier may have added it between
+        # the check and the ALTER. The column is the goal, not the path.
+        pass
 
 
 def bump_revision(client: RqliteClient) -> int:

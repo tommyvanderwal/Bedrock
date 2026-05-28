@@ -8,23 +8,35 @@ every Bedrock node runs. Three jobs in one process, one tick loop:
    age), installs `/32` host routes to peer loopback IPs so
    inter-node traffic (DRBD, libvirt, SeaweedFS, SSH) uses the
    best wire instead of falling back to the LAN router.
-2. **Witness + weighted-vote election.** Discovers BedRock Echo on
-   the LAN, heartbeats it (each beat carries this node's own
-   AEAD-sealed slot), runs `lib.election.compute()` once per
-   second over its own peer-liveness table + the rqlite snapshot,
-   acts on the outcome: `set_mgmt_master(self)` on Leader-promote,
-   `set_no_quorum_marker` + `cluster_arbiter.demote_arbiter_host()`
-   on NoQuorum. Each tick, `witness.set_own_slot(marker=drbdadm
-   current-uuid, tag=TAG_LMS iff hosting AND no peer logged_up)`
-   updates what this node will publish next. There is no
-   "claim/bless" — see `docs/cluster-quorum-spec.md`.
-3. **Self-demote on NoQuorum.** When NoQuorum persists past the
-   streak holddown (`NOQUORUM_HOLDDOWN_TICKS=5` ≈ 5 s), directly
-   call `cluster_arbiter.demote_arbiter_host()` so the master VIP
-   + arbiter rqlite + filer/s3 come down BEFORE qemu can write
-   stale data through the DRBD device. `cluster_arbiter.converge()`
-   can't help here because rqlite is by definition unreachable in
-   NoQuorum, so we bypass the rqlite-subscriber path.
+2. **Witness + 100/1 vote election.** Discovers BedRock Echo on the
+   LAN, heartbeats it (each beat carries this node's own AEAD-sealed
+   slot), AND exchanges a node-to-node **election heartbeat**
+   (protocol 4 — distinct from the mesh discovery probe) once per
+   second carrying `{believed_master, transitioning, arbiter_uuid,
+   ack_target}`. Runs `lib.election.compute()` over its peer-liveness
+   table + the per-peer ack map (derived from those heartbeats) + the
+   rqlite snapshot, then acts: `set_mgmt_master(self)` on Leader-
+   promote, `set_no_quorum_marker` + `cluster_arbiter.demote_arbiter_host()`
+   on NoQuorum. Each tick `witness.set_own_slot(marker=drbdadm
+   current-uuid)` refreshes the published marker; the LMS **tag** is
+   NOT recomputed here — it is an explicit decision owned by
+   `cluster_arbiter` (set on go-solo takeover, cleared on self-demote;
+   never auto-flipped from a steady-state heuristic — Q-01/BAD-4).
+   There is no "claim/bless" — see `docs/cluster-quorum-spec.md`.
+3. **Leader-loss + self-demote (single 10-miss detector).** A
+   candidate counts consecutive election ticks with no fresh
+   heartbeat from the believed master; at `MASTER_LOSS_MISSES=10`
+   (~10 s) it treats the master as gone and a quorate candidate
+   promotes. An old master that has itself lost quorum self-demotes
+   at `SELF_DEMOTE_MISSES=9` (~9 s, 1 s before survivors promote —
+   INV-1 margin): it calls `cluster_arbiter.demote_arbiter_host()`
+   so the master VIP + arbiter rqlite + filer/s3 come down BEFORE
+   qemu can write stale data through the DRBD device.
+   `cluster_arbiter.converge()` can't help here because rqlite is by
+   definition unreachable in NoQuorum, so we bypass the rqlite-
+   subscriber path. (Replaces the old `DOWN_HYSTERESIS_S`-driven
+   election liveness + `NOQUORUM_HOLDDOWN_TICKS` streak + the disabled
+   `LONE_MASTER_WATCHDOG_S`.)
 
 Replaces the deleted `bedrock-rust` daemon. Reads `state.json` for
 the cluster_uuid + node_name + loopback_ip; reads `cluster.json`
@@ -44,12 +56,20 @@ implementation reference.
   group + port for cross-NIC discovery probes (protocol 1).
 - `PROBE_INTERVAL = 1.0`, `TICK_INTERVAL = 0.25` — outer loop
   cadences.
-- `ELECTION_INTERVAL_S = 1.0` — election tick rate.
-- `NOQUORUM_HOLDDOWN_TICKS = 5` — consecutive NoQuorum ticks
-  before self-demote fires. Absorbs first-second startup transients.
+- `ELECTION_INTERVAL_S = 1.0` — election tick rate; also the
+  node-to-node election-heartbeat (protocol 4) send cadence.
+- `HB_PORT = 7734` — unicast election-heartbeat port (complements
+  `PROBE_PORT=7732` discovery + `ADV_PORT=7733` routing adv).
+- `MASTER_LOSS_MISSES = 10` — consecutive missed election heartbeats
+  from the believed master before a survivor treats it as gone
+  (~10 s). The single leader-loss detector; also absorbs the
+  first-second startup transient (neighbours=0 looks like NoQuorum).
+- `SELF_DEMOTE_MISSES = 9` — an old master that has lost quorum
+  self-demotes after this many NoQuorum ticks (~9 s), 1 s before
+  survivors promote (INV-1 release-before-promote margin).
 - `DOWN_HYSTERESIS_S = 10.0` — silent-this-long-before-LINK_DOWN.
-  Was 30 s; lowered to 10 s so self-demote on NoQuorum fires
-  within a 90 s isolation test window.
+  Drives mesh routing only; leader-loss is the `MASTER_LOSS_MISSES`
+  heartbeat counter, not this knob.
 - `UP_HYSTERESIS_S = 5.0` — link must be up this long before
   LINK_UP. Avoids declaring a flapping link "up" on every blip.
 - `METRIC_DIRECT_BASE = 10`, `METRIC_TRANSIT_BASE = 100`,
@@ -207,8 +227,9 @@ Reset: `demoted_in_cycle` flag clears on any non-NoQuorum tick.
 | Symptom | Where to look |
 |---------|---------------|
 | ip route replace fails silently | `journalctl -u bedrock-net | grep emit_routes` — captures rc + stderr |
-| Master flaps Leader↔NoQuorum | `NOQUORUM_HOLDDOWN_TICKS` + `demoted_in_cycle` flag |
-| Self-demote too slow | `DOWN_HYSTERESIS_S` (10 s) + 5-tick streak ≈ 12-15 s total |
+| Master flaps Leader↔NoQuorum | `SELF_DEMOTE_MISSES` NoQuorum counter + `demoted_in_cycle` flag |
+| Self-demote too slow | `SELF_DEMOTE_MISSES` (~9 s) — counts NoQuorum ticks once compute() can't see a majority |
+| Failover too slow / never fires | `MASTER_LOSS_MISSES` (~10 s); check peers' election heartbeats arrive on `HB_PORT=7734` |
 | Joiner sees stale quorum count | `ever_seen_peers` not yet populated → joiner-grace ✓ |
 | Witness vote not counted | check `lib/witness.is_alive()`; reply must be ≤12 s old |
 | Slot writes silently dropped at Echo | AEAD verify-fail (wrong cluster_key) — Echo doesn't tell, packet is just gone |

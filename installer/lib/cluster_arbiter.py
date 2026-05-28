@@ -7,8 +7,8 @@ Per docs/post-alpha-rewrite-notes.md D-04..D-08:
     rqlite (which doesn't natively understand Bedrock's
     witness-weighted election) needs at N=2 physical.
   * The arbiter's data + WAL live on a shared DRBD volume named
-    `tier-critical`, mounted at `/var/lib/bedrock/cluster/`. The
-    SeaweedFS filer's SQLite metadata also lives here (Phase E),
+    `cluster`, mounted at `/var/lib/bedrock/cluster/`. The
+    SeaweedFS filer's leveldb3 metadata + S3 IAM also live here,
     so the same DRBD-promote + mount sequence moves all
     cluster-wide singletons together.
   * The arbiter's network identity is a SECONDARY `100.X.Y.254/32`
@@ -45,12 +45,11 @@ from typing import Optional
 
 log = logging.getLogger("bedrock.cluster_arbiter")
 
-# tier-critical: the shared DRBD volume hosting all cluster-singleton
-# services (rqlite-arbiter, SeaweedFS filer metadata, future
-# singletons). Must align with the resource name set up by
-# tier_storage.setup_cluster_tier() (Phase E does the install-side
-# plumbing).
-TIER_RESOURCE   = "tier-critical"
+# `cluster`: the shared DRBD volume hosting all cluster-singleton
+# services (rqlite-arbiter, SeaweedFS filer metadata, S3 IAM, future
+# singletons). Renamed from the legacy `tier-critical` (SG-04); must
+# align with tier_storage.CLUSTER_RESOURCE.
+TIER_RESOURCE   = "cluster"
 MOUNT_POINT     = Path("/var/lib/bedrock/cluster")
 ARBITER_DATA    = MOUNT_POINT / "rqlite"
 ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
@@ -60,8 +59,21 @@ ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
 # combine here.
 ARBITER_OCTET   = 254
 
-CLUSTER_JSON    = Path("/etc/bedrock/cluster.json")
+# Peer-heartbeat freshness for the steal-back guard (C2/M12) and the
+# last-standing check (H6). netd sends an election heartbeat ~1 Hz, so a
+# peer seen within ~2 s is live. Beyond that it has gone silent and is
+# treated as not-reachable / not-claiming-master.
+PEER_HB_FRESH_S = 2.0
+
 STATE_JSON      = Path("/etc/bedrock/state.json")
+
+# Cold-boot patience: at 2+ nodes, a node that comes up believing it is
+# master waits this long before the FIRST promote so a slower peer can
+# catch up and a cleaner convergence wins (EXECUTION-PLAN BAD-1 timing
+# table). Single-node clusters promote immediately. Settable low in
+# tests. Tracked from process start via _COLD_BOOT_AT.
+COLD_BOOT_PATIENCE_S = 30.0
+_COLD_BOOT_AT = time.monotonic()
 
 # Under the unified bedrock-d daemon: bedrock-d.main() wires its
 # BedrockState here so cluster_arbiter can read netd's live election
@@ -132,7 +144,7 @@ def arbiter_loopback_ip() -> str:
 
 
 def _drbd_role() -> str:
-    """Returns 'Primary' / 'Secondary' / 'Unknown' for tier-critical.
+    """Returns 'Primary' / 'Secondary' / 'Unknown' for the cluster resource.
     'Unknown' covers both "drbdadm errored" and "resource not
     configured" (N=1 case, where no DRBD resource exists at all)."""
     rc, out, _ = _run(["drbdadm", "role", TIER_RESOURCE])
@@ -143,7 +155,7 @@ def _drbd_role() -> str:
 
 
 def _drbd_resource_exists() -> bool:
-    """True if tier-critical is a configured DRBD resource on this
+    """True if `cluster` is a configured DRBD resource on this
     node. False at N=1 (no DRBD needed — singleton services run
     directly on the local FS) or before the tier is set up by the
     install path."""
@@ -261,7 +273,7 @@ def _arbiter_ip_present() -> bool:
 def _ip_add() -> str:
     ip = arbiter_loopback_ip()
     if not ip:
-        raise RuntimeError("arbiter loopback IP unknown (cluster.json missing?)")
+        raise RuntimeError("arbiter loopback IP unknown (cluster_uuid not in rqlite?)")
     if _arbiter_ip_present():
         return ip
     log.info("arbiter: ip addr add %s/32 dev lo", ip)
@@ -317,7 +329,7 @@ def promote_to_arbiter_host() -> dict:
     demote_arbiter_host); rqlite is NOT touched — it's the service
     being recovered.
 
-    N=1 mode (no tier-cluster DRBD resource): bind .254 + start
+    N=1 mode (no cluster DRBD resource): bind .254 + start
     singletons on local FS. .254 is bound at every N including N=1
     per docs/storage-architecture.md so client config (filer URL,
     mgmt URL) is identical from day 1.
@@ -331,7 +343,7 @@ def promote_to_arbiter_host() -> dict:
 
     if not drbd_present:
         # N=1: no DRBD, no witness consult. Simple path.
-        log.info("arbiter: promoting (N=%d, no tier-cluster DRBD — "
+        log.info("arbiter: promoting (N=%d, no cluster DRBD — "
                  "running singletons on local FS, .254 on lo)", n)
         MOUNT_POINT.mkdir(parents=True, exist_ok=True, mode=0o755)
         ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -349,10 +361,14 @@ def promote_to_arbiter_host() -> dict:
             log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
         log.info("arbiter: promotion complete (N=1; ip=%s mount=%s)",
                  ip, MOUNT_POINT)
+        # H5/INV-6: mgmt_master is a RESULT of a confirmed promote, never
+        # the trigger. At N=1 there's no arbiter rqlite, so write it as
+        # soon as hosting (filer + .254) is confirmed.
+        _set_mgmt_master_after_promote(drbd_present=False)
         return arbiter_status()
 
-    # N>=2 with tier-cluster DRBD. Run the takeover protocol.
-    log.info("arbiter: promoting (N=%d, tier-cluster DRBD present)", n)
+    # N>=2 with cluster DRBD. Run the takeover protocol.
+    log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
 
     # Idempotent fast-path: if I am already the hosting node per
     # cluster.json, skip the witness protocol. This handles every
@@ -391,7 +407,84 @@ def promote_to_arbiter_host() -> dict:
         log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
     log.info("arbiter: promotion complete (ip=%s mount=%s)",
              ip, MOUNT_POINT)
+    # H5/INV-6: write mgmt_master only AFTER the arbiter rqlite is back,
+    # as a RESULT of a confirmed promote — never as the promote trigger.
+    # _set_mgmt_master_after_promote re-reads arbiter_status() and only
+    # writes when DRBD primary + .254 + arbiter service are all up.
+    _set_mgmt_master_after_promote(drbd_present=True)
     return arbiter_status()
+
+
+def _set_mgmt_master_after_promote(*, drbd_present: bool) -> None:
+    """Write this node as the rqlite ``mgmt_master`` — but ONLY once a
+    promote has actually taken hold (H5 / INV-6 two-tier ordering).
+
+    The base layer (netd's election) DRIVES the promote; mgmt_master is
+    written here as the RESULT, after arbiter_status() confirms this node
+    is hosting. This breaks the old backwards flow where netd wrote
+    mgmt_master first and the orchestrator promoted off the rqlite role.
+
+    Hosting confirmation:
+      * N>=2 (drbd_present): service_active AND ip_present AND DRBD
+        Primary — the arbiter rqlite is up, so the write commits.
+      * N=1: filer + .254 — there's no arbiter rqlite to wait on; the
+        local rqlite is the only voter and accepts the write.
+
+    No deadlock: this never gates the promote on mgmt_master already
+    being set; it runs strictly after the promote. If the write fails
+    (rqlite still electing), the next converge tick re-promotes
+    (idempotent, a no-op) and retries the write."""
+    status = arbiter_status()
+    if drbd_present:
+        hosting = (status.get("service_active")
+                   and status.get("ip_present")
+                   and status.get("drbd_role") == "Primary")
+    else:
+        try:
+            try:
+                from . import seaweedfs
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import seaweedfs  # type: ignore
+            filer_active = seaweedfs.is_filer_active()
+        except Exception:
+            filer_active = False
+        hosting = filer_active and status.get("ip_present")
+    if not hosting:
+        log.info("arbiter: promote not yet fully hosting "
+                 "(%s) — deferring mgmt_master write to next tick",
+                 {k: status.get(k) for k in
+                  ("service_active", "ip_present", "drbd_role")})
+        return
+    self_name = _self_node_name()
+    if not self_name:
+        log.warning("arbiter: cannot write mgmt_master — self node name "
+                    "unknown")
+        return
+    try:
+        try:
+            from . import bedrock_state as _bs
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import bedrock_state as _bs  # type: ignore
+        rev = _bs.set_mgmt_master(self_name)
+        log.info("arbiter: mgmt_master=%s written after confirmed "
+                 "promote (rqlite rev=%s)", self_name, rev)
+    except Exception as e:
+        log.warning("arbiter: set_mgmt_master deferred — %s "
+                    "(will retry next converge tick)", e)
+
+
+def _self_node_name() -> str:
+    """This node's name, read from state.json (per-node truth, no
+    rqlite quorum needed)."""
+    try:
+        s = json.loads(STATE_JSON.read_text())
+        return s.get("node_name") or ""
+    except Exception:
+        return ""
 
 
 def _run_takeover_protocol() -> bool:
@@ -427,14 +520,50 @@ def _run_takeover_protocol() -> bool:
     ws = SHARED_STATE.netd_ws
     my_id = ws.my_node_id
 
+    # C2/M12 STEAL-BACK GUARD: a returning old master would otherwise
+    # hit the fast path below (last_master_id == my_id) and promote,
+    # stealing the role from the live survivor that already took over
+    # while we were gone. If a peer's FRESH heartbeat advertises ITSELF
+    # as master (a live/forming master that is not us), defer — never
+    # steal the role back. This also covers the normal path. A legitimate
+    # first-takeover (no peer claims master) proceeds.
+    claimer = _peer_claims_master_now(ws)
+    if claimer:
+        log.info("arbiter: takeover DEFERRED — peer %r is currently "
+                 "claiming master (fresh heartbeat); not stealing the "
+                 "role back", claimer)
+        return False
+
     # FAST PATH: no prior master OR self is the recorded master.
-    # Nothing to take over from; proceed with the promotion. The
-    # netd tick is already publishing our slot every second, so when
-    # a witness IS present it will see us. No witness reachability
-    # gate needed at this path (covers first-ever promote where the
-    # operator hasn't deployed an Echo yet).
+    # Nothing to take over FROM another node; proceed with the
+    # promotion. The netd tick is already publishing our slot every
+    # second, so when a witness IS present it will see us. No witness
+    # reachability gate needed at this path (covers first-ever promote
+    # where the operator hasn't deployed an Echo yet).
     last_master_id = _last_known_master_node_id()
     if last_master_id is None or last_master_id == my_id:
+        # Cold-boot guard (cluster-quorum-spec cold-boot protocol): if
+        # the witness holds OUR OWN slot from a previous life and that
+        # marker is a generation we no longer have locally, the cluster
+        # advanced without us — refuse to promote a stale copy. This is
+        # the one UUID check that applies even with no other master,
+        # and it is rqlite-free.
+        if not _cold_boot_uuid_ok(ws, _witness):
+            log.error("arbiter: takeover REFUSED — cold-boot UUID check: "
+                      "local DRBD generation is older than our own last "
+                      "published slot marker. The cluster advanced without "
+                      "us; refusing to promote a stale copy (operator must "
+                      "reconcile / `seize`).")
+            return False
+        # 2+ node patience: give a slower peer time to come up and beat
+        # us cleanly before we self-promote. Single-node skips this.
+        if _cluster_size() >= 2:
+            waited = time.monotonic() - _COLD_BOOT_AT
+            if waited < COLD_BOOT_PATIENCE_S:
+                log.info("arbiter: cold-boot patience — %.0fs of %.0fs "
+                         "elapsed at N>=2; deferring first promote",
+                         waited, COLD_BOOT_PATIENCE_S)
+                return False
         log.info("arbiter: takeover protocol — no prior master to take "
                  "over from (last_master=%r, self=%d); proceeding",
                  last_master_id, my_id)
@@ -505,7 +634,7 @@ def _run_takeover_protocol() -> bool:
     slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
     if not local_uuid_step3:
         log.error("arbiter: takeover REFUSED — drbdadm current-uuid "
-                  "tier-critical failed")
+                  "cluster failed")
         return False
     if local_uuid_step3 != slot_marker:
         log.error("arbiter: takeover REFUSED — DRBD divergence: "
@@ -517,9 +646,12 @@ def _run_takeover_protocol() -> bool:
     log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
              local_uuid_step3[:12])
 
-    # Step 4: write own slot tag=lms. netd's election tick runs at 1
-    # Hz and will pick up the new tag on the very next iteration; we
-    # set it via shared state and wait for netd to send it.
+    # Step 4: go solo — set our own slot tag=lms. The arbiter OWNS the
+    # LMS bit (Q-01/BAD-4): netd no longer recomputes own_tag from a
+    # steady-state heuristic, so this explicit set is authoritative and
+    # the step-5 readback can't be raced back to 0. netd's election tick
+    # (1 Hz) ships whatever tag we set here on its next heartbeat, and
+    # only refreshes own_marker — never the tag.
     local_uuid = _read_local_drbd_uuid()
     marker_bytes = local_uuid.encode("ascii") if local_uuid else b""
     _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_LMS)
@@ -539,6 +671,157 @@ def _run_takeover_protocol() -> bool:
     log.error("arbiter: takeover REFUSED — own-slot readback failed "
               "after 3 attempts; witness unreachable or losing writes")
     return False
+
+
+def _fresh_peer_hbs() -> dict:
+    """Return {peer_name: hb} for every peer whose election heartbeat is
+    FRESH (seen within PEER_HB_FRESH_S). Reads SHARED_STATE.netd.peer_hb,
+    the live per-peer heartbeat record netd maintains. Empty if netd
+    isn't wired or no peer is fresh."""
+    out: dict = {}
+    st = SHARED_STATE
+    d = getattr(st, "netd", None) if st is not None else None
+    peer_hb = getattr(d, "peer_hb", None) if d is not None else None
+    if not peer_hb:
+        return out
+    now = time.monotonic()
+    for peer, hb in peer_hb.items():
+        if not isinstance(hb, dict):
+            continue
+        if (now - hb.get("seen_at_monotonic", 0.0)) <= PEER_HB_FRESH_S:
+            out[peer] = hb
+    return out
+
+
+def _peer_claims_master_now(ws) -> "str | None":
+    """C2/M12 steal-back cross-check. Return a peer name iff some peer has
+    a FRESH heartbeat advertising ITSELF as master (believed_master ==
+    that peer), i.e. a live/forming master that is NOT us. Returns None
+    when no peer is currently claiming the role (the legitimate
+    first-takeover case).
+
+    rqlite-free: reads only netd's in-memory peer heartbeat records."""
+    my_name = getattr(ws, "my_node_name", "") or _self_node_name()
+    for peer, hb in _fresh_peer_hbs().items():
+        if peer == my_name:
+            continue
+        if hb.get("believed_master") == peer:
+            return peer
+    return None
+
+
+def ensure_lms_if_last_standing(ws) -> bool:
+    """H6 (LMS Scenario B): when this node is the elected LEADER, is
+    hosting the arbiter, has NO reachable peer, and the witness is
+    valid+confirmed, claim last-man-standing by writing our own slot with
+    tag.lms=1 and read it back to confirm.
+
+    The arbiter OWNS the LMS bit (Q-01/BAD-4): netd no longer recomputes
+    own_tag per tick, so this explicit set is authoritative. LMS is
+    cleared only on self-demote (demote_arbiter_host), never auto-cleared
+    (INV-7). Idempotent + cheap — set_own_slot just flips ws.own_tag;
+    when we already hold a reachable peer or aren't last-standing it's a
+    no-op. Returns True iff we (re)asserted LMS this call.
+
+    Called from netd's Leader branch each tick.
+    """
+    if ws is None:
+        return False
+    try:
+        try:
+            from . import witness as _witness
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import witness as _witness  # type: ignore
+    except Exception:
+        return False
+
+    # Already last-standing? If a peer's heartbeat is fresh we are NOT
+    # alone — never set LMS while a peer is up.
+    if _fresh_peer_hbs():
+        return False
+
+    # Must actually be hosting the arbiter (don't claim LMS from a
+    # follower / mid-promote node).
+    status = arbiter_status()
+    drbd_present = _drbd_resource_exists()
+    if drbd_present:
+        hosting = (status.get("service_active")
+                   and status.get("ip_present")
+                   and status.get("drbd_role") == "Primary")
+    else:
+        hosting = status.get("ip_present")
+    if not hosting:
+        return False
+
+    # Witness must be valid + confirmed for us to trust an LMS claim
+    # (we must be able to read our own slot back). If we already hold
+    # lms=1 there's nothing to do.
+    if not (_witness.is_valid(ws) and _witness.is_confirmed(ws)):
+        return False
+    own = _witness.own_slot(ws)
+    if own is not None and own.lms:
+        return False  # already last-standing; no flip needed
+
+    local_uuid = _read_local_drbd_uuid()
+    marker = local_uuid.encode("ascii") if local_uuid else b""
+    log.info("arbiter: last-standing — no reachable peer + witness "
+             "valid+confirmed; setting own LMS bit (marker=%s)",
+             local_uuid[:12] if local_uuid else "")
+    _witness.set_own_slot(ws, marker=marker, tag=_witness.TAG_LMS)
+    # Readback-confirm (the arbiter owns the bit; the witness must
+    # reflect it). Best-effort — netd ships the new tag on its next HB.
+    for _ in range(3):
+        time.sleep(1.5)
+        back = _witness.own_slot(ws)
+        if back is not None and back.lms and back.marker == marker:
+            log.info("arbiter: LMS readback confirmed")
+            return True
+    log.warning("arbiter: LMS set but readback not yet confirmed "
+                "(witness slow/unreachable); netd will keep publishing")
+    return True
+
+
+def _cold_boot_uuid_ok(ws, _witness) -> bool:
+    """Cold-boot DRBD-UUID-vs-own-slot check (cluster-quorum-spec
+    cold-boot protocol). Returns True (safe to promote) unless we can
+    PROVE our local generation is stale.
+
+    The witness may still hold OUR OWN slot from a previous life. If its
+    marker differs from our current local DRBD UUID *and* our local UUID
+    is classified SUPERSEDED in our own 7-day history (a newer generation
+    once existed locally and we've since regressed), the cluster advanced
+    without us — refuse. If the witness has no slot for us, or the marker
+    matches, or we have no contradicting history, allow: a cold node with
+    nothing to compare against is the legitimate first-promote case.
+
+    rqlite-free: only the witness slot cache + local state.json history.
+    """
+    try:
+        own = _witness.own_slot(ws)
+    except Exception:
+        own = None
+    if own is None or not own.marker:
+        return True
+    slot_marker = own.marker.decode("ascii", errors="replace").strip()
+    local_uuid = _read_local_drbd_uuid()
+    if not local_uuid or local_uuid == slot_marker:
+        return True
+    # Markers differ. Consult our own history: is the local generation
+    # superseded (older than something we recorded)?
+    try:
+        try:
+            from . import state as _lstate
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import state as _lstate  # type: ignore
+        cls = _lstate.classify_arbiter_uuid(local_uuid)
+        return cls != _lstate.UUID_SUPERSEDED
+    except Exception:
+        # Can't classify — don't block the legitimate first promote.
+        return True
 
 
 def _last_known_master_node_id() -> "int | None":
@@ -571,7 +854,7 @@ def _last_known_master_node_id() -> "int | None":
 
 
 def _read_local_drbd_uuid() -> str:
-    """Read tier-critical's current-UUID. Returns "" if DRBD isn't
+    """Read the cluster resource's current-UUID. Returns "" if DRBD isn't
     configured (N=1) or no source has it.
 
     Primary source: DRBD9's debugfs at
@@ -616,7 +899,7 @@ def demote_arbiter_host() -> dict:
 
     Two modes mirroring promote_to_arbiter_host():
 
-      * If tier-cluster DRBD is present: stop filer + s3, stop
+      * If cluster DRBD is present: stop filer + s3, stop
         arbiter rqlite, release .254 IP, unmount, drbdadm secondary.
 
       * N=1 (no DRBD): stop filer + s3, nothing else to do — the
@@ -733,12 +1016,16 @@ def converge() -> dict:
     "Hosting" at N>=2 means: arbiter rqlite running on .254 + DRBD
     primary + mount + filer + s3. At N=1 it means: filer + s3 + .254.
 
-    Layering rule (load-bearing — see docs/cluster-quorum-spec.md):
-    converge() NEVER writes to rqlite. Master selection lives in the
-    realtime layer (election → witness slot → cluster.json via
-    netd.set_mgmt_master). cluster_arbiter just actuates whatever the
-    realtime layer has put in cluster.json. The rqlite ``cluster_info``
-    row is a follower of the realtime decision, not the source of it.
+    Layering rule (load-bearing — H5/INV-6, see docs/cluster-quorum-spec.md):
+    master selection lives in the realtime layer (netd's election). netd
+    DRIVES the promote on a Leader outcome; converge() is the idempotent
+    reconcile safety net that re-actuates hosting state if it drifts.
+    mgmt_master in rqlite is a RESULT, written at the END of
+    promote_to_arbiter_host() only after the arbiter rqlite is back —
+    never the promote trigger. So converge() reaches rqlite only
+    transitively (via promote's post-hosting mgmt_master write), and only
+    once hosting is confirmed; the rqlite ``cluster_info`` row is a
+    follower of the realtime decision, not the source of it.
 
     Two flavours of "am I hosting":
       * ``am_host_complete`` — every singleton is up. Skip promote.
@@ -780,14 +1067,12 @@ def converge() -> dict:
     # used to fire demote when our role disagrees with cluster.json.
     am_host = am_host_complete
 
-    # Note: cluster_arbiter intentionally does NOT write to rqlite.
-    # Master selection is owned by the realtime layer (netd's
-    # election + the witness slot). The rqlite ``cluster_info`` row
-    # is a follower of that decision, written exclusively by netd's
-    # ``set_mgmt_master`` path once it sees a stable LEADER outcome.
-    # converge()'s job is to actuate hosting state (filer, .254,
-    # DRBD primary) based on what the realtime layer has decided
-    # via cluster.json — never the reverse.
+    # Note: master selection is owned by the realtime layer (netd's
+    # election + the witness slot). converge() actuates hosting state
+    # (filer, .254, DRBD primary) to match that decision; the rqlite
+    # ``cluster_info.mgmt_master`` row is written only as a RESULT, at
+    # the end of promote_to_arbiter_host() once hosting is confirmed
+    # (H5/INV-6) — never as the promote trigger.
 
     if should_host and not am_host_complete:
         return promote_to_arbiter_host()

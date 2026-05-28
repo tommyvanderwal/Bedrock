@@ -13,7 +13,7 @@ Components SeaweedFS-side:
               One volume server per node.
   filer     — POSIX-style namespace on top of volumes. SQLite
               metadata DB. Single instance on the master (D-07).
-              Moves with mgmt-master role via tier-cluster DRBD.
+              Moves with mgmt-master role via cluster-singleton DRBD.
   s3        — S3 API gateway, depends on filer. Single instance
               co-resident with filer.
 
@@ -22,7 +22,7 @@ ALL-IN-ONE mode on the master node, with -volume.dir pointing at
 local LV storage. On a 2-node HA cluster, the second node runs
 the same all-in-one mode but is a master+volume peer; only the
 master-elected node activates the filer+s3 sub-roles (handled by
-cluster_arbiter.py-style mobility via tier-cluster DRBD).
+cluster_arbiter.py-style mobility via cluster-singleton DRBD).
 
 This module provides:
 
@@ -216,7 +216,7 @@ def write_master_config() -> None:
 
 def write_filer_config() -> None:
     """Render filer.toml — pins leveldb3 as the metadata store under
-    /var/lib/bedrock/cluster/seaweedfs/ (lives on the tier-cluster
+    /var/lib/bedrock/cluster/seaweedfs/ (lives on the cluster-singleton
     DRBD volume per D-07/D-10).
 
     Note: SeaweedFS v4.x dropped the SQLite filer store in favour of
@@ -230,7 +230,7 @@ def write_filer_config() -> None:
         # Bedrock-managed SeaweedFS filer config — DO NOT edit by hand.
         #
         # Per docs/post-alpha-rewrite-notes.md D-10: the metadata store
-        # lives on the tier-cluster DRBD volume so it moves with the
+        # lives on the cluster-singleton DRBD volume so it moves with the
         # mgmt-master role. SeaweedFS 4.x removed sqlite; we use the
         # embedded leveldb3 store which is feature-complete for our
         # POSIX-namespace + S3 use case.
@@ -404,7 +404,7 @@ def is_filer_active() -> bool:
 
 def promote_to_filer_host() -> None:
     """Called by cluster_arbiter.promote_to_arbiter_host() after the
-    tier-cluster volume is mounted. Starts filer + s3 gateway on
+    cluster-singleton volume is mounted. Starts filer + s3 gateway on
     this node. Idempotent."""
     log.info("seaweedfs: starting filer + s3 on this node")
     # Clear any stuck start-rate-limit from a previous failed start
@@ -424,7 +424,7 @@ def promote_to_filer_host() -> None:
 
 def demote_filer_host() -> None:
     """Called by cluster_arbiter.demote_arbiter_host() before
-    unmounting the tier-cluster volume. Stops filer + s3.
+    unmounting the cluster-singleton volume. Stops filer + s3.
     Idempotent."""
     log.info("seaweedfs: stopping filer + s3 on this node")
     _systemctl("stop", "bedrock-weed-s3.service")

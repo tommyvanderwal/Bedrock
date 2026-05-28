@@ -100,10 +100,15 @@ def test_lv_names_rejects_empty_resource():
 
 
 def test_drbd_port_offset():
-    """7700 + minor."""
-    assert _cfg.drbd_port_for(0) == 7700
-    assert _cfg.drbd_port_for(1101) == 8801   # cluster-singleton
-    assert _cfg.drbd_port_for(1200) == 8900   # first VM-disk slot
+    """Port = 7700 + (minor - 1100), keeping every DRBD resource inside
+    the documented 7700-7799 band (SG-03). The cluster singleton and
+    every per-VM disk share this one formula. Minors are laid out so
+    the band is honoured: cluster=1101→7701, VM disks 1102..1189→
+    7702..7789 (clear of 9333/8333/8080/8443/4001/4002/4011/4012)."""
+    assert _cfg.drbd_port_for(1100) == 7700   # band base
+    assert _cfg.drbd_port_for(1101) == 7701   # cluster-singleton
+    assert _cfg.drbd_port_for(1102) == 7702   # first VM-disk slot
+    assert _cfg.drbd_port_for(1189) == 7789   # last VM-disk slot in band
 
 
 def test_render_drbd_two_peers():
@@ -113,15 +118,15 @@ def test_render_drbd_two_peers():
         _cfg.Peer(node_name="n2", host="192.168.2.2",
                    loopback_ip="100.5.5.2", node_id=1),
     ]
-    text = _cfg.render("vm-test-disk0", minor=1200, peers=peers)
+    text = _cfg.render("vm-test-disk0", minor=1102, peers=peers)
     # On-blocks present for both peers
     assert "on n1" in text
     assert "on n2" in text
     # External meta — points at the meta LV, not "internal"
     assert "meta-disk /dev/bedrock/bedrock-meta-vm-test-disk0" in text
-    # Connection block for the n1-n2 pair
-    assert "100.5.5.1:8900" in text
-    assert "100.5.5.2:8900" in text
+    # Connection block for the n1-n2 pair — port 7702 (minor 1102, in band)
+    assert "100.5.5.1:7702" in text
+    assert "100.5.5.2:7702" in text
     # protocol C is non-negotiable for VMs (synchronous write ack)
     assert "protocol C" in text
 
@@ -133,7 +138,7 @@ def test_render_drbd_three_peers_full_mesh():
         _cfg.Peer(node_name="n2", host="h2", loopback_ip="10.0.0.2", node_id=1),
         _cfg.Peer(node_name="n3", host="h3", loopback_ip="10.0.0.3", node_id=2),
     ]
-    text = _cfg.render("vm-vipet-disk0", minor=1201, peers=peers)
+    text = _cfg.render("vm-vipet-disk0", minor=1103, peers=peers)
     # Three connection blocks (count occurrences)
     assert text.count("connection {") == 3
     # Every peer's loopback appears at least once
@@ -170,19 +175,30 @@ def test_render_drbd_rejects_too_many_peers():
 # ───────────────────────────────────────────────────────────────────
 
 
+# Phase 5 cutover: the create saga is now the SINGLE live path for
+# every type (cattle / pet / vipet) and is multi-disk aware. The step
+# list reflects that:
+#   - allocate_minors / register_drbd_resources are plural — they loop
+#     over every disk of the VM, not just disk0 (VM-04).
+#   - virsh_install replaces the old static-XML branch (which referenced
+#     a nonexistent _vm_xml_cattle): it runs virt-install --import on the
+#     home node, which both defines AND starts the domain for all types.
+#   - record_disk_uuids writes each disk's post-promote DRBD UUID to
+#     rqlite so the FIRST failover has a quorum-confirmed baseline
+#     (INV-5). Without it the first host-death failover is refused.
 VM_CREATE_STEPS = [
     "validate_request",
-    "allocate_minor",
-    "register_drbd_resource",
-    "lvcreate_pair_on_peers",
+    "allocate_minors",
+    "register_drbd_resources",
+    "lvcreate_on_peers",
     "write_drbd_config",
     "drbd_create_md",
     "drbd_up",
     "drbd_primary",
-    "fetch_base_image",
-    "write_image_to_drbd",
-    "write_libvirt_xml",
-    "virsh_define",
+    "write_boot_image",
+    "virsh_install",
+    "virsh_define_on_peers",
+    "record_disk_uuids",
     "register_vm",
 ]
 
@@ -198,13 +214,13 @@ def test_vm_create_steps_match_documented_flow():
 
 
 def test_vm_create_register_resource_before_lvcreate():
-    """The drbd_resources row is written BEFORE any storage is
-    provisioned. Lets a crash-mid-lvcreate resume cleanly: row
-    exists → resume picks same minor + names + peers."""
+    """The drbd_resources rows are written BEFORE any storage is
+    provisioned. Lets a crash-mid-lvcreate resume cleanly: rows
+    exist → resume picks same minors + names + peers."""
     declared = [name for (name, _fn) in _ordered_steps(
         SAGAS["vm_create"])]
-    assert declared.index("register_drbd_resource") < declared.index(
-        "lvcreate_pair_on_peers")
+    assert declared.index("register_drbd_resources") < declared.index(
+        "lvcreate_on_peers")
 
 
 def test_vm_create_drbd_up_before_primary():
@@ -214,13 +230,24 @@ def test_vm_create_drbd_up_before_primary():
     assert declared.index("drbd_up") < declared.index("drbd_primary")
 
 
-def test_vm_create_image_write_before_define():
+def test_vm_create_image_write_before_install():
     """Image bytes need to be on the device before libvirt is
     asked to boot from it."""
     declared = [name for (name, _fn) in _ordered_steps(
         SAGAS["vm_create"])]
-    assert declared.index("write_image_to_drbd") < declared.index(
-        "virsh_define")
+    assert declared.index("write_boot_image") < declared.index(
+        "virsh_install")
+
+
+def test_vm_create_records_uuid_after_promote():
+    """The first failover's INV-5 exact-equality check needs a
+    quorum-confirmed UUID baseline; the create saga records it after
+    drbd_primary on the home node (VM-02 — same fix the migrate +
+    takeover paths apply)."""
+    declared = [name for (name, _fn) in _ordered_steps(
+        SAGAS["vm_create"])]
+    assert declared.index("drbd_primary") < declared.index(
+        "record_disk_uuids")
 
 
 # ─── vm_destroy ────────────────────────────────────────────────────
@@ -301,11 +328,22 @@ def test_vm_grow_meta_before_data():
 # ─── vm_migrate ────────────────────────────────────────────────────
 
 
+# Phase 5 cutover: the saga is the SINGLE migrate path (the mgmt
+# _vm_migrate and lib.vm.migrate_vm are gone). Two contract changes:
+#   - record_uuids_after_migrate writes the new primary's post-promote
+#     DRBD UUID to rqlite, so a later host-death failover passes the
+#     INV-5 exact-equality gate. Without this, every migrate silently
+#     broke HA (VM-02). It runs after the migrate (the promote bumped
+#     the UUID) and before the source is demoted.
+#   - the saga does NOT pass --undefinesource (see migrate.py): the
+#     domain stays defined on the source so it remains a failover
+#     target for the migrated VM (VM-03).
 VM_MIGRATE_STEPS = [
     "validate_request",
     "enable_dual_primary",
     "drbd_primary_on_target",
     "virsh_migrate_live",
+    "record_uuids_after_migrate",
     "drbd_secondary_on_source",
     "disable_dual_primary",
     "update_vms_host",
@@ -321,7 +359,7 @@ def test_vm_migrate_steps_match():
 def test_vm_migrate_dual_primary_window_is_bounded():
     """Architectural invariant: dual-primary is enabled BEFORE
     target is promoted, and disabled AFTER source is demoted.
-    The window covers only the actual migration."""
+    The window covers the migration + the post-promote UUID record."""
     declared = [name for (name, _fn) in _ordered_steps(
         SAGAS["vm_migrate"])]
     enable_idx  = declared.index("enable_dual_primary")
@@ -330,6 +368,18 @@ def test_vm_migrate_dual_primary_window_is_bounded():
     demote_idx  = declared.index("drbd_secondary_on_source")
     disable_idx = declared.index("disable_dual_primary")
     assert enable_idx < promote_idx < migrate_idx < demote_idx < disable_idx
+
+
+def test_vm_migrate_records_uuid_on_new_primary():
+    """VM-02: the migrate records the target's post-promote DRBD UUID
+    in rqlite (after the live migrate, before demoting the source) so a
+    subsequent failover isn't refused by the exact-equality check."""
+    declared = [name for (name, _fn) in _ordered_steps(
+        SAGAS["vm_migrate"])]
+    assert declared.index("virsh_migrate_live") < declared.index(
+        "record_uuids_after_migrate")
+    assert declared.index("record_uuids_after_migrate") < declared.index(
+        "drbd_secondary_on_source")
 
 
 def test_vm_migrate_host_update_is_last():

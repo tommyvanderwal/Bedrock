@@ -104,7 +104,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         # nodes
         for row in client.query(
             "SELECT node_name, host, loopback_ip, role, "
-            "pubkey, bedrock_pubkey, maintenance FROM nodes",
+            "pubkey, bedrock_pubkey, maintenance, state FROM nodes",
             level=level,
         ):
             entry = {
@@ -113,9 +113,13 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "role": row.get("role", "compute"),
                 "pubkey": row.get("pubkey", ""),
                 "bedrock_pubkey": row.get("bedrock_pubkey", ""),
+                # Lifecycle gate for the election denominator (C1): only
+                # 'active' (not 'joining') nodes count toward n_nodes.
+                # maintenance is always carried so the election can
+                # exclude a drained node consistently.
+                "maintenance": bool(row.get("maintenance")),
+                "state": row.get("state") or "active",
             }
-            if row.get("maintenance"):
-                entry["maintenance"] = bool(row["maintenance"])
             out["nodes"][row["node_name"]] = entry
 
         # tiers (+ drbd_node_ids per tier)

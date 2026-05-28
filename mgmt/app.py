@@ -1265,7 +1265,7 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
     # Sign the joiner's TLS cert with the cluster CA so the joiner
     # can configure rqlited mTLS as part of its install. The joiner's
     # raw Ed25519 pubkey came in pending["bedrock_pubkey"] (hex). CA
-    # key+cert live on the DRBD tier-critical mount (master only) per
+    # key+cert live on the DRBD `cluster` singleton mount (master only) per
     # cluster_ca.py — failure here means we lost the master role
     # mid-handshake and should surface to operator.
     try:
@@ -1286,6 +1286,11 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
                 role="compute",
                 pubkey=joiner_ssh_pubkey,
                 bedrock_pubkey=pending["bedrock_pubkey"],
+                # 'joining' until the joiner's saga self-activates at the
+                # end of its join (node_set_active). Keeps the joiner out
+                # of the election denominator so the master can't be
+                # tipped into NoQuorum mid-join (C1).
+                state="joining",
                 client=_rc,
             )
             if next_loopback:
@@ -1552,7 +1557,9 @@ async def handle_rpc(method: str, params: dict) -> dict:
     elif method == "vm.poweroff":
         return await loop.run_in_executor(None, _vm_poweroff, params["name"])
     elif method == "vm.migrate":
-        return await loop.run_in_executor(None, _vm_migrate, params["name"], params.get("target_node"))
+        return await loop.run_in_executor(
+            None, lambda: api_vm_migrate(
+                params["name"], MigrateRequest(target_node=params.get("target_node"))))
     raise ValueError(f"Unknown method: {method}")
 
 # ── Background task: push cluster state every 3 seconds ────────────────────
@@ -1577,7 +1584,7 @@ _STARTUP_LOCK = threading.Lock()
 @app.on_event("startup")
 async def startup():
     global _last_state, _main_loop, _STARTUP_DONE
-    # Under bedrock-d we run TWO uvicorn instances (8443 HTTPS + 8080
+    # Under bedrock-d we run TWO uvicorn instances (8443 HTTPS + 8001
     # loopback) in SEPARATE threads, each with its own event loop —
     # both call this hook on the same `app`. Without a real lock the
     # `if _STARTUP_DONE` check + assign races and both threads proceed.
@@ -2288,6 +2295,58 @@ def api_exports_list():
     return out
 
 
+# ── VM lifecycle saga runner ────────────────────────────────────────────────
+#
+# create / migrate / delete all run through the bedrock_d/vm/* sagas — the
+# single live VM-lifecycle path (T-01/T-02). The saga executes ON THE MASTER
+# (this mgmt process), which holds DRBD/arbiter authority; the CLI is a thin
+# HTTP client that POSTs here. Returns the saga's final state dict.
+
+def _run_vm_saga(kind: str, params: dict) -> dict:
+    """Submit + synchronously run a VM-lifecycle saga on this node.
+    Raises HTTPException on saga failure so the API returns a real 5xx
+    instead of a 200 with a buried error."""
+    import sys as _sys
+    import socket as _socket
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from bedrock_d.orchestrator.sagas import SagaExecutor, SagaState
+    from bedrock_d.orchestrator.sagas.rqlite_backend import RqliteSagaBackend
+    from bedrock_d import state as _st
+    # Importing the saga modules registers them in SAGAS.
+    from bedrock_d.vm import create as _c, destroy as _d, migrate as _m  # noqa: F401
+    ex = SagaExecutor(backend=RqliteSagaBackend(_st.RqliteClient()),
+                      this_node=_socket.gethostname())
+    op_id = ex.submit(kind=kind, target_node=_socket.gethostname(),
+                      params=params, requested_by="mgmt")
+    result = ex.execute_one(op_id)
+    if result.state != SagaState.COMPLETED:
+        raise HTTPException(
+            500, f"{kind} saga failed at step "
+                 f"{result.last_step!r}: {result.error}")
+    return {"op_id": op_id, "state": result.state.value,
+            "last_step": result.last_step}
+
+
+def _vm_create_peers(vm_type: str) -> tuple[str, list[str]]:
+    """Resolve (home, peers) for a create. home = the mgmt master; peers
+    = home + (replicas-1) other nodes. Raises HTTPException if the
+    cluster is too small for the requested type."""
+    home = _mgmt_node_name()
+    others = [n for n in get_nodes() if n != home]
+    if vm_type == "cattle":
+        return home, [home]
+    if vm_type == "pet":
+        if not others:
+            raise HTTPException(400, "pet requires ≥1 peer")
+        return home, [home, others[0]]
+    if vm_type == "vipet":
+        if len(others) < 2:
+            raise HTTPException(400, "vipet requires ≥2 peers")
+        return home, [home, others[0], others[1]]
+    raise HTTPException(400, f"unknown vm_type: {vm_type}")
+
+
 class ExportRequest(BaseModel):
     format: str = "qcow2"
 
@@ -2560,16 +2619,11 @@ async def api_vm_create(req: VMCreateRequest):
 
     disk_count = 1 + len(req.extra_disks or [])
 
-    # SYNCHRONOUSLY commit the intent to the log BEFORE returning the
-    # task_id. The log idx is the durable record of "this VM is being
-    # created on this node". Crash mid-create: on restart, the
-    # vm_create_intent entry has no matching vm_created OR
-    # vm_create_failed entry, so the recovery path knows to either
-    # resume or roll back. Without this, a power loss between API
-    # accept and the async creator's first write is invisible to
-    # the cluster.
-    home = _mgmt_node_name()
-    intent_idx = None
+    # Resolve home + the full replica peer set BEFORE returning; a bad
+    # cluster size for the requested type fails 4xx here, not async.
+    # The intent breadcrumb is a secondary durability marker — the saga
+    # itself writes a durable operations row that crash-resume keys off.
+    home, peers = _vm_create_peers(req.vm_type)
     intent_idx = None
     try:
         intent_idx = _bs.vm_create_intent(
@@ -2581,9 +2635,9 @@ async def api_vm_create(req: VMCreateRequest):
             requested_by=_os.environ.get("USER", "api"),
         )
     except Exception as e:
-        # rqlite unreachable → fall through. Existing async path still
-        # creates the VM; we just don't get crash-recovery semantics
-        # for this run.
+        # rqlite unreachable → fall through. The saga still creates the
+        # VM (and writes its own durable operations row); we just don't
+        # get the vm_create_intent breadcrumb for this run.
         log.warning(f"vm_create_intent write skipped: {e}")
 
     task = task_registry().create(
@@ -2593,29 +2647,31 @@ async def api_vm_create(req: VMCreateRequest):
         f"{'s' if disk_count != 1 else ''})",
         vm_name=req.name)
 
+    # The bedrock_d vm_create saga is the single live path for every
+    # type (cattle / pet / vipet) and is multi-disk aware. It runs ON
+    # THE MASTER (this process) and crash-resumes from its own
+    # operations row.
+    saga_params = {
+        "vm_name": req.name, "vcpus": int(req.vcpus),
+        "ram_mb": int(req.ram_mb), "disk_gb": int(req.disk_gb),
+        "extra_disks": [d.size_gb for d in (req.extra_disks or [])],
+        "vm_type": req.vm_type, "priority": req.priority,
+        "iso": req.iso, "peers": peers, "home": home,
+    }
+
     async def _runner():
         loop = asyncio.get_event_loop()
         try:
             task.step_start(f"provision {req.vm_type}")
-            if req.vm_type == "cattle":
-                result = await loop.run_in_executor(None, _vm_create, req)
-            else:
-                # pet/vipet: dispatch to the lib.vm path which manages
-                # DRBD allocation + multi-host VM definition. The mgmt
-                # API runs on the master, which has SSH to every peer
-                # — same auth context lib.vm.run_on relies on.
-                result = await loop.run_in_executor(
-                    None, _vm_create_replicated, req)
+            result = await loop.run_in_executor(
+                None, _run_vm_saga, "vm_create", saga_params)
             task.step_done(f"provision {req.vm_type}")
             task.log(f"created: {result}")
             task.succeed()
-            # Settle the intent: write vm_created.
-            try:
-                _bs.vm_created(
-                    name=req.name, vm_type=req.vm_type, host=home,
-                    ram_mb=int(req.ram_mb), disk_gb=int(req.disk_gb))
-            except Exception as e:
-                log.warning(f"vm_created write skipped: {e}")
+            # NOTE: the saga's register_vm step is the authoritative vms-row
+            # writer (state='running' + failover_order). We deliberately do
+            # NOT call _bs.vm_created here — it would reset state back to
+            # 'created' on the just-started VM (ON CONFLICT … state='created').
         except HTTPException as e:
             task.fail(f"{e.status_code}: {e.detail}")
             _log_create_failed(req.name, f"{e.status_code}: {e.detail}")
@@ -2626,46 +2682,6 @@ async def api_vm_create(req: VMCreateRequest):
     asyncio.create_task(_runner())
     return {"status": "accepted", "task_id": task.id, "name": req.name,
             "intent_revision": intent_idx}
-
-
-def _vm_create_replicated(req) -> dict:
-    """pet/vipet creation via DRBD. Dispatches to lib.vm helpers which
-    handle DRBD volume allocation, peer-side LV creation, and VM
-    definition on every replica. Runs on the mgmt master synchronously
-    (called via run_in_executor)."""
-    from lib import vm as _vm
-    from lib import state as _state
-    s = _state.load()
-    home_name = s.get("node_name", "")
-    cluster = _vm._cluster()
-    nodes = cluster.get("nodes", {})
-    home_host = nodes.get(home_name, {}).get("host")
-    if not home_host:
-        raise HTTPException(500, f"mgmt node {home_name} missing host")
-    _vm._ensure_thin_pool(home_host)
-    if req.vm_type == "pet":
-        peers = [n for n in nodes if n != home_name][:1]
-        if not peers:
-            raise HTTPException(400, "pet requires ≥1 peer")
-        _vm._create_pet(
-            home_host, nodes[peers[0]]["host"],
-            home_name, peers[0],
-            req.name, int(req.ram_mb), int(req.disk_gb),
-        )
-        return {"status": "created", "name": req.name,
-                "vm_type": "pet", "node": home_name,
-                "peers": [peers[0]]}
-    elif req.vm_type == "vipet":
-        peers = [n for n in nodes if n != home_name][:2]
-        if len(peers) < 2:
-            raise HTTPException(400, "vipet requires ≥2 peers")
-        _vm._create_vipet(nodes, home_name, peers,
-                          req.name, int(req.ram_mb), int(req.disk_gb))
-        return {"status": "created", "name": req.name,
-                "vm_type": "vipet", "node": home_name,
-                "peers": peers}
-    else:
-        raise HTTPException(400, f"unknown vm_type: {req.vm_type}")
 
 
 def _log_create_failed(vm_name: str, reason: str) -> None:
@@ -2695,7 +2711,15 @@ async def api_vm_delete(vm_name: str):
     async def _runner():
         loop = asyncio.get_event_loop()
         try:
-            result = await loop.run_in_executor(None, _vm_delete, vm_name, task)
+            result = await loop.run_in_executor(
+                None, _run_vm_saga, "vm_destroy", {"vm_name": vm_name})
+            # Drop the dashboard inventory breadcrumb the saga doesn't know about.
+            try:
+                inv = load_inventory()
+                if inv.pop(vm_name, None) is not None:
+                    save_inventory(inv)
+            except Exception as e:
+                log.warning(f"vm_delete: inventory cleanup skipped: {e}")
             task.log(f"deleted: {result}")
             task.succeed()
         except HTTPException as e:
@@ -2815,7 +2839,22 @@ def api_vm_attach_disk(vm_name: str, req: AttachDiskRequest):
 
 @app.post("/api/vms/{vm_name}/migrate")
 def api_vm_migrate(vm_name: str, req: MigrateRequest = MigrateRequest()):
-    return _vm_migrate(vm_name, req.target_node)
+    """Live-migrate via the vm_migrate saga (the single migrate path).
+    The saga resolves source/target/resources from rqlite, cycles
+    dual-primary across every disk, records the post-promote UUID on the
+    new primary (so HA survives the move — VM-02), and keeps the domain
+    defined on the source for failback."""
+    target = req.target_node
+    if not target:
+        # No explicit target → pick the VM's backup peer.
+        vm = build_cluster_state()["vms"].get(vm_name)
+        if not vm:
+            raise HTTPException(404, f"Unknown VM: {vm_name}")
+        target = vm.get("backup_node")
+        if not target:
+            raise HTTPException(400, "no target node and no backup peer to pick")
+    return _run_vm_saga("vm_migrate",
+                        {"vm_name": vm_name, "target": target})
 
 
 # ── Backup endpoints ────────────────────────────────────────────────────────
@@ -3433,54 +3472,6 @@ def _vm_poweroff(vm_name: str) -> dict:
     return {"status": "powered off"}
 
 
-def _vm_migrate(vm_name: str, target_node: str = None) -> dict:
-    state = build_cluster_state()
-    vm = state["vms"].get(vm_name)
-    if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
-
-    # Multi-disk: virsh migrate handles all disks in one call, but we must
-    # cycle allow-two-primaries + primary across EVERY DRBD resource. Cattle
-    # disks (no resource) are no-ops.
-    resources = [d["drbd_resource"] for d in vm.get("disks", [])
-                 if d.get("drbd_resource")]
-    if not resources:
-        raise HTTPException(400, f"VM {vm_name} has no DRBD resources (cattle VM — cannot migrate)")
-
-    nodes_cfg = get_nodes()
-    src_name = vm["running_on"]
-    dst_name = target_node or vm["backup_node"]
-    if not dst_name or dst_name == src_name: raise HTTPException(400, "No valid target")
-    src, dst = nodes_cfg[src_name], nodes_cfg[dst_name]
-
-    # Migration URI = peer's loopback /32 (mesh-routed over whatever
-    # physical path bedrock-net picked best); falls back to mgmt host.
-    dst_migrate_ip = dst.get("loopback_ip") or dst.get("host")
-
-    for r in resources:
-        ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=yes {r}")
-        ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=yes {r}")
-        ssh_cmd(dst["host"], f"drbdadm primary {r}")
-
-    t0 = time.time()
-    out, rc = ssh_cmd_rc(src["host"],
-        f'virsh migrate --live --verbose --unsafe --migrateuri tcp://{dst_migrate_ip} '
-        f'{vm_name} qemu+ssh://root@{dst_migrate_ip}/system', timeout=120)
-    duration = time.time() - t0
-
-    for r in resources:
-        ssh_cmd(src["host"], f"drbdadm secondary {r}")
-        ssh_cmd(src["host"], f"drbdadm net-options --allow-two-primaries=no {r}")
-        ssh_cmd(dst["host"], f"drbdadm net-options --allow-two-primaries=no {r}")
-
-    if rc != 0:
-        push_log(f"VM {vm_name} migration FAILED from {src_name} to {dst_name}: {out}",
-                 node=src_name, app="bedrock-mgmt", level="error")
-        raise HTTPException(500, f"Migration failed: {out}")
-    push_log(f"VM {vm_name} migrated from {src_name} to {dst_name} in {round(duration, 2)}s",
-             node=dst_name, app="bedrock-mgmt", level="info")
-    return {"status": "migrated", "from": src_name, "to": dst_name, "duration_s": round(duration, 2)}
-
-
 # ── Workload conversion (cattle ↔ pet ↔ vipet) ──────────────────────────────
 
 def _vm_disk_vg(host: str) -> str:
@@ -3509,6 +3500,10 @@ def _vm_disk_vg(host: str) -> str:
         vgs = [v.strip() for v in vgs if v.strip()]
         if len(vgs) == 1:
             return vgs[0]
+        # Prefer the fresh-create name `bedrock-vg`, then legacy `bedrock`
+        # (mirrors tier_storage.detect_vg's multi-VG heuristic).
+        if "bedrock-vg" in vgs:
+            return "bedrock-vg"
         if "bedrock" in vgs:
             return "bedrock"
     except Exception:
@@ -3561,9 +3556,14 @@ _drbd_minor_reserved: set[int] = set()
 
 
 def _next_drbd_minor(hosts: list) -> int:
-    """Pick + atomically reserve an unused minor number (1000+) across all
-    hosts. The reservation lives until `_release_drbd_minor` is called
-    (after the resource is fully up, or on rollback)."""
+    """Pick + atomically reserve an unused minor in the VM band
+    (1102..1189) across all hosts. The band keeps every VM-disk DRBD
+    port inside 7700-7799 (drbd_port_for) and clear of the singleton
+    minor (1101) + the netd mesh minors (1132/1133/1134 → UDP probe
+    7732, advert 7733, election heartbeat 7734=netd.HB_PORT). The
+    reservation lives until `_release_drbd_minor` is called (after the
+    resource is fully up, or on rollback)."""
+    reserved_minors = {1132, 1133, 1134}
     with _drbd_minor_lock:
         used = set(_drbd_minor_reserved)
         for h in hosts:
@@ -3571,8 +3571,8 @@ def _next_drbd_minor(hosts: list) -> int:
             for n in out.split():
                 try: used.add(int(n))
                 except ValueError: pass
-        for i in range(1000, 1900):
-            if i not in used:
+        for i in range(1102, 1190):
+            if i not in used and i not in reserved_minors:
                 _drbd_minor_reserved.add(i)
                 return i
     raise HTTPException(500, "No free DRBD minor")
@@ -3601,7 +3601,12 @@ def _gen_drbd_res(resource: str, minor: int, peers: list) -> str:
     External meta-disk keeps the DRBD device the same size as the data LV,
     so virsh blockcopy can pivot 1:1 without size mismatch.
     """
-    port = 7000 + minor
+    # Shared DRBD port formula (7700-7799 band) — same mapping the
+    # cluster singleton + the VM sagas use. See drbd_config.drbd_port_for.
+    import sys as _sys
+    _sys.path.insert(0, "/usr/local/lib/bedrock")
+    from bedrock_d.vm import drbd_config as _cfg
+    port = _cfg.drbd_port_for(minor)
     lines = [f"resource {resource} {{",
              "    protocol C;",
              "    net { allow-two-primaries no; after-sb-0pri discard-zero-changes;",
@@ -4203,178 +4208,27 @@ def _mgmt_node_name() -> str:
     return next(iter(cfg)) if cfg else ""
 
 
-def _vm_create(req) -> dict:
-    """Provision a cattle VM on the mgmt node. ISO optional.
-    Stores priority + creation metadata in /etc/bedrock/vm_inventory.json."""
-    if not _VM_NAME_RE.match(req.name):
-        raise HTTPException(400, "VM name: 3-32 chars, lowercase letters/digits/dashes, start with a letter")
-    if req.priority not in _VALID_PRIORITIES:
-        raise HTTPException(400, f"priority must be one of {_VALID_PRIORITIES}")
-    if req.vcpus < 1 or req.vcpus > 32:
-        raise HTTPException(400, "vcpus must be 1-32")
-    if req.ram_mb < 128 or req.ram_mb > 131072:
-        raise HTTPException(400, "ram_mb must be 128-131072")
-    if req.disk_gb < 1 or req.disk_gb > 2048:
-        raise HTTPException(400, "disk_gb must be 1-2048")
-
-    # Existing VM?
-    state = build_cluster_state()
-    if req.name in state["vms"]:
-        raise HTTPException(409, f"VM {req.name} already exists")
-
-    home_name = _mgmt_node_name()
-    nodes_cfg = get_nodes()
-    home = nodes_cfg.get(home_name)
-    if not home:
-        raise HTTPException(500, "No mgmt node found in cluster.json")
-    host = home["host"]
-
-    # Validate ISO if given
-    iso_path = ""
-    if req.iso:
-        iso_name = Path(req.iso).name  # prevent traversal
-        # Reference via the cluster-wide auto-mount path — identical on every
-        # node so future cross-node creates work without changing this arg.
-        iso_path = f"{ISO_MOUNT_DIR}/{iso_name}"
-        if not (ISO_DIR / iso_name).exists():
-            raise HTTPException(400, f"ISO not found: {iso_name}")
-
-    # All disks: disk0 is the primary/boot disk (req.disk_gb), any additional
-    # entries from req.extra_disks become vdb, vdc, ... at their given sizes.
-    # Resolved VG: prefer `bedrock` (dedicated PV, lots of room), fall
-    # back to `almalinux` only when bedrock-storage hasn't been
-    # initialised yet.
-    vg = _vm_disk_vg(host)
-    extra = req.extra_disks or []
-    disks_plan: list[dict] = []
-    for i, spec in enumerate([VMDiskSpec(size_gb=req.disk_gb)] + extra):
-        if spec.size_gb < 1 or spec.size_gb > 8192:
-            raise HTTPException(400, f"disk{i} size_gb must be 1-8192")
-        lv_name = f"vm-{req.name}-disk{i}"
-        disks_plan.append({
-            "index": i, "lv_name": lv_name,
-            "lv_path": f"/dev/{vg}/{lv_name}",
-            "size_gb": spec.size_gb,
-        })
-
-    # 1. Ensure thin pool, create every thin LV
-    _ensure_thinpool(host, vg_name=vg)
-    for d in disks_plan:
-        push_log(f"Create VM {req.name}: lvcreate {d['size_gb']}G thin "
-                 f"({d['lv_name']}) in VG {vg} on {home_name}",
-                 node=home_name, app="bedrock-mgmt")
-        out, rc = ssh_cmd_rc(host,
-            f"lvcreate -y -V {d['size_gb']}G --thin -n {d['lv_name']} "
-            f"{vg}/thinpool", timeout=30)
-        if rc != 0 and "already exists" not in out:
-            # Unwind any LVs we already made
-            for prev in disks_plan[:d["index"]]:
-                ssh_cmd_rc(host, f"lvremove -f {prev['lv_path']} 2>&1", timeout=15)
-            raise HTTPException(500, f"lvcreate {d['lv_name']} failed: {out}")
-
-    # 1b. If no ISO, populate disk0 with the cached Alpine cloud image so
-    # the VM has something to boot from. Without this, virt-install's
-    # `--import` attaches an empty raw block device and the guest BIOS
-    # halts with "no bootable device". Same Alpine image lib.vm._create_cattle
-    # uses; cached at /var/lib/bedrock/alpine.qcow2 on every node.
-    if not iso_path:
-        boot_lv = disks_plan[0]["lv_path"]
-        alpine_url = ("https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/"
-                      "cloud/nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2")
-        push_log(f"Create VM {req.name}: writing Alpine boot image to "
-                 f"{boot_lv}", node=home_name, app="bedrock-mgmt")
-        seed_cmd = (
-            "mkdir -p /var/lib/bedrock; "
-            "test -f /var/lib/bedrock/alpine.qcow2 || "
-            f"  curl -sfL -o /var/lib/bedrock/alpine.qcow2 '{alpine_url}'; "
-            f"qemu-img convert -f qcow2 -O raw "
-            f"  /var/lib/bedrock/alpine.qcow2 {boot_lv}"
-        )
-        out, rc = ssh_cmd_rc(host, seed_cmd, timeout=180)
-        if rc != 0:
-            for prev in disks_plan:
-                ssh_cmd_rc(host, f"lvremove -f {prev['lv_path']} 2>&1", timeout=15)
-            raise HTTPException(500,
-                f"seed boot disk failed: {out[-300:]}")
-
-    # 2. virt-install — with or without CDROM. Always attach virtio-win.iso
-    #    as a 2nd CDROM when any ISO is used: Windows Setup needs it for
-    #    viostor+NetKVM; Linux installs ignore it.
-    virtio_extra = ""
-    if iso_path and (ISO_DIR / "virtio-win.iso").exists():
-        virtio_extra = (f" --disk path={ISO_MOUNT_DIR}/virtio-win.iso,"
-                        "device=cdrom,bus=sata,readonly=on")
-    cdrom_arg = f"--cdrom {iso_path}{virtio_extra}" if iso_path else "--import"
-    boot_arg = "--boot cdrom,hd" if iso_path else "--boot hd"
-
-    # Build the --disk argument list: one per data disk.
-    disk_args = " ".join(
-        f"--disk path={d['lv_path']},format=raw,bus=virtio,cache=none,discard=unmap"
-        for d in disks_plan)
-
-    vi_cmd = (
-        f"virt-install "
-        f"--name {req.name} "
-        f"--vcpus {req.vcpus} "
-        f"--ram {req.ram_mb} "
-        f"{disk_args} "
-        f"--network bridge=br0,model=virtio "
-        f"--graphics vnc,listen=0.0.0.0 "
-        f"--channel unix,target_type=virtio,name=org.qemu.guest_agent.0 "
-        f"--os-variant detect=on,name=generic "
-        f"--noautoconsole "
-        f"{cdrom_arg} "
-        f"{boot_arg} "
-        f"2>&1"
-    )
-    push_log(f"Create VM {req.name}: virt-install (vcpus={req.vcpus}, "
-             f"ram={req.ram_mb}MB, disks={len(disks_plan)}, "
-             f"iso={req.iso or 'none'})",
-             node=home_name, app="bedrock-mgmt")
-    out, rc = ssh_cmd_rc(host, vi_cmd, timeout=120)
-    if rc != 0:
-        # Clean up all LVs so the name is free for retry
-        for d in disks_plan:
-            ssh_cmd_rc(host, f"lvremove -f {d['lv_path']} 2>&1", timeout=15)
-        raise HTTPException(500, f"virt-install failed: {out[-400:]}")
-
-    # 3. Apply priority → cpu_shares (cgroup weight, default 1024)
-    shares = PRIORITY_CPU_SHARES[req.priority]
-    ssh_cmd_rc(host, f"virsh schedinfo {req.name} --live --config "
-                     f"cpu_shares={shares} 2>&1", timeout=15)
-
-    # 4. Save inventory
-    inv = load_inventory()
-    inv[req.name] = {
-        "priority": req.priority,
-        "vcpus": req.vcpus,
-        "ram_mb": req.ram_mb,
-        "disk_gb": req.disk_gb,        # primary disk size (back-compat)
-        "disks": [                      # full per-disk record (multi-disk aware)
-            {"index": d["index"], "lv": d["lv_name"], "size_gb": d["size_gb"]}
-            for d in disks_plan
-        ],
-        "iso": req.iso,
-        "home_node": home_name,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "created_by": "dashboard",
-    }
-    save_inventory(inv)
-
-    disk_summary = ", ".join(f"disk{d['index']}={d['size_gb']}G" for d in disks_plan)
-    push_log(f"Created VM {req.name} on {home_name} "
-             f"(cattle, {req.vcpus}vCPU, {req.ram_mb}MB, {disk_summary}, "
-             f"priority={req.priority}, cpu_shares={shares})",
-             node=home_name, app="bedrock-mgmt", level="info")
-    return {"status": "created", "name": req.name, "node": home_name,
-            "disks": [d["lv_name"] for d in disks_plan]}
-
-
 def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict:
     """Turn a converted import (qcow2 on mgmt node) into a cattle VM.
     Creates a thin LV sized to the qcow2 virtual size, qemu-img converts the
     qcow2 into the LV (raw), then virt-installs with machine=q35, UEFI
-    firmware, clock=UTC. Marks the import meta as consumed."""
+    firmware, clock=UTC. Marks the import meta as consumed.
+
+    NOT routed through the bedrock_d vm_create saga (unlike POST /api/vms,
+    which uses _run_vm_saga). The saga's image-fill step only knows how to
+    write the cached Alpine image or boot an ISO — it has no "import a
+    pre-existing disk image" mode, and import additionally needs source-disk
+    firmware sniffing (BIOS vs UEFI), Windows Hyper-V enlightenments, and
+    import-meta consumption that the saga doesn't model. Import is also
+    cattle-only (single local LV, no DRBD), so there is no post-promote DRBD
+    UUID to record (INV-5 only applies to replicated pet/vipet disks).
+
+    Per-resource naming: this path uses vm-<name>-disk<N> LV names, matching
+    the rest of the legacy mgmt VM layer (attach-disk at _next_drbd_minor /
+    api_vm_attach_disk, _vm_get_settings, mgmt-side destroy) so disk ops on an
+    imported VM stay consistent. That layer's LV naming differs from the
+    saga's bedrock-data-<resource> scheme; unifying the two onto the saga is
+    tracked under BAD-2/BAD-3 (finish the rewrite), not here."""
     if not _VM_NAME_RE.match(req.name):
         raise HTTPException(400, "invalid VM name (3-32 chars, lowercase)")
     if req.priority not in _VALID_PRIORITIES:
@@ -4459,6 +4313,8 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
         pass
 
     # Per-disk plan: one LV per source disk, named vm-<vm>-disk0/1/2...
+    # Resolved VG (never hardcode 'almalinux').
+    vg = _vm_disk_vg(host)
     disks_plan = []
     for sd in src_disks:
         vgb = sd["virtual_size_gb"] or 1
@@ -4466,7 +4322,7 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
         disks_plan.append({
             "index": sd["index"],
             "lv_name": ln,
-            "lv_path": f"/dev/almalinux/{ln}",
+            "lv_path": f"/dev/{vg}/{ln}",
             "size_gb": vgb,
             "size_mb": max(vgb * 1024, 1024),
             "src_qcow": sd["path"],
@@ -4482,7 +4338,7 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
                  node=home_name, app="bedrock-mgmt", level="info")
         out, rc = ssh_cmd_rc(host,
             f"lvcreate -y -V {d['size_mb']}M --thin -n {d['lv_name']} "
-            f"almalinux/thinpool 2>&1", timeout=60)
+            f"{vg}/thinpool 2>&1", timeout=60)
         if rc != 0 and "already exists" not in out:
             for lv in created_lvs:
                 ssh_cmd_rc(host, f"lvremove -f {lv} 2>&1", timeout=15)
@@ -4592,116 +4448,6 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
              node=home_name, app="bedrock-mgmt", level="info")
     return {"status": "created", "name": req.name, "node": home_name,
             "disks": [d["lv_name"] for d in disks_plan]}
-
-
-def _vm_delete(vm_name: str, task: Optional[Task] = None) -> dict:
-    """Stop (if running), tear down DRBD (if any), undefine VM + remove LVs
-    on every node where it was defined, drop inventory entry. Iterates every
-    disk the VM had, so multi-disk VMs clean up fully."""
-    state = build_cluster_state()
-    vm = state["vms"].get(vm_name)
-    if not vm:
-        raise HTTPException(404, f"Unknown VM: {vm_name}")
-    nodes_cfg = get_nodes()
-    defined_on = vm.get("defined_on") or ([vm["running_on"]] if vm.get("running_on") else [])
-    if not defined_on:
-        raise HTTPException(500, "VM has no defined_on nodes")
-
-    # Per-disk teardown plan. For each disk figure out its DRBD resource (if any)
-    # and the LV paths (data + meta) on every peer. We parse the .res on one node
-    # for peer LV paths — DRBD resource config has on <node> { disk / meta-disk }.
-    disks = vm.get("disks") or []
-    if not disks:
-        # Fallback — VM has no disks in state (pure cattle, or state stale).
-        # Guess the legacy single-disk path.
-        disks = [{"drbd_resource": vm.get("drbd_resource", ""),
-                  "backing_lv": f"/dev/almalinux/vm-{vm_name}-disk0"}]
-
-    # For each disk, collect a mini-plan: {resource, lv_by_node, meta_by_node}.
-    host0 = nodes_cfg[defined_on[0]]["host"]
-    disk_plans = []
-    for d in disks:
-        r = d.get("drbd_resource") or ""
-        plan = {"resource": r, "lv_by_node": {}, "meta_by_node": {}}
-        if r:
-            existing = _parse_drbd_res(host0, r) or {}
-            # _parse_drbd_res today returns single peer view; extend to parse all
-            # 'on <node>' blocks.
-            try:
-                cfg_text = ssh_cmd_rc(host0, f"cat /etc/drbd.d/{r}.res 2>/dev/null", timeout=10)[0]
-                import re as _re
-                for m in _re.finditer(
-                    r"on\s+(\S+)\s*\{([^}]*)\}", cfg_text or "", _re.DOTALL):
-                    node_fqdn, body = m.group(1), m.group(2)
-                    dm = _re.search(r"disk\s+(/dev/[^\s;]+)\s*;", body)
-                    mm = _re.search(r"meta-disk\s+(/dev/[^\s;]+)\s*;", body)
-                    if dm: plan["lv_by_node"][node_fqdn] = dm.group(1)
-                    if mm: plan["meta_by_node"][node_fqdn] = mm.group(1)
-            except Exception: pass
-        if not plan["lv_by_node"]:
-            # No DRBD, or parse failed — use backing_lv we saw on the live node.
-            default_lv = d.get("backing_lv") or \
-                f"/dev/almalinux/vm-{vm_name}-disk0"
-            for n in defined_on:
-                plan["lv_by_node"][n] = default_lv
-        disk_plans.append(plan)
-
-    # 1. Stop the VM (force-kill; this is delete, not shutdown)
-    if task: task.step_start("destroy VM")
-    if vm["state"] == "running" and vm.get("running_on"):
-        host = nodes_cfg[vm["running_on"]]["host"]
-        ssh_cmd_rc(host, f"virsh destroy {vm_name} 2>&1", timeout=15)
-    if task: task.step_done("destroy VM")
-
-    # 2. For each node that has the VM, undefine it + tear down DRBD + remove LVs
-    for nname in defined_on:
-        if nname not in nodes_cfg: continue
-        host = nodes_cfg[nname]["host"]
-        if task: task.step_start(f"undefine on {nname}")
-        ssh_cmd_rc(host, f"virsh undefine {vm_name} --nvram 2>&1 || virsh undefine {vm_name} 2>&1", timeout=15)
-        if task: task.step_done(f"undefine on {nname}")
-
-        # Per-disk teardown on this node
-        for i, plan in enumerate(disk_plans):
-            r = plan["resource"]
-            sn = f"disk{i}"
-            if task: task.step_start(f"{sn} teardown on {nname}")
-            if r:
-                ssh_cmd_rc(host, f"drbdadm down {r} 2>&1 || true", timeout=15)
-                ssh_cmd_rc(host, f"drbdadm wipe-md --force {r} 2>&1 || true", timeout=15)
-                ssh_cmd_rc(host, f"rm -f /etc/drbd.d/{r}.res", timeout=10)
-            lv = plan["lv_by_node"].get(nname) or next(iter(plan["lv_by_node"].values()), "")
-            mv = plan["meta_by_node"].get(nname, "")
-            rm_paths = " ".join(p for p in (lv, mv) if p)
-            if rm_paths:
-                ssh_cmd_rc(host, f"lvremove -f {rm_paths} 2>&1 || true", timeout=30)
-            if task: task.step_done(f"{sn} teardown on {nname}")
-
-    # 3. Drop inventory entry
-    inv = load_inventory()
-    if vm_name in inv:
-        inv.pop(vm_name)
-        save_inventory(inv)
-
-    # 4. If this VM was created from an import, reset the import to "ready"
-    #    so the operator can recreate the same VM (or a different one) from
-    #    the already-converted disk without re-uploading.
-    if IMPORT_ROOT.exists():
-        for d in IMPORT_ROOT.iterdir():
-            if not d.is_dir(): continue
-            m = _import_meta(d)
-            if m.get("consumed_as") == vm_name:
-                m["status"] = "ready"
-                m.pop("consumed_as", None)
-                m.pop("consumed_at", None)
-                _write_import_meta(d, m)
-                push_log(f"Import {d.name} reset to ready (was VM {vm_name})",
-                         node="mgmt", app="bedrock-mgmt", level="info")
-                break
-
-    push_log(f"Deleted VM {vm_name} (was on {','.join(defined_on)})",
-             node="mgmt", app="bedrock-mgmt", level="warn")
-    return {"status": "deleted", "name": vm_name}
 
 
 # ── Settings helpers ────────────────────────────────────────────────────────
@@ -4865,6 +4611,12 @@ def _vm_set_priority(vm_name: str, priority: str) -> dict:
     inv = load_inventory()
     inv.setdefault(vm_name, {})["priority"] = priority
     save_inventory(inv)
+    # Mirror to rqlite so the cluster-wide self-heal repair loop orders
+    # replica restoration by the operator's current choice (SG-05).
+    try:
+        _bs.vm_set_priority(name=vm_name, priority=priority)
+    except Exception as e:
+        log.warning(f"vm priority rqlite-mirror skipped: {e}")
     push_log(f"VM {vm_name}: priority → {priority} (cpu_shares={shares}, live)",
              node=running, app="bedrock-mgmt", level="info")
     return {"applied": True, "requires_reboot": False,
@@ -5006,16 +4758,25 @@ def serve_main():
       * 127.0.0.1:8001 HTTP — local CLI / intra-process endpoint. The
         ``bedrock`` CLI dials this; rqlite_client, view_builder, etc.
         also point here. **Loopback-only, no LAN exposure.**
-      * 8080 LAN HTTP — bootstrap-only, used when no TLS cert exists
+      * 8444 LAN HTTP — bootstrap-only, used when no TLS cert exists
         yet so a joiner can fetch ``/api/cluster``. As soon as the
         cert-refresh timer drops the first cert (~2 min after install)
         the next restart switches to the safe layout above.
 
-    Port 8080 is now reserved for ``weed-volume`` (see
+    Port 8080 is reserved for ``weed-volume`` (see
     docs/storage-architecture.md). Anything that previously dialled
     ``http://localhost:8080`` for the local mgmt API has moved to
     ``http://127.0.0.1:8001`` — that change is mechanical and stays
     inside this codebase; no operator-facing URL changes.
+
+    The bootstrap listener must NOT reuse 8080: weed-volume binds
+    ``0.0.0.0:8080`` (every node), and 0.0.0.0 already covers loopback,
+    so a 127.0.0.1:8080 bootstrap bind would EADDRINUSE. With bedrock-d
+    owning boot (quorum-aware), weed-volume comes up after the
+    orchestrator establishes role/quorum — but the bootstrap branch runs
+    on a fresh cert-less node where ordering can't be relied on, so we
+    bind a dedicated bootstrap port (8444) clear of the whole map.
+    (finding T-05.)
     """
     import threading
     import uvicorn
@@ -5033,13 +4794,15 @@ def serve_main():
         uvicorn.run(app, host="0.0.0.0", port=8443,
                     ssl_keyfile=str(key), ssl_certfile=str(cert))
     else:
-        # No cert yet — bind the bootstrap HTTP port on **127.0.0.1**,
-        # NOT 0.0.0.0. Port 8080 on 0.0.0.0 conflicts with weed-volume
-        # which also binds 0.0.0.0:8080 on every node (see the port
-        # map in docs/storage-architecture.md). When the cert-refresh
-        # timer drops the first cert, the next bedrock-d restart
-        # flips to 8443.
-        uvicorn.run(app, host="127.0.0.1", port=8080)
+        # No cert yet — bind a LAN-reachable bootstrap HTTP port so a
+        # joiner can fetch /api/cluster before the first cert exists.
+        # NOT 8080: weed-volume binds 0.0.0.0:8080 on every node and
+        # 0.0.0.0 already covers loopback, so any 8080 bind here would
+        # EADDRINUSE. 8444 is dedicated to this bootstrap window and
+        # clear of the whole port map (docs/storage-architecture.md).
+        # When the cert-refresh timer drops the first cert, the next
+        # bedrock-d restart flips to 8443. (finding T-05.)
+        uvicorn.run(app, host="0.0.0.0", port=8444)
 
 
 if __name__ == "__main__":

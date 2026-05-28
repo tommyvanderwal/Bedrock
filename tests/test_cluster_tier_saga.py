@@ -13,6 +13,11 @@ unit-tested separately. The tests here lock in:
     refuses to run on a node that isn't the current mgmt-master,
     and bails out gracefully when the tier is already in ``drbd``
     mode.
+
+Contract note (SG-04): the cluster-singleton tier is keyed ``cluster``
+in the rqlite ``tiers`` row + the DRBD resource. The legacy ``critical``
+key was renamed; "critical" is now only a SeaweedFS collection + the VM
+HA-importance label. These fixtures therefore use ``tiers.cluster``.
 """
 from __future__ import annotations
 
@@ -95,7 +100,7 @@ class CheckPreconditionsBehaviour(unittest.TestCase):
             {"mgmt_master": "bedrock-OTHER",
              "nodes": {"bedrock-OTHER": {"loopback_ip": "100.1.1.3"},
                        "bedrock-SELF":  {"loopback_ip": "100.1.1.1"}},
-             "tiers": {"critical": {"mode": "local"}}})
+             "tiers": {"cluster": {"mode": "local"}}})
         saga = cluster_tier.ClusterTierPromoteMaster()
         with self.assertRaisesRegex(RuntimeError, "no longer mgmt_master"):
             saga.step_check_preconditions(
@@ -107,7 +112,7 @@ class CheckPreconditionsBehaviour(unittest.TestCase):
             {"mgmt_master": "bedrock-SELF",
              "nodes": {"bedrock-SELF": {"loopback_ip": "100.1.1.1"},
                        "bedrock-OTHER": {"loopback_ip": "100.1.1.3"}},
-             "tiers": {"critical": {"mode": "drbd"}}})
+             "tiers": {"cluster": {"mode": "drbd"}}})
         saga = cluster_tier.ClusterTierPromoteMaster()
         ctx = {"peer_node": "bedrock-OTHER",
                "peer_loopback": "100.1.1.3"}
@@ -119,7 +124,7 @@ class CheckPreconditionsBehaviour(unittest.TestCase):
         self._patch_cluster(
             {"mgmt_master": "bedrock-SELF",
              "nodes": {"bedrock-SELF": {"loopback_ip": "100.1.1.1"}},
-             "tiers": {"critical": {"mode": "local"}}})
+             "tiers": {"cluster": {"mode": "local"}}})
         saga = cluster_tier.ClusterTierPromoteMaster()
         with self.assertRaisesRegex(RuntimeError, "not in cluster.json"):
             saga.step_check_preconditions(
@@ -130,7 +135,7 @@ class CheckPreconditionsBehaviour(unittest.TestCase):
         self._patch_cluster(
             {"mgmt_master": "bedrock-SELF",
              "nodes": {"bedrock-SELF": {"loopback_ip": "100.1.1.1"}},
-             "tiers": {"critical": {"mode": "local"}}})
+             "tiers": {"cluster": {"mode": "local"}}})
         saga = cluster_tier.ClusterTierPromoteMaster()
         with self.assertRaisesRegex(RuntimeError, "missing peer params"):
             saga.step_check_preconditions({})
