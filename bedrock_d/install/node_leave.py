@@ -71,8 +71,8 @@ class NodeLeave:
                 f"cannot leave-from-self ({ctx['self_name']!r}); "
                 f"run `bedrock node leave` from a different node"
             )
-        from lib import view_builder as _vb
-        snapshot = _vb.rebuild(this_node=ctx["self_name"])
+        from lib import cluster_state as _cs
+        snapshot = _cs.load_cluster()
         target_info = (snapshot.get("nodes") or {}).get(ctx["target_name"])
         if target_info is None:
             # Idempotent: if the target was already removed earlier
@@ -187,9 +187,9 @@ class NodeLeave:
         view."""
         if ctx.get("already_gone"):
             return
-        from lib import view_builder as _vb
+        from lib import cluster_state as _cs
         for _ in range(10):  # 10 × 0.5 s
-            snapshot = _vb.rebuild(this_node=ctx["self_name"])
+            snapshot = _cs.load_cluster(level="strong")
             if ctx["target_name"] not in (snapshot.get("nodes") or {}):
                 log.info("node_leave: %r removed from snapshot",
                          ctx["target_name"])

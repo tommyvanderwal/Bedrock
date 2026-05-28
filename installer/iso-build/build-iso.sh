@@ -209,13 +209,16 @@ refresh_payload() {
 
     # Kopia (backup client).
     KOPIA_VERSION="0.21.1"
-    if [ ! -f "$PAYLOAD_DIR/kopia" ]; then
+    # Staged under binaries/ so publish-to-s3 (which syncs binaries/)
+    # uploads it and install.sh fetches it like weed/rqlited.
+    if [ ! -f "$PAYLOAD_DIR/binaries/kopia" ]; then
         echo "  fetching kopia ${KOPIA_VERSION}..."
         curl -fsSL -o "$BUILD_DIR/kopia.tgz" \
             "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
         tar -xzf "$BUILD_DIR/kopia.tgz" -C "$BUILD_DIR"
-        cp "$BUILD_DIR/kopia-${KOPIA_VERSION}-linux-x64/kopia" "$PAYLOAD_DIR/kopia"
-        chmod +x "$PAYLOAD_DIR/kopia"
+        mkdir -p "$PAYLOAD_DIR/binaries"
+        cp "$BUILD_DIR/kopia-${KOPIA_VERSION}-linux-x64/kopia" "$PAYLOAD_DIR/binaries/kopia"
+        chmod +x "$PAYLOAD_DIR/binaries/kopia"
     fi
 
     # Python wheels for mgmt deps. Always include httpx — install.sh

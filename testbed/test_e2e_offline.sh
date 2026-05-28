@@ -332,7 +332,7 @@ step "2. Scale-up sim-2 → N=2"
 IP1=$(sim_ip 1)
 TOKEN=$(api_token 1)
 [ -n "$TOKEN" ] || { fail "no operator token"; exit 1; }
-sssh 2 "nohup bedrock join --witness $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
+sssh 2 "nohup bedrock join $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
 sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30
@@ -346,7 +346,7 @@ s3_verify_history 2 n1
 s3_round_trip 2 "n2"
 
 step "3. Scale-up sim-3 → N=3"
-sssh 3 "nohup bedrock join --witness $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
+sssh 3 "nohup bedrock join $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
 sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30
@@ -359,7 +359,7 @@ s3_verify_history 3 n1 n2
 s3_round_trip 3 "n3"
 
 step "4. Scale-up sim-4 → N=4"
-sssh 4 "nohup bedrock join --witness $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
+sssh 4 "nohup bedrock join $IP1 --yes >/tmp/join.log 2>&1 &" >/dev/null
 sleep 5
 approve_pending_join "$IP1" "$TOKEN"
 sleep 30

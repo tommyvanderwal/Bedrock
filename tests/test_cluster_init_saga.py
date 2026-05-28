@@ -43,6 +43,8 @@ EXPECTED_STEPS = [
     "start_obs_services",
     # Storage
     "provision_storage_n1",
+    # Cluster CA (mTLS) — must exist before rqlite starts
+    "bootstrap_cluster_ca",
     # rqlite
     "render_rqlited_env",
     "start_rqlited",

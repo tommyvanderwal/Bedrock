@@ -42,11 +42,11 @@ ssh_run "$SIM1" 'bedrock init --name bedrock-mesh-test 2>&1 | tail -10'
 
 echo
 echo "=== bedrock join sim-2 ==="
-ssh_run "$SIM2" "bedrock join --witness $SIM1 --yes 2>&1 | tail -8"
+ssh_run "$SIM2" "bedrock join $SIM1 --yes 2>&1 | tail -8"
 echo "=== bedrock join sim-3 ==="
-ssh_run "$SIM3" "bedrock join --witness $SIM1 --yes 2>&1 | tail -8"
+ssh_run "$SIM3" "bedrock join $SIM1 --yes 2>&1 | tail -8"
 echo "=== bedrock join sim-4 ==="
-ssh_run "$SIM4" "bedrock join --witness $SIM1 --yes 2>&1 | tail -8"
+ssh_run "$SIM4" "bedrock join $SIM1 --yes 2>&1 | tail -8"
 
 echo
 echo "=== Waiting for bedrock-net path discovery ==="

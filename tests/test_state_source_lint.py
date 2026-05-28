@@ -44,6 +44,17 @@ ALLOWED = {
     "mgmt/orchestrator.py",
     "mgmt/backup.py",
     "mgmt/victoria.py",
+    # In-flight VM-lifecycle saga cutover (BAD-2/3): these reach rqlite
+    # via lib.rqlite_client through the sys.path shim today; they move
+    # onto bedrock_d.state when the cutover lands and this list shrinks.
+    "bedrock_d/orchestrator/vm_failover.py",
+    "bedrock_d/vm/create.py",
+    "bedrock_d/vm/destroy.py",
+    "bedrock_d/vm/grow.py",
+    "bedrock_d/vm/migrate.py",
+    "bedrock_d/vm/failover.py",
+    # Pure rqlite READ facade (like view_builder) — a reader, not a writer.
+    "installer/lib/cluster_state.py",
 }
 
 PATTERN = re.compile(

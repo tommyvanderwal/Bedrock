@@ -477,6 +477,12 @@ chmod +x /usr/local/bin/rqlited
 log "Installing weed binary + SeaweedFS systemd units..."
 curl -fsSL "${BEDROCK_REPO}/binaries/weed" -o /usr/local/bin/weed
 chmod +x /usr/local/bin/weed
+
+# Kopia — backup/restore client; mgmt/backup.py shells out to `kopia`.
+log "Installing kopia (backup client)..."
+curl -fsSL "${BEDROCK_REPO}/binaries/kopia" -o /usr/local/bin/kopia
+chmod +x /usr/local/bin/kopia
+
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-master.service" \
     -o /etc/systemd/system/bedrock-weed-master.service
 curl -fsSL "${BEDROCK_REPO}/configs/bedrock-weed-volume.service" \

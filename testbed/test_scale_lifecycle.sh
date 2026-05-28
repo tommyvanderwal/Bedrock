@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED 2026-05-28 — superseded by testbed/test_e2e_offline.sh (which
+# walks 1->4->1) + testbed/setup_4node_cluster.sh. Predates the current
+# contract (uses net-install, the removed `bedrock init --cluster-name`
+# flag, and no /api/join/approve step). Kept for reference only.
+echo "test_scale_lifecycle.sh is DEPRECATED — use test_e2e_offline.sh" >&2
+exit 64
 # Bedrock scale-lifecycle end-to-end test.
 #
 # Per Tommy's 2026-05-18 directive: walk the full membership lifecycle,

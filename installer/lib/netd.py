@@ -2987,9 +2987,10 @@ def compute_routes(d: Daemon) -> list[str]:
 
 
 def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
-    """Read (mgmt_master_node_name, master_loopback_ip) from cluster.json.
-    Returns ('', '') if cluster.json is absent, malformed, has no master
-    set, or the master node has no loopback recorded. Used by
+    """Read (mgmt_master_node_name, master_loopback_ip) from rqlite's
+    cluster_info/nodes tables (level='none', works without quorum).
+    Returns ('', '') if rqlite is unreachable, has no master set, or the
+    master node has no loopback recorded. Used by
     compute_routes() for the /24-via-master panic catch-all (D-13).
     Master may be `my_node` itself — caller decides to skip in that case.
     """

@@ -1,6 +1,7 @@
 """Unit tests for bedrock-net Phase A changes.
 
-Per docs/post-alpha-rewrite-notes.md (Decisions D-13, D-14, D-15):
+Per the mesh-routing design (docs/06-mesh-network.md,
+docs/network-walkthrough.md) — Decisions D-13, D-14, D-15:
 
   D-13 — panic catch-all /24 routes via the current mgmt-master's
          loopback, not via the freshest neighbour. Master itself
@@ -121,10 +122,11 @@ class TestNormalizeRouteLine(unittest.TestCase):
             "100.42.42.2/32 via 169.254.1.1 dev enp2s0 metric 10",
         )
 
-    def test_multipath_metric_moves_to_tail(self):
-        """`ip route show` puts `metric` on the header line of a
-        multipath route; we emit it after all nexthops. Normalize
-        must move it to match."""
+    def test_multipath_metric_stays_before_nexthops(self):
+        """`ip route show` prints `metric` on the header line of a
+        multipath route (before the nexthops), and `ip route replace`
+        requires that form. Normalize keeps `metric` BEFORE the
+        nexthop list (it only pulls a kernel tail-form metric forward)."""
         out = netd._normalize_route_line(
             "100.42.42.2 proto static metric 10 "
             "nexthop via 169.254.1.1 dev enp2s0 weight 1 "
@@ -132,10 +134,9 @@ class TestNormalizeRouteLine(unittest.TestCase):
         )
         self.assertEqual(
             out,
-            "100.42.42.2/32 "
+            "100.42.42.2/32 metric 10 "
             "nexthop via 169.254.1.1 dev enp2s0 weight 1 "
-            "nexthop via 169.254.2.1 dev enp3s0 weight 1 "
-            "metric 10",
+            "nexthop via 169.254.2.1 dev enp3s0 weight 1",
         )
 
     def test_empty_string(self):
@@ -325,7 +326,11 @@ class TestComputeRoutes(unittest.TestCase):
         d.neighbours[("sim-2", "enp2s0", "enp2s0")] = _make_neighbour(
             "sim-2", "enp2s0", "100.42.42.2", "169.254.10.2", "enp2s0")
 
-        routes = netd.compute_routes(d)
+        # The mgmt-master is read from rqlite (cluster_info) at runtime;
+        # patch that lookup since there's no rqlited in the unit test.
+        with mock.patch.object(netd, "_mgmt_master_loopback",
+                               return_value=("sim-1", "100.42.42.1")):
+            routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(
             len(panic_routes), 0,
@@ -377,7 +382,10 @@ class TestComputeRoutes(unittest.TestCase):
         d.neighbours[("sim-1", "enp2s0", "enp2s0")] = n_master
         d.neighbours[("sim-3", "enp3s0", "enp3s0")] = n_other
 
-        routes = netd.compute_routes(d)
+        # mgmt-master is read from rqlite at runtime; patch the lookup.
+        with mock.patch.object(netd, "_mgmt_master_loopback",
+                               return_value=("sim-1", "100.42.42.1")):
+            routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(len(panic_routes), 1)
         # Master's link_addr is what we want, NOT sim-3's

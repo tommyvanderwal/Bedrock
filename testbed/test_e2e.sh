@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED 2026-05-28 — superseded by testbed/test_e2e_offline.sh +
+# testbed/setup_4node_cluster.sh. Predates the current ISO + operator
+# join-approval contract (uses net-install, no /api/join/approve, and the
+# removed `bedrock join --witness` flag). Kept for reference only.
+echo "test_e2e.sh is DEPRECATED — use test_e2e_offline.sh / setup_4node_cluster.sh" >&2
+exit 64
 # Bedrock end-to-end testbed validation.
 #
 # Scenarios:
