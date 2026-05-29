@@ -19,10 +19,11 @@ seconds. DRBD on each node wrote its **activity log** to the external
 meta-disk LV on every completed transaction, so on restart each node
 knows exactly which extents *might* have been mid-write.
 
-No data loss occurs for writes that were ACKed to the guest VM — those
-were acknowledged by DRBD only after peer ACK arrived, so the peer has
-them on disk. Writes in flight at the moment of outage are lost (same
-as any power-cut disk).
+Pet/vipet resources run **DRBD protocol C** (synchronous): a write is
+ACKed to the guest only after every peer has it on disk. So any write
+the guest saw acknowledged survives on at least one surviving peer.
+Writes in flight at the moment of outage are lost (same as any power-cut
+disk).
 
 ## Boot-up sequence (hands-off)
 
@@ -31,12 +32,13 @@ as any power-cut disk).
    coordinated; whichever boots first starts trying to reach peers.
 3. **Auto-start units come up at `multi-user.target`** on every node:
    `bedrock-d` (the unified daemon), `bedrock-rqlited` (per-node rqlite),
-   `bedrock-mdns`, `bedrock-redirect`, plus `libvirtd`. libvirtd does
-   **not** auto-start any VM — Bedrock leaves VM autostart off so a guest
-   can't open a `/dev/drbdN` that isn't up yet.
-4. **`kmod-drbd9x` loads** (via `/etc/modules-load.d/drbd.conf`). The
-   DRBD units themselves stay disabled at boot (quorum-aware boot);
-   `drbdadm up` is driven by bedrock-d once the cluster role is known.
+   `bedrock-mdns`, `bedrock-redirect`, `node-exporter`, `vm-exporter`.
+   `libvirtd` is **disabled at boot** — bedrock-d starts it later (step
+   8), after the DRBD devices its VMs need are up; no VM autostarts.
+4. **DRBD kernel module loads** (`drbd`, via
+   `/etc/modules-load.d/drbd.conf`). No `drbdadm up` runs at boot —
+   bedrock-d drives it once the cluster role is known, so a guest can
+   never open a `/dev/drbdN` before the resource is up.
 5. **rqlite re-forms quorum.** Each node's `bedrock-rqlited` reconnects
    to its peers and re-establishes the Raft leader once a majority is
    back. Until then there is no quorum and no recorded mgmt-master.
@@ -46,30 +48,30 @@ as any power-cut disk).
 7. **`cluster_arbiter` brings up the singleton and `.254`.** Once a
    master is settled, the arbiter runs `drbdadm up`/`primary` on the
    `cluster` singleton resource, mounts `/var/lib/bedrock/cluster`,
-   takes the `.254` VIP, and starts the arbiter rqlite + SeaweedFS
-   filer/s3. The takeover protocol checks witness slots and does an
-   exact generation-UUID match before promoting — no split-brain.
+   takes the `.254` VIP (a `/32` on `lo`), and starts the arbiter rqlite
+   (4011/4012) + the SeaweedFS filer singleton. The takeover protocol
+   inspects witness slots and requires an exact arbiter-DRBD generation-
+   UUID match before promoting — no split-brain.
 8. **boot_orchestrator brings up this node's VMs.** For each VM the
    rqlite `vms` table says belongs here, bedrock-d runs `drbdadm up` on
    its resource, starts libvirtd, then `virsh start`s the VM. No manual
    `drbdadm primary` is normally needed.
-9. **SeaweedFS** comes back: the filer + its s3 gateway on `.254` are
-   started by `cluster_arbiter` (step 7) once the singleton is mounted.
-   The per-node volume + s3 (`:8080` / `:8333`, every node) and master
-   (Raft-3 lowest-octet set) are restarted by `boot_orchestrator` in step 8
-   via `seaweedfs.promote_to_master_volume_host` — these units are
-   `WantedBy=` empty (role-aware, not blanket boot-enabled), so bedrock-d
-   re-starts them on every boot rather than relying on a systemd symlink
-   (`bedrock-weed-volume/-master/-s3.service`).
+9. **SeaweedFS** comes back: the filer singleton on `.254` is started by
+   `cluster_arbiter` (step 7) once the singleton is mounted. The per-node
+   volume (`:8080`) + s3 (`:8333`, every node) and master (Raft-3
+   lowest-octet set, `:9333`) are started by `boot_orchestrator` in step 8
+   via `seaweedfs.promote_to_master_volume_host` (idempotent, role-aware).
+   The `bedrock-weed-volume/-master/-s3/-filer.service` units carry
+   `WantedBy=` empty, so bedrock-d starts them per-role on every boot
+   instead of via a systemd target symlink.
 10. **VictoriaMetrics (:8428) / VictoriaLogs (:9428)** persist their data
-    to `/opt/bedrock/data/{vm,vl}`, so history before the outage is
-    preserved. The `node-exporter` (:9100) and `vm-exporter` (:9177) are
-    their own `WantedBy=multi-user.target` units, so they auto-start at
-    boot.
+    to `/opt/bedrock/data/{vm,vl}`, so history from before the outage is
+    preserved. `node-exporter` (:9100) and `vm-exporter` (:9177) come back
+    with the other auto-start units (step 3).
 
-If quorum never returns (e.g. too few nodes power back on), boot_orchestrator
-logs `boot: role=noquorum` and starts nothing local until enough nodes are
-back; the `no_quorum_responder` then drives recovery once a majority returns.
+If quorum never returns (e.g. too few nodes power back on),
+boot_orchestrator logs `boot: role='noquorum'` and starts nothing local;
+`no_quorum_responder` then drives recovery once a majority returns.
 
 ## What the dashboard shows during recovery
 
@@ -134,12 +136,14 @@ witness.
   ACKed to the guest VM are on at least 2 disks (pet) or 3 disks
   (vipet). In-flight writes lost as usual.
 - **VM XML definitions**: `/etc/libvirt/qemu/*.xml` intact.
-- **Cluster state**: topology lives in rqlite, whose data dir is on the
-  `cluster` singleton DRBD resource (replicated, mounted at
-  `/var/lib/bedrock/cluster`) — it survives the outage on the surviving
-  disks. Per-node identity in `/etc/bedrock/state.json` is written
-  crash-durably (fsync + atomic rename + dir fsync), so it survives a
-  hard power cut intact.
+- **Cluster state**: the topology tables (`nodes`, `vms`, …) live in the
+  per-node rqlite cluster (4001/4002), whose data dir is local
+  (`/var/lib/bedrock/rqlite`) and Raft-replicated to every node — so it
+  survives on the nodes that come back. The arbiter rqlite + SeaweedFS
+  filer metadata live on the `cluster` singleton DRBD resource
+  (`/var/lib/bedrock/cluster`), replicated across its 2-3 disks. Per-node
+  identity in `/etc/bedrock/state.json` is written crash-durably (fsync +
+  atomic rename + dir fsync), so it survives a hard power cut intact.
 - **Metrics + logs history**: `/opt/bedrock/data/{vm,vl}` intact.
 - **DRBD activity log**: used on restart to recover any in-flight block
   ranges deterministically.
@@ -157,7 +161,7 @@ data is lost — which is the contract with the operator.
 
 ## Related
 
-- [`power-loss-secondary.md`](power-loss-secondary.md) — single-node case.
-- [`power-loss-primary.md`](power-loss-primary.md) — primary-only outage.
+- [`power-loss-secondary.md`](power-loss-secondary.md) — a single DRBD-Secondary node loses power.
+- [`power-loss-primary.md`](power-loss-primary.md) — the VM-running primary loses power (failover).
 - [`node-rejoin.md`](node-rejoin.md) — bringing a single node back.
 - [`split-brain.md`](split-brain.md) — if generation UUIDs diverged.

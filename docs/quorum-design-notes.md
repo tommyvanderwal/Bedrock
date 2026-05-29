@@ -1,632 +1,341 @@
-# Quorum design — working notes
+# Quorum design — rationale notes
 
-Scratch design doc kept while we lock in the master-election state
-machine, one question at a time. Locked decisions move into the
-canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
-`election.md`); this file is the queue.
+Why the master-election state machine is shaped the way it is. The
+load-bearing protocol lives in the canonical specs
+(`cluster-quorum-spec.md`, `cluster_arbiter.md`, `election.md`,
+`witness.md`); this file is the design reasoning behind it.
 
-## Working conventions
-- One question at a time. Don't pile up multi-part asks.
-- Spell out state names in full (`LEADER`, `FOLLOWER`, `NOQUORUM`).
-  Same in code identifiers and docs. Single-letter shorts
-  save no space that matters and obscure meaning.
-- Background lists below stay persistent. Items only leave when
-  resolved or explicitly retired.
+State names are spelled in full — `LEADER`, `FOLLOWER`, `NOQUORUM` —
+in both code identifiers and docs.
 
-## Decisions locked in
-- Cold-boot patience window = 30 s before any witness-assisted
-  decision can fire. Worst case if peer was actually dead = a short
-  DRBD resync on its eventual return.
-- Witness quorum = majority of **all configured** witnesses
-  (1-of-1, 2-of-3, 3-of-5, 2-of-2). Not "majority of valid ones".
-- A witness counts toward the quorum only if it currently has slot
-  entries for **every active node** in the rqlite `nodes` table
-  (read locally via `cluster_state.load_cluster()`). Older entries
-  are OK; missing entries disqualify the witness. Heartbeats keep
-  flowing regardless.
-- LMS write is "set" only after acknowledgment from a witness quorum.
-- LMS state is persisted in two places: on each contributing witness
-  slot AND on the node that set it (local file).
-- `/etc/bedrock/state.json` (the per-node local file)
-  holds the realtime master-election view, distinct from rqlite's
-  `cluster_info.mgmt_master`.
-- **One local-state file per node, in memory, written on change.**
-  Folds into the existing `/etc/bedrock/state.json` (already
-  per-node identity + role; election state goes here too — no new
-  file). The DRBD UUID history list lives in the same file as a
-  field (per-node observation log, capped at 7 days; same scope).
-  In-memory representation is the authority; the file is a
-  dump-on-change snapshot, atomic tmp+rename (the existing save
-  helper at `installer/lib/state.py:14` already does this).
-- **Cluster-wide state stays in rqlite.** Membership, witnesses,
-  VMs, tiers, operators, the UUID-history table — all rqlite.
-  Locally readable from every node via the per-node rqlited
-  replica (the autonomous-isolated-node argument).
-- **Weighted vote model (as implemented in `election.py`).**
-  - `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1`.
-  - `total_votes = 100·N_active_nodes + N_configured_witnesses`;
-    `majority = total_votes // 2 + 1`. ALL configured witnesses
-    count in the denominator.
-  - `my_votes = 100·(self + ACKing peers) + (valid+confirmed
-    witnesses)`. A configured-but-invalid witness adds 0 to
-    `my_votes` while still raising the bar — biasing toward "do
-    not fail over" (safety > availability).
-  - The 100/1 spread (vs 1/1) keeps a single node from ever
-    crossing the bar on witness votes alone: a witness can break a
-    node-vs-node tie but can never substitute for a peer.
-  - The witness layer is also the *arbiter of LMS uniqueness*:
-    only one node at a time can hold an acked `tag.lms = 1`,
-    because each node owns its own slot.
-  - Voting pool excludes nodes in maintenance mode (0 votes,
-    dropped from both numerator and denominator).
-- Two-node baseline locked in first. Operator overrides (maintenance,
-  forced promote, scheduled handoff) layered on after the baseline
-  is correct.
-- **rqlite stays as Tier 1. Two-tier architecture confirmed.**
-  Reason: every node needs autonomous read access to cluster policy
-  data — most concretely, per-VM `vm_type` (cattle / pet / vipet)
-  determines correct local behavior during isolation. A cattle VM
-  must keep running on an isolated node; a pet VM must get paused on NoQuorum.
-  That policy lives in rqlite's `vms` table; the per-node rqlited
-  replica is what makes the isolated node act correctly without a
-  live cluster connection. Removing rqlite would just re-implement
-  this replication via a different mechanism, not eliminate it.
-  At N≥3 the two-tier also gives free rqlite continuity through
-  master failover (3 of 5 voters quorate without the new arbiter).
-  The 2-node-HA awkwardness is the cost; the master-election
-  design fixes the awkwardness, doesn't dodge it.
-- **Single unified promote-decision function.** Same logic decides
-  "may this node become master right now" at cold-boot, at failover,
-  on recovery from NOQUORUM, or any other not-master → master
-  transition. There is no separate cold-boot path.
-- **Authorization rule** (you may promote, ANY of these is enough):
-  - `state.json.last_man_standing == true` for this host, OR
-  - vote count ≥ quorum threshold, where votes = 1 per reachable
-    non-maintenance node (self always counts as reachable to itself)
-    + witness-quorum-as-one-vote when witness-quorum is valid.
-    Threshold = strict majority; ties broken by the witness vote.
-- **Veto rule — required**: a signed payload (from any witness,
-  including witnesses that fail quorum-validity, or any peer mesh
-  assertion) that reports a node other than self with
-  `last_man_standing = true` blocks promotion. Load-bearing.
-- **DRBD UUID + history chain is the tie-break for promotion when
-  the LMS flag does not decide.** Each node knows its own current
-  UUID and its own history chain (debugfs:
-  `/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id`,
-  line 1 = current, then per-peer bitmap UUIDs, then history
-  generations). Each node also knows the peer's current UUID
-  (last published in the peer's witness-slot marker, or read live
-  from DRBD once the connection is up).
-  - **Equal current UUIDs** → no divergence; both nodes are equally
-    valid as the next master. A tie-break beyond DRBD is needed —
-    expected to be the local `state.json` view, but the
-    exact fallback rule is open (question 3 below).
-  - **Different current UUIDs** → exactly one will be in the
-    other's history chain. The node whose current UUID is *not* in
-    the peer's history is the newer one — it holds writes the
-    peer doesn't — and is the one that promotes. The peer becomes
-    Follower and DRBD resyncs it.
-  - **Neither side's current UUID is in the other's history** →
-    real divergence (split-brain that wasn't caught). Refuse on
-    both sides. Operator reconciles.
-- **Asymmetry**: authorization needs a witness *quorum*; the
-  required veto needs only one signed payload. Easier to reject
-  than to authorize.
-- **Single-node operation (N=1)**: `last_man_standing` is by
-  definition always set; no patience wait; just be the master.
-- **30 s patience wait** applies only when the rqlite `nodes` table
-  (read locally via `cluster_state.load_cluster()`) contains more
-  than one node. During the wait the promote-decision function still
-  runs, but the "not enough information to authorize" outcome stays
-  Pending rather than NoQuorum until 30 s elapse.
-- A node in **maintenance mode** contributes 0 votes (does not count
-  in either the numerator or the denominator of the quorum math).
-- **Maintenance mode is the mechanism that enables clean single-node
-  shutdown.** Putting node X into maintenance:
-  1. Sets `tag.maintenance = 1` on X's witness slot, state.json,
-     and mesh heartbeat.
-  2. Peers' election functions observe + recompute the cluster's vote
-     count *without* X (numerator and denominator both shrink by X's
-     weight).
-  3. If X was master, the maintenance bit is incompatible with being
-     master — triggers a planned handoff to a peer (same failover
-     mechanism, just operator-initiated).
-  4. Once the cluster has acknowledged X is in maintenance (peers
-     have updated their views), X can shut down cleanly. The cluster
-     continues with the recomputed quorum.
-- **Two distinct graceful-shutdown flavors:**
-  - **Single-node shutdown.** Enter maintenance on the target node
-    first (steps above). Then stop services. Cluster continues
-    running on remaining voters.
-  - **Cluster-wide shutdown.** Every node shuts down with its votes
-    intact — no maintenance bit, no handoff. Each node stops
-    services in safe order. On the next cold-boot, the existing
-    30 s patience window + eligibility rules apply: nodes wait
-    for peers, and only resume work once enough come back to
-    form quorum. No special "cluster was shut down cleanly"
-    marker is needed — the existing rules handle it correctly
-    (refuse-to-promote-alone is the safe default if a peer
-    doesn't return).
-- **Join saga is operator-initiated and runs on the master.** Triggered
-  by the operator pressing "Accept" on a pending join request in the
-  dashboard. The saga executes via the existing rqlite saga backend
-  (operations / operation_steps tables), runs through the
-  details — rqlite `nodes` insert, key distribution, peer DRBD config,
-  rqlited join, etc. The joiner side polls the master's HTTPS API
-  for the result. Existing flow; nothing master-election-specific.
-- **`state.json` writer:**
-  - Bedrock-net's election logic is the **sole writer**. Sagas
-    (join, takeover, graceful shutdown) influence the file
-    *indirectly* by changing the inputs the election reads —
-    mesh state via actuators, cluster membership via rqlite, witness
-    slot via heartbeat. They never write `state.json`
-    themselves.
-  - This keeps the file a single deterministic function of
-    observable cluster state. No two writers, no races.
-  - Writes use atomic tmp+rename. Election skips the write when
-    the computed content equals the on-disk content.
-- **`state.json` fields (all kept in memory; file is a
-  dump-on-change snapshot, never updated by syscall-on-read):**
-  - `current_master` — node name; realtime cluster-master view
-    from this node.
-  - `last_man_standing` — bool, this node's own LMS status.
-  - `maintenance_mode` — bool, this node's maintenance state
-    (mirrors witness slot tag bit 2).
-  - `transitioning` — bool, mirror of witness slot tag bit 1.
-    Lets a daemon-restart see "I was mid-saga last time".
-  - `transition_id` — saga reference (for VictoriaLogs cross-ref),
-    set whenever `transitioning = true`.
-  - `last_role_change_ms` — local timestamp of last transition.
-    Operator-friendly; not used in decision logic.
-  - `last_drbd_uuid_observed` — DRBD `current-uuid` recorded the
-    last time the election successfully completed a tick. Forensic.
-  - `cluster_uuid` — sanity check that this file belongs to this
-    cluster (catches "node moved between clusters without wipe").
-  - `self_node_name` — sanity check this file is for the node it
-    claims (catches accidental file-copy operator errors).
-  - **Rule**: every field must be readily available in memory
-    when the election tick runs. No command calls or external
-    lookups to populate the file. The election maintains an
-    in-memory state struct that is updated event-driven (mesh
-    callback, witness reply, DRBD observation, operator
-    command); the file is a dump of that struct, written only
-    when the in-memory content changes.
-- **Promote-decision cadence:**
-  - Runs every 1 Hz tick, same loop as the witness heartbeat.
-    Recomputes from current inputs each second; result either
-    matches existing actuator state (no-op) or triggers a
-    transition.
-  - Event-driven wake-ups for the promote-decision logic itself
-    are nice-to-have optimizations, low priority — the next
-    1 Hz tick will catch the change anyway.
-- **Heartbeat cadence is 1 Hz baseline PLUS immediate
-  out-of-band heartbeats on local state change.** Whenever this
-  node's `state.json` changes value (LMS flips,
-  transitioning bit flips, `current_master` view changes, etc.),
-  the next heartbeat goes out *immediately* — both via mesh to
-  peers and via slot-write to witnesses — without waiting for
-  the next 1 Hz tick. This is what makes the multi-phase consensus
-  converge in sub-second time instead of multiple ticks.
-- **Peer acknowledgment is implicit and computed independently.**
-  When peer Y receives an incoming heartbeat from X carrying
-  `current_master = X, transitioning = true`, Y does NOT
-  blindly relay. Y runs its own promote-decision logic against
-  current inputs (X's claim being one of them) and emits a
-  heartbeat with Y's own conclusion. When Y's conclusion is
-  `current_master = X`, that heartbeat IS the acknowledgment X
-  was waiting for. When Y's conclusion differs, Y broadcasts its
-  own view and X sees no ack from Y, no quorum on Y's side.
-- **Patience window lifecycle (30 s):**
-  - Clock starts when local state has been read at boot —
-    `state.json`, the rqlite `nodes` table (locally readable via
-    `cluster_state.load_cluster()`), witness list. The read is
-    fast, so the clock effectively starts a few ms after daemon
-    start.
-  - **No resets** during a node's life. A graceful daemon stop
-    should hand off all cluster work first (DRBD demote, release
-    `.254`, etc.) before exiting, so a clean restart re-enters the
-    BOOT state from a known-quiet position and the 30 s window
-    starts again naturally. Daemon restart without graceful
-    handoff is not a normal operation.
-- **Witness slot tag bitflag — locked assignments:**
-  - bit 0 = `last_man_standing` (LMS)
-  - bit 1 = `transitioning` (mid-saga; this node is doing something
-    non-instantaneous — see VictoriaLogs for the saga details)
-  - bit 2 = `maintenance_mode` (node has 0 votes; the cluster's
-    quorum math excludes it from both numerator and denominator)
-  - bits 3–7 = reserved
-- **Phase-1 / phase-3 advertisement is both A and B together:**
-  - **Marker sentinel** — phase 1 writes `slot.marker =
-    0x0000000000000000`. Trips any "are UUIDs equal" comparison
-    trivially without anyone needing to interpret it specially.
-    Phase 3 restores the real new UUID.
-  - **Tag bit** — phase 1 sets `tag.transitioning = 1`. Phase 3
-    clears it. The flag is a generic "something non-instantaneous
-    is in progress" signal; the witness payload deliberately stays
-    minimal (witnesses are sometimes ESP32, not interrogable for
-    rich state). All saga details live in VictoriaLogs.
-  - **VictoriaLogs forensic line at each phase**, including:
-    `"writing all-zeros UUID + transitioning=1 to witness slot N,
-     from current UUID <X>"` at phase 1; and
-    `"writing new UUID <Y> + transitioning=0 to witness slot N"`
-    at phase 3. DRBD's own history-uuid chain on disk is the
-    secondary forensic record.
-- **Cluster master-claim consensus spans BOTH peers AND witnesses,
-  not witnesses only.** Other cluster nodes are first-class
-  participants in the master-election quorum and report their own
-  observed view of who the master is.
-  - Quorum vote-weights use the existing formula: 100 votes per
-    reachable non-maintenance cluster node + 1 vote per valid
-    witness. Threshold = strict majority of the total.
-  - A peer "acknowledges" a master claim by updating its OWN
-    `state.json` with the new `current_master` value
-    (carrying the transitioning bit while the claim is mid-saga)
-    and broadcasting that view on its next mesh heartbeat. There
-    are no explicit signed "ACK X" messages — observation + relay
-    via the existing heartbeat is the ack.
-  - The claiming node waits until ENOUGH peers' heartbeats AND
-    witness slot replies reflect itself as master (with
-    transitioning bit) to clear the weighted-vote threshold.
-  - In 3-node + 1 witness: this node alone (100) is below the
-    threshold (151 of 301). Needs at least one peer ack (100) to
-    clear. Witness alone is not sufficient.
-  - In 2-node + 1 witness: this node alone (100) is below the
-    threshold (101 of 201). Needs either a peer ack (100) or the
-    witness vote (1) to clear.
-- **Failover is multi-phase: advertise intent, gather acks,
-  actuate, advertise end state.**
-  - **Phase 1 — local commit.** Compute new state. Write own
-    `state.json` first with `current_master = self`,
-    `transitioning = true`, `last_man_standing = <new value>`.
-    In-memory state matches.
-  - **Phase 2 — broadcast intent.** Next mesh heartbeat carries
-    the new view to peers. Next witness slot write: `marker =
-    0x00…0`, `tag.transitioning = 1`, `tag.lms = <new value>`.
-  - **Phase 3 — gather acks.** Wait until peers' mesh heartbeats
-    AND witness slot replies confirm they see this node as the
-    new (transitioning) master. The weighted-vote sum of acking
-    participants must reach the cluster's majority threshold.
-    Timeout → abort, revert local file + slot to previous state.
-  - **Phase 4 — actuate.** `drbdadm primary` (new UUID), mount,
-    bind `.254`, start arbiter rqlite, start filer.
-  - **Phase 5 — end-state broadcast.** Update own
-    `state.json` (`transitioning = false`,
-    `last_drbd_uuid_observed = <new>`,
-    `last_role_change_ms = now`). Next mesh heartbeat carries
-    final view. Next witness slot write: `marker = <new real
-    UUID>`, `tag.transitioning = 0`, `tag.lms = <as set>`.
-  - **Phase 6 — peer convergence.** Peers observe the final state
-    and update their own `state.json` (clear transitioning
-    bit, record new master+UUID). No explicit handshake; the next
-    heartbeat tick on each peer carries the update.
-  - Crash anywhere is recoverable: phase 1 commits locally before
-    any cluster effect, and phases 2-6 leave the transitioning
-    bit visible to the cluster until phase 5 clears it.
-    Recovery on reboot inspects `state.json.transitioning`
-    + live DRBD state + last observed slot to decide whether to
-    re-run from phase 4 (DRBD already primary) or abandon (DRBD
-    not yet primary).
-- **Candidate eligibility — strict.** A node refuses to claim
-  master entirely if *any* known cluster peer has a more
-  up-to-date DRBD `cluster` generation, regardless of
-  whether that peer is currently reachable. Reason: if the peer's
-  data is ahead, promoting this node would silently lose those
-  writes — including S3/SeaweedFS metadata on the `cluster`
-  singleton volume. The peer might be temporarily unreachable, not
-  permanently dead.
-- **"rqlite came back online" is an event, not a saga.** A small,
-  reusable event source that fires once when `_rqlite_ready`
-  transitions `False → True` on this node. The probe already
-  exists in `installer/lib/netd.py:1027–1064` — a per-tick
-  strong-consistency `SELECT 1` against the local rqlited. Turn
-  the per-tick boolean into an edge-triggered event so other
-  components can subscribe. Triggers from any cause that makes
-  rqlite writable from this node: arbiter rqlited just joined
-  quorum after a new master started it, quorum recovery after a
-  mass-partition heals, the local rqlited recovering from a brief
-  outage, etc. Subscribers don't care why — only that "now I can
-  write".
-- **The master maintains a UUID-history backlog.** While rqlite
-  is not writable from the master (between the new master
-  becoming DRBD Primary and the arbiter rqlited joining quorum),
-  any DRBD UUID transitions that need to be logged into the
-  history table are buffered. Source of the buffer is the local
-  DRBD UUID history file (always written first; rqlite is a
-  follower of the local record). On `rqlite_came_back_online`,
-  the master replays unposted entries from the local history
-  file into the rqlite history table. Replay is idempotent
-  (uuid + ts_set as primary key).
-- **Mass-isolation recovery.** When every node has lost quorum
-  (e.g., 4–5 nodes simultaneously partitioned from one another,
-  rare), the cluster comes back via the same mechanism: whichever
-  node first regains a quorum-forming partition + holds the
-  last-known-master role flushes the backlog from its local
-  history file into rqlite. Other nodes' history files converge
-  once rqlite replicates the writes. No special "mass-isolation
-  recovery saga" is needed if the per-master backlog + replay-on-
-  rqlite-came-back works correctly.
-- **Authoritative model for DRBD UUID provenance.** The current
-  master's local DRBD state is the single authority. Three
-  mirrors, in increasing order of staleness tolerance:
-  1. **Master's heartbeat** — current master broadcasts its
-     current DRBD UUID on every mesh heartbeat + witness slot
-     write. Newest signal; authoritative for "what is true right
-     now"; ephemeral.
-  2. **rqlite UUID history table** — master writes `(uuid,
-     ts_set, ts_superseded)` into rqlite. Keeps 7 days. Replicated
-     to every node. Lags the heartbeat (rqlite may have been
-     down during failover; the write lands after rqlite quorum
-     re-forms on the new master).
-  3. **Per-node local DRBD UUID history file** — each node
-     records every UUID it observed in a master heartbeat, with
-     the observation timestamp. Autonomous: needs no rqlite, no
-     peer. This is the cold-boot fallback before rqlite is up
-     and before any peer is reachable.
-  Invariants: heartbeat may be ahead of rqlite (rqlite hasn't
-  caught up). Heartbeat is never behind rqlite. All three
-  agree at steady state. The eligibility check uses whichever
-  mirrors are available and compares this node's current local
-  DRBD UUID against the most-recent UUID found across them.
-- **Operator seize override.** When a peer with more-recent data
-  is permanently lost (irrecoverable hardware, building burned
-  down, etc.), the operator can explicitly force promotion with
-  the stale-data warning acknowledged. Conceptual parallel to
-  Active Directory's FSMO seize on a lagging domain controller:
-  the operator asserts "the up-to-date node is never coming
-  back, proceed with what I have, accept the data loss." Without
-  this command, the cluster refuses to come up — which is the
-  safe default. CLI shape TBD (separate operator-abuse layer
-  design).
-- **Tie-break order when LMS does not decide**, in this exact
-  priority:
-  1. **DRBD current-UUID comparison.** If UUIDs differ, the history
-     chain says who's newer (per the locked rule above) — that node
-     promotes, no further check needed.
-  2. **`state.json` agreement.** Used only when DRBD UUIDs
-     are equal. The node whose file says `current_master = self`
-     promotes; the other follows.
-  3. **Files disagree while UUIDs match** is considered structurally
-     impossible: a role transition implies `drbdadm primary` on at
-     least one side, which bumps the UUID. If this state is
-     observed in practice, treat as inconsistent: both nodes refuse
-     and surface to operator. (A failed file-write mid-saga falls
-     here only if the other side already did `drbdadm primary` —
-     but then UUIDs differ, and rule 1 fires before this case.)
+## Two tiers
 
-## Open questions — queue, top-down
+- **Base layer** (`netd.py`, `election.py`, `witness.py`,
+  `cluster_arbiter.py`): mesh + weighted-vote election + witness +
+  the `.254` arbiter. No rqlite dependency — this is the layer that
+  *recovers* rqlite.
+- **rqlite** holds cluster-wide policy (membership, witnesses, VMs,
+  tiers, operators, UUID history). Every node runs a local rqlited
+  replica, read via `cluster_state.load_cluster()` at level `none`, so
+  policy is readable without quorum. This matters most for per-VM
+  `vm_type` (cattle / pet / vipet): an isolated node must keep a cattle
+  VM running and pause a pet VM on `NOQUORUM`, and that decision needs
+  the `vms` table locally. At N>=3 the two-tier split also gives rqlite
+  continuity through master failover (3 of 5 voters stay quorate
+  without the new arbiter).
 
-1. (resolved 2026-05-22 — see locked decisions)
-2. (retired 2026-05-22 — DRBD UUIDs don't carry useful timestamps;
-   the history-chain mechanism is the actual tie-break, see locked
-   decisions)
-3. (resolved 2026-05-22 — clock starts after local disk state is
-   read, no resets, see locked decisions)
-3a. (resolved 2026-05-22 — both: sentinel marker + tag bit 1, see
-    locked decisions)
-4. (resolved 2026-05-25 — maintenance mode folds into the
-   single-node graceful-shutdown flow; see locked decisions)
-5. (resolved 2026-05-22 — 1 Hz tick primary, events as low-priority
-   nice-to-have, see locked decisions)
-6. (resolved 2026-05-22 — election is sole writer; sagas influence
-   inputs only, see locked decisions)
-7. Stale-but-present witness slot: counted as fresh-enough for the
-   slot's data to be used as a veto, or only fresh slots veto?
-8. (resolved 2026-05-25 with correction — LMS clear requires
-   slot-owner AND witness both online; no self-correction. See
-   "LMS clear semantics — verified against code" section.)
-9. rqlite (`cluster_info.mgmt_master`) vs `state.json` — authority
-   order and who writes which on each transition. (Resolved in the
-   spec: election is the realtime authority and sole `state.json`
-   writer; rqlite follows. See lesson `lesson_lms_writeback_race`.)
-10. Witness reconfiguration mid-flight: how the validity rule
-    behaves when an operator adds or removes a witness.
-11. (resolved 2026-05-25 — two flavors: single-node via maintenance,
-    cluster-wide via plain stop; see locked decisions)
-12. Operator seize command shape: CLI invocation, what it writes,
-    safety prompts, audit trail. (Layered on after baseline.)
+## Weighted vote model (`election.py`)
 
-## Bonus safety nets (operator-abuse resilience, not load-bearing)
-- (UUID-history check moved up to a locked decision — it is
-  load-bearing for the tie-break, not bonus. This section is
-  reserved for future genuine extras.)
+- `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1`.
+- `total_votes = 100·N_active + N_configured_witnesses`;
+  `majority = total_votes // 2 + 1`. ALL configured witnesses count in
+  the denominator; only valid+confirmed ones add to `my_votes`. A
+  configured-but-invalid witness raises the bar and biases toward "do
+  not fail over" (safety over availability).
+- The 100/1 spread lets a witness break an exact node-vs-node tie but
+  never substitute for a peer: one node alone can never cross the bar on
+  witness votes.
+- Active-node set = rqlite `nodes` with `state == 'active'` and not in
+  maintenance (netd filters before calling `compute`), plus self. The
+  denominator is this active count, NOT the heard-from set — so a master
+  that *restarts* while partitioned reads N from rqlite, stands alone
+  below majority, and falls to `NOQUORUM` instead of faking a one-node
+  cluster.
 
-## LMS clear semantics — verified against code (2026-05-25)
+### Votes are active acks, not passive reachability
 
-The witness slot tag bit 0 (`last_man_standing`) cannot be assumed
-to clear "automatically" or "best-effort with self-correction".
-Verified facts from the source:
+In steady state (a live master), `compute()` uses reachability and acks
+are ignored. Once the master is gone, a candidate's node-vote tally is
+`100·(self + acking peers)`. A peer grants its 100 votes only when it
+has *also* lost the master AND finds the candidate eligible. Eligibility
+= the candidate's advertised arbiter-DRBD UUID classified against the
+voter's own 7-day local UUID history (`state.classify_arbiter_uuid`):
+`superseded` => refuse, `current`/`unseen` => votable. Each peer makes
+that decision in netd and ships it as its `ack_target`; `election.py`
+just tallies the resulting `peer_acks`.
 
-- `installer/lib/witness.py:317-328` `set_own_slot` only updates
-  the in-memory `own_tag` field. The wire write happens in the
-  next `heartbeat_all` (line 246).
-- `installer/lib/witness.py:255` silently swallows `OSError` from
-  `sendto`. A failed wire write is invisible to the caller.
-- `installer/lib/netd.py:1122` recomputes `lms_bit` from current
-  observables every tick — but the new value reaches the witness
-  only if the UDP packet lands.
-- `installer/lib/cluster_arbiter.py:602-618` demote path calls
-  `set_own_slot(tag=0)` and explicitly labels it best-effort.
+When a quorum of acks is reached, a deterministic tiebreak keeps two
+candidates from both promoting: the lowest-loopback-octet contender
+proposes; everyone else defers a tick and acks it.
 
-The hard rule:
+## Timing (`netd.py`)
 
-- An `lms = 1` slot is cleared ONLY by a successful write from the
-  slot owner to the witness, requiring both online at the same
-  moment.
-- If the slot owner dies with `lms = 1` outstanding, the slot stays
-  `lms = 1` until the slot owner comes back and successfully writes
-  `lms = 0`, or the operator decommissions the owner (removes it from
-  the rqlite `nodes` table, so readers ignore its slot), re-keys the
-  cluster witness identity, or manually clears.
-- A witness that loses state and comes back EMPTY is **not** a clear:
-  per spec INV-7 a missing slot is treated as worst-case
-  (`lms = 1`-possible) until repopulated by a fresh heartbeat from the
-  current owner. Takeover stays refused in the meantime.
-- The 10 s slot staleness rule (`witness.SLOT_STALE_MS = 10_000`) is
-  **not** a clear either. It changes how readers interpret a stale
-  `lms = 1` — peer takeover via exact UUID equality / history-chain
-  match (stricter than treating the bit as cleared).
+- Election tick: `ELECTION_INTERVAL_S = 1.0` s. The vote recomputes from
+  current inputs every tick; result either matches actuator state (no-op)
+  or drives a transition.
+- A survivor promotes at `MASTER_LOSS_MISSES = 10` consecutive ticks with
+  no fresh heartbeat from the believed master (~10 s).
+- An isolated old master self-demotes to `NOQUORUM` at
+  `SELF_DEMOTE_MISSES = 9` (~9 s) — one tick *earlier*, so `.254` /
+  arbiter rqlite is released before any survivor promotes and the VIP is
+  never on two nodes at once (INV-1 margin).
+- Cold-boot patience `COLD_BOOT_PATIENCE_S = 30.0` s
+  (`cluster_arbiter.py`): at N>=2, a node that boots believing it should
+  be master defers its *first* promote for 30 s, giving a slower peer
+  time to come up and beat it cleanly. Tracked from process start
+  (`_COLD_BOOT_AT`). N=1 skips it. Worst case if the peer was truly dead:
+  a short DRBD resync on its eventual return.
 
-Operational consequence: an LMS that cannot be cleared can leave
-the cluster in an inconsistent visible state (witness slot says
-`lms = 1`, mesh heartbeats say `lms = 0`; or two slots end up
-`lms = 1` simultaneously after a handoff that crossed a witness
-outage). Resolution then funnels through the staleness +
-UUID-lineage path, which is more restrictive than the normal
-"one LMS holder, others defer" model. Worth surfacing to
-operators (alert on stuck LMS) and providing an explicit clear
-command for the edge case.
+## Witness — BedRock Echo (`witness.py`)
 
-## Doubts / uncertainties (fill as we go)
-- (DRBD UUID timestamp / recency question retired — DRBD UUIDs
-  don't carry useful timestamps and history-chain membership is
-  the better, well-defined safety net.)
-- Cold-boot with peer reachable but neither side LMS: how is the
-  promoter chosen — by local file, by deterministic tie-break, or
-  by inspection of last witness slots? (Tracked as next question.)
+A passive per-node K/V slot store on UDP 12321, ChaCha20-Poly1305 AEAD
+over msgpack. The witness has no logic: it stores the last write per slot
+and returns all slots on every reply. One slot per node (key = node_id =
+loopback last octet, 1-250). Kept tiny on purpose so an ESP32 can run it
+in a few hundred lines.
 
-## Pending sub-questions raised by the multi-phase protocol
-- Mesh heartbeat payload extension: what fields does each peer's
-  heartbeat need to carry so peers can see one another's
-  `state.json` view? (Likely: `current_master`,
-  `transitioning`, `last_man_standing`, `last_drbd_uuid_observed`,
-  `cluster_uuid`, signed with cluster key.)
-- Ack timeout: how long does a claiming node wait for the quorum
-  threshold before aborting? (Witness reply latency typically
-  < 100 ms; peer heartbeat tick is 1 Hz; total must be a few
-  ticks worst case.)
-- Peer-refuses-to-ack: what happens if a peer sees the claim and
-  refuses (e.g. because the peer already considers itself master
-  or because of an inconsistency)? Is "refusal" silent (peer's
-  heartbeat just keeps showing the old `current_master`) or
-  explicit (peer broadcasts a different view that's clearly a
-  conflict)?
-- Multi-claimer race: two peers simultaneously start the protocol
-  for becoming master. Both write their own files first, both
-  broadcast. Peers ack whichever they observe first. The losing
-  claimant aborts when it sees its own claim outnumbered. Need to
-  verify this resolves deterministically.
+- `WITNESS_FRESHNESS_S = 12.0` — reply-freshness for the "witness
+  reachable" vote.
+- `SLOT_STALE_MS = 10_000` — a survivor treats the master's slot as gone
+  after >10 s, matching the 10-miss leader-loss detector.
+- Slot tag bitflag: **bit 0 = `TAG_LMS` (last-man-standing); bits 1-7
+  reserved.** The marker carries the arbiter resource's DRBD current-UUID
+  (`MARKER_KIND_DRBD_ARBITER_UUID = 1`).
+- **Witness validity**: a witness counts toward the tally only when its
+  reply holds a slot for *every* active node in the rqlite `nodes` table
+  (`ws.member_ids`, plumbed each netd tick). Older entries are fine; a
+  missing member's slot disqualifies the witness. `member_ids = None`
+  (membership not yet known) => not valid => 0 votes.
+- **Witness confirmed**: our own slot is present at the witness, carries
+  our current marker, and is fresh — the readback proof.
+- `count_valid_confirmed()` tallies CONFIGURED witnesses that are
+  individually valid+confirmed, capped at `n_configured` (a rogue extra
+  Echo can't inflate the vote). Single-witness testbed yields 0 or 1.
+- LMS denominator/quorum rule: witness quorum = majority of *all
+  configured* witnesses, each contributing only when valid. The witness
+  layer is the arbiter of LMS uniqueness — each node owns its own slot,
+  so at most one node holds an acked `tag.lms = 1`.
 
-## Election flow (one 1 Hz tick)
+## Election tick flow (`_election_tick`)
 
 ```
-                       ┌─────────────────────────┐
-                       │  TICK START (1 Hz)      │
-                       └────────────┬────────────┘
-                                    │
-              ┌─────────────────────▼─────────────────────┐
-              │  READ INPUTS (all should be in memory;    │
-              │  refresh fast from these sources)         │
-              │                                            │
-              │   • own DRBD current-UUID + history chain  │
-              │     (debugfs)                              │
-              │   • signed mesh heartbeats from peers      │
-              │     (last received per peer)               │
-              │   • signed witness slot replies            │
-              │     (last received per witness)            │
-              │   • state.json (own last election state)   │
-              │   • local UUID history (field in state.json)│
-              │   • rqlite UUID history table (if reachable)│
-              │   • /run/bedrock-no-quorum marker          │
-              └─────────────────────┬─────────────────────┘
-                                    │
-                                    ▼
-                       ┌────────────────────────────┐
-                       │  no-quorum marker present? ├── yes ──► role = NOQUORUM, done
-                       └──────────────┬─────────────┘
-                                    │ no
-                                    ▼
-                       ┌────────────────────────┐
-                       │  self in maintenance?  ├── yes ──► role = FOLLOWER (0 vote), done
-                       └────────────┬───────────┘
-                                    │ no
-                                    ▼
-              ┌─────────────────────────────────────────┐
-              │  ELIGIBILITY: does ANY known peer have  │
-              │  a newer DRBD UUID than mine?           │
-              │  (peer's UUID NOT in my history chain   │
-              │   AND mine IS in their history chain)   │
-              │                                          │
-              │  Evidence sources for peer UUID:        │
-              │   • peer's mesh heartbeat (newest)      │
-              │   • peer's witness slot marker (signed) │
-              │   • rqlite UUID history table           │
-              │   • own state.json UUID history field   │
-              └──────────────────┬──────────────────────┘
-                                 │
-                  yes (a peer is ahead)              no (I am at-least-as-up-to-date)
-                                 │                          │
-                                 ▼                          ▼
-              role = FOLLOWER             ┌──────────────────────────────────┐
-              (refuse to claim;           │  COUNT VOTES                     │
-              await operator              │   = 100 (self)                   │
-              seize)                      │   + 100·(peers whose mesh hb     │
-                                          │     shows current_master = me)   │
-                                          │   + 1 per valid+confirmed        │
-                                          │     witness                      │
-                                          └──────────────┬───────────────────┘
-                                                         │
-                                          ┌──────────────▼───────────────┐
-                                          │  votes ≥ strict majority of  │
-                                          │  total_votes?                │
-                                          │  (= 100·active nodes + all   │
-                                          │   configured witnesses;      │
-                                          │   maintenance nodes excluded)│
-                                          └──────────────┬───────────────┘
-                                                         │
-                                       no                │              yes
-                                       │                                │
-                                       ▼                                ▼
-                          role = FOLLOWER (if a       ┌──────────────────────────┐
-                          peer is observed as         │ another peer also shows  │
-                          master) or NOQUORUM         │ tag.lms=1 fresh AND      │
-                          (no master observable)      │ claims master?           │
-                                                      └──────────┬───────────────┘
-                                                                 │
-                                            yes                  │              no
-                                            │                                   │
-                                            ▼                                   ▼
-                                  apply tie-break:                   role = LEADER
-                                  1. DRBD UUID + history
-                                     (newer wins; if neither
-                                      in other's history,
-                                      refuse and operator)
-                                  2. lowest loopback octet
-                                  → role = LEADER or FOLLOWER
-
-                              ┌─────────────────────────────────────────────┐
-                              │  COMPARE computed role to actuator state    │
-                              │                                              │
-                              │  same  → no-op                              │
-                              │  change → run two-phase transition:         │
-                              │            phase 1: update state.json,      │
-                              │                     set transitioning=1,    │
-                              │                     immediate heartbeat,    │
-                              │                     write witness slot      │
-                              │                     (sentinel marker + lms) │
-                              │            phase 2: wait for convergence    │
-                              │                     (peer heartbeats +      │
-                              │                      witness acks reflect   │
-                              │                      me as new master)      │
-                              │            phase 3: actuate (drbdadm        │
-                              │                     primary → new UUID,     │
-                              │                     mount, .254, services)  │
-                              │            phase 4: update state.json,      │
-                              │                     clear transitioning,    │
-                              │                     write witness slot      │
-                              │                     (real UUID),            │
-                              │                     immediate heartbeat     │
-                              └─────────────────────────────────────────────┘
+TICK START (1 Hz)
+  │
+  ├─ witness IO: reprobe/heartbeat + drain replies (best-effort)
+  ├─ peer liveness from netd neighbour table (+ ever_seen_peers floor)
+  ├─ rqlite snapshot (level='none'): active nodes, mgmt_master,
+  │     witnesses → node_loopbacks, member_ids, n_configured_witnesses
+  ├─ read own arbiter DRBD current-UUID (debugfs data_gen_id),
+  │     record into local 7-day history
+  ├─ count valid+confirmed witnesses
+  ├─ missed-master-beat detector → master_lost at MASTER_LOSS_MISSES
+  ├─ build peer_acks (a peer's ack_target == me, fresh)
+  │
+  ├─ compute()  ─────────────────────────────► LEADER / FOLLOWER / NOQUORUM
+  │     no-quorum marker present?  → NOQUORUM (sticky)
+  │     I am master?               → reachability quorum check
+  │     live master, not me?       → FOLLOWER
+  │     master gone?               → self + acking peers + witnesses
+  │                                   ≥ majority, lowest octet → LEADER
+  │
+  ├─ publish heartbeat fields: believed_master, transitioning,
+  │     ack_target, arbiter_uuid
+  ├─ persist believed_master to state.json (cold-boot recovery)
+  │
+  └─ act on outcome:
+       NOQUORUM  → after SELF_DEMOTE_MISSES streak: drop no-quorum
+                   marker; if hosting, demote_arbiter_host()
+                   (release .254, stop arbiter rqlite, drbdadm secondary)
+       LEADER    → cluster_arbiter.promote_to_arbiter_host()
+                   + ensure_lms_if_last_standing()
+       FOLLOWER  → (nothing; follow current master)
 ```
+
+### Heartbeat fields (mesh, protocol 4)
+
+Each node broadcasts a signed (HMAC-SHA256) election heartbeat carrying:
+- `believed_master` — who this node follows now (`""` mid-failover).
+- `transitioning` — this node has lost the master AND is advertising
+  itself as master-to-be (it is the lowest-octet eligible contender).
+- `ack_target` — the contender this node votes for (self if it is the
+  lowest-octet eligible contender, else the one it defers to). Computed
+  independently of `compute()`'s quorum gate, so the vote can bootstrap:
+  peers ack the prospective winner before it reaches quorum.
+- `arbiter_uuid` — this node's live arbiter DRBD current-UUID, the
+  eligibility evidence peers classify against their own history.
+
+Acknowledgment is implicit: a peer "acks" by naming this node as its
+`ack_target` on its next heartbeat. No explicit signed "ACK X" messages.
+Heartbeats and witness slot writes both ride the 1 Hz tick.
+
+## Two-tier writeback ordering (who writes `mgmt_master`)
+
+The base layer DRIVES the promote; `cluster_info.mgmt_master` in rqlite
+is written by the arbiter as a *result*, only after the arbiter rqlite is
+back. The promote needs no rqlite (witness + local commands only), so
+there is no deadlock: on a `LEADER` outcome netd calls
+`promote_to_arbiter_host()`, which runs the takeover protocol, brings up
+DRBD primary + `.254` + arbiter rqlite + filer, then writes `mgmt_master`
+once `arbiter_status()` confirms hosting. netd never writes `mgmt_master`
+itself. The realtime election is the authority; rqlite follows.
+
+## Arbiter takeover protocol (`cluster_arbiter.py`)
+
+Witness slot inspection + DRBD UUID match + own-slot write/readback,
+gated by the election's `LEADER` outcome. All local commands
+(`drbdadm`, `ip`, `mount`, `systemctl`) — rqlite is the service being
+recovered, never on this path. Outline:
+
+1. **Defer-to-claimer**: if a peer's fresh heartbeat advertises *itself*
+   as master, defer — never steal the role back from a live survivor.
+2. **Fast path**: no prior master, or self is the recorded master —
+   nothing to take over from. Subject to the cold-boot UUID guard and
+   (at N>=2) the 30 s patience window.
+3. **Cold-boot UUID guard** (`_cold_boot_uuid_ok`): if the witness holds
+   our own slot from a previous life with a marker we no longer have
+   locally, the cluster advanced without us — refuse to promote a stale
+   copy. rqlite-free; applies even with no other master.
+4. **Witness reachability**: at N<=2 a witness reply within 5 s is
+   mandatory (rqlite quorum depends on the arbiter we are about to
+   promote). At N>=3 the cluster has natural rqlite quorum and the
+   isolated old master self-demotes via `NOQUORUM`, so takeover proceeds
+   cautiously without a witness.
+5. **Slot inspection** of the last-known master's slot:
+   - missing slot => REFUSE (INV-7: a missing slot is worst-case, could
+     have held `lms = 1`; operator decommissions the node or re-keys the
+     witness).
+   - fresh slot => REFUSE (cluster healthy elsewhere).
+   - stale + `lms = 1` => REFUSE (previous master died without clearing
+     LMS; LMS never times out — operator clears via override).
+   - stale + `lms = 0` => continue.
+6. **DRBD UUID match**: the local `cluster` resource's current-UUID
+   (`_read_local_drbd_uuid()`, via debugfs `data_gen_id` with a
+   `drbdadm dump-md` fallback — `drbdadm current-uuid` does not exist in
+   DRBD 9.x) must equal the slot marker exactly; mismatch => REFUSE
+   (divergence, operator reconciles).
+7. **Go solo**: set own slot `tag = lms`. The arbiter OWNS the LMS bit —
+   netd refreshes only the marker each tick and never the tag, so the
+   step-5 readback can't be raced back to 0.
+8. **Actuate + readback**, then DRBD primary, mount, bind `.254`, start
+   arbiter rqlite + filer, write `mgmt_master`.
+
+## LMS (last-man-standing) lifecycle
+
+The witness slot `tag.lms` bit asserts "I am hosting the cluster alone
+because the peer is gone." It is an explicit local decision owned solely
+by `cluster_arbiter`: set on go-solo / `ensure_lms_if_last_standing`,
+cleared on self-demote (`demote_arbiter_host`). netd's per-tick recompute
+never flips it (doing so raced the takeover readback).
+
+Clear semantics are strict:
+
+- An `lms = 1` slot is cleared ONLY by a successful write from the slot
+  owner to the witness — both online at the same moment. `set_own_slot`
+  updates the in-memory tag; the wire write is the next `heartbeat_all`,
+  whose `sendto` errors are swallowed (`OSError`), so a failed write is
+  invisible. The demote-path clear is best-effort.
+- If the owner dies with `lms = 1` outstanding, the slot stays `lms = 1`
+  until the owner returns and writes `lms = 0`, or the operator
+  decommissions it (remove from rqlite `nodes` so readers ignore its
+  slot), re-keys the witness identity, or clears manually.
+- A witness that loses state and returns EMPTY is NOT a clear: per INV-7
+  a missing slot is worst-case (`lms = 1`-possible) until repopulated by
+  a fresh heartbeat from the current owner; takeover stays refused.
+- The 10 s slot-staleness rule is NOT a clear either: it only changes how
+  a reader interprets a stale `lms = 1` — takeover then needs exact
+  UUID/history-chain match (stricter than treating the bit as cleared).
+
+A stuck LMS can leave a visible inconsistency (slot says `lms = 1`, mesh
+heartbeats say `lms = 0`). Resolution funnels through the staleness +
+UUID-lineage path; operators alert on a stuck LMS and clear via override.
+
+## DRBD UUID provenance — the split-brain guard
+
+The current master's local DRBD state is the single authority. Three
+mirrors, increasing staleness tolerance:
+
+1. **Master heartbeat** — broadcasts its current arbiter UUID on every
+   mesh heartbeat + witness slot write. Newest, authoritative-now,
+   ephemeral.
+2. **rqlite UUID-history table** — `(uuid, ts_set, ts_superseded)`, 7-day
+   retention, replicated to every node. Lags the heartbeat (rqlite may
+   have been down during failover; the write lands after quorum reforms).
+3. **Per-node local history** (`state.arbiter_uuid_history`) — each node
+   records every arbiter UUID it observes, newest last, capped at 7 days
+   (`UUID_HISTORY_RETENTION_S`). Autonomous: needs no rqlite, no peer.
+   The cold-boot fallback.
+
+Invariants: the heartbeat may be ahead of rqlite, never behind; all three
+agree at steady state.
+
+Eligibility (`state.classify_arbiter_uuid`): a candidate's advertised
+UUID is `current` (matches our newest), `unseen` (never recorded —
+assume newer, votable), or `superseded` (seen but a later UUID replaced
+it — refuse). The refuse case is the split-brain guard: a stale candidate
+can never win a vote, even on raw node count. A node refuses to claim
+master at all if any known peer holds a newer arbiter generation, even an
+unreachable one — promoting would silently lose those writes, including
+the SeaweedFS/S3 metadata on the `cluster` singleton. When the
+up-to-date peer is permanently lost, the operator can `seize` (force
+promote, data loss acknowledged); without it the cluster refuses to come
+up, which is the safe default.
+
+## `state.json` — per-node election persistence (`state.py`)
+
+The local `/etc/bedrock/state.json` carries this node's identity plus the
+two base-layer facts that must survive reboot with no rqlite (they are
+what recovers rqlite):
+
+- `believed_master` — who this node last believed was mgmt master, read
+  on cold boot before rqlite quorum exists. Written by the election when
+  the believed master changes; atomic tmp+rename+fsync (`state.save`).
+- `arbiter_uuid_history` — the local 7-day UUID log above; appended each
+  tick via `record_arbiter_uuid`.
+
+The election is the sole writer of these fields. Sagas (join, takeover,
+shutdown) influence them only indirectly, by changing the inputs the
+election reads (mesh state, rqlite membership, witness slot). On a lost
+or 0-byte `state.json`, `recover_identity_from_cluster_json` rebuilds
+identity from the local `cluster.json` + hostname;
+`arbiter_uuid_history` restarts empty (a candidate then classifies as
+`unseen` / votable — acceptable, because the hard promotion gate is the
+live local DRBD current-UUID exact match (debugfs `data_gen_id`), not
+state.json).
+
+## Maintenance mode
+
+A node in maintenance contributes 0 votes — dropped from both numerator
+and denominator. netd's active-node filter excludes
+`info.get("maintenance")` nodes from `node_loopbacks` and `member_ids`,
+so peers recompute the cluster's vote total without it. Putting the
+master into maintenance triggers a planned handoff (same failover
+mechanism, operator-initiated), letting a single node shut down cleanly
+while the cluster continues on the recomputed quorum.
+
+## Graceful shutdown
+
+- **Single-node shutdown**: enter maintenance on the target first (votes
+  drop out, master hands off), then stop services. The cluster continues
+  on remaining voters.
+- **Cluster-wide shutdown**: every node stops with its votes intact — no
+  maintenance bit, no handoff. On the next cold boot the 30 s patience
+  window + eligibility rules apply: nodes wait for peers and resume only
+  once enough return to form quorum. No "was shut down cleanly" marker is
+  needed — refuse-to-promote-alone is the safe default if a peer doesn't
+  return.
+
+A graceful daemon stop hands off all cluster work (DRBD demote, release
+`.254`) before exiting, so a clean restart re-enters from a quiet
+position and the 30 s window starts fresh.
+
+## Join
+
+Operator-initiated, runs on the master, triggered by accepting a pending
+join request. It executes via the rqlite saga backend (operations /
+operation_steps): rqlite `nodes` insert, key distribution, peer DRBD
+config, rqlited join. The joiner polls the master's HTTPS API for the
+result. A mid-join (`state == 'joining'`) node is excluded from the
+election denominator so the master can't be tipped into `NOQUORUM` while
+a peer joins.
 
 ## Glossary
-- **LMS** — "last-man-standing". A flag on a node's witness slot
-  asserting "I am hosting the cluster alone because the peer is
-  gone." Set only after a witness-quorum-acknowledged write.
-- **Witness quorum** — majority of all configured witnesses, where
-  each contributing witness must be **valid** (has slot entries
-  for every cluster node).
-- **Valid witness** — a witness whose last reply contained a slot
-  for every active node in the rqlite `nodes` table (read locally
-  via `cluster_state.load_cluster()`).
-- **Patience window** — fixed 30 s after bedrock-d start during
-  which no witness-assisted decision fires.
+
+- **LMS** — last-man-standing. A node's witness-slot `tag` bit 0
+  asserting it hosts the cluster alone; set only after the go-solo
+  takeover step.
+- **Witness quorum** — majority of all configured witnesses, each
+  contributing only when valid.
+- **Valid witness** — its last reply holds a slot for every active node
+  in the rqlite `nodes` table.
+- **Patience window** — the 30 s after process start at N>=2 during which
+  a node defers its first arbiter promote.

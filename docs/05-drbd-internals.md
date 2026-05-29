@@ -101,24 +101,17 @@ It uses **UUIDs that only change when the cluster topology changes**.
       Either node can be Primary
 ```
 
-### Why this is brilliant
+### Cost summary
 
 ```
-  ┌────────────────────────────────────────────────────┐
-  │                                                    │
-  │  UUID rotation cost:  ONE write, ONCE, only when   │
-  │  the cluster topology changes (peer joins/leaves)  │
-  │                                                    │
-  │  Normal operation:    ZERO extra writes             │
-  │  Secondary node:      ZERO extra writes             │
-  │  Both nodes in sync:  ZERO extra writes             │
-  │                                                    │
-  │  Compare to journaling/WAL approaches:              │
-  │    - Write-ahead log: 1 extra write PER write      │
-  │    - On BOTH nodes: 2x total write amplification    │
-  │    - DRBD: 0x write amplification                  │
-  │                                                    │
-  └────────────────────────────────────────────────────┘
+  UUID rotation:      ONE write, ONCE, only on topology change
+                      (peer joins/leaves)
+  Normal operation:   ZERO extra writes
+  Secondary node:     ZERO extra writes
+  Both nodes in sync: ZERO extra writes
+
+  vs. write-ahead log: 1 extra write per write, on both nodes
+                       → 2x write amplification. DRBD adds 0x.
 ```
 
 ## Activity Log — Crash Recovery Without Full Resync
@@ -257,29 +250,62 @@ The three layers work together:
   │ other was idle         │ (no writes    │ needed         │
   │ (Secondary, no writes) │ happened)     │                │
   │                        │               │                │
-  │ Split-brain (both      │ Both have     │ CONFLICT       │
-  │ wrote independently)   │ different     │ Needs policy   │
-  │                        │ new UUIDs     │ (discard one)  │
+  │ Split-brain (both      │ Both have     │ Auto-resolve   │
+  │ wrote independently)   │ different     │ per after-sb   │
+  │                        │ new UUIDs     │ policy; both   │
+  │                        │               │ primary →      │
+  │                        │               │ disconnect     │
   └─────────────────────────────────────────────────────────┘
 ```
 
-## Summary — Why DRBD's Design Is Exceptional
+## How Bedrock configures DRBD
+
+Every Bedrock resource (the cluster singleton and every per-VM disk) is rendered
+by `tier_storage.render_drbd_res` / `render_drbd_res_mesh`, so the behavior above
+is exactly what runs in production:
 
 ```
-  ┌────────────────────────────────────────────────────────┐
-  │                                                        │
-  │  Normal writes:     0 extra I/O  (UUID unchanged)     │
-  │  Secondary node:    0 extra I/O  (no AL, no journal)  │
-  │  New 4MB extent:    1 extra I/O  (AL update, rare)    │
-  │  Topology change:   1 extra I/O  (UUID rotation)      │
-  │  Crash recovery:    < 1% resync  (AL limits scope)    │
-  │  Clean reconnect:   bitmap only  (exact dirty blocks) │
-  │                                                        │
-  │  Total write amplification: effectively 0x             │
-  │  Data integrity guarantee: Protocol C (synchronous)    │
-  │  Recovery certainty: 100% (UUID history is definitive) │
-  │                                                        │
-  │  20+ years of production use. Real engineering.        │
-  │                                                        │
-  └────────────────────────────────────────────────────────┘
+  protocol C;                          synchronous — a write acks only after
+                                       it lands on every connected peer
+  options { on-no-quorum suspend-io; } a peer that loses DRBD quorum freezes
+                                       I/O rather than diverge
+  net {
+    max-buffers 8000; sndbuf-size 0; rcvbuf-size 0;
+    after-sb-0pri discard-zero-changes  split-brain auto-resolution:
+    after-sb-1pri discard-secondary       keep the side with real writes /
+    after-sb-2pri disconnect               the primary; bail if both wrote
+  }
+  disk {
+    c-plan-ahead 0; c-min-rate 0; resync-rate 100M;
+    rs-discard-granularity 65536;        pass TRIM/discard down to the thin LV,
+    discard-zeroes-if-aligned yes;       so `fstrim` reclaims pool blocks on
+  }                                      every peer
+
+  create-md --force --max-peers=7      bitmap slots for up to 7 peers
+  meta-disk /dev/<vg>/bedrock-meta-<r> external metadata in a separate thin LV,
+                                       so promoting a plain local LV to DRBD
+                                       leaves the existing XFS byte-for-byte
+```
+
+Resource naming: the singleton is `cluster` (minor 1101, data LV
+`bedrock-data-cluster`, meta LV `bedrock-meta-cluster`); each VM disk is
+`vm-<name>-disk0`. The `on` block addresses each peer by its stable loopback
+`/32`; `render_drbd_res_mesh` additionally emits one `path` per direct mesh link
+(plus a loopback fallback) so DRBD multipaths over whichever NIC is healthy.
+Cattle disks are a plain local thin LV with no DRBD at all; pets are 2-way and
+vipets 3-way, and the singleton replica set caps at `min(3, N)`.
+
+## Summary
+
+```
+  Normal writes:     0 extra I/O  (UUID unchanged)
+  Secondary node:    0 extra I/O  (no AL, no journal)
+  New 4MB extent:    1 extra I/O  (AL update, rare)
+  Topology change:   1 extra I/O  (UUID rotation)
+  Crash recovery:    < 1% resync  (AL limits scope)
+  Clean reconnect:   bitmap only  (exact dirty blocks)
+
+  Write amplification: effectively 0x
+  Data integrity:      Protocol C (synchronous)
+  Recovery direction:  certain (UUID history is definitive)
 ```

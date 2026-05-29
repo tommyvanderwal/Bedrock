@@ -1,156 +1,201 @@
-# `witness.py`
+# installer/lib/witness.py
 
-**Module purpose.** Talk to a BedRock Echo device on the LAN over
-UDP/12321. The Echo is a **passive per-node K/V slot store** — each
-node owns one slot keyed by `node_id` (the last octet of its
-`100.X.Y.N/32` loopback), writes its own slot every 1 s, and reads
-every other node's slot from the Echo's reply. The Echo has NO
-arbitration logic: it stores last-write per slot and returns all
-slots on every reply.
+BedRock witness client — the per-node side of the BedRock Echo K/V slot
+protocol. Each node owns exactly one slot (keyed by its `node_id`, a single
+byte 1-250), publishes that slot to every reachable Echo once per second, and
+reads back every other node's slot to decide arbiter takeover. The Echo itself
+is dumb storage: it keeps the last write per slot and returns all slots on every
+reply. This module owns the wire format (two layers of ChaCha20-Poly1305 AEAD
+over msgpack), the local slot cache, and the validity/confirmation predicates
+that `netd`'s election tick folds into the vote tally. `netd` drives the I/O
+(probe / heartbeat / drain / set-own-slot once per tick on a single
+`WitnessState`); `election` consumes the predicates. See
+`docs/cluster-quorum-spec.md` for the load-bearing protocol.
 
-See `docs/cluster-quorum-spec.md` for the load-bearing protocol —
-this file is just the implementation reference. The takeover logic
-that USES the slots lives in `installer/lib/cluster_arbiter.py`, not
-here.
+## Functions / Classes
 
-The wire protocol is intentionally tiny so an ESP32 firmware can
-implement it:
+### `Slot` (dataclass)
+A decoded slot read back from a witness reply (plaintext).
+- **Fields:** `node_id`, `ts_writer_ms` (writer's epoch-ms clock), `tag`
+  (bitflag, bit 0 = LMS), `marker` (bytes; DRBD current-UUID for the arbiter
+  slot), `kind` (default `MARKER_KIND_DRBD_ARBITER_UUID`), `seen_at_monotonic`.
+- `.lms` → bool: tag bit 0 (`TAG_LMS`) set.
+- `.is_stale(now_local_ms=None, threshold_ms=SLOT_STALE_MS)` → bool: true when
+  `(reader's clock) - ts_writer_ms >= threshold`. The reader uses its own clock,
+  not the writer's; defaults `now` to `time.time()*1000`.
+
+### `EchoEndpoint` (dataclass)
+One discovered Echo. Fields: `addr` (`(ip, port)`), `echo_id`, `last_reply_ms`,
+a per-endpoint decoded slot cache `slots`, and `last_reply_monotonic`. The
+per-endpoint cache is what `count_valid_confirmed` validates individually so
+each configured witness can contribute to the tally.
+
+### `WitnessState` (dataclass)
+All live witness state for this node. Fields: `cluster_uuid` (msgpack `cu`
+value), `cluster_key` (32-byte AEAD key), `my_node_id` (1-250), `my_node_name`
+(informational, off-wire), `sock`, `discovered: dict[str, EchoEndpoint]`,
+`last_probe_at`, `last_alive_at` (monotonic of most recent decryptable reply),
+the merged latest-reply cache `slots: dict[int, Slot]`, the outgoing slot fields
+`own_marker` / `own_kind` / `own_tag`, and `member_ids: Optional[set[int]]` (the
+current active node set; `None` = membership not yet known).
+
+### `open_socket() -> socket.socket`
+Open the witness UDP socket.
+- **Out:** an `AF_INET`/`SOCK_DGRAM` socket with `SO_BROADCAST` +
+  `SO_REUSEADDR`, bound to `("", WITNESS_PORT)` (12321), non-blocking. Caller
+  assigns it to `ws.sock`.
+
+### `broadcast_probe(ws, broadcast_addrs) -> None`
+Send a slot-less `probe` envelope to every broadcast address (discovery / re-discovery).
+- **In:** `ws`; `broadcast_addrs` → iterable of broadcast IP strings.
+- **Out:** None. Sends one UDP packet per address to `:WITNESS_PORT`; sets
+  `ws.last_probe_at`. No-op if `ws.sock is None`. Per-send `OSError` is swallowed.
+
+### `heartbeat_all(ws) -> None`
+Unicast a `hb` envelope carrying this node's own slot to every discovered Echo. Called once per election tick.
+- **In:** `ws`.
+- **Out:** None. One UDP packet per discovered endpoint. No-op if no socket or
+  nothing discovered. Per-send `OSError` swallowed. The slot is only attached
+  when `ws.own_marker` is set.
+
+### `drain_replies(ws, max_packets=32) -> None`
+Non-blocking receive loop that absorbs `ack` replies and refreshes local state.
+- **In:** `ws`; `max_packets` → loop bound per call.
+- **Out:** None. Updates `ws.discovered` (adds/refreshes endpoints, keyed by
+  `echo_id`), `ws.last_alive_at`, each endpoint's `slots` + `last_reply_monotonic`,
+  and the merged `ws.slots`. Drops packets that fail AEAD, mismatch
+  `cluster_uuid`, or aren't type `ack`; drops slots whose `node_id` isn't in
+  `ws.member_ids` (when known) or whose decoded `node_id` disagrees with the
+  map key.
+
+### `is_alive(ws) -> bool`
+Witness reachable iff a decryptable reply landed within `WITNESS_FRESHNESS_S`
+(12 s). False before any reply (`last_alive_at == 0.0`).
+
+### `is_valid(ws) -> bool`
+True iff the merged cache holds a slot for every active member (`ws.member_ids`,
+which must be known and non-empty). A missing member's slot ⇒ invalid ⇒ the
+witness contributes 0 votes. Merged-cache (single-witness) view.
+
+### `is_confirmed(ws, now_local_ms=None) -> bool`
+Readback proof for this node's own takeover: true iff our own slot is present in
+the merged cache, carries our current `own_marker`, and is not stale. The
+predicate the takeover step-5 readback relies on, surfaced so the election can
+fold it into the tally.
+
+### `count_valid_confirmed(ws, n_configured, now_local_ms=None) -> int`
+Multi-witness tally: how many configured Echoes are individually valid AND confirmed right now.
+- **In:** `ws`; `n_configured` → number of configured witnesses (the cap);
+  `now_local_ms` → staleness clock override.
+- **Out:** int in `[0, n_configured]`. Iterates `ws.discovered`, skips endpoints
+  whose last reply is older than `WITNESS_FRESHNESS_S`, validates each
+  endpoint's own `slots` cache (`_slots_valid` + `_slots_confirmed`), and caps
+  the result at `n_configured` so a rogue extra Echo can't inflate the vote.
+  Returns 0 if `n_configured <= 0` or `member_ids` is unknown.
+
+### `needs_reprobe(ws) -> bool`
+Whether to re-broadcast a probe: ~1 s cadence while nothing is discovered, never
+while `is_alive`, else every `DISCOVERY_REPROBE_S` (30 s) once cached endpoints
+have gone stale.
+
+### `set_own_slot(ws, *, marker, tag=0, kind=MARKER_KIND_DRBD_ARBITER_UUID) -> None`
+Stage what this node publishes on its next heartbeat.
+- **In:** `marker` → bytes (the `cluster` singleton's DRBD current-UUID);
+  `tag` → set `TAG_LMS` when operating last-man-standing, else 0; `kind` →
+  marker kind.
+- **Out:** None. Mutates `ws.own_marker` / `ws.own_tag` / `ws.own_kind` (tag and
+  kind masked to one byte). `heartbeat_all` picks them up on the next tick.
+
+### `read_slot(ws, node_id) -> Optional[Slot]`
+Most recent decoded `Slot` for `node_id` from the merged cache, or None.
+
+### `own_slot(ws) -> Optional[Slot]`
+This node's own slot from the merged cache (the takeover step-5 readback).
+
+### `load_cluster_key(path=Path("/etc/bedrock/cluster.key")) -> bytes`
+Read the shared 32-byte AEAD key from disk.
+- **In:** `path` → key file.
+- **Out:** raw key bytes, or `b""` on `OSError` (caller decides if fatal).
+  Strips a single trailing `\n` only when the file is exactly 33 bytes; never
+  `strip()`s, because ~5% of random keys start or end with a byte
+  (`0x09`-`0x0D`/`0x20`) that `bytes.strip()` would eat.
+
+### Constants
+`WITNESS_PORT = 12321`, `MAGIC = b"BREC"`, `NONCE_LEN = 12`,
+`WITNESS_FRESHNESS_S = 12.0`, `DISCOVERY_REPROBE_S = 30.0`,
+`SLOT_STALE_MS = 10_000`, `NODE_ID_MIN = 1`, `NODE_ID_MAX = 250`,
+`TAG_LMS = 0x01`, `MARKER_KIND_DRBD_ARBITER_UUID = 1`.
+
+### Private helpers
+- `_aead()` / `_msgpack()` — lazy imports (keep module import cheap).
+- `_aead_seal(key, plaintext)` → `nonce(12) || ChaCha20Poly1305(...)`.
+- `_aead_open(key, blob)` → plaintext or None on auth fail / blob shorter than
+  `NONCE_LEN + 16`.
+- `_encode_slot` / `_decode_slot` — seal/open one opaque slot blob (decode does
+  bounds + `NODE_ID_MIN..MAX` checks).
+- `_encode_envelope` / `_decode_envelope` — build/parse the outer wire envelope.
+- `_slots_valid` / `_slots_confirmed` — validity / confirmation over a given
+  slot cache; used by both the merged and per-endpoint predicates.
+
+## How it works
+
+Each tick `netd` calls `set_own_slot` (publishing the cluster DRBD UUID + LMS
+bit), then `heartbeat_all` (unicast own slot to known Echoes), `drain_replies`
+(absorb acks), and reads the predicates. Discovery is bootstrapped by
+`broadcast_probe` whenever `needs_reprobe` says so.
+
+Two layers of ChaCha20-Poly1305, both under the same `cluster_key`:
+
 ```
-b"BREC" || nonce(12) || ChaCha20-Poly1305(cluster_key, nonce, plaintext)
+UDP packet:
+  "BREC" || nonce(12) || AEAD( msgpack{ v,t,cu,n[,slot][,slots][,echo_id] } )
+                                                  │            │
+                          hb only ────────────────┘            └──── ack only
+  slot / each slots[nid] value is itself an opaque blob:
+      nonce(12) || AEAD( msgpack{ n, ts_writer, tag, marker, kind } )
 ```
-Anything that doesn't AEAD-verify is silently dropped, so multiple
-Bedrock clusters can share an Echo on the same LAN without leaking.
-Crypto: ChaCha20-Poly1305 with a 32-byte cluster_key from
-`/etc/bedrock/cluster.key`, 12-byte nonces, 16-byte Poly1305 tags.
 
-Module owns no I/O scheduling — the caller (netd's election tick)
-drives `broadcast_probe`, `heartbeat_all`, `drain_replies`,
-`set_own_slot` once per tick. State lives on a single `WitnessState`
-dataclass passed in.
+The Echo never sees plaintext slots — it stores and echoes opaque blobs. All
+decode happens here on read. Anything that doesn't AEAD-verify or whose `cu`
+doesn't match is silently dropped, so multiple clusters can share one Echo on a
+LAN without crosstalk.
 
-## Constants
+Reply ingestion (`drain_replies`) is a chain of guards: AEAD must open → `cu`
+must match our cluster → type must be `ack`. For each `slots[nid]` entry the
+slot must decrypt, its decoded `node_id` must equal the map key, and (when
+membership is known) `nid` must be a current member. The member filter is the
+stuck-LMS escape: `bedrock node leave` drops a node from rqlite, so its stale
+`lms=1` slot stops counting and a blocked takeover can proceed. The per-endpoint
+cache and the merged `ws.slots` are swapped wholesale, so a reader always sees
+one consistent reply, never a half-updated map.
 
-- `WITNESS_PORT = 12321` — UDP port the Echo binds; cluster nodes
-  broadcast probes here and unicast heartbeats to discovered
-  endpoints here. Matches the canonical bedrock-echo firmware.
-- `MAGIC = b"BREC"` — 4-byte packet prefix. Lets receivers drop
-  garbage on the broadcast socket cheaply before invoking AEAD.
-- `NONCE_LEN = 12` — ChaCha20-Poly1305 nonce length.
-- `WITNESS_FRESHNESS_S = 12.0` — election treats the witness vote
-  as valid only if a reply landed within the last 12 s.
-- `DISCOVERY_REPROBE_S = 30.0` — re-broadcast probes at this
-  cadence when every cached endpoint has gone stale.
-- `SLOT_STALE_MS = 15_000` — reader's threshold for "slot is stale":
-  `now_local_ms - slot.ts_writer_ms ≥ 15_000`. 14 missed ticks + 1
-  grace.
-- `NODE_ID_MIN = 1`, `NODE_ID_MAX = 250` — valid slot keys. 251–253
-  reserved; 254 = arbiter VIP marker; 255 = broadcast; 0 unused.
-- `TAG_LMS = 0x01` — bit 0 of the slot `tag` field, set when this
-  node is operating last-man-standing.
-- `MARKER_KIND_DRBD_ARBITER_UUID = 1` — `kind` value identifying a
-  slot whose `marker` carries the tier-critical DRBD current-uuid.
+Voting predicates compose as:
 
-## Dataclasses
+```
+        is_alive ── decryptable reply within the 12 s freshness window
+                          │
+   valid ── slot present for EVERY active member (member_ids known, non-empty)
+                          │
+ confirmed ── our own slot present, carries current marker, not stale (readback)
+                          │
+   election counts a witness only when valid AND confirmed → +1
+```
 
-- **`Slot(node_id, ts_writer_ms, tag, marker, kind, seen_at_monotonic)`**
-  — a decoded slot. `lms` property checks `tag & TAG_LMS`.
-  `is_stale(now_local_ms, threshold_ms)` compares the reader's
-  clock against `ts_writer_ms`.
-- **`EchoEndpoint(addr, echo_id, last_reply_ms)`** — one discovered
-  Echo. `addr` is the `(ip, port)` tuple; `echo_id` is the Echo's
-  self-identifier from the reply.
-- **`WitnessState`** — held by `Daemon` (netd) for the duration of
-  bedrock-d's run. Fields:
-  - `cluster_uuid` (16-byte string used as msgpack `cu` value)
-  - `cluster_key` (32-byte AEAD key)
-  - `my_node_id` (1–250)
-  - `my_node_name` (informational; not on the wire)
-  - `sock` (non-blocking UDP socket)
-  - `discovered: dict[str, EchoEndpoint]`
-  - `last_probe_at`, `last_alive_at` (monotonic timestamps)
-  - `slots: dict[node_id, Slot]` — wholesale-replaced cache from
-    the most recent `drain_replies` pass.
-  - `own_marker: bytes` / `own_kind: int` / `own_tag: int` —
-    what THIS node will publish on its next heartbeat. Set by
-    `set_own_slot()`.
+`is_valid` / `is_confirmed` read the merged cache (single-witness takeover path).
+`count_valid_confirmed` validates each discovered Echo's own cache independently
+and caps the result at `n_configured`. When `member_ids` is `None` (early boot,
+before netd plumbs the rqlite `nodes` set) nothing is valid — every predicate
+returns 0/false, which raises the vote bar and biases toward "do not fail over".
 
-## Functions
+Staleness is reader-side: `Slot.is_stale` compares the reader's wall clock to the
+writer's claimed `ts_writer_ms` against `SLOT_STALE_MS` (10 000 ms), matching
+netd's 10-missed-heartbeat leader-loss detector. The LMS tag bit itself never
+expires by time — only the member filter or a fresher slot clears it.
 
-### Crypto helpers (internal)
+## Why
 
-- `_aead_seal(key, plaintext) -> bytes` — `nonce(12) ||
-  ChaCha20-Poly1305(key, nonce, plaintext)`. Returns the
-  concatenation; the 16-byte Poly1305 tag is appended to the
-  ciphertext by the library.
-- `_aead_open(key, blob) -> bytes | None` — inverse; returns
-  plaintext or None on auth fail.
-- `_encode_slot(ws, ts_writer_ms) -> bytes` — msgpack-encode the
-  Slot plaintext, AEAD-seal with `ws.cluster_key`. Returns the
-  opaque blob the witness will store.
-- `_decode_slot(key, blob) -> Slot | None` — inverse. Validates
-  `NODE_ID_MIN ≤ n ≤ NODE_ID_MAX`.
-- `_encode_envelope(ws, *, t, include_own_slot) -> bytes` — build
-  the on-wire envelope: `MAGIC || AEAD(msgpack({v, t, cu, n, slot?}))`.
-- `_decode_envelope(key, data) -> dict | None` — inverse;
-  validates MAGIC prefix, AEAD-decrypts, msgpack-decodes.
-
-### Public API (called by netd's election tick)
-
-- `open_socket() -> socket.socket` — non-blocking UDP socket bound
-  to `("", WITNESS_PORT)` with `SO_REUSEADDR` and `SO_BROADCAST`.
-- `broadcast_probe(ws, broadcast_addrs)` — sends a `t="probe"`
-  envelope (no slot payload) to each broadcast address. Used at
-  discovery and when every cached endpoint has gone stale.
-- `heartbeat_all(ws)` — unicasts a `t="hb"` envelope (containing
-  our own slot, AEAD-sealed) to every discovered Echo. No-op when
-  `ws.discovered` is empty.
-- `drain_replies(ws, max_packets=32)` — non-blocking recvfrom loop.
-  For each accepted reply: upserts the `EchoEndpoint`, updates
-  `last_alive_at`, decodes every slot blob in the reply, and
-  wholesale-replaces `ws.slots`. Election tick reads from
-  `ws.slots` after this call.
-- `is_alive(ws) -> bool` — `True` iff `last_alive_at` is within
-  `WITNESS_FRESHNESS_S`. The election uses this for the +1 witness
-  vote.
-- `needs_reprobe(ws) -> bool` — `True` if no endpoint has ever
-  replied OR if the witness has gone stale (used as the toggle
-  between `broadcast_probe` and `heartbeat_all`).
-- `set_own_slot(ws, *, marker, tag=0, kind=MARKER_KIND_DRBD_ARBITER_UUID)`
-  — update what this node publishes on its next heartbeat. Caller
-  responsibility: every 1 s, set `marker = drbdadm current-uuid
-  tier-critical` and `tag = TAG_LMS` iff hosting `.254` AND no peer
-  is logged_up; else `tag = 0`. `heartbeat_all` picks these up on
-  the next tick.
-- `read_slot(ws, node_id) -> Slot | None` — most recent decoded
-  Slot for `node_id`, or None.
-- `own_slot(ws) -> Slot | None` — convenience for the takeover
-  protocol's step-5 readback check (see
-  `docs/cluster-quorum-spec.md`).
-- `load_cluster_key(path) -> bytes` — reads `/etc/bedrock/cluster.key`
-  (32 raw random bytes). Returns `b""` if unreadable; caller
-  decides whether that's fatal. **Note**: does NOT `strip()` — 32
-  random bytes have a ~5 % chance of starting/ending with a
-  whitespace-coded byte; stripping silently corrupts the key.
-
-## What this module is NOT responsible for
-
-- **The takeover decision.** That lives in
-  `cluster_arbiter.promote_to_arbiter_host()` per
-  `cluster-quorum-spec.md`. This module only does I/O + caching.
-- **"Blessing" a master.** The old `send_claim` / `blessed_master` /
-  `holddown_ms` model is gone (see
-  `cluster-quorum-spec.md#what-this-spec-replaces`). The witness
-  has no notion of who's master.
-- **Witness clock.** All freshness comparisons use the **reader's**
-  local clock against the writer's `ts_writer_ms`. The witness
-  doesn't generate timestamps.
-
-## Failure modes
-
-| Symptom                          | Where to look                                          |
-|----------------------------------|--------------------------------------------------------|
-| All slots show stale even fresh  | Reader clock skew vs writers — verify chronyd healthy. |
-| No replies from Echo             | `WITNESS_PORT` reachable? Cluster_key mismatch (silent drop on AEAD fail)? |
-| `ws.slots` empty after drain     | Cluster_uuid mismatch in reply — Echo serving multiple clusters; envelope.cu doesn't match. |
-| Takeover loops on readback fail  | UDP loss; `cluster-quorum-spec.md` step 5 retries 3 ×; check for asymmetric routing. |
-| Witness vote stays 0             | `is_alive` requires reply ≤ 12 s old; check `last_alive_at` in `/run/bedrock/witness.json` if dumped. |
+Two AEAD layers let the Echo be a trivial, untrusted store (small enough for
+ESP32 firmware) while keeping slot contents confidential and authenticated
+end-to-end between nodes. Reader-clock staleness avoids trusting a possibly-dead
+writer's timestamp. The "unknown membership ⇒ 0 votes" stance ensures a node
+that can't yet certify the witness never uses it to justify a takeover.

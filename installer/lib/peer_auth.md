@@ -1,69 +1,87 @@
-# `peer_auth.py`
+# installer/lib/peer_auth.py
 
-**Module purpose.** Ed25519 identity for inter-node authenticated
-API calls. Each node holds a long-lived keypair at
-`/etc/bedrock/peer.key` (private, mode 0600) and
-`/etc/bedrock/peer.key.pub`; the public key is registered in
-rqlite (`nodes.bedrock_pubkey`) when the node joins.
+Per-node Ed25519 identity and request signing for inter-node API auth. Each node owns a keypair at `/etc/bedrock/node.{key,pub}`; the public key is registered (`/api/nodes/register`) and replicated to every node's snapshot via the log, so any node can verify any peer's signature without a side channel. Outgoing mgmt/installer code calls `request()` to talk to another node's API; the receiving side calls `verify()` to authenticate a peer's `Authorization` header. Signing binds the method, path (with query string), SHA-256 of the body, a timestamp, and the node name, so a tampered body or stale request fails verification.
 
-Used by the `/api/peer/*` endpoints in `mgmt/app.py`: any node
-can ask any other node for its loopback IP, drbd state, etc.,
-with the requester signing a per-request nonce + body.
+The header carried on every signed request:
 
-Distinct from `cluster.key` (the witness HMAC) — peer_auth is
-asymmetric (signed by sender, verified by receiver against
-registered pubkey), witness uses symmetric HMAC because the
-Echo can't track per-node pubkeys.
+```
+Authorization: Bedrock-Ed25519 <node_name>:<ts>:<sig_b64>
+```
+
+## Functions / Classes
+
+### `ensure_node_key() -> tuple[bytes, bytes]`
+Return this node's `(priv_seed, pub_bytes)`, both 32-byte raw representations; generate the keypair on first call, idempotent afterward.
+- **In:** none.
+- **Out:** `(priv_seed, pub_bytes)`. Side effects: on first use, writes `/etc/bedrock/node.key` (mode `0600`, via tmp+rename) and `/etc/bedrock/node.pub` (mode `0644`); also rewrites `node.pub` if it is missing or disagrees with the derived public key. Raises `ValueError` if an existing `node.key` is not 32 bytes.
+
+### `pubkey_hex() -> str`
+This node's public key as a hex string (calls `ensure_node_key()`).
+- **In:** none.
+- **Out:** 64-char hex string. Side effect: may generate/write the keypair via `ensure_node_key()`.
+
+### `sign(method, path, body, node_name) -> str`
+Build a signed `Authorization` header value for an outgoing request.
+- **In:** `method` HTTP verb; `path` request path (caller includes any query string); `body` raw request bytes; `node_name` this node's name, embedded in the canonical string and header.
+- **Out:** header string `"Bedrock-Ed25519 <node_name>:<ts>:<sig_b64>"` where `ts` is the current unix time and `sig` is `Ed25519_sign(privkey, canonical)`. Side effect: may generate/write the keypair via `ensure_node_key()`.
+
+### `verify(header, method, path, body, pubkey_lookup) -> str`
+Authenticate an incoming `Authorization` header; return the verified node name or raise.
+- **In:** `header` the raw header value; `method`/`path`/`body` of the received request (must match what was signed); `pubkey_lookup` callable `node_name -> Optional[bytes]` returning that node's 32-byte raw pubkey (or `None`).
+- **Out:** verified `node_name` on success. Raises `ValueError` on: missing/wrong scheme, malformed header, timestamp skew greater than `TOKEN_TTL_S`, no pubkey on file for the node, or invalid signature. No side effects.
+
+### `request(method, url, body, node_name, timeout=10.0) -> dict`
+Sign and send a request to another node's mgmt API; return parsed JSON.
+- **In:** `method` HTTP verb; `url` full target URL; `body` dict (JSON-encoded) or `None` (no body); `node_name` this node's name for signing; `timeout` seconds.
+- **Out:** parsed JSON `dict` (empty dict if the response body is empty). Side effects: signs via `sign()` (may write the keypair); performs an HTTP(S) request via `urllib`. For `https` URLs, TLS certificate/hostname verification is disabled (`CERT_NONE`, `check_hostname=False`).
+
+### Private helpers
+- `_canonical(method, path, body, ts, node)` — build the byte string that is signed/verified: `"<METHOD> <PATH>\n<sha256_hex(body)>\n<ts>\n<node>"`.
 
 ## Constants
 
-- `KEY_PATH = /etc/bedrock/peer.key` — private (mode 0600).
-- `PUB_PATH = /etc/bedrock/peer.key.pub` — public hex.
+- `NODE_KEY = /etc/bedrock/node.key` — 32-byte raw private seed, mode `0600`.
+- `NODE_PUB = /etc/bedrock/node.pub` — 32-byte raw public key, mode `0644`.
+- `TOKEN_TTL_S = 300` — accepted timestamp skew window (±5 min); replay bound.
+- `SCHEME = "Bedrock-Ed25519"` — `Authorization` scheme prefix.
 
-## Functions
+## How it works
 
-- `ensure_keypair() -> tuple[Ed25519PrivateKey, str]` — load
-  the existing keypair, or generate + write + return a fresh
-  one. Idempotent. Returns `(priv_key, pub_hex)`.
-- `pubkey_hex() -> str` — short read of `PUB_PATH`. Used by
-  `mgmt_install` + `agent_install` to populate
-  `nodes.bedrock_pubkey` at init/join.
-- `sign(payload: bytes) -> str` — Ed25519 sign + base64-url
-  encode the signature. Caller assembles the canonical request
-  body and signs it.
-- `verify(pub_hex: str, payload: bytes, sig_b64: str) -> bool`
-  — inverse: decode + verify against the supplied pubkey. Used
-  by `/api/peer/*` request handlers.
-- `sign_request(method, path, body_bytes, ts_ms) -> dict` —
-  build the canonical header set:
-  `{"X-Bedrock-Node": <node_name>, "X-Bedrock-Sig":
-  <sig_b64>, "X-Bedrock-Ts": <ts_ms>}`. The canonical body is
-  `f"{method} {path}\n{ts_ms}\n".encode() + body_bytes`.
-- `verify_request(headers, body_bytes, *, max_age_ms=10_000)
-  -> str | None` — server side. Looks up `nodes` row by
-  `X-Bedrock-Node`, fetches `bedrock_pubkey`, calls `verify()`.
-  Rejects with `None` if signature invalid or `ts_ms` too old
-  (replay protection). Returns the node_name on success.
+Canonical string (signed by `sign`, recomputed by `verify`):
 
-## Lifecycle
+```
+<METHOD> <PATH>\n<sha256_hex(body)>\n<ts>\n<node_name>
+```
 
-- `bedrock bootstrap` calls `ensure_keypair()` so the pubkey
-  exists before `bedrock init/join`.
-- `bedrock init`: the master's `mgmt_install.install_full`
-  registers its own pubkey via `bs.node_register`.
-- `bedrock join`: agent_install's `_register` POSTs its
-  `pubkey_hex()`; on approval the master writes
-  `nodes.bedrock_pubkey` for the joiner via `bs.node_register`.
-- After join, every `/api/peer/*` call from this node carries
-  signed headers; the receiver verifies against the registered
-  pubkey.
+The body is never signed directly; only its SHA-256 hex digest is, so a tampered body produces a different canonical string and fails verification. `PATH` is the path plus raw query string (so `/a?b=c` is matched as-is), which `request()` reconstructs from the parsed URL and the caller of `verify()` must supply consistently.
 
-## Why this layer exists
+Key material is lazy and crash-safe. `ensure_node_key()` reads `node.key` if present (rejecting any file that is not exactly 32 bytes), otherwise generates a fresh Ed25519 private key, writes the 32-byte seed to a `.tmp` sibling at mode `0600`, then renames it over `node.key` so a crash mid-write can never leave a half-written key. The public key (`node.pub`, mode `0644`) is derived from the seed and rewritten whenever it is absent or stale.
 
-Without it, every inter-node API call would have to fall back
-to SSH (which Bedrock uses for explicit operator-level
-fan-outs like `bedrock node leave`'s "stop services on target"
-step). SSH is heavyweight (TCP + handshake + paramiko); for
-fast cluster queries (drbd status, mesh state, witness state)
-HTTPS+Ed25519 is much cheaper and the rate-limit story is
-clearer.
+Verify path and its guards, in order:
+
+```
+header  ──► startswith "Bedrock-Ed25519 " ? ─no─► ValueError (wrong scheme)
+        │
+        ▼
+   split "<node>:<ts>:<sig_b64>" + b64decode ─fail─► ValueError (malformed)
+        │
+        ▼
+   |now - ts| <= TOKEN_TTL_S (300s) ? ─no─► ValueError (outside window)
+        │
+        ▼
+   pubkey_lookup(node) -> 32 bytes ? ─none─► ValueError (no pubkey)
+        │
+        ▼
+   Ed25519.verify(sig, canonical) ─bad─► ValueError (signature invalid)
+        │
+        ▼
+   return node_name
+```
+
+The `TOKEN_TTL_S = 300` window (±5 min skew) bounds replay: a captured header stops being accepted once the timestamp ages past the window.
+
+`request()` is the outgoing convenience wrapper: it JSON-encodes the body (empty bytes if `None`), reconstructs the signed path including query, sets `Authorization` via `sign()`, adds `Content-Type: application/json` only when there is a body, and issues the call with `urllib`. For `https` it supplies the insecure SSL context.
+
+## Why
+
+Peer trust comes from the Ed25519 signature, not TLS PKI — the cert on 8443 is for `<dashed-ip>.my.local-ip.co`, never the bare IP a peer dials, so certificate verification is intentionally off and authentication rests on the signature instead. The threat model is a LAN attacker forging requests as a cluster member; it deliberately does not defend against a compromised node, whose pubkey is in the snapshot and which may legitimately sign anything as itself.

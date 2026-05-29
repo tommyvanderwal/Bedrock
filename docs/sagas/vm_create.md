@@ -1,190 +1,189 @@
 # Saga: `vm_create`
 
-**Module:** `bedrock_d/vm/create.py`  
-**Class:** `VmCreate`
+**Module:** `bedrock_d/vm/create.py` — **Class:** `VmCreate`
 
-## Purpose
+## Summary
 
-Provision a new VM (`cattle` / `pet` / `vipet` type). Per the
-storage architecture, every VM disk is backed by a per-resource
-DRBD pair (`bedrock-data-vm-<name>-disk0` + `bedrock-meta-vm-<name>-disk0`)
-mirrored to `peers` (1 for cattle, 2 for pet, 3 for vipet). On
-each peer the LVs live in the shared thinpool.
+Provisions a VM (`cattle` / `pet` / `vipet`) and starts it.
 
-## Trigger
+- **What:** allocate storage, bring up DRBD (pet/vipet only), fill or
+  ISO-boot disk0, `virt-install` the domain on the home node, propagate the
+  domain definition to peers, register the VM in rqlite.
+- **Trigger:** `POST /api/vms` (dashboard / CLI). The handler resolves
+  `(home, peers)` via `_vm_create_peers`, then `_run_vm_saga` submits the saga
+  and runs it synchronously **on the mgmt master** (this process).
+- **Where it runs:** entirely on the master. Steps that must touch a peer SSH
+  into it via `lvm._run_on(host, cmd)` (runs locally when `host` is self).
+- **End state:** disk LVs on every peer; for pet/vipet a per-disk DRBD resource
+  Up on every peer, Primary on home; a defined libvirt domain on every peer; a
+  running domain on home; one `vms` row (`state='running'`).
 
-`POST /api/vms` from the dashboard / CLI. The route submits the
-saga via the executor with `target_node = home`, where the steps
-that need to run on every peer SSH into them.
+Storage by type (`is_replicated = vm_type in {pet, vipet}`):
 
-## Inputs (`ctx`)
+| type   | peers | disk0 storage                              |
+|--------|-------|--------------------------------------------|
+| cattle | 1     | one local thin LV, no DRBD, no failover    |
+| pet    | 2     | 2-way DRBD, external-meta LV pair per disk |
+| vipet  | 3     | 3-way DRBD, external-meta LV pair per disk |
 
-| key | type | meaning |
-|-----|------|---------|
-| `vm_name` | str | Globally unique VM name |
-| `vcpus` | int | vCPU count |
-| `ram_mb` | int | RAM in MiB |
-| `disk_gb` | int | Data LV size in GiB |
-| `vm_type` | `"cattle"\|"pet"\|"vipet"` | Determines how many peers replicate |
-| `priority` | `"low"\|"normal"\|"high"` | QoS hint (currently informational) |
-| `iso` | str (optional) | Filename in `/mnt/bedrock/iso/` to boot from. If empty, a base Alpine image is written to the DRBD device. |
-| `peers` | list[str] | 1 / 2 / 3 node names depending on vm_type |
-| `home` | str | Node where the VM runs (must be in `peers`) |
+Multi-disk: `disk0` (boot, `disk_gb`) plus one resource per entry in
+`extra_disks` (vdb, vdc, …). Every disk gets its own resource
+`vm-<name>-disk<N>` and, when replicated, its own DRBD minor/port.
 
-## Outputs (`ctx`)
-
-| key | filled by | meaning |
-|-----|-----------|---------|
-| `minor` | `allocate_minor` | DRBD minor in 1200..1899 (cluster-singleton lives at 1101) |
-| `port` | `allocate_minor` | DRBD link port = `7700 + minor` |
-| `data_lv` | `lvcreate_pair_on_peers` | `bedrock-data-vm-<name>-disk0` |
-| `meta_lv` | `lvcreate_pair_on_peers` | `bedrock-meta-vm-<name>-disk0` |
-| `libvirt_xml` | `write_libvirt_xml` | Rendered domain XML |
-
-## Step overview
+### Steps
 
 | # | Step | What it does |
 |---|------|--------------|
-| 1 | [`validate_request`](#validate_request) | Sanity-check ctx; refuse malformed requests |
-| 2 | [`allocate_minor`](#allocate_minor) | Pick free DRBD minor (re-use existing row on resume) |
-| 3 | [`register_drbd_resource`](#register_drbd_resource) | Insert row into rqlite `drbd_resources` |
-| 4 | [`lvcreate_pair_on_peers`](#lvcreate_pair_on_peers) | `lvcreate data + meta` on every peer (idempotent) |
-| 5 | [`write_drbd_config`](#write_drbd_config) | Render and write `/etc/drbd.d/vm-<name>-disk0.res` on every peer |
-| 6 | [`drbd_create_md`](#drbd_create_md) | `drbdadm create-md --max-peers=7` on every peer |
-| 7 | [`drbd_up`](#drbd_up) | `drbdadm up` on every peer (idempotent) |
-| 8 | [`drbd_primary`](#drbd_primary) | `drbdadm primary --force` on `home` (initial sync source) |
-| 9 | [`fetch_base_image`](#fetch_base_image) | Ensure Alpine cloud image on `home` (skipped if `iso` set) |
-| 10 | [`write_image_to_drbd`](#write_image_to_drbd) | `qemu-img convert` base image onto `/dev/drbdN` (skipped if `iso` set; skipped if data already present) |
-| 11 | [`write_libvirt_xml`](#write_libvirt_xml) | Render domain XML; write `/tmp/<name>.xml` on every peer |
-| 12 | [`virsh_define`](#virsh_define) | `virsh define` on every peer |
-| 13 | [`register_vm`](#register_vm) | Insert row into rqlite `vms` (state=`created`) |
+| 1  | `validate_request`     | Check ctx; build per-disk plan + `is_replicated` |
+| 2  | `allocate_minors`      | Pick a free DRBD minor per disk (replicated only) |
+| 3  | `register_drbd_resources` | Compute LV names; write `drbd_resources` rows (replicated only) |
+| 4  | `lvcreate_on_peers`    | Create disk LVs on every peer |
+| 5  | `write_drbd_config`    | Write `.res` on every peer (replicated only) |
+| 6  | `drbd_create_md`       | `drbdadm create-md --max-peers=7` on every peer (replicated only) |
+| 7  | `drbd_up`              | `drbdadm up` on every peer (replicated only) |
+| 8  | `drbd_primary`         | `drbdadm primary --force` on home (replicated only) |
+| 9  | `write_boot_image`     | Write cached Alpine onto disk0 (no-op if ISO set or data present) |
+| 10 | `virsh_install`        | `virt-install` on home; dump XML into ctx |
+| 11 | `virsh_define_on_peers`| `virsh define` the domain on the other peers (replicated only) |
+| 12 | `record_disk_uuids`    | Record post-promote DRBD current-UUIDs in rqlite (replicated only) |
+| 13 | `register_vm`          | Write the `vms` row, `state='running'` |
+
+### Inputs (`ctx`, from `POST /api/vms`)
+
+| key | type | meaning |
+|-----|------|---------|
+| `vm_name` | str | Unique VM name |
+| `vcpus` | int | vCPU count |
+| `ram_mb` | int | RAM in MiB |
+| `disk_gb` | int | disk0 size in GiB |
+| `extra_disks` | list[int] | Extra data-disk sizes in GiB (optional) |
+| `vm_type` | `cattle\|pet\|vipet` | Replica count |
+| `priority` | `low\|normal\|high` | HA-importance; drives self-heal restore ordering |
+| `iso` | str (optional) | Filename in `/mnt/bedrock/iso/`; boots from CDROM. Empty → Alpine image written to disk0 |
+| `peers` | list[str] | 1 / 2 / 3 node names; `peers[0] == home` |
+| `home` | str | Node the VM runs on |
+
+### Outputs (`ctx`)
+
+- `disks`: list of per-disk dicts, each `{index, resource, size_gb, data_lv,
+  meta_lv}` plus `{minor, port}` when replicated.
+- `is_replicated`: bool.
+- `libvirt_xml`: domain XML dumped from home after `virt-install`.
+
+## Detail
+
+Idempotency is per step: the executor records each step `done` and skips it on
+resume, and the step bodies also self-guard so re-running is safe. Resume after
+a crash re-submits the same op and walks from the first not-`done` step.
+
+### 1. `validate_request`
+Rejects if any of `vm_name, vcpus, ram_mb, disk_gb, vm_type, peers, home` is
+missing/empty, `vm_type` is unknown, `len(peers)` != {cattle:1, pet:2, vipet:3},
+or `home not in peers`. Builds `ctx["disks"]` from `disk_gb` + `extra_disks` and
+sets `ctx["is_replicated"]`.
+- **Revert:** none (no side effects).
+- **Idempotent:** pure.
+
+### 2. `allocate_minors` *(replicated only)*
+Reads `drbd_resources` minors in `[1102, 1189]`, then assigns each disk the
+lowest free minor not in use and not in `{1132, 1133, 1134}`; existing rows
+reuse their minor. `port = 7700 + (minor - 1100)`.
+- **Why this band:** every DRBD port stays in 7700-7799; minors 1132/1133/1134
+  are skipped because their ports collide with the netd mesh probe/advert/
+  heartbeat ports 7732/7733/7734. The cluster singleton is minor 1101.
+- **Revert:** none (rqlite row written by step 3, removed by `vm_destroy`).
+- **Idempotent:** reuses the row's minor on resume.
+
+### 3. `register_drbd_resources` *(replicated only)*
+Sets each disk's `data_lv` / `meta_lv` via `lvm.lv_names_for` (always, for both
+types). For replicated disks, `INSERT OR REPLACE` into `drbd_resources`
+(`name, minor, data_lv, meta_lv, thinpool, data_size_bytes, meta_size_bytes,
+max_peers=7, peers, timestamps`). Recording the resource before burning on-disk
+state lets `vm_destroy` clean up a half-finished create.
+- **Revert:** `vm_destroy` deletes the row.
+- **Idempotent:** `INSERT OR REPLACE`.
+
+### 4. `lvcreate_on_peers`
+For every peer × disk: replicated disks call `lvm.lvcreate_pair` (data + meta
+thin LVs; meta size from `lvm.meta_size_mb_for(size_gb, max_peers=7)`); cattle
+creates a single thin data LV. Both check `lvs` first.
+- **Revert:** `vm_destroy` → `lvm.lvremove_pair` (and the cattle data LV).
+- **Idempotent:** per-LV existence check.
+
+### 5. `write_drbd_config` *(replicated only)*
+Renders `drbd_config.render(resource, minor, peers)` — protocol C, external
+meta, full-mesh connection blocks (every peer pair, one port), per-node
+`node-id`. Writes `/etc/drbd.d/<resource>.res` on every peer. Peer metadata
+(host, loopback `/32`, node-id by position) comes from rqlite `nodes`.
+- **Revert:** `vm_destroy` removes the `.res` file.
+- **Idempotent:** content-deterministic; rewrites identical bytes.
+
+### 6. `drbd_create_md` *(replicated only)*
+`drbdadm create-md --force --max-peers=7 <resource>` on every peer.
+`--max-peers=7` is fixed at create-md; the meta LV pre-reserves bitmap space so
+adding peers later needs no downtime.
+- **Revert:** `vm_destroy` wipes metadata.
+- **Idempotent:** `check=False`; existing metadata exits non-zero and is
+  tolerated.
+
+### 7. `drbd_up` *(replicated only)*
+`drbdadm up <resource>` on every peer.
+- **Revert:** `vm_destroy` → `drbdadm down`.
+- **Idempotent:** `check=False`; already-up is success.
+
+### 8. `drbd_primary` *(replicated only)*
+`drbdadm primary --force <resource>` on home only, so the image step can write
+disk0 and libvirt can boot. Peers stay Secondary.
+- **Revert:** none needed (`drbdadm down` in destroy covers it).
+- **Idempotent:** promoting an already-Primary resource is a no-op.
+
+### 9. `write_boot_image`
+No-op when `iso` is set (install runs from CDROM). Otherwise targets disk0's
+device (`/dev/drbd<minor>` if replicated, else the local LV path): skips if
+`blkid` reports a filesystem signature; else curls the cached Alpine qcow2 to
+`/var/lib/bedrock/alpine.qcow2` if absent and `qemu-img convert -O raw` writes
+it onto the device. Runs on home.
+- **Revert:** none (LV/DRBD teardown in destroy reclaims it).
+- **Idempotent:** `blkid` signature check.
+
+### 10. `virsh_install`
+On home: if `virsh dominfo <name>` fails, `virt-install` defines + starts the
+domain — `--disk path=…,format=raw,bus=virtio,cache=none,discard=unmap` per
+disk (DRBD device or local LV), `--network bridge=br0,model=virtio`,
+`--graphics vnc,listen=0.0.0.0`, qemu-guest-agent virtio channel,
+`--noautoconsole`. With an ISO: `--cdrom <iso> --boot cdrom,hd`; otherwise
+`--import --boot hd`. Then `virsh dumpxml` → `ctx["libvirt_xml"]`.
+- **Revert:** `vm_destroy` → `virsh destroy` + `undefine`.
+- **Idempotent:** already-defined domain skips straight to the XML dump.
+
+### 11. `virsh_define_on_peers` *(replicated only)*
+Writes `ctx["libvirt_xml"]` to `/tmp/<name>.xml` on each non-home peer and
+`virsh define`s it so any peer can run the VM on failover. A failed define is
+logged (that peer can't take over) but does not fail the saga.
+- **Revert:** `vm_destroy` → `virsh undefine` on each peer.
+- **Idempotent:** `virsh define` updates in place.
+
+### 12. `record_disk_uuids` *(replicated only)*
+Calls `failover.record_uuid_after_promote(resource)` per disk: reads the local
+post-promote DRBD current-UUID and writes it to rqlite (through Raft) so the
+first failover's exact-equality safety check has a quorum-confirmed baseline.
+Failures are logged, not fatal.
+- **Revert:** none (`vm_destroy` deletes the resource row).
+- **Idempotent:** UPDATE to the current value.
+
+### 13. `register_vm`
+`INSERT OR REPLACE INTO vms (vm_name, vm_type, host, ram_mb, disk_gb, state,
+failover_order, priority, updated_at)` with `state='running'`.
+`failover_order` is `[]` for cattle, else `ctx["peers"]` verbatim
+(`peers[0]=home=primary`); the failover orchestrator consults it to decide
+who is next in line after a dead primary. `priority` defaults to `normal`.
+- **Revert:** `vm_destroy` deletes the row.
+- **Idempotent:** `INSERT OR REPLACE`.
 
 ## Revert
 
-The inverse is [`vm_destroy`](vm_destroy.md). Submit it with the
-same `vm_name` and it reverses each effect in the safe order
-(virsh destroy → undefine → drbd down → wipe-md → res file remove →
-lvremove → delete rqlite rows).
-
-A `vm_create` that partially completed and never reached step 13
-leaves a half-state visible in `drbd_resources` but absent from
-`vms`. `vm_destroy` handles this case — it reads `drbd_resources`
-to know which LVs/DRBD to clean up.
-
-## Idempotency / resume
-
-Every step opens with the appropriate idempotency check:
-- `allocate_minor` re-uses the existing row if one exists for this `vm_name`
-- `lvcreate_pair_on_peers` uses `lv_exists` per LV before creating
-- `drbd_create_md` checks `drbdadm status` and skips if configured
-- `drbd_up` is naturally idempotent ("Minor already exists" is success)
-- `drbd_primary` is idempotent on the home node (no-op if already Primary)
-- `write_image_to_drbd` skips if `blkid` reports an existing filesystem
-- `virsh_define` updates the existing definition in place
-
-Resume after crash: re-submitting the same vm_create op (via
-`/api/operations` retry) walks the not-`done` steps. The saga is
-safe to re-run on the home node any number of times — every step
-converges to the desired final state without re-doing finished
-work.
-
-## Step details
-
-### `validate_request`
-
-Refuses if:
-- Any required ctx field is missing or empty
-- `vm_type` not in `{cattle, pet, vipet}`
-- `len(peers)` doesn't match the type's expectation (1 / 2 / 3)
-- `home` not in `peers`
-
-### `allocate_minor`
-
-Reads `drbd_resources WHERE name = "vm-<name>-disk0"`:
-- If a row exists: re-use its `minor` (saga-resume safe).
-- Otherwise: pick the lowest integer in `[1200, 1899]` not already
-  used by another `drbd_resources` row.
-
-`port = 7700 + minor` (i.e. minor 1200 → port 8900).
-
-VM minors start at 1200 to keep them clearly above the
-cluster-singleton minor 1101 in `drbdadm status` output.
-
-### `register_drbd_resource`
-
-`INSERT OR IGNORE` a row into `drbd_resources` so the cluster has a
-durable record of `name → minor` mapping before we burn any
-on-disk state. Used by `vm_destroy` to find the resource later
-even if other rqlite tables drift.
-
-### `lvcreate_pair_on_peers`
-
-For each peer in `ctx["peers"]`: SSH (or run locally if peer is
-self) and call `lvm.lvcreate_pair(host, resource, data_gb)`. That
-helper computes meta-LV size from
-`lvm.meta_size_mb_for(data_gb, max_peers=7)` and creates both LVs
-as thin LVs in the `thinpool`. Idempotent per LV.
-
-### `write_drbd_config`
-
-Renders `tier_storage.render_drbd_res_mesh()` for the per-VM
-resource — full mesh, every peer pair, single minor. Writes
-`/etc/drbd.d/vm-<name>-disk0.res` on every peer.
-
-### `drbd_create_md`
-
-`drbdadm create-md --force --max-peers=7 vm-<name>-disk0` on every
-peer. `--max-peers=7` is baked in at create-md once; raising it
-later is the only thing that needs downtime.
-
-Skips if `drbdadm status vm-<name>-disk0` already reports the
-resource configured (idempotent on retry).
-
-### `drbd_up`
-
-`drbdadm up vm-<name>-disk0` on every peer. Idempotent — DRBD's
-"Minor or volume exists already" return is treated as success.
-
-### `drbd_primary`
-
-`drbdadm primary --force vm-<name>-disk0` on the `home` node only.
-The other peers stay Secondary so writes flow home → peers.
-
-### `fetch_base_image`
-
-If `ctx["iso"]` is set (ISO-booted VM), this step is a no-op.
-Otherwise it ensures `/var/lib/bedrock/alpine.qcow2` exists on the
-home node (downloads via the legacy `vm._download_alpine_on_node`
-helper). Skipped if file already present.
-
-### `write_image_to_drbd`
-
-If `ctx["iso"]` is set, this step is a no-op (install runs from
-CDROM). Otherwise it `qemu-img convert -f qcow2 -O raw` the Alpine
-image onto `/dev/drbd<minor>` on the home node.
-
-Lightweight idempotency: skips if `blkid -s TYPE -o value
-/dev/drbdN` returns anything (means data is already there from a
-previous run).
-
-### `write_libvirt_xml`
-
-Uses the legacy `vm._vm_xml_cattle` / `_vm_xml_pet` helpers to
-render a libvirt domain XML appropriate to the VM type. Writes the
-XML to `/tmp/<vm_name>.xml` on **every** peer so `virsh define`
-in the next step can reference it.
-
-(A future Stage 8.1 PR replaces these helpers with a clean
-`bedrock_d/vm/libvirt_xml.py` module.)
-
-### `virsh_define`
-
-`virsh define /tmp/<vm_name>.xml` on every peer. virsh on an
-already-defined VM updates the in-place definition — idempotent.
-
-### `register_vm`
-
-`INSERT OR REPLACE INTO vms (vm_name, vm_type, host, ram_mb,
-disk_gb, state, updated_at) VALUES (?, ?, ?, ?, ?, 'created', ?)`.
-State is `created` (NOT `running` yet) — a separate
-`bedrock vm start` (or auto-start hook) flips it to `running`.
+The inverse is [`vm_destroy`](vm_destroy.md): re-run with the same `vm_name` and
+it reverses each effect in safe order (virsh destroy → undefine → drbd down →
+wipe-md → `.res` remove → lvremove → delete rqlite rows). A create that crashed
+before step 13 leaves a `drbd_resources` row but no `vms` row; `vm_destroy`
+reads `drbd_resources` to find the LVs/DRBD to clean up.

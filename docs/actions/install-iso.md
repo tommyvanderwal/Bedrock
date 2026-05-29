@@ -7,7 +7,7 @@ and naming convention.
 | ISO | Size | Source | Internet at install? | Use when |
 |---|---|---|---|---|
 | `bedrock-installer-<version>.iso` | ~1 GB | AlmaLinux 10 boot.iso | Yes | Most installs. Default visible download. |
-| `bedrock-installer-<version>-offline.iso` | ~5 GB | AlmaLinux 10 DVD | No | Airgap / MSP-ship-to-site. Operator-control deliverable. |
+| `bedrock-installer-<version>-offline.iso` | ~10 GB | AlmaLinux 10 DVD | No | Airgap / MSP-ship-to-site. Operator-control deliverable. |
 
 Same kickstart partitioning, same first-boot UX, same end state:
 Bedrock installed, services prepared, waiting for the operator to
@@ -53,21 +53,23 @@ named `…-v0.8.iso` fetches from `/v0.8/`, never from `/dev/`.
 ### Offline ISO (`bedrock-installer-<version>-offline.iso`)
 
 ```
-bedrock-installer-dev-offline.iso  (≈5 GB)
+bedrock-installer-dev-offline.iso  (≈10 GB)
 ├── EFI/, boot/, isolinux/, images/        ← AlmaLinux 10 DVD content
 ├── BaseOS/Packages/, AppStream/Packages/  ← stock OS RPMs (offline-usable)
 ├── ks.cfg                                  ← Bedrock kickstart (cdrom mode)
 └── bedrock/                                ← full Bedrock payload
     ├── install.sh                          ← runs at first boot from /var/lib/bedrock-install
     ├── bedrock                             ← operator CLI
-    ├── bedrock-d                           ← unified daemon
+    ├── bedrock-d                           ← the node daemon
     ├── bedrock-{cert-refresh,mdns,redirect}
-    ├── mgmt.tar.gz                         ← FastAPI + Svelte build
-    ├── bedrock_d.tar.gz                    ← unified daemon code tree
-    ├── kopia                               ← backup repo client
-    ├── lib/*.py                            ← installer libraries
-    ├── configs/*                           ← systemd units, etc.
-    ├── rpms/                               ← ELRepo: kmod-drbd9x + utils
+    ├── mgmt.tar.gz                         ← FastAPI + Svelte build (→ /opt/bedrock/mgmt)
+    ├── bedrock_d.tar.gz                    ← daemon code tree (→ /usr/local/lib/bedrock/bedrock_d)
+    ├── lib/*.py                            ← installer libraries + bedrock_schema.sql
+    ├── configs/*                           ← systemd units, sshd drop-in
+    ├── binaries/*                          ← rqlited, weed, victoria-{metrics,logs},
+    │                                          vmagent, vlagent, vm{backup,restore},
+    │                                          node_exporter, vm_exporter.py, kopia
+    ├── rpms/                               ← ELRepo: kmod-drbd9x + drbd9x-utils
     ├── wheels/                             ← Python deps (httpx, fastapi, etc.)
     ├── virtio-win.iso                      ← Windows VM driver disk
     └── alpine.qcow2                        ← cattle-VM default boot image
@@ -168,8 +170,10 @@ installer/iso-build/build-iso.sh --version dev
 testbed/publish-to-s3.sh --prefix dev --with-iso --allow-dirty
 ```
 
-For releases, use `--prefix v0.8 --tag` (refuses `--allow-dirty`,
-treats prefix as immutable unless `--allow-tag-overwrite`).
+For releases, use `--prefix v0.8 --tag`: a versioned (`vN*`) prefix
+requires `--tag`, and an existing release prefix is immutable unless
+you also pass `--allow-tag-overwrite`. A dirty working tree is refused
+for any prefix unless `--allow-dirty`.
 
 ## Failure modes
 

@@ -1,30 +1,29 @@
-# Daemon unification — single `bedrock-d` process
+# Single daemon — `bedrock-d`
 
-The two daemons that own cluster decisions — `bedrock-net` (mesh,
-election, witness) and `bedrock-mgmt` (FastAPI + orchestrator) — are
-collapsed into one process so all live state shares a single address
-space. No more file IPC, no more "two daemons drifted" failure mode.
-The CLI stays separate (a thin HTTP client to `127.0.0.1:8001`).
+One Python process per node owns every cluster decision: a **netd thread**
+(mesh, election, witness, `.254` arbiter, routing) plus an **asyncio
+mgmt/orchestrator** (FastAPI dashboard, saga executor, reactor). Both halves
+share one in-memory `BedrockState` object, so there is no file-based IPC for
+live decisions and no "two daemons drifted" failure mode. The `bedrock` CLI is
+a separate executable that dials this process over HTTP on `127.0.0.1:8001`.
 
-## In scope (folded into `bedrock-d`)
+## What runs inside `bedrock-d`
 
-| Old daemon | Source | Role in unified daemon |
+| Subsystem | Source | Form |
 |---|---|---|
-| `bedrock-net` | `installer/lib/netd.py` | netd thread (blocking loop) |
-| `bedrock-mgmt` | `mgmt/app.py` + `mgmt/orchestrator.py` | asyncio (FastAPI + tasks) |
-| `bedrock-fence-watchdog` | bash | **removed** — operator can troubleshoot in alpha/beta |
+| mesh / election / witness / arbiter / routing | `installer/lib/netd.py` | netd thread (blocking loop) |
+| dashboard + mgmt API + orchestrator | `mgmt/app.py`, `mgmt/orchestrator.py` | asyncio (FastAPI + tasks) |
 
-## Stays separate (third-party, external-by-design, or cosmetic)
+## What runs as its own systemd unit
 
-The cosmetic / browser-facing helpers are NOT cluster-decision code
-paths, so they keep their own small systemd units; `bedrock-d` neither
-imports nor owns them (it could `systemctl` them later if needed):
+Cosmetic / browser-facing helpers are not cluster-decision paths, so they keep
+small standalone units; `bedrock-d` neither imports nor owns them:
 
 - `bedrock-mdns` (`installer/lib/mdns_responder.py`) — mDNS responder
-- `bedrock-redirect` (`installer/lib/http_redirect.py`) — HTTP :80 → :8443
-- `bedrock-cert-refresh` (`installer/lib/cert_manager.py`) — TLS cert renewal
+- `bedrock-redirect` (`installer/lib/http_redirect.py`) — HTTP `:80` → `:8443`
+- `bedrock-cert-refresh.timer` (`installer/lib/cert_manager.py`) — TLS cert renewal
 
-Genuinely separate processes (third-party or external-by-design):
+Third-party / external-by-design processes:
 
 - `bedrock-rqlited`, `bedrock-rqlited-arbiter` — cluster Raft store
 - `bedrock-weed-{master,volume,filer,s3}` — SeaweedFS
@@ -35,86 +34,116 @@ Genuinely separate processes (third-party or external-by-design):
 
 ```
 bedrock-d (single Python process)
-├── BedrockState (shared in-memory object, locked where needed)
+├── BedrockState (installer/lib/state_shared.py — shared in-memory, locked)
 ├── netd thread        — netd.run_daemon(shared_state=state)
-│                         owns: Daemon (peer_liveness, neighbours, ws, …)
+│                         owns: Daemon (neighbours, peer liveness, witness)
 │                         decides: election, witness, no-quorum marker write
-├── asyncio event loop (main thread)
-│   ├── FastAPI / uvicorn on 8443 (HTTPS, LAN-reachable)
-│   │     (8444 plain-HTTP bootstrap before a cert exists)
-│   ├── FastAPI / uvicorn on 127.0.0.1:8001 (HTTP, loopback) [bedrock CLI dials this]
-│   ├── rqlite_subscriber task
-│   ├── no_quorum_responder task
-│   ├── boot_orchestrator task
-│   ├── converge_retry task
-│   └── backup_scheduler task
-└── shutdown: SIGTERM → stop_event.set() → netd thread exits → uvicorn stops
+└── asyncio (main thread)
+    ├── uvicorn :8443 HTTPS (LAN dashboard + mgmt API; :8444 plain-HTTP
+    │     bootstrap until a cert exists) — separate thread, own loop
+    ├── uvicorn 127.0.0.1:8001 HTTP (local CLI / intra-process, auth-exempt)
+    │     — separate thread, own loop
+    └── orchestrator tasks (mgmt/orchestrator.py start_all):
+          rqlite_subscriber, no_quorum_responder, boot_orchestrator,
+          backup_scheduler, converge_retry, cluster_tier_watcher,
+          saga_resume, self-heal loop
+shutdown: SIGTERM → state.stop_event.set() → netd thread exits →
+          uvicorn returns → process ends (TimeoutStopSec=20s, then SIGKILL)
 ```
 
-The loopback listener is `127.0.0.1:8001`, NOT 8080 — `weed-volume`
-binds `0.0.0.0:8080` on every node, and `0.0.0.0` already covers
-loopback, so any 8080 bind here would `EADDRINUSE`. HTTP :80 → :8443
-redirect, mDNS, and cert renewal stay in their own units (see above),
-so they are not tasks/threads on this loop.
+The loopback listener is `127.0.0.1:8001`, not `8080`: `weed-volume` binds
+`0.0.0.0:8080` on every node and `0.0.0.0` already covers loopback, so an 8080
+bind here would `EADDRINUSE`. The cert-less bootstrap listener uses a dedicated
+`8444` for the same reason.
+
+The 8443 and 8001 listeners run as two uvicorn instances in separate threads,
+each with its own event loop. Both fire the same FastAPI `startup` hook on the
+same `app`, so the hook and `orchestrator.start_all()` guard against
+double-spawn under a lock (`_STARTUP_LOCK` / `_START_LOCK`); without it each
+orchestrator task would start twice and the two `no_quorum_responder`s would
+clobber each other's role-wait timing.
 
 ## Shared state (`installer/lib/state_shared.py`)
+
+`BedrockState` is the single source of in-process truth. Key fields:
 
 ```python
 @dataclass
 class BedrockState:
-    # netd-owned (single-writer = netd thread)
-    netd: Optional[netd.Daemon] = None          # the netd Daemon obj
-    netd_lock: RLock                            # readers from asyncio
+    stop_event: threading.Event            # SIGTERM/SIGINT → set
+    self_node_name / self_loopback_ip / cluster_uuid: str
 
-    # orchestrator-owned (single-writer = subscriber task)
-    snapshot: dict                              # current rqlite snapshot
-    prev_snapshot: dict                         # for reactor diffs
-    last_log_idx: int = 0
-    services_started: bool = False
-    snapshot_lock: RLock                        # readers from FastAPI
+    # netd-owned (single-writer = netd thread; asyncio copies out under lock)
+    netd: Daemon | None                    # neighbours, peer liveness, witness
+    netd_lock: RLock
+    netd_ws: WitnessState | None           # Echo sock + slot cache; arbiter reads
+    last_election_outcome: str
 
-    # cross-cutting (any subsystem writes/reads)
-    no_quorum_marker_present: bool = False      # netd writes True, no_quorum_responder writes False
-    self_node_name: str = ""
-    self_loopback_ip: str = ""
+    # orchestrator-owned (single-writer = rqlite_subscriber)
+    snapshot / prev_snapshot: dict         # current + previous rqlite projection
+    last_log_idx: int
+    snapshot_lock: RLock
+    services_started: bool                 # boot ↔ no_quorum_responder rendezvous
 
-    # Stop signaling
-    stop_event: threading.Event
+    # cross-cutting
+    no_quorum_marker_present: bool         # netd sets True; responder sets False
+    scheduled_inflight: set                # backup_scheduler dedupe
 ```
 
-Locks are RLock; nothing holds them across `await` points. Readers
-copy-out before processing.
+Locks are `RLock`; nothing holds them across an `await`. Readers copy out under
+the lock before processing. `netd_ws` is published by `netd.run_daemon` so
+`cluster_arbiter`'s takeover protocol can read peers' Echo slots and set its own
+LMS slot at the moment of promotion, without waiting for the slower election
+path; the arbiter owns the LMS bit (`own_tag`), netd only refreshes `own_marker`
+each tick.
 
-## What dies (no longer needed in production)
+## State, not files
 
-- `/run/bedrock/mesh_neighbors.json`, `switch_neighbors.json`, `physical_topology.json` — these were netd→mgmt IPC. Now direct reads from `state.netd`.
-- `/etc/bedrock/cluster.json` — GONE (deleted 2026-05-26). Cluster topology lives only in rqlite; the subscriber no longer writes this file and consumers query rqlite directly via `cluster_state.load_cluster()` (read level `none`, so it works without quorum).
-- `/etc/bedrock/state.json` — KEPT as the only per-node on-disk cluster file: this node's identity + derived role + master URL, written crash-durably so cold boot has a role before rqlite is reachable. The subscriber still projects it on each revision.
-- `/run/bedrock-no-quorum` — KEPT (it's a useful debugging signal and the orchestrator's `no_quorum_responder` still uses it). Becomes a write of `state.no_quorum_marker_present = True` AND a file-write for visibility.
+- Cluster topology lives only in rqlite. Subsystems read it via
+  `cluster_state.load_cluster()` (read level `none`, so it works without
+  quorum); the netd `Daemon` view is read directly from `state.netd` via
+  `state_shared.netd_status_view()` for the dashboard `/api/mesh` and
+  `/api/witness` endpoints.
+- `/etc/bedrock/state.json` is the only per-node on-disk cluster file: this
+  node's identity + derived role + master URL, written crash-durably so cold
+  boot has a role before rqlite is reachable. The subscriber re-projects it on
+  each revision.
+- `/etc/bedrock/cluster.json` is a local bootstrap file holding the rqlite peer
+  list, written at init/join and read by `rqlite_setup --render-env` each boot
+  (rqlite can't report its own peers before it starts). It is not a runtime
+  state projection.
+- `/run/bedrock-no-quorum` mirrors `state.no_quorum_marker_present` on disk for
+  external debug tooling: netd's election writes it on sticky no-quorum,
+  `no_quorum_responder` clears it once cleanup is done and quorum is back.
 
-## How it's wired
+## Wiring
 
-1. **`BedrockState`** lives in `installer/lib/state_shared.py` and holds the live `netd.Daemon` plus the orchestrator snapshot.
-2. **netd entry** — `netd.run_daemon(shared_state=state)` runs the blocking mesh/election/witness loop on the netd thread; it observes `state.stop_event`.
-3. **orchestrator** — `_SNAPSHOT` / `_PREV_SNAPSHOT` / `_LAST_LOG_IDX` / `_SERVICES_STARTED` are kept in lockstep with `state`; `orchestrator.attach_state(state)` wires it in, and the FastAPI startup hook spawns the tasks.
-4. **`installer/bedrock-d`** entry script composes everything: build state, start the netd thread, `orchestrator.attach_state(state)` + `cluster_arbiter.attach_state(state)`, then `mgmt_app.serve_main()` runs uvicorn. (mDNS, redirect, and cert-refresh are NOT spun up here — they stay in their own units.)
-5. **Single systemd unit `bedrock-d.service`** replaces `bedrock-net.service` + the implicit-via-`dashboard_install` `bedrock-mgmt.service`.
-6. **install.sh / iso-build** ship the single `bedrock-d` executable + `bedrock-d.service`. The cosmetic units (`bedrock-mdns`, `bedrock-redirect`, `bedrock-cert-refresh`) still ship alongside it.
-7. **`mgmt_install` + `agent_install`** enable `bedrock-d.service` once.
-8. **e2e** — `test_e2e_offline.sh` passes with the one daemon.
+The `installer/bedrock-d` entry script:
 
-## Risk
+1. Builds `BedrockState`, installs SIGTERM/SIGINT handlers that set
+   `stop_event`.
+2. Starts the netd thread (`netd.run_daemon(shared_state=state)`), a daemon
+   thread that observes `stop_event`. A netd crash signals shutdown rather than
+   killing mgmt mid-flight, so the operator gets a clean exit and the journal.
+3. `orchestrator.attach_state(state)` + `cluster_arbiter.attach_state(state)`,
+   then sets `mgmt_app.app.state.bedrock = state`.
+4. Calls `mgmt_app.serve_main()`, which binds the loopback `:8001` listener in a
+   thread and the LAN listener (`:8443` with a cert, else `:8444`) on the main
+   thread; FastAPI's `startup` hook fires `orchestrator.start_all()`.
 
-Single process means one crash takes everything down. Per user
-direction: no watchdog, no auto-reboot. We'll troubleshoot
-crashes directly in alpha/beta. The kernel + systemd `Restart=on-failure`
-on `bedrock-d.service` is enough — if Python segfaults or `OOMKilled`,
-systemd restarts us.
+`mgmt_install` and `agent_install` enable `bedrock-d.service` once
+(`systemctl enable --now`). `install.sh` / iso-build ship the `bedrock-d`
+executable, `bedrock-d.service`, and the standalone cosmetic units alongside it.
+The SeaweedFS, rqlited, and weed units order themselves `After=bedrock-d.service`.
 
-## What survives a crash in v1 alpha
+## Crash behaviour
 
-- rqlite (separate process) keeps the cluster state durable
-- DRBD continues replicating
-- libvirt / running VMs keep running
-- weed / weed-volume keep serving data
-- On `bedrock-d` restart: boot_orchestrator re-reads cluster state from rqlite (via `cluster_state.load_cluster()`), converges to the current cluster role, re-arms tasks. On-disk `state.json` supplies this node's identity/role before rqlite is reachable.
+`bedrock-d.service` runs `Restart=on-failure RestartSec=3s` with no
+StartLimit and no external watchdog: single-process by design, the operator
+troubleshoots a stuck daemon directly via `journalctl -u bedrock-d`.
+`MemoryHigh=512M` / `MemoryMax=1G` catches a runaway leak. While `bedrock-d` is
+down, rqlite keeps cluster state durable, DRBD keeps replicating, libvirt VMs
+keep running, and weed keeps serving. On restart, `boot_orchestrator` re-reads
+cluster state from rqlite, converges to the current role, and re-arms the
+tasks; `state.json` supplies this node's identity and role before rqlite is
+reachable.

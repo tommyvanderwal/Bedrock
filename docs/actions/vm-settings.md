@@ -4,9 +4,11 @@ A settings page at `/vm/<name>/settings` collects every per-VM knob an
 operator needs. Each section shows **clearly** whether the change is
 applied live or queued for the next reboot.
 
-**Source:** `mgmt/ui/src/routes/vm/[name]/settings/+page.svelte` (UI) and
-the `_vm_get_settings`, `_vm_set_resources`, `_vm_set_priority`,
-`_vm_set_cdrom` helpers in `mgmt/app.py`.
+**Source:** `mgmt/ui/src/routes/vm/[name]/settings/+page.svelte` (UI), the
+`$lib/api` wrappers `getVmSettings`/`setVmResources`/`setVmPriority`/`setVmCdrom`,
+and the `_vm_get_settings`, `_vm_set_resources`, `_vm_set_priority`,
+`_vm_set_cdrom` helpers in `mgmt/app.py`. The mgmt process actuates each knob
+with `virsh`/`lvextend`/`drbdadm` on the VM's running node over its SSH pool.
 
 ## Layout
 
@@ -24,10 +26,11 @@ the `_vm_get_settings`, `_vm_set_resources`, `_vm_set_priority`,
   └───────────────────────────────────────────┘
 
   ┌── HA Replication ── ✓ conversion is online ┐
-  │ [x] PET (2-way DRBD)                       │
-  │    [ ] ViPet (3-way DRBD)                  │
+  │ [x] PET   (2-way DRBD)   needs >= 2 nodes  │
+  │    [ ] ViPet (3-way DRBD) needs >= 3 nodes │
   │ Current: pet    Resource: vm-foo-disk0     │
   └───────────────────────────────────────────┘
+  (PET unchecked = cattle. ViPet requires PET first.)
 
   ┌── CD-ROM ── ✓ live eject / insert ─────────┐
   │ Currently: foo.iso       [ Eject ]         │
@@ -42,19 +45,23 @@ the `_vm_get_settings`, `_vm_set_resources`, `_vm_set_priority`,
 | vCPUs | `virsh setvcpus NAME N --config --maximum` + `--config` | reboot | Hot-add is possible on Linux with CPU hot-plug slots pre-declared; we keep it simple and reboot-queued. |
 | RAM  | `virsh setmaxmem NAME KIB --config` + `virsh setmem NAME KIB --config` | reboot | Same reasoning as vCPU — avoids balloon/maxmem mismatch. |
 | Disk | `lvextend -L +<Δ>G` then `virsh blockresize NAME <target> <size>K` | **live** (grow only) | For pet/ViPet: extend on every peer first, then `drbdadm resize` on the Primary — propagates. Guest may need a rescan inside the OS (Linux auto-detects on virtio-blk; Windows: Disk Management → Rescan Disks). |
-| Priority | `virsh schedinfo NAME --live --config cpu_shares=N` | **live** | Mapping: low=256, normal=1024, high=4096 (cgroup cpu.weight on v2, cpu.shares on v1). Written to both running VM and XML for next boot. |
-| HA (cattle ↔ pet ↔ ViPet) | Convert pipeline — [`vm-convert.md`](vm-convert.md) | **live** | Moved from the detail page to settings; logic is unchanged. |
-| CDROM eject | `virsh change-media NAME sda --eject --live --force` | **live** | Requires a CDROM slot to exist (created when the VM had an install ISO). |
-| CDROM insert | `virsh change-media NAME sda /mnt/bedrock/iso/X --insert --live --force` | **live** | From any ISO in `/mnt/bedrock/iso` (SeaweedFS FUSE mount, same path on every node; virtio-win hidden from dropdown). |
+| Priority | `virsh schedinfo NAME --live --config cpu_shares=N` | **live** | Mapping: low=256, normal=1024, high=4096 (cgroup cpu.weight on v2, cpu.shares on v1). Written to the running VM and the XML for next boot, mirrored to inventory, and mirrored to rqlite `vms.priority` so the self-heal repair loop restores replicas in the operator's priority order. |
+| HA (cattle ↔ pet ↔ ViPet) | Convert pipeline — [`vm-convert.md`](vm-convert.md) | **live** | The settings page delegates to the convert pipeline. |
+| CDROM eject | `virsh change-media NAME <slot> --eject --live --force` | **live** | Requires a CDROM slot to exist (created when the VM had an install ISO). |
+| CDROM insert | `virsh change-media NAME <slot> /mnt/bedrock/iso/X --insert --live --force` | **live** | From any ISO in `/mnt/bedrock/iso` (SeaweedFS FUSE mount, same path on every node; virtio-win hidden from dropdown). `<slot>` is the SATA CDROM target that is not virtio-win.iso. |
 
 ## API endpoints
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/api/vms/{name}/settings` | — | full config blob (see below) |
-| POST | `/api/vms/{name}/resources` | `{vcpus?, ram_mb?, disk_gb?}` | per-field `{applied, requires_reboot, note}` |
-| POST | `/api/vms/{name}/priority` | `{priority: "low"|"normal"|"high"}` | `{applied, priority, cpu_shares}` |
-| POST | `/api/vms/{name}/cdrom` | `{action: "eject"|"insert", iso?: string}` | `{applied, note}` |
+| POST | `/api/vms/{name}/compute` | `{vcpus?, ram_mb?, disk_gb?}` | per-field `{applied, requires_reboot, note}` |
+| POST | `/api/vms/{name}/priority` | `{priority: "low"|"normal"|"high"}` | `{applied, requires_reboot, priority, cpu_shares}` |
+| POST | `/api/vms/{name}/cdrom` | `{action: "eject"|"insert", iso?: string}` | `{applied, requires_reboot, note}` |
+
+`/compute` validates `vcpus` 1-32, `ram_mb` 128-131072; disk only grows (a
+shrink request returns 400). The HA-conversion controls POST to the convert
+endpoint (see [`vm-convert.md`](vm-convert.md)), not to these three.
 
 Settings blob:
 

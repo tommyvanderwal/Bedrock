@@ -1,283 +1,314 @@
 # Operator override actions — safety catalog
 
-Catalog of explicit operator commands that bypass an automatic
-safety check. Every override here is necessary precisely because
-the safe default refuses — auto-recovery would risk silent data
-loss or split-brain. Each entry needs hard thinking about how to
-make the override as safe as possible *without* turning it back
-into the automatic behavior we just removed.
+Catalog of explicit operator commands that bypass an automatic safety
+check. Each override exists because the safe default refuses on
+purpose — auto-recovery there would risk silent data loss or
+split-brain. The design goal for each: make the override as safe as
+possible *without* re-introducing the automatic behavior the safe
+default deliberately omits.
 
-This file is the index. Detailed per-command design (CLI shape,
-required prompts, audit trail, what state changes, what locks)
-lives in the per-command section below as it gets specified.
+One override is built and shipped (stuck-LMS decommission, via the
+existing `bedrock node leave` saga). The rest are design entries —
+the failure they address is real, but no CLI verb exists yet. Each is
+marked `Built` or `Design`.
 
-## Status of each override
+## Catalog
 
-| Override | Required? | Status |
+| Override | Why it's needed | Status |
 |---|---|---|
-| Decommission stuck-LMS holder (`bedrock node leave …` on dead node) | Yes — primary path for resolving INV-7 stuck-LMS | Drafted (this file) |
-| Re-key witness identity (new `cluster_uuid` / `cluster.key`) | Yes — full cleanup of stale witness state including ESP32-reboot worst-case | Drafted (this file) |
-| Seize master with stale data | Yes — irrecoverable up-to-date peer | Outline only |
-| Force `drbdadm invalidate` on a node | Yes — DRBD divergence resolution | Outline only |
-| Force-clear no-quorum marker | Yes — operator override after misfire | Outline only |
-| Force cluster to single-node mode | Yes — surviving solo node after permanent peer loss | Outline only |
-| Cancel an in-flight saga | Maybe — stuck join, stuck takeover | Not yet specified |
-| Demote current master on operator command | Yes — planned handoff outside maintenance flow | Not yet specified |
-| Re-key cluster CA (TLS) | Eventually — operator-triggered key rotation | Outline only |
+| Decommission stuck-LMS holder (`bedrock node leave <node>`) | Resolve INV-7 stuck-LMS so takeover can proceed | **Built** |
+| Re-key witness identity (new `cluster_uuid` / `cluster.key`) | Clear stale witness slot state, incl. ESP32-reboot limbo | Design |
+| Seize master with stale data | Up-to-date peer is irrecoverable | Design |
+| Force `drbdadm invalidate` on a node | Resolve DRBD divergence (operator picks the winner) | Design |
+| Force-clear no-quorum marker | Marker stuck after a misfire, blocking healthy recovery | Design |
+| Collapse to single-node mode | Surviving solo node after permanent peer loss | Design |
+| Cancel an in-flight saga | Stuck join / stuck takeover | Design |
+| Demote current master on command | Planned handoff outside maintenance flow | Design |
+| Re-key cluster CA (TLS) | CA key compromise or scheduled rotation | Design |
 
 ## General principles for every override
 
-1. **Authentication.** Override must require operator credentials,
-   not a passive flag. Per the existing `bedrock operator` model,
-   operators have salt+hash credentials in rqlite. Override CLI
-   verbs require an authenticated session.
-2. **Confirmation.** Every override prompts with the specific
-   consequence (data loss, split-brain risk, etc.) and requires
-   an explicit confirmation string — not just `y/N`. Example:
-   `Type the cluster name to confirm: bedrock-prod-01`.
-3. **Audit trail.** Every override writes an `operator_override`
-   row into rqlite (or a local audit log if rqlite is the thing
-   being recovered) with: timestamp, operator name, command
-   verb, target (node/witness/saga ID), reason field (operator
-   input), pre-state snapshot, post-state outcome. Cannot be
-   suppressed.
-4. **Reversibility check first.** Where possible, the command
-   checks whether a safer alternative exists right now
-   (e.g. before "seize with stale data," check if the up-to-date
-   peer might be reachable via any alternate path) and surfaces
-   that to the operator.
-5. **Single-actor lock.** While an override is running, all other
-   overrides on the same target are refused. Stops two operators
-   stomping on each other during an incident.
-6. **No silent retries.** If an override fails (e.g. witness
-   unreachable mid-execution), it fails loudly. Does not silently
-   queue.
+These are the rules an override must satisfy. Where the supporting
+machinery already exists today it is named; where it does not, the
+entry is a design constraint on the unbuilt verb.
 
-## Override: Decommission stuck-LMS holder
+1. **Authentication.** An override requires operator credentials, not
+   a passive flag. Operators have salt+hash credentials in the rqlite
+   `operators` table (`operator_auth.py`); the mgmt API mints a Bearer
+   token via `/api/login`. Override verbs that go through the mgmt API
+   carry that token. (`bedrock node leave` today runs the saga
+   directly on the master and records `requested_by` from
+   `$SUDO_USER`/`$USER`; tightening it to require a Bearer token is
+   part of its hardening.)
+2. **Confirmation.** An override prompts with the specific consequence
+   (data loss, split-brain risk) and requires an explicit confirmation
+   string — e.g. typing the cluster name — not a bare `y/N`. The
+   built `node leave` path does not yet enforce this prompt.
+3. **Audit trail.** Every saga-driven action writes an `operations`
+   row in rqlite (`kind`, `target_node`, `params`, `state`,
+   `requested_by`, timestamps) plus per-step `operation_steps`. That
+   is the audit record today; `bedrock node leave` lands there as
+   `kind="node_leave"` with the operator's `reason` in `params`. A
+   richer override-specific record (pre/post-state snapshot, reason
+   field, un-suppressible) is a design target, not yet a separate
+   table.
+4. **Reversibility check first.** Where a safer alternative might still
+   exist right now (e.g. an up-to-date peer reachable via an alternate
+   path before a stale-data seize), the command surfaces it before
+   proceeding. Design constraint for the seize/invalidate verbs.
+5. **Single-actor lock.** While an override runs, other overrides on
+   the same target are refused, so two operators can't stomp on each
+   other mid-incident. The saga executor's per-op state gives the
+   substrate; explicit cross-override locking is a design target.
+6. **No silent retries.** An override that fails mid-execution (e.g.
+   witness unreachable) fails loudly. It never silently queues.
 
-**When needed.** A node had `tag.lms = 1` on a witness slot and
-died (or got partitioned away permanently) without ever writing
-`tag.lms = 0`. Per INV-7, this slot stays `lms = 1` forever from
-the cluster's POV. The takeover protocol (`cluster-quorum-spec.md`
-step 2) will refuse for every surviving peer until the cluster
-stops treating the dead node as a member.
+---
 
-**Why this is the primary path.** The cluster's slot-read logic
-ignores any witness slot for a node not in the rqlite `nodes` table.
+## Override: Decommission stuck-LMS holder — **Built**
+
+**When needed.** A node held `tag.lms = 1` on a witness slot and then
+died (or was partitioned away permanently) without ever writing
+`tag.lms = 0`. Per INV-7, that slot reads `lms = 1` forever from the
+cluster's point of view. The takeover protocol
+(`cluster-quorum-spec.md` step 2) refuses for every surviving peer
+until the cluster stops treating the dead node as a member.
+
+**Why decommission is the right escape.** The slot-read logic ignores
+any witness slot for a node not in the rqlite `nodes` table.
 `witness.drain_replies` filters every reply against `ws.member_ids`
 (refreshed each netd tick from rqlite via
-`cluster_state.load_cluster()`), so a slot whose `node_id` is no
-longer a member is dropped before it can count. Removing the dead
-node from cluster membership — the routine `node leave` saga —
-therefore *also* removes the LMS-veto effect without ever writing to
-the witness. The witness is a passive last-write slot store with no
-expiry, so the dead node's encrypted slot persists there indefinitely
-(nothing overwrites it); the cluster just stops looking at it once the
-node_id leaves `ws.member_ids`.
+`cluster_state.load_cluster()`), so a slot whose `node_id` is not a
+current member is dropped before it can count. Removing the dead node
+from membership — the routine `node leave` saga — therefore also
+removes the LMS-veto without ever touching the witness. The witness is
+a passive last-write slot store with no expiry, so the dead node's
+encrypted slot stays there indefinitely; the cluster simply stops
+looking at it once that `node_id` leaves `ws.member_ids`.
 
-**Why no "clear LMS bit" override exists.** Writing `tag.lms = 0`
-on behalf of a dead node would mean impersonating that node at
-the witness — either through a privileged-write extension to the
-witness protocol (INV-2 currently forbids cross-node writes) or
-via key material the dead node owns. Neither is correct: the
-LMS bit is *evidence the dead node had set itself as solo
-master*, and you can't safely retract that evidence on its
-behalf. You can only stop counting the dead node as part of
-the cluster.
+**Why there is no "clear LMS bit" verb.** Writing `tag.lms = 0` on the
+dead node's behalf means impersonating it at the witness — either via
+a privileged cross-node write (INV-2 forbids cross-node slot writes)
+or via key material only the dead node holds. Neither is correct: the
+LMS bit is *evidence the dead node had set itself solo master*, and
+that evidence cannot be safely retracted on its behalf. The only safe
+move is to stop counting the dead node as a member.
 
 **What the operator must verify before running this.** All of:
-- The LMS-holder node is genuinely gone, not just unreachable
-  from this node. (Hardware confirmed dead, returned, scrapped,
-  or chained to a fence we're never opening.)
-- The accepted risk: any data the dead LMS-holder wrote after
-  the cluster's last successful DRBD sync to it is lost. This
-  is likely — LMS was set precisely because the surviving peer
-  was already gone when this node went solo.
-- A surviving node has the DRBD `cluster` singleton resource in a
-  usable state (UpToDate, even if behind the lost LMS-holder's last
+- The LMS-holder is genuinely gone, not merely unreachable from one
+  vantage point (hardware confirmed dead, scrapped, or fenced and
+  never coming back).
+- Accepted risk: any data the dead LMS-holder wrote after the
+  cluster's last successful DRBD sync to it is lost. This is likely —
+  LMS was set precisely because the surviving peer was already gone
+  when the dead node went solo.
+- A surviving node holds the DRBD `cluster` singleton resource in a
+  usable state (`UpToDate`, even if behind the lost LMS-holder's last
   writes).
 
-**CLI shape.** Uses the existing `bedrock node leave` saga but
-with the operator-accept-data-loss flag (currently used only for
-seize). Reuses the existing rqlite-backed remove + rqlite `nodes` table
-update path; no new witness operation needed.
+**CLI.**
 
 ```
-bedrock node leave --target <node-name> \
-    --reason "<free-text>" \
-    --accept-data-loss
+bedrock node leave <target-node> [--reason "<free-text>"]
 ```
 
-**What it does, in order:**
+The positional `<target-node>` names the dead node; `--reason`
+(default `"leave"`) is the audit string carried into the `operations`
+row. There is no separate `--accept-data-loss` flag — `node leave` is
+the same verb used for any decommission; the data-loss acceptance is
+the operator's pre-flight judgement above. The command runs the
+`node_leave` saga on the current master.
 
-1. Verify caller is authenticated operator.
-2. Verify target node is not reachable on mesh (last seen >
-   5 × patience window). If reachable, suggest maintenance-mode
-   shutdown instead.
-3. Show the operator the stuck LMS slot details (last refresh
-   timestamp, marker UUID, DRBD history chain context).
-4. Confirmation prompt: type the cluster name + the target node
-   name.
-5. Write `operator_override` audit row to rqlite.
-6. Run the existing `node_leave` saga: `DELETE /remove` on rqlite
-   to drop the voter and remove the row from the `nodes` table.
-7. Surviving nodes' next netd tick: each node refreshes
-   `ws.member_ids` from rqlite, the target node-id is no longer a
-   member → its witness slot is dropped in `drain_replies`
-   regardless of `tag.lms`. Takeover can proceed.
+**What the saga does** (`bedrock_d/install/node_leave.py`,
+`@saga("node_leave")`, crash-resumable, each step idempotent):
 
-**Membership-filter dependency (satisfied).** This override relies
-on the rqlite `nodes` table filter in
-`installer/lib/witness.py:drain_replies`, which is implemented:
-`drain_replies` skips any slot whose `node_id` is not in
-`ws.member_ids`, and netd plumbs `member_ids` from rqlite each tick.
-Once `node leave` removes the node from the `nodes` table, surviving
-nodes stop counting its stale `lms=1` slot on the next tick and the
-takeover unblocks.
+```
+validate_target ─→ rqlite_node_unregister ─→ rqlite_voter_remove
+     │ self?→raise        │ skip if already_gone   │ skip if already_gone
+     │ absent?→already_gone│                        │ no voter_id?→warn+skip
+     ▼
+propagate_daemon_config ─→ stop_remote_services ─→ verify_membership_drop
+     (bump_revision)         (best-effort SSH)       (poll strong-read ≤5s)
+```
 
-## Override: Re-key witness identity
+1. `validate_target` — looks the target up; raises if it equals the
+   master (a master can't leave itself); sets `already_gone` if the
+   target is already absent (clean re-run); else records
+   `target_host`, `target_loopback`, `target_voter_id` (loopback last
+   octet).
+2. `rqlite_node_unregister` — master single-writer removes the row
+   from the `nodes` table; Raft replicates.
+3. `rqlite_voter_remove` — `curl -X DELETE https://127.0.0.1:4001/remove`
+   (mTLS) with `{"id": voter_id}` drops the dead node's Raft voter
+   slot, so consecutive leaves can't strand quorum at `N/2` live
+   voters. A gone voter returns 200 OK (idempotent).
+4. `propagate_daemon_config` — bumps the cluster revision so every
+   node's rqlite subscriber regenerates `daemon.toml` and drops the
+   leaver from its peer set.
+5. `stop_remote_services` — best-effort SSH to stop the leaver's
+   bedrock units and `rm -f /run/bedrock-no-quorum`. Non-fatal: if the
+   host is unreachable, the witness slot ages out naturally.
+6. `verify_membership_drop` — polls a strong rqlite read up to ~5 s to
+   confirm the target has left `nodes`.
 
-**When needed.** Either:
-- The witness itself has lost state (ESP32 reboot, fileshare
-  data corruption) and the cluster needs a deterministic clean
-  start rather than a worst-case-assumed limbo.
-- After a stuck-LMS decommission, the operator wants the witness
-  to actually drop the old slot rather than rely on the membership
-  filter ignoring it.
-- The `cluster.key` is suspected compromised.
+**The takeover unblock.** Once `rqlite_node_unregister` lands, every
+surviving node's next netd tick refreshes `ws.member_ids` from rqlite;
+the dead node's `node_id` is absent from the member set, so its stale
+`lms = 1` slot is dropped in `drain_replies` regardless of the tag.
+Takeover can then proceed. This dependency is implemented in
+`witness.py:drain_replies` and plumbed via `member_ids` each tick.
 
-**What it does.** Generates a new `cluster_uuid` and/or
-`cluster.key`, distributes via rqlite + secure peer-to-peer to
-every surviving cluster member, restarts witness heartbeats on
-all nodes with the new identity. Old encrypted slots (held by
-the witness with the old cluster_uuid) become un-decryptable
-by any current cluster member — they're effectively cleared
-from the cluster's perspective.
+---
 
-**CLI shape (proposed):**
+## Override: Re-key witness identity — **Design**
+
+**When needed.** Any of:
+- The witness lost state (ESP32 reboot, fileshare corruption) and the
+  cluster needs a deterministic clean start rather than worst-case
+  limbo.
+- After a stuck-LMS decommission, the operator wants the witness to
+  actually drop the old slot instead of relying on the membership
+  filter to ignore it.
+- `cluster.key` is suspected compromised.
+
+**Mechanism.** Generate a new `cluster_uuid` and/or `cluster.key`,
+distribute to every surviving member, restart witness heartbeats on
+all nodes with the new identity. Old slots — encrypted under the old
+`cluster_uuid`/key — become un-decryptable by any current member, so
+they are effectively cleared from the cluster's view. The witness
+re-populates the new-identity slot map within a few seconds of the
+first fresh heartbeats.
+
+**Proposed CLI.**
 
 ```
 bedrock cluster rekey-witness --reason "<free-text>"
 ```
 
-**What it does, in order:**
+Intended order: authenticate operator → confirm a quorum is reachable
+(so the new key distributes atomically) → generate new
+`cluster_uuid` (+ optional new `cluster.key`) → record audit → push to
+all reachable nodes over the existing secure peer-to-peer channel →
+each node atomically swaps its in-memory identity and restarts witness
+heartbeats.
 
-1. Verify caller is authenticated operator.
-2. Verify a quorum of nodes is reachable (so the new key can be
-   distributed atomically).
-3. Generate new `cluster_uuid` (and optionally new `cluster.key`).
-4. Write `operator_override` audit row to rqlite.
-5. Distribute new key + uuid to all reachable nodes via the
-   existing secure peer-to-peer channel.
-6. Each node atomically swaps its in-memory cluster identity for
-   the new one + restarts witness heartbeats.
-7. Within a few seconds the witness's slot map for the new
-   cluster_uuid populates from fresh heartbeats. Old cluster_uuid
-   slot map is no longer addressable from cluster members.
+**Fileshare-witness variant.** For an SMB/NFS/S3-backed witness, the
+equivalent is `rm` on every `slot-*.bin`; slot files re-populate from
+heartbeats within seconds. Lower-overhead than a full re-key when the
+only goal is clearing stale slot state.
 
-**Fileshare-witness variant.** For a fileshare-backend witness
-(SMB / NFS / S3) the equivalent is `rm` on every `slot-*.bin`
-file. Slot files repopulate from heartbeats within a few seconds.
-Lower-overhead than a full re-key when only goal is to clear
-stale slot state.
+**Failure modes to handle.**
+- A surviving node unreachable during distribution keeps the old key,
+  sees no slots under its query, and goes out of sync — the operator
+  must reach it manually and apply the new key.
+- `cluster_uuid` may be referenced elsewhere (backups, audit logs); a
+  re-key creates a before/after boundary in those records.
 
-**Failure modes:**
-- A surviving node is unreachable during distribution → that
-  node will continue with the old key, see no slots when
-  it queries with the old cluster_uuid, become out-of-sync.
-  Operator must reach it manually and apply the new key.
-- The cluster_uuid is referenced elsewhere in the system
-  (e.g., backups, audit logs) — re-keying creates a "before / after"
-  boundary in those records. Plan accordingly.
+---
 
-## Override: Seize master with stale data
+## Override: Seize master with stale data — **Design**
 
-**When needed.** The up-to-date master died and is not coming
-back (hardware lost, datacenter event, etc.). A surviving node
-has stale data (its UUID is in the dead master's history; some
-peer writes are unrecoverable). Without override, eligibility
-check (cluster-quorum-spec.md INV-5 + history rule) refuses
-promotion forever.
+**When needed.** The up-to-date master died and is not coming back
+(hardware lost, datacenter event). A surviving node has stale data —
+its UUID is in the dead master's history; some peer writes are
+unrecoverable. The eligibility check (`cluster-quorum-spec.md` INV-5 +
+history rule) refuses promotion of a stale node forever, by design.
 
-**Conceptual parallel.** Active Directory's FSMO role "seize"
-on a lagging domain controller.
+**Conceptual parallel.** Active Directory FSMO role *seize* onto a
+lagging domain controller.
 
-**Status.** Outline only. Needs full spec before shipping.
-The CLI verb is approximately:
-`bedrock cluster seize --reason "<free-text>" --accept-data-loss-from <peer-name>`.
+**Proposed CLI.**
 
-## Override: Force `drbdadm invalidate`
+```
+bedrock cluster seize --reason "<free-text>" --accept-data-loss-from <peer-name>
+```
 
-**When needed.** Two nodes have DRBD generations that have
-diverged (neither's current UUID is in the other's history).
-DRBD itself refuses to auto-sync; operator must pick which
-side wins.
+Needs the reversibility check (principle 4) wired first: before
+seizing, probe whether the up-to-date peer is reachable by any
+alternate path, and surface that to the operator.
 
-**Status.** Outline only. CLI is approximately:
-`bedrock storage invalidate --tier <name> --on <node> --in-favor-of <peer>`.
+---
 
-## Override: Force-clear no-quorum marker
+## Override: Force `drbdadm invalidate` — **Design**
 
-**When needed.** `/run/bedrock-no-quorum` was created in
-error (test misfire, transient bug) and is now blocking
-recovery even though the cluster is healthy.
+**When needed.** Two nodes have DRBD generations that diverged —
+neither's current UUID is in the other's history — so DRBD refuses to
+auto-sync and the operator must pick the winner.
 
-**Status.** Outline only. CLI is approximately:
-`bedrock node clear-no-quorum --node <name> --reason "<free-text>"`.
+**Proposed CLI.**
 
-## Override: Force cluster to single-node mode
+```
+bedrock storage invalidate --tier <name> --on <node> --in-favor-of <peer>
+```
 
-**When needed.** A 2-node cluster has permanently lost one node
-(hardware gone, never coming back) and the operator wants to
-collapse to N=1 operation rather than running degraded forever.
+---
 
-**Status.** Outline only. Requires removing the dead node from
-rqlite `nodes` table + reconfiguring DRBD to single-replica + adjusting
-rqlite voter set. Wide blast radius; needs multi-step saga.
+## Override: Force-clear no-quorum marker — **Design**
 
-## Override: Re-key cluster CA (TLS)
+**When needed.** `/run/bedrock-no-quorum` was created in error (test
+misfire, transient bug) and now blocks recovery even though the
+cluster is healthy.
 
-**When needed.** The cluster CA private key is suspected
-compromised, or the operator wants to rotate it on a schedule
-(unusual — certs are 100-year and rotation is explicit, not
-time-triggered). Same mechanism for issuing fresh per-node certs
-under a new CA without a full re-install.
+**Mechanism that exists today.** The marker is the sticky no-quorum
+file. `election.set_no_quorum_marker(reason)` drops it (once per
+episode — its mtime is the quorum-loss timestamp the vm_failover
+suspend timer reads), and `election.clear_no_quorum_marker()` removes
+it. On quorum return netd's orchestrator clears it automatically. An
+operator-facing verb to force-clear it on a single node does not yet
+exist.
 
-**Why it's load-bearing.** rqlite has no hot-reload for TLS certs
-(verified against `./installer/binaries/rqlited -h` — no `-reload`
-flag, no SIGHUP support). Any CA rotation therefore requires
-restarting `bedrock-rqlited` on every node + `bedrock-rqlited-arbiter`
-on the master. The restart must be **rolling and quorum-aware** —
-restarting two voters simultaneously in a 3-voter cluster
-(2 per-node + 1 arbiter) drops to 1 voter = no quorum =
-control plane offline.
+**Proposed CLI.**
 
-**Outline of the saga, not specified:**
-1. Generate new CA (key+cert) → write to staging path on master.
-2. Re-sign every existing node cert under the new CA →
-   distribute via rqlite to each node (using the *existing* CA
-   for transport while the rotation runs).
-3. On each node, write new cert + new CA cert to staging paths.
-4. Rolling restart: one voter at a time, wait for Raft to
-   re-form quorum, move on.
+```
+bedrock node clear-no-quorum --node <name> --reason "<free-text>"
+```
+
+---
+
+## Override: Collapse to single-node mode — **Design**
+
+**When needed.** A 2-node cluster permanently lost its peer (hardware
+gone, never returning) and the operator wants to collapse to N=1
+operation rather than run degraded forever.
+
+**Building blocks that exist today.** `bedrock storage demote` already
+takes the DRBD-replicated `cluster` singleton back to a local LV
+(safe to run on the last surviving node), and `bedrock node leave`
+removes the dead peer from rqlite and drops its Raft voter. The
+missing piece is a single guided saga that sequences voter-set
+shrink + DRBD single-replica reconfigure + membership removal with the
+right confirmations; the blast radius is wide enough to warrant one.
+
+---
+
+## Override: Re-key cluster CA (TLS) — **Design**
+
+**When needed.** The cluster CA private key is suspected compromised,
+or the operator rotates it deliberately. (Per-node certs are
+100-year; rotation is explicit, never time-triggered.) Same mechanism
+issues fresh per-node certs under a new CA without a full re-install.
+
+**Why it's load-bearing.** rqlite has no hot-reload for TLS certs (no
+`-reload` flag, no SIGHUP). Any CA rotation therefore restarts
+`bedrock-rqlited` on every node plus `bedrock-rqlited-arbiter` on the
+master. That restart must be **rolling and quorum-aware** — restarting
+two voters at once in a 3-voter set (2 per-node + 1 arbiter) drops to
+1 voter, i.e. no quorum, i.e. control plane offline.
+
+**Intended saga shape.**
+1. Generate new CA (key+cert) into a staging path on the master.
+2. Re-sign every node cert under the new CA; distribute over the
+   *existing* CA's transport while the rotation runs.
+3. Each node writes the new cert + new CA cert to staging.
+4. Rolling restart — one voter at a time, wait for Raft to re-form
+   quorum, then the next.
 5. Promote staging files to live paths atomically.
-6. Verify every node + arbiter healthy with the new CA.
+6. Verify every node + arbiter healthy under the new CA.
 7. Delete the old CA + old certs.
 
-**Status.** Outline only — no CLI verb yet. Tracked here because
-it's the only operational reason to need the rolling-restart
-machinery; routine joins/leaves don't require it (CA-signed
-certs are trusted without bundle changes).
-
-## Override: Remove a permanently-dead node from rqlite `nodes` table
-
-**When needed.** Companion to single-node mode: a 3+-node cluster
-where one node is permanently dead. Removing it from rqlite `nodes` table
-shrinks the voting pool so quorum can be reached with fewer
-survivors.
-
-**Status.** Outline only. Less risky than single-node-mode forcing,
-but still needs operator confirmation + audit.
+This is the only operational reason to need the rolling-restart
+machinery; routine joins/leaves don't (CA-signed certs are trusted
+without bundle changes).
 
 ---
 

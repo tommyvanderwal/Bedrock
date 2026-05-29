@@ -1,322 +1,296 @@
-# Change HA level (cattle ↔ pet ↔ ViPet)
+# Change HA level (cattle <-> pet <-> ViPet)
 
-Hot-converts a running VM between workload types. The VM stays up the entire
-time — data is swung in or out of DRBD via `virsh blockcopy --reuse-external
---pivot` while QEMU keeps serving I/O.
+Converts a VM between workload types by swinging each disk in or out of DRBD.
+A **running** VM stays up the whole time: `virsh blockcopy --reuse-external
+--pivot` mirrors the disk under live QEMU I/O. A **shut-off** VM skips
+blockcopy and just rewrites its persistent libvirt XML to point at the DRBD
+device; DRBD's initial sync streams to the peers in the background.
 
 **Triggered by:**
 
-- Dashboard: VM detail page → PET / ViPet checkboxes
-- HTTP: `POST /api/vms/{name}/convert` with `{"target_type": "cattle|pet|vipet"}`
-  → returns **202 Accepted + `{task_id, from, to}`**; progress flows over
-  the WS `task` channel. See [`../components/tasks.md`](../components/tasks.md).
+- Dashboard: VM **Settings** page -> PET / ViPet checkboxes.
+- HTTP: `POST /api/vms/{vm_name}/ha-level` with `{"vm_type": "cattle|pet|vipet",
+  "peer_nodes": [...]?}`. `peer_nodes` is optional (auto-picked otherwise).
+  All validation runs synchronously, so a bad request gets a 4xx instead of a
+  task that fails async. On success returns
+  `{"status":"accepted","task_id":...,"from":...,"to":...}`; progress flows
+  over the WS `task` channel. See [`../components/tasks.md`](../components/tasks.md).
+  A no-op target returns `{"status":"no-op","current":...}`.
 
-**Source:** `mgmt/app.py:_vm_convert`, `_vm_convert_upgrade`,
-`_vm_convert_downgrade`.
+**Source:** `mgmt/app.py` — `api_vm_set_ha_level` (route) ->
+`_vm_set_ha_level` (dispatch) -> `_vm_set_ha_level_up` / `_vm_set_ha_level_down`.
+
+Current type is derived live: `vm.drbd_resource` set + `_count_drbd_peers >= 3`
+=> vipet; resource set => pet; else cattle. Source node = `running_on`, falling
+back to the first `defined_on` node for a shut-off VM.
 
 ## Multi-disk semantics
 
-The convert iterates over **every** data disk the VM has. A VM with
-`vda` + `vdb` + `vdc` becomes three DRBD resources on cattle→pet:
+The convert iterates over **every** data disk (`get_vm_disks`, cdroms
+excluded). A VM with `vda`+`vdb`+`vdc` becomes three DRBD resources on
+cattle->pet:
 
 ```
-  vm-NAME-disk0   (minor 1000, port 8000)   ← was vda's local LV
-  vm-NAME-disk1   (minor 1001, port 8001)   ← was vdb's local LV
-  vm-NAME-disk2   (minor 1002, port 8002)   ← was vdc's local LV
+  vm-NAME-disk0   <- vda's local LV
+  vm-NAME-disk1   <- vdb's local LV
+  vm-NAME-disk2   <- vdc's local LV
 ```
 
-Each resource has its own `.res` file, its own external meta LV, its own
-pair of peer LVs. `_next_drbd_minor()` picks unique minors across the
-cluster; `_gen_drbd_res(resource, minor, peers)` takes the resource name
-explicitly so one VM's .res files don't collide.
+Each resource gets its own `.res` file, external meta LV, and peer LV pair.
+Minors come from `_next_drbd_minor()`, which picks + reserves an unused minor
+in the **1102..1189** band across all hosts (process-local lock guards two
+concurrent converts from picking the same minor). `drbd_port_for(minor)` maps
+each to a port in the **7700..7799** band (minor 1102 -> 7702, 1103 -> 7703).
+`_gen_drbd_res(resource, minor, peers)` takes the resource name explicitly so
+one VM's `.res` files never collide.
 
-**Atomicity:** the upgrade is all-or-nothing per operation. If disk 2's
-`blockcopy` fails mid-way, the rollback stack unwinds disks 0 and 1
-(drbd-down + wipe-md + remove peer LVs + delete `.res`) before the task
-fails, so the VM doesn't end up half-pet, half-cattle. Task steps are
-emitted per disk so the dashboard drawer shows where it is:
+**Atomicity (upgrade only):** all-or-nothing per operation. If disk 2 fails
+mid-way, `_unwind()` aborts any in-flight blockcopy (`virsh blockjob --abort`,
+so libvirt clears `disk->blockjob`) then unwinds disks 0 and 1 (drbd down +
+wipe-md + remove peer LVs + delete `.res` + release the minor reservation), so
+the VM never ends up half-pet. Steps emit per disk via `task.step_*`, so the
+dashboard drawer shows progress:
 
 ```
-  disk0 (vda): create meta LV on source          ok   0.9 s
-  disk0 (vda): generate DRBD res                 ok   1.1 s
-  disk0 (vda): create-md + up                    ok   1.3 s
-  disk0 (vda): blockcopy → /dev/drbd1000         ok  12.4 s
-  disk1 (vdb): create meta LV on source          running …
+  disk0 (vda): create meta LV on source            ok
+  disk0 (vda): generate DRBD res                    ok
+  disk0 (vda): create-md + up                       ok
+  disk0 (vda): assert /dev/drbd1102 == backing LV   ok
+  disk0 (vda): blockcopy -> /dev/drbd1102           ok
+  disk1 (vdb): create meta LV on source             running ...
 ```
 
 ## What each transition does
 
 ```
-  ┌── cattle ──┐     ┌─── pet (2-way) ───┐    ┌──── ViPet (3-way) ────┐
-  │  local LV  │ ◀─▶ │ local LV + DRBD   │ ◀─▶ │ local LV + DRBD 3-way │
-  │  (raw)     │     │ + 1 peer LV+meta  │    │ + 2 peer LV+meta pairs│
-  └────────────┘     └───────────────────┘    └───────────────────────┘
+  +-- cattle --+     +--- pet (2-way) ---+    +---- ViPet (3-way) ----+
+  |  local LV  | <-> | local LV + DRBD   | <-> | local LV + DRBD 3-way |
+  |  (raw)     |     | + 1 peer LV+meta  |    | + 2 peer LV+meta pairs |
+  +------------+     +-------------------+    +-----------------------+
 
-    cattle → pet     : add peer, swing to /dev/drbdN, sync
-    pet → ViPet      : add 3rd peer, drbdadm adjust, background sync
-    ViPet → pet      : drop 1 peer, rewrite config, del-peer on primary
-    pet → cattle     : swing back to raw LV, drbdadm down, lvremove peer
+    cattle -> pet     : add peer, swing to /dev/drbdN, sync
+    pet -> ViPet      : add 3rd peer, drbdadm adjust, background sync
+    ViPet -> pet      : drop 1 peer, rewrite config, del-peer on kept
+    pet -> cattle     : swing back to raw LV, drbdadm down, lvremove peer
 ```
 
-Each step logs to VictoriaLogs **and** pushes a WS `event` to the dashboard.
+Direct cattle <-> ViPet is allowed too (rank-based dispatch); it just adds or
+drops two peers in one operation.
 
 ## Preconditions
 
-- VM is **running**. Stopped VMs are rejected (`400 VM must be running to
-  hot-convert`) — the pivot relies on QEMU's live blockcopy.
-- For upgrade: enough peer nodes exist (the checkbox is already greyed
-  out in the UI when not; the API enforces the same).
-- SSH key mesh established between home and any peer nodes to be used.
+- **Running** VM: blockcopy path (zero downtime). **Shut-off** VM: offline
+  XML-rewrite path. Both are supported; the VM state is not a hard gate.
+- Upgrade requires enough usable peer nodes. The route filters `peer_nodes`
+  (or all other nodes) down to the count needed (`pet`=1, `vipet`=2) and 400s
+  if too few. The dashboard greys the checkbox in the same case.
+- Each peer must already have a thin pool (`bedrock bootstrap` ran on it).
+  `_ensure_thinpool` only verifies it and raises a clear 500 if absent;
+  runtime never auto-creates pools.
+- SSH key mesh established between the source host and any peers used.
 
-## Sequence — cattle → pet
-
-```
-  T=0   POST /api/vms/NAME/convert {"target_type":"pet"}
-        │
-        │ build_cluster_state() → find current type = "cattle"
-        │ pick peer = first other node
-        │
-        │ _find_vm_disk(src_host, NAME) via virsh dumpxml
-        │   → src_lv = /dev/almalinux/vm-NAME-disk0, target_dev = vda
-        │
-        │ meta_lv_name = vm-NAME-disk0-meta   (4 MB thin)
-        │ size_mb = blockdev --getsize64 src_lv  →  MB
-        │
-  T+0.1 ssh src: lvcreate -V 4M  -T almalinux/thinpool -n vm-NAME-disk0-meta
-        │ push_log "Convert NAME: create external DRBD meta LV <path>"
-        │
-  T+0.3 ssh peer: _ensure_thinpool
-        │ ssh peer: lvcreate -V <size>M -T almalinux/thinpool -n vm-NAME-disk0
-        │ ssh peer: lvcreate -V 4M      -T almalinux/thinpool -n vm-NAME-disk0-meta
-        │ push_log "Convert NAME: create peer LVs on <peer> (<n>M data + 4M meta)"
-        │
-  T+1s  _next_drbd_minor(all_hosts)  →  pick unused minor (e.g. 1000)
-        │ _gen_drbd_res(NAME, minor, peers_info)  →  /etc/drbd.d/vm-NAME-disk0.res
-        │   peers_info = [(name, ip, lv, meta_path), ...]
-        │   protocol C; external meta-disk; max-peers via create-md flag
-        │
-        │ for h in all_hosts:
-        │   ssh h: echo <b64> | base64 -d > /etc/drbd.d/vm-NAME-disk0.res
-        │
-  T+1.3 for h in all_hosts:
-        │   ssh h: drbdadm create-md --force --max-peers=7 vm-NAME-disk0
-        │   ssh h: drbdadm up vm-NAME-disk0
-        │
-  T+2s  ssh src: drbdadm primary --force vm-NAME-disk0
-        │         (src has the data; peer is SyncTarget / Inconsistent)
-        │
-  T+2.3 push_log "Convert NAME: blockcopy vda → /dev/drbd1000"
-        │
-  T+2.3 ssh src:
-        │   virsh blockcopy NAME vda /dev/drbd1000
-        │     --reuse-external --wait --pivot --verbose
-        │     --transient-job --blockdev --format raw
-        │
-        │   QEMU mirrors all of vda → /dev/drbd1000 while the VM keeps
-        │   writing. /dev/drbd1000 maps to the same bytes on this host
-        │   (src_lv is identical to the first N bytes of drbdN under
-        │   external meta), so the copy is essentially self-to-self on
-        │   the primary and replicates to the peer via DRBD.
-        │
-        │   On blockcopy completion, QEMU does an atomic "pivot": the
-        │   VM disk becomes /dev/drbd1000; the original LV is released.
-        │
-  T+~4s blockcopy done.
-        │
-  T+4.1 dumpxml src NAME → the VM XML now has
-        │     <source dev='/dev/drbd1000'/>
-        │   scp XML to peer, virsh define on peer
-        │     (so peer can run the VM after a future migrate)
-        │
-  T+4.5 push_log "Convert NAME: cattle → pet in 4.24s (DRBD minor 1000)"
-        │ return 200 {"status":"converted","duration_s":4.24, ...}
-        │
-  (async) DRBD sync peer ← primary continues in background (~1 MB/s × disk-size
-          depending on link and thin-mapping); dashboard DRBD tile shows
-          Inconsistent/SyncTarget until it flips to UpToDate.
-```
-
-## Sequence — pet → ViPet
-
-No blockcopy. Just add a third peer to an already-primary DRBD resource:
+## Sequence -- cattle -> pet (running VM)
 
 ```
-  T=0   POST /api/vms/NAME/convert {"target_type":"vipet"}
-        │
-        │ _parse_drbd_res(src, "vm-NAME-disk0") gives:
-        │   { peers:[A,B], minor:1000, lv_path, meta_path, size_bytes }
-        │
-        │ chosen = first node not in peers
-        │
-  T+0.1 ssh new_peer: _ensure_thinpool
-        │ ssh new_peer: lvcreate data LV  (size_mb from existing)
-        │ ssh new_peer: lvcreate meta LV  (4 M)
-        │ push_log "Convert NAME: add 3rd peer <new_peer>"
-        │
-  T+0.5 regenerate /etc/drbd.d/vm-NAME-disk0.res with 3 "on" blocks +
-        │ connection-mesh; broadcast to all 3 nodes.
-        │
-  T+0.7 ssh new_peer: drbdadm create-md --force --max-peers=7 ...
-        │ ssh all_hosts: drbdadm adjust vm-NAME-disk0
-        │   (picks up the new peer entry, opens connection)
-        │ ssh new_peer: drbdadm up vm-NAME-disk0
-        │
-  T+1s  scp VM XML to new_peer, virsh define
-        │
-  T+1.2 push_log "Convert NAME: pet → vipet, added <new_peer>"
-        │ return 200 {"status":"converted","added_peer":"<new_peer>"}
-        │
-  (async) initial sync to new_peer over DRBD ring. During the sync, the
-          DRBD tile shows SyncSource/Inconsistent on peer; writes still
-          commit on the 2 UpToDate copies so the VM is unaffected.
+  T=0   POST /api/vms/NAME/ha-level {"vm_type":"pet"}
+        |
+        | build_cluster_state() -> current type = cattle, src = running_on
+        | chosen = (peer_nodes or other nodes)[:1]
+        | get_vm_disks(src) -> [{target:vda, backing_lv:/dev/VG/vm-NAME-disk0}, ...]
+        |
+  per disk i (resource = vm-NAME-disk<i>):
+        |
+        | meta_mb = max(32, 32 + size_gb*2); meta_lv = <data-lv>-meta
+        | ssh src : lvcreate -V <meta_mb>M -T VG/thinpool -n <data-lv>-meta
+        |
+        | ssh peer: _ensure_thinpool
+        | ssh peer: lvcreate -V <size>M data LV ; lvcreate -V <meta_mb>M meta LV
+        |
+        | minor = _next_drbd_minor(all_hosts)
+        | _gen_drbd_res(resource, minor, peers_info)  -> /etc/drbd.d/<res>.res
+        |   protocol C; external meta-disk; split-brain policy
+        |   (after-sb-0pri discard-zero-changes / 1pri discard-secondary /
+        |    2pri disconnect); 2 "on" blocks + connection
+        | write .res to all_hosts (base64 over ssh)
+        |
+        | for h in all_hosts:
+        |   ssh h: drbdadm create-md --force --max-peers=7 <res>
+        |   ssh h: drbdadm up <res>
+        | ssh src: drbdadm primary --force <res>   (src has data; peer SyncTarget)
+        |
+        | SILENT-TRUNCATION GUARD: assert blockdev /dev/drbd<minor> == src LV
+        |   bytes. A short device => meta LV too small; fail loud pre-pivot.
+        |
+        | ssh src: virsh blockjob NAME vda --abort   (clear any stale job)
+        | ssh src: virsh blockcopy NAME vda /dev/drbd<minor>
+        |            --reuse-external --wait --pivot --verbose
+        |            --transient-job --blockdev --format raw
+        |   QEMU mirrors vda -> /dev/drbd<minor> while the VM keeps writing,
+        |   then atomically pivots the VM disk to /dev/drbd<minor>. External
+        |   meta keeps the bytes 1:1, so on the primary the copy is local;
+        |   DRBD replicates to the peer.
+        | _release_drbd_minor(minor)
+        |
+  all disks done:
+        | dumpxml NAME -> define on each peer (so a later migrate works)
+        | push_log "Convert NAME: cattle -> pet in <dur>s (N disk(s))"
+        | return {"status":"converted","from":"cattle","to":"pet",
+        |         "disks":[...],"duration_s":<dur>,"peers":[src,...]}
+        |
+  (async) DRBD resync peer<-primary continues; the DRBD tile shows
+          Inconsistent/SyncTarget until UpToDate.
 ```
 
-## Sequence — ViPet → pet (downgrade)
+Shut-off VM: identical up to `drbdadm primary --force`, then instead of
+blockcopy it rewrites `<source dev='...'>` in the inactive XML to
+`/dev/drbd<minor>` and `virsh define`s it. No local copy; DRBD's initial sync
+from the (forced-primary) live data LV streams to the peer.
+
+## Sequence -- pet -> ViPet
+
+No blockcopy: add a third peer to each already-primary DRBD resource.
 
 ```
-  T=0   POST /api/vms/NAME/convert {"target_type":"pet", "peer_nodes":["<drop>"]}
-        │
-        │ Peer selection: peer_nodes[0] if set, else
-        │   candidates = [n for n in existing.peers if n != src_name]
-        │   drop = candidates[0]
-        │ (Never drops the current Primary. If the operator passes the
-        │ Primary as peer_nodes[0] the request 400s.)
-        │
-  T+0.1 ssh drop: virsh undefine NAME     (remove VM from peer's libvirt)
-        │ ssh drop: drbdadm down vm-NAME-disk0
-        │ ssh drop: drbdadm wipe-md --force vm-NAME-disk0
-        │
-  T+0.5 rewrite /etc/drbd.d/vm-NAME-disk0.res for the remaining 2 peers
-        │ write to kept_hosts; rm on dropped host
-        │
-  T+0.8 # del-peer dance per kept host — three steps in strict order:
-        │  1. disconnect  — tear the TCP link (--force because state may
-        │     be mid-sync and drbdadm disconnect refuses otherwise)
-        │  2. del-peer    — free the node-id slot in DRBD kernel state
-        │  3. adjust      — re-read the now-2-peer .res so each host
-        │     sees the reduced connection-mesh
-        │
-        │ for h in kept_hosts:
-        │   ssh h: drbdsetup disconnect RES <dropped_node_id> --force
-        │   ssh h: drbdsetup del-peer   RES <dropped_node_id> --force
-        │   ssh h: drbdadm  adjust      vm-NAME-disk0
-        │
-  T+1s  ssh drop: lvremove -f <lv_path> <meta_path>
-        │ push_log "Convert NAME: vipet → pet (dropped <drop>)"
+  T=0   POST /api/vms/NAME/ha-level {"vm_type":"vipet"}
+        | resources = [d.drbd_resource for d in get_vm_disks(src)]
+        | new_peer = peer_nodes[0], else first node not in existing peers
+        |
+  per resource:
+        | existing = _parse_drbd_res(src, resource)  -> peers, minor, lv/meta, size
+        | ssh new_peer: _ensure_thinpool; lvcreate data LV; lvcreate meta LV
+        | _gen_drbd_res(resource, minor, 3 peers) -> connection-mesh; write all 3
+        | ssh new_peer: drbdadm create-md --force --max-peers=7 <res>
+        | ssh all_hosts: drbdadm adjust <res>   (opens the new connection)
+        | ssh new_peer: drbdadm up <res>
+        |
+        | dumpxml NAME -> virsh define on new_peer
+        | push_log "Convert NAME: pet -> vipet in <dur>s (N resource(s) added peer X)"
+        | return {"status":"converted","from":"pet","to":"vipet",
+        |         "resources":[...],"added_peer":X,"duration_s":<dur>}
+        |
+  (async) initial sync to new_peer over the DRBD ring; writes still commit on
+          the 2 UpToDate copies, so the VM is unaffected.
 ```
 
-## Sequence — pet or ViPet → cattle
+## Sequence -- ViPet -> pet (downgrade)
 
 ```
-  T=0   POST /api/vms/NAME/convert {"target_type":"cattle"}
-        │
-        │ _parse_drbd_res → peers, lv_path, minor, meta_path
-        │ _find_vm_disk → target_dev (vda)
-        │
-  T+0.1 push_log "Convert NAME: pivot vda back to <lv_path>"
-        │
-  T+0.1 ssh src:
-        │   virsh blockcopy NAME vda <lv_path>
-        │     --reuse-external --wait --pivot --verbose
-        │     --transient-job --blockdev --format raw
-        │
-        │   QEMU mirrors /dev/drbdN → raw LV (on primary, same underlying
-        │   bytes minus meta-disk area; copy is a local no-op + trim).
-        │   Pivots VM to the raw LV.
-        │
-  T+~2s for n in peers:
-        │   h = host of n
-        │   if n != src:
-        │     ssh h: virsh undefine NAME
-        │   ssh h: drbdadm down vm-NAME-disk0
-        │   ssh h: drbdadm wipe-md --force vm-NAME-disk0
-        │   ssh h: rm -f /etc/drbd.d/vm-NAME-disk0.res
-        │
-  T+~3s for n in peers where n != src:
-        │   ssh host: lvremove -f <lv_path> <meta_path>
-        │ ssh src: lvremove -f <meta_path>   (data LV kept — it's the VM disk now)
-        │
-  T+3.5 push_log "Convert NAME: vipet → cattle in 3.77s" (or pet→cattle)
-        │ return 200 {"status":"converted","duration_s":3.77}
+  T=0   POST /api/vms/NAME/ha-level {"vm_type":"pet", "peer_nodes":["DROP"]?}
+        |
+        | drop = peer_nodes[0] if set, else first existing peer != src.
+        | Never the source/primary; passing it 400s.
+        |
+        | ssh drop: virsh undefine NAME    (remove VM from dropped peer's libvirt)
+        |
+  per resource:
+        | ssh drop: drbdadm down <res> ; drbdadm wipe-md --force <res>
+        | rewrite .res for the 2 remaining peers; write kept hosts; rm on drop
+        |
+        | del-peer dance per kept host, drop_idx = peers.index(drop) (strict order):
+        |   1. drbdsetup disconnect <res> <drop_idx> --force  (tear TCP; --force
+        |      because the link may be mid-sync)
+        |   2. drbdsetup del-peer   <res> <drop_idx> --force  (free the node-id slot)
+        |   3. drbdadm  adjust      <res>                     (re-read 2-peer mesh)
+        |
+        | ssh drop: lvremove -f <lv_path> <meta_path>
+        |
+        | push_log "Convert NAME: vipet -> pet (dropped X, N resource(s))"
+        | return {"status":"converted","from":"vipet","to":"pet",
+        |         "dropped":X,"resources":[...]}
 ```
 
-## Log lines — exact strings
-
-Each `push_log` call lands in **VictoriaLogs** as a JSON line
-(`{_msg, _time, hostname, app=bedrock-mgmt, level=info}`) and is
-broadcast on the WebSocket `event` channel instantly.
+## Sequence -- pet or ViPet -> cattle
 
 ```
-Convert NAME: create external DRBD meta LV <path>
-Convert NAME: create peer LVs on <peer> (<n>M data + 4M meta)
-Convert NAME: blockcopy <target_dev> → /dev/drbd<minor>
-Convert NAME: cattle → pet in <dur>s (DRBD minor <minor>)
-Convert NAME: add 3rd peer <new_peer>
-Convert NAME: pet → vipet, added <new_peer>
-Convert NAME: vipet → pet (dropped <drop_name>)
-Convert NAME: pivot <target_dev> back to <lv_path>
-Convert NAME: vipet → cattle in <dur>s
-Convert NAME: pet → cattle in <dur>s
+  T=0   POST /api/vms/NAME/ha-level {"vm_type":"cattle"}
+        |
+        | per_resource = _parse_drbd_res(src, r) for each disk's resource
+        |
+  pivot phase (before teardown -- tearing DRBD first would crash the VM):
+        | per resource: match target_dev via disk.drbd_minor == existing.minor
+        |   ssh src: virsh blockcopy NAME <target_dev> <lv_path>
+        |              --reuse-external --wait --pivot --verbose
+        |              --transient-job --blockdev --format raw
+        |   QEMU mirrors /dev/drbdN -> raw LV (same bytes) and pivots to it.
+        |
+  teardown phase:
+        | for each non-src peer: ssh: virsh undefine NAME
+        | per resource, per peer:
+        |   ssh: drbdadm down <res> ; drbdadm wipe-md --force <res>
+        |   ssh: rm -f /etc/drbd.d/<res>.res
+        |   src:  lvremove -f <meta_path>           (data LV kept -- it's the VM disk)
+        |   peer: lvremove -f <lv_path> <meta_path>
+        |
+        | push_log "Convert NAME: <cur> -> cattle in <dur>s"
+        | return {"status":"converted","from":<cur>,"to":"cattle","duration_s":<dur>}
 ```
 
-Browser side: these land in the Recent Logs panel via the `events` store,
-newest at top, **before** the next cluster-state push flips the tile
-(tiles lag logs by up to ~3 s).
+## Logging
+
+Per-step progress is reported through the task system (`task.step_start` /
+`step_done` / `step_fail`), surfaced in the dashboard task drawer and on the WS
+`task` channel. One summary `push_log` lands per operation in **VictoriaLogs**
+as `{_msg, _time, hostname, app="bedrock-mgmt", level}` and broadcasts on the
+WS `event` channel:
+
+```
+Convert NAME: cattle -> pet in <dur>s (N disk(s))
+Convert NAME: pet -> vipet in <dur>s (N resource(s) added peer X)
+Convert NAME: vipet -> pet (dropped X, N resource(s))
+Convert NAME: <cur> -> cattle in <dur>s
+Convert NAME: FAILED (<err>) -- unwinding              (level=error, on rollback)
+```
 
 ## Why the specific order
 
-- **Extend (or add) metadata LV before touching DRBD**: `drbdadm create-md`
-  writes at the very end of the meta-disk; if the meta LV were created
-  after, `create-md` would hit the underlying data LV and corrupt it.
-- **External meta-disk, not internal**: DRBD internal metadata steals
-  ~128 KB off the tail of the data LV, so `/dev/drbdN < underlying-LV`
-  size. `virsh blockcopy` refuses to target a smaller destination — "dst
-  too small". External meta-disk keeps them byte-identical.
-- **`--max-peers=7` at create-md**: reserves bitmap slots for up to 7
-  peers in the metadata region. Without it, adding a 3rd peer later
-  fails with "Not enough free bitmap slots" and the only recovery is
-  `wipe-md` + full resync.
-- **`drbdadm primary --force` before blockcopy**: blockcopy's write path
-  goes through DRBD, which refuses writes to a Secondary.
-- **`--blockdev --format raw` on blockcopy**: legacy blockdev API assumes
-  `file` driver for the destination and fails with "'file' driver
-  requires … to be a regular file" on /dev/drbdN. `--blockdev` switches
-  to the new QEMU blockdev interface which supports `host_device`.
+- **Create the meta LV before `create-md`**: `drbdadm create-md` writes at the
+  end of the meta-disk; if the meta LV came later, `create-md` would land on
+  the data LV and corrupt it.
+- **External meta-disk, not internal**: internal metadata steals tail bytes,
+  so `/dev/drbdN < underlying LV`. `virsh blockcopy` refuses a smaller
+  destination ("dst too small"). External meta keeps them byte-identical, which
+  the silent-truncation guard asserts before any pivot.
+- **`--max-peers=7` at create-md**: reserves bitmap slots for up to 7 peers so
+  adding a 3rd peer later doesn't fail with "Not enough free bitmap slots"
+  (whose only fix is wipe-md + full resync).
+- **`drbdadm primary --force` before blockcopy**: blockcopy writes go through
+  DRBD, which refuses writes to a Secondary.
+- **`--blockdev --format raw` on blockcopy**: the new QEMU blockdev interface
+  supports `host_device`; the legacy API assumes a regular `file` and fails on
+  `/dev/drbdN`.
 - **`--transient-job` on blockcopy**: persistent domains reject blockcopy
-  without this flag. The job state doesn't need to survive a VM restart.
-- **Define VM on peers only after successful pivot**: if the pivot fails
-  mid-flight, we don't want stale XML pointing at a nonexistent drbdN on
-  peers.
-- **Downgrade pet → cattle pivots *before* teardown**: if DRBD is torn
-  down first, the VM would lose its disk and crash.
+  without it, and the job needn't survive a VM restart.
+- **Define VM on peers only after a successful pivot**: a mid-flight failure
+  must not leave stale XML pointing at a nonexistent drbdN on peers.
+- **pet/ViPet -> cattle pivots before teardown**: tearing DRBD down first would
+  yank the VM's disk and crash it.
 
 ## Failure modes
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `Copy failed` from virsh blockcopy | dst smaller than src (internal meta?) or peer unreachable | Check `blockdev --getsize64` on both; ensure external meta. |
-| `Not enough free bitmap slots` when adding 3rd peer | Resource was created without `--max-peers=7` | Destroy (convert → cattle) and recreate with max-peers. |
-| `Connection for peer node id N already exists` | Stale peer slot after failed add | `drbdsetup disconnect RES N --force; drbdsetup del-peer RES N --force; drbdadm adjust RES`. |
-| HTTP 500 "no resources defined!" | `drbdadm status` returned before res file written (race on slow SSH) | Retry the convert — idempotent on a fresh cluster. |
-| lvcreate on peer fails "Volume group … not found" | Peer never had a VM, no thinpool yet | `_ensure_thinpool()` now runs first; upgrade mgmt if older build. |
-| Host key verification failed on blockcopy/migrate | SSH known_hosts cold on a peer | `ssh-keyscan -H <peer> >> /root/.ssh/known_hosts` — or set `BEDROCK_SSH_PASS` (dev only). |
+| Silent-truncation guard tripped | `/dev/drbdN` smaller than backing LV (meta LV too small / internal meta) | Caught pre-pivot with byte counts in the log; fix the `meta_mb` formula and retry. |
+| `blockcopy failed` (rc != 0) | dst smaller than src, or peer unreachable | Compare `blockdev --getsize64`; ensure external meta; the upgrade rolls back automatically. |
+| `Not enough free bitmap slots` adding 3rd peer | Resource made without `--max-peers=7` | Convert -> cattle and recreate. |
+| `Connection for peer node id N already exists` | Stale peer slot after a failed add | `drbdsetup disconnect RES N --force; drbdsetup del-peer RES N --force; drbdadm adjust RES`. |
+| 500 `thin pool ... does not exist on <peer>` | Peer never ran `bedrock bootstrap` | Bootstrap that node; `_ensure_thinpool` does not auto-create pools. |
+| `Host key verification failed` on blockcopy/migrate | SSH known_hosts cold for a peer | `ssh-keyscan -H <peer> >> /root/.ssh/known_hosts`. |
 
 ## State after each transition
 
 | Direction | On primary | On peer(s) | DRBD state |
 |---|---|---|---|
-| cattle → pet | data LV + meta LV, VM on `/dev/drbdN` | new data LV + meta LV, VM defined | Primary / SyncSource → UpToDate |
-| pet → ViPet | unchanged | existing peer same; new peer gets LV+meta, VM defined | new peer SyncTarget until caught up |
-| ViPet → pet | unchanged | dropped peer: VM undefined, LVs gone, res file removed | 2-way resource, adjust applied |
-| pet/ViPet → cattle | VM on raw LV; meta LV gone; data LV kept | VM undefined, LVs + res removed | resource fully torn down |
+| cattle -> pet | data LV + meta LV, VM on `/dev/drbdN` | new data LV + meta LV, VM defined | Primary / SyncSource -> UpToDate |
+| pet -> ViPet | unchanged | existing peer unchanged; new peer gets LV+meta, VM defined | new peer SyncTarget until caught up |
+| ViPet -> pet | unchanged | dropped peer: VM undefined, LVs gone, `.res` removed | 2-way resource, adjust applied |
+| pet/ViPet -> cattle | VM on raw LV; meta LV gone; data LV kept | VM undefined, LVs + `.res` removed | resource torn down |
 
 ## Operator perspective
 
-- **Downtime**: zero. The VM's QEMU process never pauses beyond the
-  sub-millisecond blockcopy pivot.
-- **Observed latency during sync**: negligible on the primary (writes
-  commit when local ACKs; DRBD doesn't wait for peer ACK in protocol C
-  *for already-synced regions*). During initial sync to a fresh peer, the
-  disk shows `Inconsistent` on the peer until the resync catches up.
-- **Rollback**: every transition has an inverse. The downgrade paths are
-  implemented and tested. Flipping a checkbox on and off is safe.
+- **Downtime**: zero for a running VM -- QEMU never pauses beyond the
+  sub-millisecond blockcopy pivot. A shut-off VM converts via XML rewrite.
+- **Latency during sync**: negligible on the primary (protocol C commits on
+  local ACK for already-synced regions). A fresh peer shows `Inconsistent`
+  until its resync catches up.
+- **Rollback**: every transition has an inverse; flipping the checkbox on and
+  off is safe.

@@ -57,11 +57,11 @@ plane per pair-redundancy-level is enough). Between every pair
 of nodes there are **4 distinct paths**. Lose one, the other
 three keep working.
 
-> The bedrock testbed actually runs 4 mesh planes (an extra one
-> for stress-testing the multi-NIC code), which is why testbed
-> verification output you'll see further down shows five paths
-> per peer rather than four. The shape of the design is identical
-> either way — just add or remove a plane.
+The number of planes is free to vary: add a plane, you get one
+more path per pair; remove one, you get one fewer. The shape of
+the design is identical either way. The verification output
+further down shows five paths per peer — a five-plane setup —
+to make the multi-path machinery visible.
 
 That's the goal. The rest of this doc is about how a piece of
 software called **bedrock-net** turns all that physical
@@ -163,8 +163,8 @@ choice of cable, because:
 Cluster membership (which records "node B has joined", "node B's
 loopback IP is …") lives in rqlite, the cluster's Raft-replicated
 SQLite store. It tells the daemon *who is a member*. It does **not**
-tell anyone which cable to use; that's decided fresh every second
-from in-memory state.
+tell anyone which cable to use; that's recomputed from in-memory
+state on every ~250 ms daemon tick.
 
 ---
 
@@ -424,13 +424,14 @@ latency *to the advertiser*.
 ## 4. The metric — picking the best path
 
 Every receiver computes a score for every (destination, next-hop)
-combination it knows about. **Lower is better.** The formula is:
+combination it knows about (`local_metric()` in `netd.py`).
+**Lower is better.** The formula is:
 
 ```
    ┌──────────────────────────────────────────────────────────┐
    │   score  =       1 000 000 / bandwidth_in_Mbps           │
    │                                                          │
-   │              +   latency_in_µs / 100                     │
+   │              +   max(0, latency_in_µs − 1000) / 100      │
    │                                                          │
    │              +   50  if the link came up <60 s ago       │
    │                                                          │
@@ -441,14 +442,14 @@ combination it knows about. **Lower is better.** The formula is:
 Translated:
 
 ```
-   bandwidth term            latency term
-   ─────────────────         ─────────────────
-   1 Gbps    → 1000           every 100 µs    → 1
-   2.5 Gbps  →  400           every 1 ms      → 10
-   10 Gbps   →  100           every 10 ms     → 100
-   40 Gbps   →   25           every 100 ms    → 1000
-   80 Gbps   →   12           every 1 s       → 10 000
-   
+   bandwidth term            latency term  (floored below 1 ms)
+   ─────────────────         ──────────────────────────────────
+   1 Gbps    → 1000           anything < 1 ms → 0
+   2.5 Gbps  →  400           2 ms            → 10
+   10 Gbps   →  100           11 ms           → 100
+   40 Gbps   →   25           101 ms          → 1000
+   80 Gbps   →   12
+
    flap penalty              loss penalty
    ─────────────────         ─────────────────
    age < 60 s   +50          0% loss          → 0
@@ -457,17 +458,25 @@ Translated:
                              5%+ loss         → 500 (capped)
 ```
 
+The latency term floors anything below 1 ms to zero: on a healthy
+sub-millisecond LAN, latency jitter is noise and bandwidth should
+decide the path. Latency only starts to matter once a path is
+genuinely slow (≥1 ms), which on a mesh means a transit hop or a
+degraded link.
+
 So on a 4-node cluster with five 10 Gbps cables between every
-pair, the score for every path is roughly:
+pair, the score for every path is the same:
 
 ```
-   100 (bandwidth term) + 1 (latency term at 100 µs) + 0 + 0  ≈  101
+   100 (bandwidth term) + 0 (sub-ms latency) + 0 + 0  =  100
 ```
 
-…and the daemon picks one of them as the primary, the rest as
-backups in score order. Where the scores tie, it tiebreaks by
-RTT and then by cable name, so all nodes agree on the order
-without negotiating.
+When every path to a peer ties at the same score, the daemon
+emits them as **one multipath route** (one kernel route, N
+nexthops) — see section 5. Paths with *different* scores become
+separate routes at increasing backup metrics. Where scores tie
+for ordering purposes, it tiebreaks by RTT and then by cable name,
+so all nodes agree without negotiating.
 
 ### Why this formula?
 
@@ -500,8 +509,9 @@ on, in time order.
    t = 0 s   ─┬─  bedrock-d starts the netd thread
               │
               │   ├─  Reads /etc/bedrock/cluster.key   (32-byte HMAC key)
-              │   ├─  Reads /etc/bedrock/state.json   (cluster_uuid, node_name)
-              │   ├─  Reads loopback_ip from rqlite via cluster_state.load_cluster()
+              │   ├─  Reads /etc/bedrock/state.json   (cluster_uuid,
+              │   │     node_name, loopback_ip; falls back to a rqlite
+              │   │     read via cluster_state.load_cluster() if missing)
               │   ├─  Adds 100.X.Y.N/32 to lo  (identity)
               │   ├─  Opens UDP socket on port 7732   (discovery in/out)
               │   └─  Opens UDP socket on port 7733   (advertisement in/out)
@@ -531,17 +541,20 @@ on, in time order.
               │   continuously for 5 seconds.
               │
               │   `logged_up` becomes true.
-              │   On the mgmt master, the LINK_UP observation is recorded
-              │   to rqlite so the dashboard can draw this path.
+              │   On the mgmt master, the LINK_UP observation is written
+              │   to rqlite's `paths` table so the dashboard can draw it.
               │   `emit_routes` installs:
               │       • /32 link-local host route to the peer's per-cable IP
-              │       • /32 route to the peer's loopback IP via that link,
-              │         at metric 10 (the best of N direct paths)
-              │       • /32 routes for other direct cables to the same peer
-              │         at metrics 11, 12, 13 (backups; one per remaining
-              │         cable — three in a 4-cable-per-node cluster)
-              │       • a panic catch-all route for the cluster /24 at
-              │         metric 999, via the freshest neighbour overall
+              │         (scope link, dev <my_nic>) so DRBD's path blocks
+              │         resolve to the right physical wire
+              │       • /32 route(s) to the peer's loopback IP, grouped by
+              │         score: all equal-cost cables collapse into ONE
+              │         multipath route at metric 10 (N nexthops, kernel
+              │         hashes flows across them); each worse-scoring tier
+              │         gets its own route at metric 11, 12, … (backups)
+              │       • a panic catch-all for the cluster /24 at metric 999,
+              │         via the best path to the mgmt master (freshest
+              │         neighbour if the master is unknown/unreachable)
               │
    t ≈ 7 s   ─┼─  First Job 3 advertisement round runs.
               │
@@ -551,16 +564,19 @@ on, in time order.
    t ≈ 9 s   ─┼─  Second advertisement round. Now the adv_table is
               │   populated everywhere.
               │
-              │   `recompute_best_transit_paths` runs every tick (250 ms).
+              │   `recompute_best_transit_paths` runs whenever the
+              │   adv_table changes and at least every ~2 s.
               │   If any destination is NOT a direct neighbour, the best
               │   transit advertisement is selected; emit_routes installs
               │   a /32 to that destination at metric 100, via the chosen
               │   next-hop's link IP.
               │
    t = 10 s+ ─┴─  Cluster mesh ready.
-              
+
                    • Every node has a /32 route to every other node's
-                     loopback, with N backup metrics (failover free).
+                     loopback — one multipath route across equal-cost
+                     cables, plus backup metrics for worse tiers
+                     (failover free).
                    • Every node has a (smoothed, junk-free) RTT for every
                      direct path.
                    • Every node has each peer's view of the cluster, so
@@ -571,10 +587,10 @@ on, in time order.
 
 In a fully-meshed setup (every node has a cable to every other),
 the *transit* part of step 9 produces no new routes — every
-destination is already direct, with five backups. The transit
-machinery exists for partial meshes (e.g. five nodes where only
-some pairs are directly cabled) and for the moment after a real
-failure when the transit path is what saves you.
+destination is already direct. The transit machinery exists for
+partial meshes (e.g. five nodes where only some pairs are directly
+cabled) and for the moment after a real failure when the transit
+path is what saves you.
 
 ---
 
@@ -640,16 +656,18 @@ direct) is already known via B's own advertisements.
   * **t=0**: cable yanked.
   * **t≤10 s**: A's daemon stops seeing discovery probes from B
     on that cable. Hysteresis countdown.
-  * Meanwhile, A's *other* cables to B (if any) still work — the
-    kernel route table for B has additional backup entries at
-    higher metrics (three more in a 4-cable cluster). The kernel
-    auto-fails-over to the next-best. **Sub-second.** The
-    application (libvirt, DRBD, dashboard) sees no error; the
-    TCP connection keeps going.
+  * Meanwhile, A's *other* cables to B (if any) still work. If
+    they were equal-cost, B's loopback /32 is a single multipath
+    route with that cable as one nexthop; the kernel stops using
+    the dead nexthop and keeps using the rest. If they were
+    different-cost, the dead one was a backup-metric route the
+    kernel falls past. Either way: **sub-second**, no application
+    error, the TCP connection keeps going.
   * **t=10 s**: LINK_DOWN hysteresis fires for that specific
-    cable. The /32 route for that cable is removed. The route to
-    B's loopback via that cable is also removed. Other cables to
-    B keep their routes.
+    cable. `emit_routes` rebuilds the route set without that cable
+    — its link-local /32 is removed and it drops out of B's
+    multipath nexthop list (or its backup route disappears). Other
+    cables to B keep their place.
 
 If A and B had **only that one cable**, then:
 
@@ -690,10 +708,11 @@ happens?":
    ┌─────────────────────────┬───────────────┬──────────────────────────┐
    │ Failure                 │ How detected  │ Recovery                 │
    ├─────────────────────────┼───────────────┼──────────────────────────┤
-   │ One cable unplugged     │ LINK_DOWN     │ Kernel uses backup       │
-   │                         │ at 10 s OR    │ /32 route immediately;   │
-   │                         │ ICMP timeouts │ daemon cleans up         │
-   │                         │ before that   │ metadata at 10 s.        │
+   │ One cable unplugged     │ LINK_DOWN     │ Kernel drops the dead    │
+   │                         │ at 10 s OR    │ nexthop / falls to the   │
+   │                         │ ICMP timeouts │ backup metric instantly; │
+   │                         │ before that   │ daemon rebuilds routes   │
+   │                         │               │ at 10 s.                 │
    ├─────────────────────────┼───────────────┼──────────────────────────┤
    │ Cable cut silently      │ ICMP echoes   │ Same as above — once     │
    │ (link still "up" but    │ stop coming   │ ICMP loss is detectable, │
@@ -846,27 +865,33 @@ flagging.
 
 The mgmt master scrapes this file from every node every 3 s (via
 the same SSH fan-out that already gathers DRBD / virsh / load
-state for the dashboard), assembles a cluster-wide rollup **in
-memory**, and ALSO caches it to `/run/bedrock/physical_topology.json`
-on the mgmt node so a post-mortem inspection without the mgmt
-service running is still possible. The live data is reachable
-via `GET /api/topology`.
+state for the dashboard, and that also pulls each node's
+`/run/bedrock/mesh_neighbors.json` for the node-to-node link list),
+assembles a cluster-wide rollup **in memory** (`build_physical_
+topology` in `mgmt/app.py`), and ALSO caches it to
+`/run/bedrock/physical_topology.json` on the mgmt node so a
+post-mortem inspection without the mgmt service running is still
+possible. The live data is reachable via `GET /api/topology`.
 
 **It is never written to rqlite.** The consensus store is reserved
 for state the cluster has agreed on (membership, master role,
 loopback assignment). Switch identity is per-node local reality; it
 doesn't need cluster consensus, so it stays out.
 
-From this rollup a question like
+The rollup groups per-node entries by the device's **MAC**
+(`device_key`), not by `chassis_id`: the same physical switch
+reports a different identifier depending on the protocol (CDP a
+name, MNDP a MAC, LLDP either), and the MAC is the one identifier
+every switch carries and the only one guaranteed unique. From this
+a question like
 
 > *Both `node A enp2s0` and `node B enp2s0` are plugged into
 >  `office-sw-01`, ports `7` and `23` respectively.*
 
-falls out by grouping per-node entries on `chassis_id` and
-listing `(node, nic, port_id)` tuples per group. For dead-node
-history (e.g. "what was node X's enp2s0 connected to last
-Tuesday?") the dashboard queries VictoriaLogs LogsQL on the
-`NIC_SWITCH` event stream instead.
+falls out by listing the `(node, nic, port_id)` connections under
+each device. For dead-node history (e.g. "what was node X's enp2s0
+connected to last Tuesday?") the dashboard queries VictoriaLogs
+LogsQL on the `NIC_SWITCH` event stream instead.
 
 **First-seen logging.** When a NIC first sees a switch (or when
 the chassis ID under it changes — cable moved, switch replaced),
@@ -939,12 +964,13 @@ The netd thread prints a one-liner every 30 seconds (look under the
 journalctl -u bedrock-d | grep status
 ```
 
-You should see something like:
+You should see one line (wrapped here for readability):
 
 ```
 status neighbours=15 (logged_up=15);
        advertisers=[bedrock-X(3p),bedrock-Y(3p),bedrock-Z(3p)];
-       transit_dests=[bedrock-Y,bedrock-Z,bedrock-X]
+       transit_dests=[bedrock-Y,bedrock-Z,bedrock-X];
+       blips_total=0; switches=1(cdp:br0->office-sw-01/vlan1)
 ```
 
 Translation:
@@ -960,6 +986,10 @@ Translation:
     candidates in my table. (In a fully meshed cluster these
     aren't actually installed since direct routes win; they
     exist as live failover candidates.)
+  * **blips_total=0**: no latency samples have been rejected
+    (see Job 2). Non-zero adds `last=<µs>@<age>_ago(peer/nic)`.
+  * **switches=N(…)**: how many switch/router neighbours this node
+    sees via LLDP/CDP/MNDP (see section 9).
 
 If `neighbours` drops or `advertisers` shrinks, something has
 broken. rqlite membership + the dashboard health page will tell
@@ -992,28 +1022,34 @@ first thing to fix.
 ip -4 route show | grep "^100\."
 ```
 
-Expected output (some of):
+Expected output on an equal-cost cluster (all cables same score):
 
 ```
 100.104.109.0/24 via 169.254.72.115 dev enp5s0 metric 999
-100.104.109.2 via 192.168.2.62 dev br0 metric 10
-100.104.109.2 via 169.254.151.72 dev enp2s0 metric 11
-100.104.109.2 via 169.254.49.209 dev enp3s0 metric 12
-100.104.109.2 via 169.254.11.214 dev enp4s0 metric 13
-100.104.109.2 via 169.254.248.218 dev enp5s0 metric 14
-100.104.109.3 via …                 (same pattern, 5 paths)
-100.104.109.4 via …                 (same pattern, 5 paths)
+100.104.109.2 metric 10
+        nexthop via 192.168.2.62  dev br0    weight 1
+        nexthop via 169.254.151.72 dev enp2s0 weight 1
+        nexthop via 169.254.49.209 dev enp3s0 weight 1
+        nexthop via 169.254.11.214 dev enp4s0 weight 1
+        nexthop via 169.254.248.218 dev enp5s0 weight 1
+100.104.109.3 metric 10  (same pattern, 5 nexthops)
+100.104.109.4 metric 10  (same pattern, 5 nexthops)
 ```
 
 Reading this:
 
-  * **`100.104.109.0/24 … metric 999`** — the panic catch-all.
-    Used only if nothing else matches. Last resort.
-  * Five entries per peer at metrics 10, 11, 12, 13, 14. The
-    kernel uses metric 10 (the best) first. If that path goes
-    silent (the device fails or the cable unplugs), the kernel
-    automatically uses the metric-11 path for the next packet.
-    No application restart, no awareness.
+  * **`100.104.109.0/24 … metric 999`** — the panic catch-all,
+    via the best path to the mgmt master. Used only if nothing
+    else matches. Last resort.
+  * **One multipath route per peer at metric 10**, one `nexthop`
+    per equal-cost cable. The kernel hashes each flow's 5-tuple
+    across the nexthops (`fib_multipath_hash_policy=1`) and stops
+    using any nexthop whose cable goes silent — sub-second, no
+    application awareness.
+  * If the cables to a peer have *different* scores (mixed link
+    speeds, or one path >1 ms slower), they split into separate
+    routes at metric 10, 11, 12, … — best first, the kernel falls
+    to the next on failure.
 
 In a partial mesh you would also see entries at metric 100 —
 those are transit routes via another node. They appear (and
@@ -1100,13 +1136,13 @@ If after 30 seconds you still see `neighbours=0`:
    │   ┌────────────────────────────────────────────────────────────┐  │
    │   │   emit_routes(): write Linux kernel routing table          │  │
    │   │                                                            │  │
-   │   │   • /32 for every peer's loopback, one entry per direct    │  │
-   │   │     cable (e.g. metrics 10..13 in a 4-cable cluster)       │  │
-   │   │     — kernel auto-fails-over                               │  │
+   │   │   • /32 for every peer's loopback: equal-cost cables in    │  │
+   │   │     one multipath route at metric 10, worse tiers as       │  │
+   │   │     backups at 11, 12, … — kernel auto-fails-over          │  │
    │   │                                                            │  │
    │   │   • /32 for transit destinations, metric 100               │  │
    │   │                                                            │  │
-   │   │   • Panic /24 catch-all, metric 999                        │  │
+   │   │   • Panic /24 catch-all via the master, metric 999         │  │
    │   └─────────┬──────────────────────────────────────────────────┘  │
    └─────────────┼─────────────────────────────────────────────────────┘
                  ▼

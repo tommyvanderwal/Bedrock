@@ -18,7 +18,7 @@ talking to the operator's LAN. VMs are running somewhere in the cluster
                           X
                           X
                          node3                 (DRBD isolated)
-      all 3 ─── LAN ─── (operator)             (mgmt/SSH still work)
+      all 3 ─── LAN ─── (operator)             (mgmt still reachable)
 
   Shape C: mgmt LAN split, DRBD ring intact (rare, dedicated ring OK)
       node1 ─┐ mgmt LAN A                      (operator on A talks to node1)
@@ -35,52 +35,60 @@ talking to the operator's LAN. VMs are running somewhere in the cluster
 From the majority side (node1 + node2):
 
 - DRBD to node3 drops. `drbdadm status` shows node3 as `Connecting` /
-  `StandAlone`. The data plane is unaffected — writes continue to
-  commit on the connected peers.
-- node3's `node-exporter` and `vm-exporter` are still scraped via the
-  LAN (we scrape by host IP, not drbd_ip). The dashboard shows node3
-  as **Online**, but its DRBD tiles show it missing from the peer list.
+  `StandAlone`. The data plane is unaffected — writes keep committing on
+  the connected peers.
+- node3's `node-exporter` (9100) and `vm-exporter` (9177) run on every
+  node and are still scraped — they ride the LAN/loopback path, not the
+  DRBD link. The dashboard shows node3 as **Online**, but its DRBD tiles
+  show it missing from each resource's peer list.
 
 From node3's side:
 
 - All its DRBD peers show `Connecting` / `StandAlone`. Its local disks
-  are still `UpToDate`, but it's out of the cluster from a data perspective.
-- It can still run cattle VMs. Any pet/ViPet it previously hosted as
-  Secondary keeps running as Secondary (no writes — waiting for peer).
-- If node3 was the Primary of a VM, it stops accepting acks from peers;
-  depending on `on-no-data-accessible` policy (default: freeze I/O) the
-  VM may stall or (with `io-error`) get I/O errors. Bedrock's default
-  does not explicitly set this — DRBD falls back to its own default.
+  are still `UpToDate`, but it is out of the cluster from a data
+  perspective.
+- It keeps running cattle VMs (local thin LV, no DRBD). Any pet/vipet it
+  hosted as Secondary keeps running as Secondary — no writes, waiting for
+  a peer.
+- If node3 was the Primary of a pet/vipet, its DRBD writes stop being
+  acked by peers. The default config sets `after-sb-0pri
+  discard-zero-changes` but does not set `on-no-data-accessible`, so DRBD
+  uses its own default for the in-flight-I/O behaviour.
 
-**Automatic action**: none, by design. node3 alone cannot safely decide
-it has the "right" state — it might be the one that's wrong.
+**Automatic action**: none on the isolated minority side, by design.
+node3 alone is below quorum and cannot safely decide it holds the right
+state. On the majority side, the weighted vote (below) keeps the master
+role and storage live without any operator action.
 
 **Operator action**: fix the DRBD link. On recovery, DRBD partial-resync
 catches node3 up and the cluster re-converges.
 
 ### Shape B — DRBD ring split
 
-Same as A for node3 specifically. The majority (node1+node2 for pet, or
-any two-of-three for ViPet) continues serving. DRBD's `after-sb-0pri
-discard-zero-changes` + generation UUIDs + the operator-run witness
-ensure no split-brain.
+For node3 specifically, same as Shape A. The majority (node1+node2 for a
+pet, any two-of-three for a vipet) keeps serving. `after-sb-0pri
+discard-zero-changes` + generation UUIDs + the witness slot check ensure
+no split-brain.
 
-If **both halves** try to promote, that's split-brain — see
+If **both halves** try to promote, that is split-brain — see
 [`split-brain.md`](split-brain.md).
 
 ### Shape C — mgmt LAN split, DRBD intact
 
-Replication continues across the DRBD ring; the data is safe. But:
+Replication continues across the DRBD ring; the data is safe. But the
+mgmt API collects per-node state by SSH to each node's LAN host IP, so:
 
-- Operator on LAN segment A can reach node1 only.
-- Operator on LAN segment B can reach node2, node3.
+- Operator on LAN segment A reaches node1 only.
+- Operator on LAN segment B reaches node2, node3.
 - The dashboard on whichever node runs mgmt has partial visibility: it
-  can't SSH to the other segment's hosts, so those tiles go red.
+  cannot SSH to the other segment's hosts, so those node tiles go red
+  (`online: false`).
 
-**Behaviour**: both segments observe what they can. No action is
-automatic. If the operator tries to migrate a VM through the dashboard,
-it either succeeds within the reachable segment or fails with SSH
-timeout to unreachable nodes. The log panel shows:
+**Behaviour**: each segment observes what it can. No action is automatic.
+A `bedrock vm migrate` succeeds within a reachable segment or fails when
+the target is unreachable — the migrate saga's `virsh migrate --live` to
+`qemu+ssh://root@<target-loopback>/system` cannot open the SSH channel.
+The log panel shows:
 
 ```
 VM foo migration FAILED from nodeA to nodeB: ssh: connect to host nodeB
@@ -88,71 +96,119 @@ VM foo migration FAILED from nodeA to nodeB: ssh: connect to host nodeB
   level=error
 ```
 
-**Operator action**: fix LAN. Or, if the split is expected (e.g.,
-maintenance on a switch), drain workloads to one segment first via
-`bedrock vm migrate` and plan accordingly.
+**Operator action**: fix the LAN. If the split is planned (e.g. switch
+maintenance), drain workloads to one segment first via
+`bedrock vm migrate`.
 
-## The witness + quorum principle
+## The witness + weighted-vote principle
 
-The failover orchestrator (`bedrock-failover.py`, scaffolded but not yet
-fully wired on the sim cluster) uses 2-of-3 quorum: promote only if the
-witness agrees AND the majority of peers agree. This prevents Shape B
-from escalating to split-brain:
+Failover is decided per node by a pure weighted-vote election
+(`installer/lib/election.py`), run once per second inside `bedrock-d`'s
+netd thread. It needs no rqlite — it is what *recovers* rqlite.
+
+Vote model (`node = 100`, `witness = 1`):
 
 ```
-  node1 loses contact with node2 and node3 (partition):
-    witness says:  node2 and node3 alive
-    peers say:     cannot reach any peer
-    → no quorum; I do NOT promote
-
-  node2 and node3 lose contact with node1:
-    witness says:  node1 alive (it's behind a partition, not dead)
-    peers say:     each other alive, node1 not
-    → witness disagrees with peers; conservative: no promote
+  total    = 100·active_nodes + configured_witnesses     (from rqlite)
+  majority = total // 2 + 1
+  my_votes = 100·(self + ACKing peers) + valid_witnesses
 ```
 
-If the witness can distinguish "partitioned" from "dead" (it's on a
-different power domain / different path), its vote is the tiebreaker.
-Bedrock's witness runs on the MikroTik switch — in the same room but on
-a separate PSU and separate uplink, which is enough for most LAN
-partition cases.
+A peer's 100 votes are an **active ack**, not passive reachability: a
+peer grants them only once it too has lost the master AND finds the
+candidate's advertised arbiter-DRBD UUID eligible. A witness adds its 1
+vote only when it is reachable AND reflects our own slot write-back;
+otherwise it counts 0 in `my_votes` but still counts in `total` — which
+raises the bar and biases toward "do not fail over". A witness can only
+ever break an exact node-tie, never overrule a real node.
+
+This is what stops Shape B from escalating to split-brain:
+
+```
+  node1 loses contact with node2 and node3:
+    my_votes = 100·(self) + witness     ≈ 100
+    total    = 300 (+ witnesses), majority = 151
+    → 100 < 151 → NoQuorum; node1 does NOT promote
+
+  node2 + node3 lose contact with node1:
+    my_votes = 100·(self + acking peer) = 200 (+ witness)
+    → 200 ≥ 151 → quorum; lowest-loopback-octet of the two promotes,
+      the other defers a tick and acks it (deterministic tiebreak)
+```
+
+Timing (election tick 1 s):
+
+- A survivor promotes at `MASTER_LOSS_MISSES = 10` (~10 s after the
+  master's heartbeats stop).
+- An isolated master self-demotes at `SELF_DEMOTE_MISSES = 9` (~9 s, one
+  second earlier) so the `.254` arbiter VIP is never on two nodes at once.
+- An isolated master that *restarts* mid-partition reads all active nodes
+  from rqlite, sees `n_nodes = N`, and falls to NoQuorum instead of
+  faking a single-node cluster.
+
+The witness is **BedRock Echo** on UDP 12321 — a passive per-node K/V
+slot store, ChaCha20-Poly1305 over msgpack. Each node owns one slot
+(key = loopback last octet), writes it every second and reads the others
+to decide arbiter takeover. A slot is stale after `SLOT_STALE_MS = 10000`.
+Echo runs on a separate power domain and path from the nodes (an ESP32
+appliance in production; `testbed/bedrock_echo_stub.py` on the testbed),
+so it can distinguish "partitioned" from "dead" and serve as the
+tiebreaker for an exact node split.
+
+## What actually moves the VMs
+
+On a node that loses quorum, the arbiter and VM failover paths run
+inside `bedrock-d` (`bedrock_d/orchestrator/vm_failover.py`,
+`installer/lib/cluster_arbiter.py`) with no operator action:
+
+- The isolated minority side suspends its local pet/vipet VMs ~20 s after
+  the connection drops (RAM-frozen, no disk writes). Cattle are left
+  alone.
+- The surviving majority side takes over each VM where it is next in
+  `vms.failover_order` ~35 s in: `drbdadm disconnect` → `primary` →
+  record the new UUID in rqlite → strong-read safety check → `virsh
+  start` → `UPDATE vms SET host = me`.
+- A VM still down **5 minutes after quorum loss** is killed on the
+  isolated side (the clock runs from the connection drop, not from
+  suspend); it has been taken over elsewhere by then.
+
+The arbiter takeover (`.254` VIP + arbiter rqlite + SeaweedFS filer)
+uses only the witness slot read plus local commands (`drbdadm`, `ip`,
+`mount`, `systemctl`) with an exact arbiter-UUID match — no rqlite, since
+rqlite is the service being recovered.
 
 ## Recovery
 
 For every partition shape:
 
 1. Restore the failed link.
-2. DRBD reconnects automatically (if `auto-promote-timeout` policies
-   haven't kicked in to force StandAlone). Partial resync runs.
-3. The state push loop picks up the re-arrived nodes on the next 3 s
-   tick; dashboard tiles flip back to Online.
-4. No data loss *for writes that were quorum-acked*. Any writes on a
-   minority-isolated node were either never acked (lost on link drop)
-   or are now in that node's DRBD activity log and will be reconciled
-   by resync.
+2. DRBD reconnects and runs a partial resync.
+3. The mgmt state collection picks up the re-arrived nodes on its next
+   ~3 s SSH poll; dashboard tiles flip back to Online.
+4. On quorum return, a still-suspended pet/vipet is resumed and dropped
+   from the kill record.
+5. No data loss for writes that were quorum-acked. Writes made on a
+   minority-isolated node were either never acked (lost on link drop) or
+   sit in that node's DRBD activity log and are reconciled by resync.
 
-## Log lines during a partition
+## Observability during a partition
 
-Bedrock today doesn't push dedicated "partition detected" events; it
-surfaces the symptoms:
+Bedrock surfaces the symptoms rather than a dedicated "partition" event:
 
-- State push loop: affected nodes move to `online: false` (visible as
-  red dots in the sidebar and `-` tiles on `/hosts`). No push_log —
-  this is **observation**, not an action.
-- Any migrate / convert attempt that crosses the partition will fail
-  with an SSH error; `_vm_migrate` pushes a push_log at level=error.
-- Kernel log (`journalctl -k`) on each side shows DRBD connection drops
-  and reconnect attempts.
-
-A future improvement is to push a `push_log` event from the state loop
-when a node transitions `online=true` → `online=false` so the Recent
-Logs panel captures the moment.
+- The mgmt state collection moves unreachable nodes to `online: false`
+  (red dots in the sidebar, `-` tiles on `/hosts`). This is observation,
+  not an action — no `push_log`.
+- Any migrate/convert that crosses the partition fails with an SSH error;
+  that path emits a `push_log` at `level=error`.
+- `journalctl -k` on each side shows DRBD connection drops and reconnect
+  attempts.
+- The takeover/suspend/kill steps log under `bedrock.vm_failover`.
 
 ## Related
 
-- [`split-brain.md`](split-brain.md) — what to do if both sides
-  promoted during the partition.
-- [`power-loss-primary.md`](power-loss-primary.md) — special case of
-  partition where one side is just dead, not isolated.
+- [`split-brain.md`](split-brain.md) — what to do if both sides promoted
+  during the partition.
+- [`power-loss-primary.md`](power-loss-primary.md) — partition where one
+  side is dead, not isolated.
 - [`node-rejoin.md`](node-rejoin.md) — the clean rejoin path after the
   link comes back.

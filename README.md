@@ -8,11 +8,9 @@ dashboard.
 No corosync. No PVE framework. Just plain libvirt + DRBD + LVM with
 a thin orchestrator on top.
 
-> **Status** — pushing v1.0. Cluster state (rqlite), the mesh/election/witness
-> protocol, dashboard, VM lifecycle (cattle / pet / vipet), live migration,
-> import/export, and backups (Kopia, S3 / S3-compatible / filesystem) are
-> working end-to-end on the testbed. Hardening + power-yank validation are the
-> remaining items.
+Cluster state lives in rqlite. The mesh/election/witness protocol, dashboard,
+VM lifecycle (cattle / pet / vipet), live migration, import/export, and backups
+(Kopia to S3 / S3-compatible / filesystem) all run as one Python daemon per node.
 
 ## What's in here
 
@@ -30,9 +28,6 @@ a thin orchestrator on top.
 ├── installer/                  ← OOB install flow served over HTTP
 │   ├── install.sh              ← `curl … | bash` bootstrap
 │   ├── lib/                    ← Python libraries (state, daemon_setup, etc.)
-│   ├── lib/rustfs-patches/     ← upstream RustFS bug-fix patches (kept for the
-│   │                              issue at rustfs/rustfs#2795 — RustFS isn't
-│   │                              shipped in v1.0 but may return in v1.1+)
 │   ├── bedrock                 ← the operator CLI
 │   └── mgmt.tar.gz             ← packaged dashboard (FastAPI + Svelte build)
 ├── mgmt/                       ← dashboard service (runs in bedrock-d)
@@ -46,16 +41,15 @@ a thin orchestrator on top.
 │   └── novnc/                  ← bundled noVNC for in-browser console
 ├── testbed/                    ← nested-KVM lab harness (spawn 1–4 sim nodes,
 │                                 install repo HTTP server, e2e test)
-└── dev-witness/                ← legacy dev-witness; today's witness is the
-                                  passive UDP/12321 echo (see
-                                  docs/cluster-quorum-spec.md)
+└── dev-witness/                ← Python Bedrock-Echo witness for local dev; the
+                                  production target is the Bedrock-Echo ESP32
+                                  firmware (passive UDP/12321 AEAD K/V store)
 ```
 
-> **Note**: there is no separate `rust/bedrock-rust/` directory in
-> the current tree. The May-2026 rewrite unified the realtime
-> netd, mgmt, and orchestrator components into a single
-> `bedrock-d` Python process. See
-> [`docs/daemon-unification.md`](docs/daemon-unification.md).
+The whole node runs as one Python daemon, `bedrock-d`: the realtime netd
+(mesh, election, witness, `.254` arbiter, routing) on its own thread, plus
+the asyncio mgmt/orchestrator. See
+[`docs/daemon-unification.md`](docs/daemon-unification.md).
 
 ## How the pieces connect at runtime
 
@@ -94,7 +88,7 @@ a thin orchestrator on top.
                   └─────┬───────────────┘     (passive AEAD K/V slot store)
                         ▼
                   ┌──────────────────┐
-                  │ libvirtd, DRBD,  │ ── unchanged stock pieces
+                  │ libvirtd, DRBD,  │ ── stock pieces
                   │ qemu-kvm, LVM,   │
                   │ SeaweedFS,       │
                   │ kopia (backup)   │
@@ -118,7 +112,7 @@ first. See `docs/actions/init-cluster.md` and `docs/actions/join-cluster.md`.
 
 ## Backups
 
-v1.0 ships a **Kopia-based** backup engine integrated into the dashboard:
+A **Kopia-based** backup engine is integrated into the dashboard:
 
 - **Set a target** at `/backups` — S3 / S3-compatible (Wasabi, B2, R2, MinIO,
   QNAP-S3, …) or a filesystem path. Encryption password is set **once**;
@@ -136,21 +130,8 @@ v1.0 ships a **Kopia-based** backup engine integrated into the dashboard:
   maintenance run` from the master.
 
 See [`docs/snapshots-and-backup.md`](docs/snapshots-and-backup.md) for the
-full v1 architecture and `docs/actions/backup-*.md` /
+architecture and `docs/actions/backup-*.md` /
 `docs/actions/vm-{backup,restore}.md` for per-action sequence diagrams.
-
-## RustFS patches (v1.1 candidate)
-
-`installer/lib/rustfs-patches/` holds the patch series for the RustFS
-shared-lock leak we found and reported upstream
-([`rustfs/rustfs#2795`](https://github.com/rustfs/rustfs/issues/2795)),
-plus the reproducer + sweep results referenced from that issue.
-
-RustFS is **not** shipped as a backend in v1.0 — Kopia + S3-compatible
-target is the v1 path. RustFS is a candidate for v1.1+ once the upstream
-fixes land (we're tracking the patches we applied locally). The artifacts
-under `installer/lib/rustfs-patches/` and `docs/scenarios/rustfs-*.md` are
-kept stable so the bug-report links keep resolving.
 
 ## Documentation
 
@@ -178,9 +159,9 @@ nohup ./serve.py &        # serve installer over :8000
 ./test_e2e.sh             # full multi-scenario validation
 ```
 
-The testbed mirrors the v1 layout: each sim plugs into the LAN bridge
-(DHCP-assigned `192.168.2.x`) plus three isolated mesh bridges
-(`bedrock-mesh-{1,2,3}`). bedrock-net discovers per-NIC link-local
+The testbed mirrors the production layout: each sim plugs into the LAN bridge
+(static `192.168.2.20x`, above the router's DHCP pool) plus three isolated mesh
+bridges (`bedrock-mesh-{1,2,3}`). bedrock-net discovers per-NIC link-local
 addresses via NetworkManager, builds the cluster path table, and
 installs metric-ordered host routes for the per-cluster `/24` it
 derives from `cluster_uuid` inside RFC 6598 (`100.64.0.0/10`). See

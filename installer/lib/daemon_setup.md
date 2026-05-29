@@ -1,37 +1,52 @@
-# `daemon_setup.py`
+# installer/lib/daemon_setup.py
 
-**Module purpose.** Cluster-key bootstrap. The historical job —
-rendering `/etc/bedrock/daemon.toml` and starting the
-bedrock-rust daemon — is gone (Rust deleted in P4 of the May-2026
-rewrite). Only the surviving helper lives here.
+Cluster-key bootstrap. Owns `/etc/bedrock/cluster.key`, the 32-byte shared secret
+every node uses to HMAC-sign and verify mesh traffic (HMAC-SHA256 over the UDP
+probe/advert/heartbeat). Called at install time by `mgmt_install` on the master and
+`agent_install` on a joiner: the master mints the key and ships the bytes back over
+the join handshake, and the joiner persists those same bytes so both ends share one
+secret.
 
-The HMAC key is a 32-byte shared secret used by `lib.witness.py`
-to sign Echo probes/heartbeats/claims. Master generates it on
-`bedrock init`; joiners receive it in the join-approval response
-and call `write_cluster_key(material)` to persist it.
+## Functions / Classes
 
-## Constants
+### `write_cluster_key(material: bytes | None = None) -> bytes`
+Write (or preserve) the node's cluster HMAC key.
+- **In:** `material` — an optional 32-byte key to install (the master's key, handed
+  to a joiner). When omitted, a fresh random 32-byte key is generated via
+  `secrets.token_bytes(32)`.
+- **Out:** returns the 32-byte key. Side effects: creates `/etc/bedrock` (parents)
+  if needed and writes `/etc/bedrock/cluster.key` mode `0o600`. If the key file
+  already exists, it is left untouched and its bytes are returned (idempotent).
+  Raises `ValueError` if a supplied `material` is not exactly 32 bytes. No
+  subprocess, no rqlite, no services.
 
-- `CLUSTER_KEY = /etc/bedrock/cluster.key`.
+## How it works
 
-## Functions
+```
+write_cluster_key(material)
+        |
+        v
+  cluster.key exists? --yes--> read_bytes() -> return  (no write, material ignored)
+        |
+        no
+        v
+  mkdir -p /etc/bedrock
+  key = material or secrets.token_bytes(32)
+  len(key) == 32 ? --no--> raise ValueError
+        |
+        yes
+        v
+  write_bytes(key); chmod 0o600 -> return key
+```
 
-- `write_cluster_key(material=None) -> bytes` — idempotent. If
-  the file already exists, returns its bytes (preserves the
-  master's key across re-runs of `bedrock init`). Otherwise
-  uses `material` if given, else generates 32 random bytes via
-  `secrets.token_bytes(32)`. Writes mode 0o600. Returns the key
-  bytes for the master to ship back in the join-approval JSON.
+The existence check runs first, so a re-run never rotates or clobbers an established
+key — the call is safe on every install/join, and the length validation only runs on
+a genuine first write. The master calls it with no `material` to generate the secret
+and returns the bytes; the joiner calls it with those exact bytes so the whole
+cluster holds one key.
 
-  Raises `ValueError` if `material` is not exactly 32 bytes.
+## Why
 
-This module file is intentionally tiny (~30 lines). Callers:
-
-- `mgmt_install.install_full` — `daemon_setup.write_cluster_key()`
-  with no args at init.
-- `agent_install.install` — `daemon_setup.write_cluster_key(
-  bytes.fromhex(approval["cluster_key_hex"]))` at join.
-
-The file name + path stay because both callers import
-`from . import daemon_setup`. Renaming it would force a sweep
-of the install paths for no real benefit.
+A single stable shared secret must exist on every node so HMAC-signed mesh traffic
+verifies across the cluster; the idempotent write keeps that key constant across
+re-runs and reboots rather than regenerating it.

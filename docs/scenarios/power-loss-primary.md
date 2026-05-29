@@ -1,9 +1,8 @@
 # Scenario: primary node power loss (VM failover)
 
-The node that is **running** a pet/ViPet VM — DRBD Primary, QEMU process,
-writable mount — loses power or crashes hard. The VM stops instantly.
-Bedrock must detect the loss, promote a surviving peer to Primary, and
-restart the VM there.
+The node **running** a pet/vipet VM — DRBD Primary, QEMU process, writable
+mount — loses power or crashes hard. The VM stops instantly. Bedrock detects
+the loss, promotes a surviving peer to Primary, and restarts the VM there.
 
 ## State before
 
@@ -12,127 +11,144 @@ Pet example:
 ```
    node1 (P, mgmt)                node2 (S)
   ┌──────────────┐               ┌──────────────┐
-  │  VM foo ←──  │               │              │
-  │  DRBD Primary│═══════════════│  DRBD Sec.   │
-  │  UpToDate    │               │  UpToDate    │
+  │  VM foo ←──   │               │              │
+  │  DRBD Primary │═══════════════│  DRBD Sec.   │
+  │  UpToDate     │               │  UpToDate    │
   └──────────────┘               └──────────────┘
 ```
 
-ViPet: same but with a 3rd Secondary on node3.
+vipet: same with a 3rd Secondary on node3.
 
 ## What happens
 
-1. **T=0 — node1 dies.** QEMU process gone. DRBD connection drops.
-   libvirtd gone. mgmt dashboard gone (if node1 was the mgmt host).
-2. **Immediately**: any in-flight writes the VM had issued but not yet
-   ACKed to the guest are lost. Writes that had already been ACKed to
-   the guest were also ACKed by the peer (protocol C = synchronous),
-   so the peer's disk is byte-identical up to the last completed write.
-3. **~6 s**: DRBD on peers notes the connection drop. `drbdadm status`
-   on node2 shows peer node1 as `Connecting` or `StandAlone` depending
-   on `after-sb-0pri` policy. Its own disk is still `UpToDate`. It is
-   still Secondary — DRBD9 does **not** auto-promote on peer loss.
-4. **Meanwhile the witness** (if configured) observes node1's heartbeat
-   stop. After `witness.miss_count` consecutive misses (default 3) it
-   marks node1 dead and publishes that to its `/status` endpoint.
+1. **T=0 — node1 dies.** QEMU gone, DRBD connection drops, libvirtd gone,
+   mgmt dashboard gone if node1 hosted it.
+2. **Immediately**: in-flight writes the guest issued but never got an ACK for
+   are lost. Anything already ACKed to the guest was also ACKed by the peer
+   (protocol C = synchronous), so the peer's disk is byte-identical up to the
+   last completed write.
+3. **~6 s**: DRBD on peers notes the connection drop. `drbdadm status` on node2
+   shows peer node1 `Connecting` or `StandAlone`. node2's own disk stays
+   `UpToDate`. It is still Secondary — DRBD9 never auto-promotes on peer loss.
+4. **Mesh**: peers stop hearing node1's heartbeat (`bedrock-d` netd tracks
+   each neighbour's `last_seen`).
 
-## What Bedrock currently does
+## What Bedrock does
 
-In v0.1 the failover orchestration is described in the plan but not yet
-fully automated on the sim cluster. The physical-lab validation (25-run
-migration test) proved the forward path; the backward path (autonomous
-VM promotion) is a **manual step** for now:
-
-```bash
-# on a surviving peer, typically the one with the most recent data
-# (any UpToDate peer is fine; DRBD9 resolves consistency automatically)
-drbdadm primary --force vm-foo-disk0
-virsh start foo
-```
-
-Once the surviving node holds the DRBD Primary and has the VM defined
-in its libvirt (pet/ViPet VMs are defined on all peers via the convert
-path — see [`../actions/vm-convert.md`](../actions/vm-convert.md)), `virsh
-start` brings the VM up from the last ACK'd block state.
-
-### What the orchestrator *will* do (follow-up)
-
-`bedrock-failover.py` (already in the repo root as a scaffold) is the
-daemon that each node runs. Its 2-of-3 quorum logic:
+Failover is automated by the three-task state machine in
+[`../../bedrock_d/orchestrator/vm_failover.py`](../../bedrock_d/orchestrator/vm_failover.py),
+running inside `bedrock-d` on every node. Two independent clocks drive it:
+the **dying side** suspends its own VMs, and the **surviving peer** takes them
+over. Both keep off split-brain — neither acts without a clear signal.
 
 ```
-  every 2s:
-    ask witness  : is node1 alive? (result A)
-    ping node1   : TCP 22 and 9100 reachable? (result B)
-    ask peers    : what do you see? (result C)
-    if A==dead AND B==dead AND C confirms:
-       I am the failover target (lowest node_id among live peers with UpToDate)
-       promote DRBD, virsh start, push_log to mgmt
+  on the surviving peer (every 5 s tick):
+    if rqlite has quorum
+       AND a known peer's last_seen >= 35 s (mesh-neighbour view):
+      for each VM with vms.host == dead_peer
+          AND peers_after_dead(vms.failover_order, me, dead_peer):   # I'm next in line
+        drbdadm disconnect <each disk>     # stop refused inbound replication
+        drbdadm primary    <each disk>     # bumps DRBD current-UUID
+        record_uuid_after_promote          # write new UUID to rqlite (quorum-confirmed)
+        is_safe_to_start_vm                # STRONG-read: local UUID == recorded UUID?
+        virsh start                        # VM is already defined on every peer (create/convert)
+        UPDATE vms SET host = me
 ```
 
-The gate is quorum: a node alone (disconnected from witness and peers)
-does **not** promote — prevents split-brain in network-partition cases.
+Targeting is deterministic: `vms.failover_order` (set at create/convert) picks
+exactly one next-in-line peer, so two survivors never both promote the same VM.
+
+The pre-start safety check refuses takeover unless the local DRBD current-UUID
+matches the cluster's recorded UUID (strong read, forcing a Raft round-trip).
+A mismatch means the local copy is behind or a later takeover already happened
+elsewhere — promoting would lose writes, so it refuses and logs for the
+operator.
+
+### Quorum gate (the dying side)
+
+When node1's own weighted vote falls below majority, netd's election layer
+drops `/run/bedrock-no-quorum`. ~5 s after that marker (≈T+20 wall-clock from
+the partition) `bedrock-d` suspends every local pet/vipet VM and records each
+in `/var/lib/bedrock/suspended-vms.json`, keyed by the marker mtime
+(quorum-loss start). A node that cannot see quorum therefore freezes its VMs
+rather than keep writing — so even if the surviving peer were wrong, the dead
+side is not racing it with new writes.
+
+A suspended VM that is still down **5 minutes after quorum loss** (clock runs
+from the marker mtime, not from suspend) is `virsh destroy`ed — by then the peer
+holds it, and the frozen local copy is only consuming RAM. Recovery on quorum
+return resumes any VM still suspended inside that window (see *Recovery* below).
+
+Election weights (`installer/lib/election.py`): node = 100, valid+confirmed
+witness = 1; `majority = (100·active_nodes + configured_witnesses)//2 + 1`. A
+configured-but-invalid witness raises the bar and biases toward "don't fail
+over". Survivor promotes at `MASTER_LOSS_MISSES = 10` (~10 s); an isolated
+master self-demotes at 9 (~9 s, one tick earlier, so `.254` is never on two
+nodes at once).
+
+The **witness** is BedRock Echo — a passive per-node K/V slot store on UDP
+12321 (ChaCha20-Poly1305 over msgpack), one slot per node. It is consulted for
+the *arbiter* (`.254` rqlite/SeaweedFS singleton) takeover, not for per-VM
+failover, which keys off the mesh-neighbour view + rqlite quorum above.
 
 ## What the operator sees
 
 | Where | What |
 |---|---|
-| Dashboard — if mgmt was on node1 | Page stops loading / WS disconnect (browser auto-reconnects forever). Operator moves to cockpit on a surviving node and manually promotes. |
-| Dashboard — if mgmt on another node | node1 dot red, VM tile shows `running_on=(unreachable)`, DRBD role last-known `Primary`. |
-| Recent Logs | `push_log` was never called from node1 at failure time (it was SIGKILL'd). Surviving mgmt can log a witness-driven "Node X dead" event (future) or the operator's manual `virsh start`. |
-| witness `/status` | `nodes.node1.alive=false` within ~6–10 s. |
+| Dashboard — if mgmt was on node1 | Page stops loading / WS disconnect (browser auto-reconnects). Reach the dashboard on any surviving node — every node serves it on `:8443`. |
+| Dashboard — if mgmt on another node | node1 dot red; VM tile flips `running_on` to the takeover peer within ~35–45 s once `vms.host` is updated. |
+| `journalctl -u bedrock-d` on the takeover peer | `vm_failover: TAKEOVER COMPLETE — VM 'foo' now running on <me>`, or a refusal with the UUID-mismatch reason. |
+| rqlite `vms` table | `host` rewritten to the takeover peer; `drbd_resources.current_uuid` bumped to the post-promote value. |
 
 ## Recovery — node1 returns
 
-Once node1 comes back up and rejoins:
+1. DRBD comes up (`drbdadm up`), connects, and finds itself `Outdated` — its
+   last UpToDate generation is older than the now-primary peer.
+2. It enters `SyncTarget` and resyncs the delta. The VM keeps running on the
+   new primary throughout (the returning node is a read-only shadow during
+   resync).
+3. When both are `UpToDate`, the operator may live-migrate back to node1 — see
+   [`../actions/vm-migrate.md`](../actions/vm-migrate.md).
 
-1. DRBD resources come up with `drbdadm up`. They connect to peers and
-   discover they are `Outdated` (their last UpToDate generation is
-   older than the now-primary peer).
-2. They enter `SyncTarget` state and resync the delta from the new
-   primary. Meanwhile the VM keeps running on the new primary with full
-   I/O (the old primary is a read-only shadow during resync).
-3. When resync completes, both are `UpToDate`. At this point the
-   operator (or orchestrator) may choose to live-migrate back to node1
-   — see [`../actions/vm-migrate.md`](../actions/vm-migrate.md).
+If node1 was suspended (not killed) before quorum returned, `bedrock-d`'s
+recovery path strong-reads the `vms` table: if `vms.host` still names node1 and
+the VM is `running`, it `virsh resume`s and drops it from the suspended record;
+if a peer took over, it `virsh destroy`s the stale local copy and `drbdadm
+secondary`s the resource so DRBD resyncs from the new primary.
 
 ### Split-brain variant
 
-If the old primary stayed up long enough after the failover to accept
-any writes (e.g., the new primary was promoted while the old was
-temporarily disconnected but still running), both disks diverge.
-See [`split-brain.md`](split-brain.md) for resolution.
+If the old primary kept accepting writes after the failover (promoted while the
+old primary was briefly disconnected but still running), both disks diverge —
+the UUID-match safety check refuses an unsafe start, but a genuine split-brain
+still needs resolution. See [`split-brain.md`](split-brain.md).
 
 ## Impact per workload type
 
 | Type | Data integrity | Recovery |
 |---|---|---|
-| cattle on dead node | VM is gone; local LV is intact on disk but inaccessible until reboot. | Power on node; VM auto-restarts on libvirtd startup (XML still defined locally). |
-| pet on dead node | No data loss beyond the last un-ACKed write. | Manual (today) or auto (orchestrator) promote on peer + `virsh start`. |
-| ViPet on dead node | Two surviving Secondaries. Either can become Primary — DRBD9 elects via generation UUIDs (the one with the latest is preferred). | Same as pet but with higher resilience (one more Secondary can die). |
+| cattle on dead node | VM gone; local LV intact on disk but inaccessible until reboot. No DRBD, no failover. | Power on node; VM auto-restarts (XML defined locally, libvirtd auto-starts it). |
+| pet on dead node | No loss beyond the last un-ACKed write. | Peer takes over automatically (~T+35); `virsh start` from the last ACKed block state. |
+| vipet on dead node | Two surviving Secondaries; one becomes Primary. | Same as pet, one more Secondary can die before data is at risk. |
 
 ## The 2-node trap
 
-A 2-node pet cluster where the **primary** dies has a 50 / 50 split-brain
-risk if the surviving Secondary promotes blindly and the old primary
-returns first with its own unreplicated writes. The witness is the third
-voice that lets the survivor decide safely:
+A 2-node pet cluster whose **primary** dies risks split-brain if the survivor
+promotes blindly and the old primary returns first with its own unreplicated
+writes. The witness is the third voice: with a valid witness the survivor's
+vote clears majority and it promotes safely; without one, a lone survivor's
+100 votes fall short of `majority` for a 2-node + 1-configured-witness cluster
+(total 201, majority 101) when the witness is unreachable, so it stays
+NoQuorum and refuses — safety over availability.
 
-```
-   survivor asks:
-      - witness: node1 is dead (confirmed)
-      - node3:   (n/a, only 2 nodes)
-   → witness says dead, I'm the only UpToDate left
-   → promote, start VM
-```
-
-Without a witness, the safe manual procedure is: **do not promote until
-the operator confirms the old primary is not coming back with newer
-data**. If in doubt, power it off permanently before promoting.
+If a witness is genuinely unavailable and the operator must promote by hand,
+confirm the old primary is **not** coming back with newer data first; if in
+doubt, power it off permanently before promoting.
 
 ## Related
 
 - [`power-loss-secondary.md`](power-loss-secondary.md) — easy case.
 - [`power-loss-all.md`](power-loss-all.md) — total outage.
+- [`network-partition.md`](network-partition.md) — split with no node loss.
 - [`split-brain.md`](split-brain.md) — diverged writes.
 - [`node-rejoin.md`](node-rejoin.md) — clean rejoin after outage.

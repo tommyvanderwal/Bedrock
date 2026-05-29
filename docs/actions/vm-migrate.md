@@ -18,22 +18,26 @@ Migrate runs through the VM-lifecycle saga executor on the master.
 
 ## Preconditions
 
-- VM is **running** (`state=="running"`).
-- VM has a DRBD resource. Cattle has none, so the saga's
-  `validate_request` step rejects it (surfaced as a 500 — see failure
-  modes; the dashboard greys the button so this is an API-only path).
-- `target_node` is in the resource's peer set (a node in rqlite `nodes`)
-  and reachable; `target_node != source_node`.
+- VM is **running**. QEMU live migration copies RAM state, so a stopped
+  domain has nothing to migrate. The saga does not gate on VM state; it
+  relies on `virsh migrate` to fail cleanly if the domain isn't active.
+- VM has a DRBD resource. Cattle has none, so `validate_request` rejects
+  it (surfaced as a 500 — see failure modes; the dashboard greys the
+  button, so this is an API-only path).
+- `target_node` is in the resource's peer set (`drbd_resources.peers`)
+  and reachable; `target_node != source`.
 - Passwordless `ssh root@<target-loopback>` works from the source node
   (SSH mesh established at join time).
-- Target node has the VM **defined** in libvirt — the convert and create
-  paths handle this; manual XML edits may leave it undefined.
+- Target node has the VM **defined** in libvirt — the create path handles
+  this; manual XML edits may leave it undefined.
 
 ## Sequence
 
 ```
   T=0    POST /api/vms/NAME/migrate  {"target_node":"<dst>" | null}
-         │  api_vm_migrate → _run_vm_saga("vm_migrate", …) on the master
+         │  api_vm_migrate: null target → the VM's backup_node
+         │  (400 if it has none). Then _run_vm_saga("vm_migrate", …)
+         │  on the master.
          │
   step 1 validate_request
          │   → confirm VM has replicated record (cattle rejected),
@@ -92,34 +96,37 @@ Migrate runs through the VM-lifecycle saga executor on the master.
          │     drbdadm net-options --allow-two-primaries=no {r}
   step 8 update_vms_host
          │   UPDATE vms SET host=<dst>, updated_at=… WHERE vm_name=NAME
-         │   → bumps bedrock_meta.revision so every node's subscriber
-         │     sees the VM has moved
+         │   → the new home is now in rqlite; nodes re-reading the vms
+         │     table see the VM has moved
          │
          │ _run_vm_saga returns 200 {
          │   "op_id": <N>, "state": "completed", "last_step": "update_vms_host"
          │ }
          │ (a saga failure raises 500 with the failing step + error)
          │
-  (async) next rqlite revision tick broadcasts the new host; the VM
-          tile in the dashboard updates.
+  (async) the dashboard reflects the new host on its next read of the
+          vms table.
 ```
 
 ## Log lines
 
-The saga doesn't emit a single "migrated" event line; progress is per
-step. Watch the daemon journal on the master:
+There is no single "migrated" event line; progress is per step. The saga
+executor logs one line per step, plus the migrate saga's own UUID line.
+Watch the daemon journal on the master:
 
 ```
 journalctl -u bedrock-d -f
-  vm_migrate: step enable_dual_primary on <src>/<dst>
-  vm_migrate: step virsh_migrate_live …
+  saga[vm_migrate] op=<N> run step=enable_dual_primary
+  saga[vm_migrate] op=<N> run step=virsh_migrate_live
   vm_migrate: recorded UUID for vm-NAME-disk0 = <12-hex>
-  vm_migrate: step update_vms_host → host=<dst>
+  saga[vm_migrate] op=<N> run step=update_vms_host
+  saga[vm_migrate] op=<N> COMPLETED
 ```
 
-**Failure**: the failing step's `drbdadm`/`virsh` stderr is captured in
-the saga's `error` field. HTTP response: `500` with
-`detail: "vm_migrate saga failed at step '<step>': <error>"`.
+**Failure**: the executor logs `saga[vm_migrate] op=<N> step=<step> FAILED:
+<error>` and stores the message in the operation's `error`. HTTP response:
+`500` with `detail: "vm_migrate saga failed at step '<step>': step
+<step>: <error>"` (the failing `drbdadm`/`virsh` stderr is in `<error>`).
 
 ## Why this exact order
 
@@ -152,10 +159,10 @@ the saga's `error` field. HTTP response: `500` with
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `500 vm_migrate saga failed at step 'validate_request': no replicated record for vm '<name>' (cattle VMs cannot migrate)` | Cattle has no DRBD resource; the saga's validate step rejects it. The UI greys the button, so this is an API-only path | Convert to pet first (see [`vm-convert.md`](vm-convert.md)). |
-| `Host key verification failed. Connection reset by peer` | known_hosts cold for the target's loopback | `ssh-keyscan -H <target_loopback> >> /root/.ssh/known_hosts` on src. The join saga's `prescan_peer_hostkeys` step covers this on fresh installs. |
+| `Host key verification failed. Connection reset by peer` | known_hosts cold for the target's loopback | `ssh-keyscan -H <target_loopback> >> /root/.ssh/known_hosts` on src. The join saga's `prescan_peer_hostkeys` scans peer LAN IPs, not loopbacks, so the loopback entry can still be cold. |
 | `Requested operation is not valid: domain is already active` | Stale VM on target | `virsh undefine <vm>` on target; it will be re-created on successful migrate. |
 | Migration aborts mid-way, VM resumes on src | QEMU detected dirty-page thrash / link saturation | Harmless — VM is still healthy on src. Retry with less load. |
-| Migrate succeeded, dashboard still shows the old host briefly | rqlite revision tick hasn't propagated yet | Wait a tick. The `event` log line arrives instantly; the tile updates once the subscriber projects the new `vms.host`. |
+| Migrate succeeded, dashboard still shows the old host briefly | the dashboard hasn't re-read the `vms` table yet | Wait for the next refresh; the tile updates once it re-reads the new `vms.host`. |
 | Migrate succeeded, DRBD split-brain after | Both sides accepted writes for an extended overlap | See [`scenarios/split-brain.md`](../scenarios/split-brain.md). |
 
 ## Operator perspective
@@ -166,4 +173,4 @@ the saga's `error` field. HTTP response: `500` with
 - VM clock is preserved (KVM + qemu-guest-agent). TCP connections are
   held open by memory-state continuity; clients typically don't notice.
 - The VM detail tile updates its host once the saga's `update_vms_host`
-  step lands and the next rqlite revision tick projects it on each node.
+  step commits and the dashboard re-reads the `vms` table.

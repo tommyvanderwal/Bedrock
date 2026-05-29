@@ -1,166 +1,156 @@
 # Saga: `cluster_tier_promote_master`
 
-**Module:** `bedrock_d/install/cluster_tier.py`  
-**Class:** `ClusterTierPromoteMaster`
+**Module:** `bedrock_d/install/cluster_tier.py` — class `ClusterTierPromoteMaster`
 
-## Purpose
+## Summary
 
-Convert the cluster-singleton tier (DRBD resource `cluster`) from a
-**local directory on the root FS** (N=1 mode) into a **DRBD primary**
-(N≥2 mode), preserving the on-disk contents (filer leveldb3,
-rqlite-arbiter data dir, S3 IAM database, cluster CA) byte-for-byte
-via DRBD external metadata.
+Converts the cluster-singleton tier (DRBD resource + tier name `cluster`,
+mounted at `/var/lib/bedrock/cluster`) from a plain directory on the root FS
+(N=1) into a **DRBD Primary** (N≥2), preserving the on-disk contents
+(SeaweedFS filer leveldb3, arbiter rqlite data dir, S3 IAM database) byte for
+byte. External DRBD metadata lives on its own LV, so the data LV is never
+rewritten during the move.
 
-Runs **on the mgmt-master only** — the node that currently holds
-`.254` and the live filer state. Pair this with
-[`cluster_tier_join_peer`](cluster_tier_join_peer.md) on the peer
-that will become DRBD Secondary.
+- **What:** local `cluster` singleton → DRBD Primary, mirrored to one peer.
+- **When:** the cluster first reaches N≥2 while the tier is still `mode=local`.
+- **Where:** runs on the mgmt-master only — the node holding `.254` and the
+  live filer state. The first peer runs
+  [`cluster_tier_join_peer`](cluster_tier_join_peer.md) to become Secondary.
+- **End state:** `tiers.cluster.mode == "drbd"` in rqlite; `/dev/drbd1101`
+  Primary + mounted at `/var/lib/bedrock/cluster`; singletons restarted;
+  `/etc/bedrock/cluster-drbd-ready` written so the arbiter promote can move
+  `.254` on a later failover.
 
-## Trigger
+**Trigger.** `cluster_tier_watcher()` in `mgmt/orchestrator.py` ticks every
+10 s, reading the rqlite snapshot via `cluster_state.load_cluster()`. It
+submits this saga when `mgmt_master == self`, `len(nodes) >= 2`, and
+`tiers.cluster.mode == "local"`. The peer is the lowest-octet other node. The
+watcher submits with `target_node = self` and runs it synchronously in a
+thread, then records the peer key in an in-memory set so it won't re-submit a
+completed or in-flight promote.
 
-The `cluster_tier_watcher()` task in `mgmt/orchestrator.py` polls
-every 10 s (reading the rqlite snapshot via
-`cluster_state.load_cluster()`) and submits this saga when ALL of:
-
-- `self == mgmt_master`
-- `len(nodes) >= 2`
-- `tiers.cluster.mode == "local"`
-
-are true. Submit happens via the saga executor with
-`target_node = self`, so the saga runs locally.
-
-The watcher tracks the submitted peer key in an in-memory set so it
-won't re-submit while a prior op is in flight or completed.
-
-## Inputs (`ctx`)
+**Inputs (`ctx`)**
 
 | key | type | meaning |
 |-----|------|---------|
-| `peer_node` | str | Name of the first peer to mirror to (lowest-octet other node) |
-| `peer_loopback` | str | The peer's `100.X.Y.Z/32` for the DRBD link address |
+| `peer_node` | str | First peer to mirror to (lowest-octet other node) |
+| `peer_loopback` | str | Peer's `100.X.Y.Z/32` for the DRBD link address |
 
-## Outputs (`ctx`)
+**Outputs (`ctx`)**
 
-| key | filled by | meaning |
-|-----|-----------|---------|
-| `_already_drbd` | `check_preconditions` | Short-circuit flag if the tier is already mode=drbd |
-| `_promote_result` | `promote_local_to_drbd` | Echo of `transition_to_n2_master`'s return dict |
+| key | set by | meaning |
+|-----|--------|---------|
+| `_already_drbd` | `check_preconditions` | Short-circuit flag when the tier is already `mode=drbd` |
+| `_promote_result` | `promote_local_to_drbd` | `transition_to_n2_master`'s return dict (`{"peers": [...]}`) |
 
-## Step overview
+**Steps**
 
 | # | Step | What it does |
 |---|------|--------------|
-| 1 | [`check_preconditions`](#check_preconditions) | Confirm self is still master + the `cluster` tier is still local + peer params are sane |
-| 2 | [`promote_local_to_drbd`](#promote_local_to_drbd) | The big move: stop singletons, snapshot leveldb3, umount local LV, create meta LV, write .res, drbdadm create-md/up/primary, mount DRBD device, restore snapshot, update fstab/symlinks, restart singletons |
-| 3 | [`record_tier_state_rqlite`](#record_tier_state_rqlite) | Mirror the new `tiers.cluster` row into rqlite so every node sees `mode=drbd` |
+| 1 | [`check_preconditions`](#1-check_preconditions) | Self is still master, tier still `local`, peer params sane |
+| 2 | [`promote_local_to_drbd`](#2-promote_local_to_drbd) | Stop singletons, snapshot data, create LV pair + `.res`, `create-md`/`up`/`primary`, mount, restore, fix fstab, restart singletons |
+| 3 | [`record_tier_state_rqlite`](#3-record_tier_state_rqlite) | Re-affirm `tiers.cluster` row so every node sees `mode=drbd` |
 
-## Revert
+## Detail
 
-There is no automated cluster_tier demote-to-local saga yet —
-`tier_storage.drbd_demote_to_local()` exists as a helper, intended
-for the operator's "shrink to N=1 / decommission cluster" path, but
-it isn't wrapped as a saga. v1.x candidate.
+### 1. `check_preconditions`
 
-Until then: if a promote leaves the cluster in a half-state, the
-operator can:
-1. `drbdadm down cluster && drbdadm wipe-md cluster` on both nodes
-2. `umount /var/lib/bedrock/cluster` on the master
-3. Restore the cluster-singleton dir back onto the root FS at
-   `/var/lib/bedrock/cluster`
-4. Hand-edit the `cluster` row in rqlite's `tiers` table back to
-   `mode = local`
+Read-only. Reads the cluster snapshot (`cluster_state.load_cluster()`) and
+raises to abort when:
 
-## Idempotency / resume
-
-- `check_preconditions` is read-only.
-- `promote_local_to_drbd` wraps `transition_to_n2_master` which is
-  *mostly* idempotent — see
-  [`transition_to_n2_master`](#promote_local_to_drbd) below for the
-  one case where it wasn't (and was fixed: `drbdadm create-md` now
-  skips when the resource is already configured).
-- `record_tier_state_rqlite` is `INSERT OR UPDATE`.
-
-If the saga crashes mid-`promote_local_to_drbd` (e.g. between
-`drbdadm primary` and `mount`), re-running the saga walks
-`transition_to_n2_master` again; each sub-step's idempotency check
-no-ops the work already done and the surviving steps complete. The
-data already on the LV (filer leveldb3 + arbiter rqlite) survives
-because external metadata leaves the data LV byte-untouched until
-mount.
-
-## Step details
-
-### `check_preconditions`
-
-Reads the cluster snapshot from rqlite (`cluster_state.load_cluster()`)
-and refuses to proceed when:
-- `mgmt_master != self_name` — the cluster failed over while the
-  watcher was waiting; the new master's watcher will fire its own
-  promote.
-- Peer is missing from `nodes` — bootstrap window race; retry next
-  watcher tick.
+- `mgmt_master != self` — the cluster failed over while the watcher waited; the
+  new master's watcher fires its own promote.
 - `peer_node` or `peer_loopback` ctx is empty — caller bug.
+- `peer_node` is missing from `nodes` — bootstrap window race; the watcher
+  retries next tick.
 
-Sets `ctx["_already_drbd"] = True` and returns silently if the tier
-is already in `mode=drbd` (saga becomes a no-op).
+If the tier is already `mode=drbd`, sets `ctx["_already_drbd"] = True` and
+returns; steps 2 and 3 then no-op.
 
-### `promote_local_to_drbd`
+- **Revert:** none (read-only).
+- **Idempotent:** yes.
 
-Wraps `tier_storage.transition_to_n2_master()` →
-`promote_local_to_drbd_master("cluster", peers)`. Short-circuits to a
-no-op if the resource is already `Primary` and mounted. Otherwise the
-full sequence is:
+### 2. `promote_local_to_drbd`
 
-1. Create the data + meta LV pair (`bedrock-data-cluster`,
-   `bedrock-meta-cluster`; meta sized by the standard DRBD9 formula,
-   `--max-peers=7`)
-2. Write `/etc/drbd.d/cluster.res` (mesh-aware, full-mesh peer blocks)
-3. Stop the singletons (`bedrock-weed-s3`, `bedrock-weed-filer`,
-   `bedrock-rqlited-arbiter`) so the leveldb3 is quiescent
-4. `cp -a /var/lib/bedrock/cluster/. /var/lib/bedrock-promote-snapshot/`
-   to preserve the existing singleton data
-5. `umount /var/lib/bedrock/cluster` if it's a mountpoint (at N=1 it's
-   just a dir on the root FS, so usually a no-op)
-6. `drbdadm create-md … --force --max-peers=7` + `drbdadm up cluster`
-   — both skipped if the resource is already configured (DRBD9 refuses
-   create-md/up on a configured device; this lets the step re-run safely)
-7. `drbdadm primary --force cluster` (initial sync source; idempotent)
-8. `mount -t xfs /dev/drbd1101 /var/lib/bedrock/cluster` (mkfs.xfs on
-   first promote; existing XFS preserved on re-run)
-9. Restore the snapshot back into the DRBD volume, then `rm` the snapshot
-10. Swap fstab: drop any prior `/var/lib/bedrock/cluster` line, add the
-    DRBD line
-11. Restart the singletons; `cluster_arbiter.converge()` on the next
-    subscriber tick reapplies the full set
+Thin wrapper over `tier_storage.transition_to_n2_master(self_loopback_ip,
+peer)`, which builds the two-node peer list and calls
+`promote_local_to_drbd_master("cluster", peers)`. Skipped when
+`_already_drbd`.
 
-### `record_tier_state_rqlite`
+Short-circuits to a no-op if the resource is already `Primary` and mounted
+(`drbdadm status` + `mountpoint -q`). Otherwise:
 
-Re-affirms the `cluster` tier's rqlite row (`tier_storage.set_tier_state`
-with `mode="drbd"`, the master, peers, and `backend_path =
-/var/lib/bedrock/cluster`). `transition_to_n2_master` already wrote it;
-this re-affirmation bumps `bedrock_meta.revision` so every peer's
-`rqlite_subscriber` wakes and sees the new mode.
+```
+1. ensure data + meta LV pair  bedrock-data-cluster (5 GiB thin) +
+                               bedrock-meta-cluster (DRBD9 meta-size formula)
+2. write /etc/drbd.d/cluster.res  full-mesh peer blocks, --max-peers=7,
+                               resync-rate 100M, c-min-rate 0, c-plan-ahead 0
+3. stop singletons             bedrock-weed-s3, bedrock-weed-filer,
+                               bedrock-rqlited-arbiter  (quiesce leveldb3)
+4. cp -a /var/lib/bedrock/cluster/. -> /var/lib/bedrock-promote-snapshot/
+5. umount /var/lib/bedrock/cluster  (only if it is a mountpoint; at N=1 it is
+                               a plain dir, so usually a no-op)
+6. drbdadm create-md --force --max-peers=7 ; drbdadm up cluster
+                               both skipped if the resource is already
+                               configured (DRBD9 rejects create-md/up on a
+                               configured device -> lets the step re-run)
+7. drbdadm primary --force cluster  (initial sync source; no-op if Primary)
+8. mount /dev/drbd1101 /var/lib/bedrock/cluster
+                               mkfs.xfs on first promote; existing XFS reused
+9. cp -a snapshot/. -> /var/lib/bedrock/cluster/ ; rm snapshot
+10. rewrite /etc/fstab          drop any prior cluster line, add the DRBD line
+11. restart the three singletons
+```
 
-The peer's [`cluster_tier_join_peer`](cluster_tier_join_peer.md)
-saga is waiting on exactly this — it polls rqlite for
-`tiers.cluster.mode == "drbd"`.
+`transition_to_n2_master` then writes the `tiers.cluster` rqlite row
+(`mode=drbd`) and writes `/etc/bedrock/cluster-drbd-ready`, releasing
+`cluster_arbiter` to host `.254` + the arbiter rqlite via DRBD handoff on a
+later failover.
+
+- **Revert:** no demote-to-local saga. `tier_storage.drbd_demote_to_local()`
+  is the operator helper for shrinking to N=1 / decommission (it removes
+  `cluster.res`, rewrites fstab to the local LV, `drbdadm down`, remounts the
+  data LV, sets `mode=local`; persistent state changes before the kernel-side
+  down, so a reboot mid-flight still lands at the local mount). Manual recovery
+  from a half-promote: `drbdadm down cluster && drbdadm wipe-md cluster` on both
+  nodes, `umount /var/lib/bedrock/cluster` on the master, restore the singleton
+  dir onto the root FS, set the `cluster` row back to `mode=local` in rqlite.
+- **Idempotent:** yes. Re-running walks `promote_local_to_drbd_master` again;
+  each sub-step's guard no-ops completed work (`create-md`/`up` skip when the
+  resource is configured; `primary --force`, fstab rewrite, and snapshot
+  restore are repeat-safe). The data LV survives a crash because external
+  metadata leaves it byte-untouched until the mount; the snapshot copy under
+  `/var/lib/bedrock-promote-snapshot/` is recreated each run.
+
+### 3. `record_tier_state_rqlite`
+
+Re-affirms the `cluster` tier row via
+`tier_storage.set_tier_state("cluster", mode=..., master=..., peers=...,
+backend_path="/var/lib/bedrock/cluster")`. Step 2 already wrote it; this
+re-write bumps `bedrock_meta.revision` so every node's `rqlite_subscriber`
+re-projects within ~2 s and sees `mode=drbd`. `set_tier_state` is master-only
+(followers no-op) and `INSERT OR REPLACE`. Skipped when `_already_drbd`.
+
+The peer's [`cluster_tier_join_peer`](cluster_tier_join_peer.md) saga polls
+rqlite for exactly this `mode=drbd` before joining as Secondary.
+
+- **Revert:** none meaningful (re-affirming an already-correct row).
+- **Idempotent:** yes (`INSERT OR REPLACE`).
 
 ## Kopia / backup snapshot compatibility
 
-The layout chosen by this saga keeps LVM thin snapshots usable.
 `bedrock-data-cluster` is a thin LV in the same pool as VM disks, so
-`lvcreate --snapshot --thinpool` captures point-in-time views without
-copying blocks. The standard recipe:
+`lvcreate --snapshot --thinpool` captures point-in-time views without copying
+blocks. DRBD mirrors at the block layer below LVM and is unaware of the
+snapshot; the data LV must stay a thin LV (not thick, raw, or non-LVM) for this
+path to work. Resolve the VG name at runtime — never hardcode it.
 
 ```bash
 fsfreeze --freeze /var/lib/bedrock/cluster
-lvcreate --snapshot -n cluster-snap-$(date +%s) bedrock/bedrock-data-cluster
+lvcreate --snapshot -n cluster-snap-$(date +%s) <VG>/bedrock-data-cluster
 fsfreeze --unfreeze /var/lib/bedrock/cluster
-mount -o ro,nouuid /dev/bedrock/cluster-snap-… /mnt/snap
+mount -o ro,nouuid /dev/<VG>/cluster-snap-... /mnt/snap
 kopia snapshot create /mnt/snap
 umount /mnt/snap
-lvremove bedrock/cluster-snap-…
+lvremove <VG>/cluster-snap-...
 ```
-
-DRBD is unaware of the snapshot — it's mirroring at the block
-layer below LVM.

@@ -1,8 +1,8 @@
 # Mesh networking — bedrock-net
 
 The mesh layer runs inside `bedrock-d`'s netd thread (`installer/lib/netd.py`).
-It owns the layer between "L2 cable plugged in" and "DRBD / libvirt / NFS can
-talk to a peer's cluster identity."
+It owns the layer between "L2 cable plugged in" and "DRBD / libvirt / rqlite /
+SeaweedFS can talk to a peer's cluster identity."
 
 The architecture is **three small protocols**, each doing exactly
 one job, never overlapping:
@@ -10,8 +10,13 @@ one job, never overlapping:
 | Concern | Protocol | Cadence | Transport |
 |---|---|---|---|
 | **Link discovery** | Signed UDP multicast probe | per-NIC, every 1 s | `239.7.7.7:7732`, TTL=1 |
-| **Latency measurement** | ICMP echo | per-`(peer, my_nic)`, every 2 s | Unprivileged kernel ICMP (`SOCK_DGRAM/IPPROTO_ICMP`), kernel timestamps |
+| **Latency measurement** | ICMP echo | per direct neighbour, every 2 s | Unprivileged ICMP (`SOCK_DGRAM/IPPROTO_ICMP`), monotonic-clock RTT |
 | **Routing advertisement** | Signed UDP unicast | per-peer (not per-link), every 2 s | UDP to peer's loopback `/32` on port 7733 |
+
+A fourth UDP unicast, the election heartbeat on port 7734, rides the
+same per-peer routing as the advertisement but answers a different
+question (who is master / who am I acking); it belongs to the election
+layer, not the mesh, and is documented in `installer/lib/election.py`.
 
 Three independent failure modes. If ICMP gets blocked, latency goes
 blank but discovery and routing keep working. If advertisement is
@@ -29,10 +34,13 @@ node index:
 - Range: `100.X.Y.0/24` in RFC 6598 Shared Address Space
   (`100.64.0.0/10`). IANA-reserved for non-public use, so it cannot
   collide with an operator LAN.
-- Per-cluster `/24` from `sha256(cluster_uuid)[0..1]`: 16,384
-  distinct prefixes, two-cluster collision ≈ 0.006 %.
-- Master `.1`, joiners get the lowest free index from
-  `mgmt /api/nodes/register`.
+- Per-cluster `/24` from `sha256(cluster_uuid)`:
+  second octet `64 + h[0]%64` (keeps it inside `100.64.0.0/10`), third
+  octet `h[1]`. 64 × 256 = 16,384 distinct prefixes; two-cluster
+  collision ≈ 0.006 %. (`cluster_addr.cluster_loopback_prefix`.)
+- Master is index `.1`. A joiner gets the lowest free index, allocated
+  by the mgmt master during the join-approve handshake (it scans the
+  `nodes` table for taken loopbacks). `cluster_addr.node_loopback_ip`.
 - Stored as a `/32` on `lo`. **All cluster-internal protocols bind
   to or address this identity** — DRBD `path` blocks, libvirt
   migrate-uri, rqlite peer dial, SSH-from-scripts, dashboard
@@ -57,8 +65,9 @@ nodes in its `nodes` table. The mesh layer **consumes** membership —
 read via `cluster_state.load_cluster()` (read-level `none`, so it
 works even without quorum) — to know which nodes are legitimate
 cluster members, but **does not** depend on it for routing decisions.
-Routes are recomputed locally on every node, every ~250 ms, from
-in-memory state fed by the three protocols above.
+The neighbour table is updated every ~250 ms tick from in-memory state
+fed by the three protocols above; `emit_routes()` recomputes the
+desired table each tick and applies only the delta when it changes.
 
 ## Protocol 1 — Link discovery (multicast probe)
 
@@ -96,28 +105,31 @@ topology view (single-writer invariant).
 
 ## Protocol 2 — Latency measurement (ICMP echo)
 
-**Purpose**: clean, kernel-timestamped RTT per direct path.
+**Purpose**: clean RTT per direct path, measured against one node's
+own clock so it needs no NTP/PTP between nodes.
 
-**Mechanism**: every 2 s per `(peer, my_nic)`, send an ICMP echo
-request to `peer_link_addr` on the local NIC that received the
-peer's discovery probe. The kernel handles both send and receive
-timestamping; userspace never enters the measurement path.
+**Mechanism**: every 2 s, send an ICMP echo request to every logged-up
+neighbour's `peer_link_addr`. One unprivileged ICMP socket per local
+NIC, bound to that NIC's link-local address so the kernel uses it as
+the source; replies drain non-blocking each tick. Send time is stamped
+with `time.monotonic_ns()` and stashed against the echo's sequence
+number; the reply is matched back by sequence and source, and the RTT
+is `now - send_ts`. Both timestamps come from this node's monotonic
+clock, so the subtraction is single-clock regardless of peer time.
 
 ```python
-# Pseudocode
+# One socket per local NIC (sockets pooled per my_nic).
 sock = socket.socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)  # unprivileged
 sock.bind((my_link_addr, 0))
 send_at = time.monotonic_ns()
+pending[seq] = (peer_link_addr, send_at)
 sock.sendto(echo_request(seq=N), (peer_link_addr, 0))
-# … wait for reply on recv path with cmsg-attached timestamp …
-recv_at = parse_timestamp_cmsg(reply)
-rtt_ns = recv_at - send_at
+# … later, on drain: match reply by seq + source …
+rtt_ns = time.monotonic_ns() - pending[seq].send_at
 ```
 
 **Why ICMP, not a custom UDP protocol**:
-- Kernel hot-path; reply latency is single-digit µs.
-- 40 years of testing.
-- `tcpdump`/`mtr` can validate from outside.
+- 40 years of testing; `tcpdump`/`mtr` can validate from outside.
 - Unprivileged via `/proc/sys/net/ipv4/ping_group_range`.
 - No userspace echoer needed on the peer; peer's kernel responds.
 
@@ -177,11 +189,6 @@ outlier IS information:
   (my_nic) count()` in LogsQL gives an operator the per-link
   blip rate over any window.
 
-Optional: expose smoothed values as Prometheus gauges (e.g.
-`bedrock_path_rtt_us{peer, nic}`, `bedrock_path_blip_total{peer,
-nic}`) via `vm_exporter.py`. Operators get latency-over-time +
-blip-rate graphs per peer-link.
-
 ## Protocol 3 — Routing advertisement (unicast UDP)
 
 **Purpose**: tell every cluster peer how this node sees the
@@ -190,9 +197,9 @@ destination including transit through other nodes.
 
 **Mechanism**: every 2 s, send one UDP unicast per peer to peer's
 loopback `/32` on port 7733. Kernel routes the unicast over
-whichever NIC its current best-path metric picks — so we send
+whichever NIC its current best-path metric picks — so it sends
 **one advertisement per peer regardless of how many physical links
-connect us** (the architectural fix the previous design botched).
+connect them**.
 
 Payload:
 
@@ -203,6 +210,7 @@ msgpack({
     cluster_uuid,
     advertiser: "bedrock-X",
     seq: 42,                              # monotonic; receiver dedups
+    ts: <float>,
     paths: [
       { dest:      "bedrock-Z",
         via_chain: ["bedrock-X", "bedrock-Y", "bedrock-Z"],
@@ -220,11 +228,14 @@ bandwidth composes as **min** along a path; latency composes as
 **sum**. A compound metric conflates them. Keep both raw; let
 each receiver compute its own local metric.
 
-**Loop prevention** — receiver invariants:
-- Drop the advertisement if `via_chain` contains the receiver's
-  own node name (would be a loop if installed).
-- Accept the path if `via_chain[0] == advertiser` (advertiser
-  vouches it can reach `via_chain[1]` directly).
+**Loop prevention** — receiver invariants (`process_advertisement`):
+- The advertiser MUST be a direct logged-up neighbour. A
+  transit-borne advertisement (C hearing A's advert relayed by B) is
+  dropped — only direct neighbours' adverts drive routing. This makes
+  the protocol loop-free by induction regardless of topology depth.
+- `seq` must advance (wrap-aware); replays and older adverts drop.
+- Drop the advert if `via_chain` contains the receiver's own node
+  name (would install a loop); `via_chain[0] == advertiser`.
 
 **Receiver composition** — when node R receives an advertisement
 from neighbour Y about path to Z:
@@ -239,13 +250,17 @@ metric_R_to_Z_via_Y = local_metric(bw, lat, loss, age)
 EIGRP-style composite tuned for modern speeds):
 
 ```python
-def local_metric(bw_mbps, latency_us, loss_rate, age_s):
-    bw_cost  = 1_000_000 / max(bw_mbps, 1)       # 12 at 80G, 400 at 2.5G
-    lat_cost = latency_us / 100                   # 1 unit per 100 µs
+def local_metric(bw_mbps, latency_us, loss_rate=0.0, age_s=1e9):
+    bw_cost  = 1_000_000 / max(bw_mbps, 1)        # 12@80G 100@10G 400@2.5G 1000@1G
+    lat_cost = max(0, latency_us - 1000) / 100    # 0 below 1 ms (LAN noise
+                                                  #   floor), then 1 per 100 µs
     flap     = 50 if age_s < 60 else 0            # additive anti-flap
     loss     = 500 * min(1.0, loss_rate * 20)     # graded, not binary
-    return bw_cost + lat_cost + flap + loss
+    return int(bw_cost + lat_cost + flap + loss)
 ```
+
+Sub-millisecond latency is scheduler noise on a healthy LAN, so the
+latency term floors at 1 ms and bandwidth dominates at local scale.
 
 **Path selection** per receiver per destination Z:
 1. Collect every valid advertisement claiming a path to Z.
@@ -253,15 +268,18 @@ def local_metric(bw_mbps, latency_us, loss_rate, age_s):
 3. Install one `/32 via <Y's link_addr on best my_nic to Y>`
    with the lowest metric.
 4. Refresh on every advertisement; withdraw if no fresh
-   advertisement in 6 s (3× cadence).
+   advertisement in 6 s (`ADV_STALE_S`, 3× cadence).
 
 ## Routing layer (kernel-route emission)
 
-`emit_routes()` runs every ~1 s. Reads in-memory state (direct
+`emit_routes()` runs every ~250 ms tick. Reads in-memory state (direct
 neighbours + advertised paths), produces the desired routing table,
-diffs against current state, applies the delta.
+and applies only the delta (it owns only routes in this cluster's
+`/24` plus the per-NIC `169.254.x.y` `/32`s — operator routes are
+never touched).
 
-Three classes of routes:
+Three classes of routes (metric constants: `METRIC_DIRECT_BASE = 10`,
+`METRIC_TRANSIT_BASE = 100`, `METRIC_PANIC = 999`; lower wins):
 
 1. **Per-peer-link `/32` host routes** (one per direct path):
    `<peer_link_addr>/32 dev <my_nic> scope link`. The kernel's auto
@@ -273,14 +291,25 @@ Three classes of routes:
 2. **Per-peer loopback `/32`** with monotonic metrics:
    `<peer_loopback>/32 via <next-hop-link-addr> dev <my_nic> metric N`.
    For each cluster peer:
-   - Metric 10..N: every direct path, ordered by local metric.
-   - Metric 50..M: best transit paths via neighbour advertisements
-     (only the single best per (dest, next-hop), not every option).
-   - Kernel auto-fails-over on link-down.
+   - Metric 10+i: direct paths, grouped by tied `local_metric`.
+     Paths in the same tier (identical cost after the sub-ms latency
+     floor + bucketed bandwidth) emit as a single ECMP multipath route
+     (`nexthop ... weight 1` per path); the kernel L4-hashes flows
+     across them (`fib_multipath_hash_policy=1`, set in
+     `ensure_routing_sysctls`). Lower-cost tiers get lower metrics, so
+     the kernel auto-fails-over to the next tier on link-down.
+   - Metric 100+i: best transit paths from neighbour advertisements
+     (only the single best per dest, not every option).
 
-3. **Panic-neighbour catch-all**:
-   `<cluster_prefix>.0/24 via <freshest direct neighbour> metric 999`.
-   Last resort. Loops bounded by IP TTL.
+3. **Panic catch-all** for the whole cluster `/24` at metric 999:
+   `<cluster_prefix>.0/24 via <best path to the mgmt master>`. The
+   arbiter's `.254` VIP lives at the top of the `/24` and reaches the
+   master this way without a dedicated advertisement. The master
+   itself installs no `/24`-via-self (loop); it terminates `.254`
+   traffic locally via the secondary `/32` on its `lo`. If the master
+   is unknown or unreachable this tick (bootstrap, master-down
+   transient), the route falls back to the freshest direct neighbour.
+   Loops bounded by IP TTL.
 
 ## Cross-segment LL collision detection
 
@@ -311,27 +340,27 @@ idempotent against multiple defends.
 ## DRBD multi-path integration
 
 `tier_storage.regen_drbd_configs_from_snapshot()` runs on every
-cluster-state change (subscribed via `mgmt/orchestrator.py`). For
-every DRBD resource — the `cluster` singleton and each per-VM
-`vm-<name>-disk0` — it regenerates the resource file:
+cluster-state change (subscribed via the orchestrator). It rewrites
+the `cluster` singleton's `/etc/drbd.d/cluster.res` from the snapshot's
+mesh `paths` table (`render_drbd_res_mesh`), then `drbdadm adjust`s it;
+in-flight replication survives. It no-ops at N=1 or if the `.res` file
+is absent / the tier isn't DRBD-backed.
+
+The singleton resource:
 
 - One `connection` per peer pair.
-- One `path` block per direct link observed by bedrock-net, with
-  the actual per-NIC `link_addr` pair. DRBD does its own
-  path-level failure detection independent of kernel routing.
-- Final `path` block uses loopback `/32`s — catch-all that
-  survives even when every direct path is down (kernel routes via
-  panic-neighbour through any healthy peer).
+- One `path` block per direct `(nic_a, nic_b)` link the path table
+  observed, using the actual per-NIC `link_addr_a`/`link_addr_b`. DRBD
+  runs its own per-path TCP + keepalive + carrier detection,
+  independent of kernel routing. Paths are ordered speed-desc,
+  RTT-asc (the same order kernel routes use).
+- A final loopback-fallback `path` (peer `/32`s) is always appended
+  last, so DRBD still connects when every direct path is down — the
+  kernel routes it via the panic catch-all, including transit through
+  a third node.
 
-`drbdadm adjust` after each regen; in-flight replication survives.
-
-**Per-protocol path ordering**: DRBD sorts its `path` blocks by
-latency (smallest RTT first) because DRBD-ack-per-write is
-latency-sensitive. The kernel routing table sorts by bandwidth
-(metric = 1_000_000/Mbps + lat/100) because libvirt-migrate and
-bulk NFS dominate by volume. Same physical mesh, two preference
-orders, applied at the protocol layer — no two-routing-tables
-complexity needed.
+Per-VM resources (`vm-<name>-disk0`) use loopback-only `path` blocks
+(`render_drbd_res`); the kernel routing layer picks the physical NIC.
 
 ## Lifecycle (single node, simplified)
 
@@ -373,8 +402,8 @@ ip -br -4 addr | grep -v "127\|UNKNOWN.*lo\b"
 # expected: br0 with DHCP LAN IP, enpXs0 with 169.254.x.y/16,
 #           lo with the cluster's /32
 
-# Latency per peer-link (in-memory smoothed):
-journalctl -u bedrock-d | grep "srtt"            # or future Prometheus
+# Mesh status (neighbours, advertisers, transit dests, RTT blips):
+journalctl -u bedrock-d | grep "bedrock-net: status"
 
 # Per-peer kernel routes:
 ip -4 route show | grep "^100\." | head -20

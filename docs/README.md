@@ -1,13 +1,13 @@
 # Bedrock documentation
 
-Bedrock is a local-infrastructure HA platform. It turns one AlmaLinux 9
-box into a cluster of 1 → N nodes, running KVM VMs with DRBD replication,
-and lets you flip workloads between **cattle** (local-only), **pet**
-(2-way DRBD), and **ViPet** (3-way DRBD) — online, no downtime.
+Bedrock is a local-infrastructure HA platform. It turns AlmaLinux 10 boxes into
+a cluster of 1 → N nodes running KVM VMs with DRBD replication, and flips
+workloads between **cattle** (one local thin LV, no DRBD), **pet** (2-way DRBD),
+and **ViPet** (3-way DRBD) online, no downtime.
 
-This documentation exists so any engineer picking up the project can answer:
+These docs answer:
 
-- **What happens** when I click `Migrate`, or check `PET (HA)`, or kill a node?
+- **What happens** when I click `Migrate`, check `PET (HA)`, or kill a node?
 - **In what order** do the pieces move, and **why**?
 - **Where do I look** when something breaks — which log line, on which node,
   from which component?
@@ -16,44 +16,38 @@ This documentation exists so any engineer picking up the project can answer:
 
 ## Start here
 
-- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) —
-  **authoritative spec for the witness + arbiter takeover
-  protocol.** Passive K/V slot store, AEAD on UDP 12321, weighted
-  vote, exact-UUID-match takeover. Replaces all earlier
-  witness/bless/holddown writing.
-- [`storage-architecture.md`](storage-architecture.md) —
-  **authoritative spec for the storage stack:** one thinpool per
-  node, per-resource thin meta LV per DRBD instance, cluster-
-  singleton DRBD capped at 3 peers, SeaweedFS topology (filer on
-  `.254`, master Raft-3 on regular nodes, volume + S3 on every
-  node), three SeaweedFS collections, calm-vs-critical loop split.
-- [`sagas/README.md`](sagas/README.md) — **index of every
-  long-running cluster operation as a saga.** Per-saga docs list
-  inputs / outputs / step-by-step contents / revert behaviour /
-  idempotency guarantees. Read here first when adding a new
-  cluster operation — the saga pattern + step-doc template are
-  load-bearing for crash-safety.
-- [`state-flow.md`](state-flow.md) — **what each node does in each
-  cluster state, what triggers transitions, and what failure modes
-  look like.** Covers N=1 init → join → critical-tier promote →
-  healthy N≥2 → isolation+failover → master rejoin → 2-node HA →
-  scale-down → boot recovery, plus a what-can-go-wrong matrix.
-- [`architecture.md`](architecture.md) — the whole stack on one page, with a
-  component map, port list, and data-flow diagram.
-- [`network-walkthrough.md`](network-walkthrough.md) — a friendly,
-  ASCII-art-heavy tour of how the cluster's networking actually works
-  (every step, every decision). Aimed at non-network engineers; use as
-  the gentle introduction before diving into `06-mesh-network.md`.
+- [`architecture.md`](architecture.md) — the whole stack on one page:
+  component map, port list, data-flow diagram. Read this first.
+- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) — the witness + arbiter
+  takeover protocol. Passive K/V slot store (BedRock Echo, AEAD on UDP 12321),
+  weighted vote (node = 100, witness = 1), exact-UUID-match arbiter takeover.
+- [`storage-architecture.md`](storage-architecture.md) — the storage stack:
+  one thinpool per node, an external-meta LV per DRBD resource, the cluster
+  singleton DRBD capped at 3 peers, and SeaweedFS topology (filer on `.254`,
+  master Raft-3 on lowest-octet nodes, volume + S3 on every node).
+- [`sagas/README.md`](sagas/README.md) — index of every long-running cluster
+  operation as a crash-resumable saga, with per-saga inputs/outputs, step
+  contents, revert behaviour, and idempotency guarantees. Read here first when
+  adding a cluster operation; the saga pattern is load-bearing for crash-safety.
+- [`state-flow.md`](state-flow.md) — what each node does in each cluster state,
+  what triggers transitions, and what failure modes look like: N=1 init → join
+  → critical-tier promote → healthy N≥2 → isolation+failover → master rejoin →
+  2-node HA → scale-down → boot recovery, plus a what-can-go-wrong matrix.
+- [`network-walkthrough.md`](network-walkthrough.md) — an ASCII-heavy tour of
+  the cluster's networking aimed at non-network engineers; the gentle intro
+  before [`06-mesh-network.md`](06-mesh-network.md).
 
-Per-module Python source companion notes live next to the code
-under [`installer/lib/*.md`](../installer/lib/) and
-[`mgmt/*.md`](../mgmt/). Each has a module-purpose paragraph at
-the top + a one-sentence description per function.
+Per-module source companion notes live next to the code under
+[`installer/lib/*.md`](../installer/lib/) and [`mgmt/*.md`](../mgmt/): a
+module-purpose paragraph plus a one-line description per function.
 
 ## Actions (what engineers trigger)
 
-These are the operations the dashboard / CLI expose. Each doc walks through
-the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes.
+The operations the dashboard / CLI expose. An operator change flows
+operator → mgmt API → rqlite → reactor/saga → converge on each node; nobody
+SSHes a compute node for state changes. Each doc walks the full sequence —
+the API call, the rqlite writes, the DRBD/libvirt commands, the log lines
+emitted, and the failure modes.
 
 | Action | Trigger | Doc |
 |---|---|---|
@@ -112,40 +106,36 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 | node_exporter + vm_exporter | 9100 / 9177 | node | [`components/exporters.md`](components/exporters.md) |
 | DRBD | kernel + per-link port (7000+minor) | per-NIC IP | [`storage-architecture.md`](storage-architecture.md) + [`05-drbd-internals.md`](05-drbd-internals.md) |
 | bedrock-net (mesh) | UDP 7732 mcast probe + 7733 advert + 7734 heartbeat + ICMP | per-NIC | [`06-mesh-network.md`](06-mesh-network.md) |
-| **bedrock-d (unified daemon)** | — | — | [`daemon-unification.md`](daemon-unification.md) |
-| Cockpit | 9090 | node | —  (upstream docs) |
+| bedrock-mdns | mDNS (5353) | node | — |
+| bedrock-redirect | :80 → :8443 | `0.0.0.0` | — |
+| **bedrock-d (the daemon)** | — | — | [`daemon-unification.md`](daemon-unification.md) |
+| Cockpit | 9090 | node | — (upstream docs) |
 
-> **Post-alpha state (2026-05+)**: cluster state lives in
-> **rqlite**; the bedrock-rust hash-chained log is gone. Witness is
-> a passive AEAD K/V slot store on UDP 12321 (see
-> [`cluster-quorum-spec.md`](cluster-quorum-spec.md)). S3 storage
-> uses **SeaweedFS** (Garage + RustFS retired); see
-> [`storage-architecture.md`](storage-architecture.md). The
-> per-component daemons (netd, mgmtd, orchd) are unified into a
-> single `bedrock-d` Python process.
-> Design rationale for those choices (D-01..D-22) lived in
-> `post-alpha-rewrite-notes.md`; it has since been retired (git
-> history retains it).
+> **One daemon, one state store.** Every node runs a single `bedrock-d` Python
+> process: a netd thread (mesh, election, witness, `.254` arbiter, routing) plus
+> an asyncio mgmt/orchestrator (dashboard, saga executor, reactor). It is the
+> only thing that auto-starts the rest. Cluster-wide state lives in **rqlite**
+> (Raft-replicated SQLite, mTLS on 4001/4002). The witness is a passive AEAD K/V
+> slot store on UDP 12321 ([`cluster-quorum-spec.md`](cluster-quorum-spec.md)).
+> S3 object storage is **SeaweedFS** ([`storage-architecture.md`](storage-architecture.md)).
 
 ---
 
 ## Deep dives (design-level internals)
 
-- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) — witness +
-  arbiter takeover protocol.
-- [`storage-architecture.md`](storage-architecture.md) — on-disk
-  layout, DRBD topology, SeaweedFS deployment.
-- [`05-drbd-internals.md`](05-drbd-internals.md) — DRBD activity
-  log, bitmap, how DRBD stays fast + crash-safe (pure DRBD primer
-  — backend-agnostic).
-- [`06-mesh-network.md`](06-mesh-network.md) — bedrock-net mesh
-  daemon, per-NIC link-local addressing, kernel routing, DRBD
-  multi-path integration.
+- [`daemon-unification.md`](daemon-unification.md) — how the single `bedrock-d`
+  process structures its netd thread and asyncio mgmt/orchestrator, and the
+  locking that keeps the shared state safe across them.
+- [`cluster-quorum-spec.md`](cluster-quorum-spec.md) — witness + arbiter
+  takeover protocol.
+- [`storage-architecture.md`](storage-architecture.md) — on-disk layout, DRBD
+  topology, SeaweedFS deployment.
+- [`05-drbd-internals.md`](05-drbd-internals.md) — DRBD activity log, bitmap,
+  how DRBD stays fast and crash-safe (backend-agnostic primer).
+- [`06-mesh-network.md`](06-mesh-network.md) — the bedrock-net mesh, per-NIC
+  link-local addressing, kernel routing, DRBD multipath integration.
 - [`mesh-network-v1-uncertainties.md`](mesh-network-v1-uncertainties.md) —
-  honest list of what's tested, what isn't, and what's
-  known-to-be-fragile in the mesh layer.
-- [`daemon-unification.md`](daemon-unification.md) — design and
-  rationale for the single-`bedrock-d` Python process.
+  what's tested, what isn't, and what's known-fragile in the mesh layer.
 
 ## Conventions used in these docs
 

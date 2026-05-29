@@ -1,11 +1,12 @@
 # Bedrock — Project Reference
 
 ## What it is
-Local infrastructure HA platform. One single, 2 in HA or more in HA x86 nodes running KVM/QEMU on AlmaLinux 10, with per-VM DRBD block device replication, live migration via temporary dual-primary, and a simple witness-based failover orchestrator. No corosync, no PVE, no cluster frameworks. Just assembled LEGO from mature Linux components.
+Local infrastructure HA platform. One node, two in HA, or more in HA — x86 nodes running KVM/QEMU on AlmaLinux 10, with per-VM DRBD block-device replication, live migration via temporary dual-primary, and a witness-based failover orchestrator. No corosync, no PVE, no cluster frameworks — assembled LEGO from mature Linux components.
+
+Each node runs one daemon, **`bedrock-d`**: a netd thread (mesh, election, witness, `.254` arbiter, routing) plus an asyncio mgmt/orchestrator (dashboard, saga executor, reactor). Cluster-wide state lives in **rqlite** (Raft-replicated SQLite). It is the only thing that auto-starts the rest. See `docs/daemon-unification.md`.
 
 ## Target market
-MSPs shipping a single or HA infrastructure to small/medium businesses. VMware refugees with two-server setups. The 90% that don't need Nutanix-scale but need better than Proxmox-on-two-nodes.
-Growth path from 1 single box into 2 with HA is crucial for the 1.0 release version. Just put a box there to run an app. Later if it ever did go down or needs increased uptime: Add another box + interconnect cable.
+MSPs shipping single-node or HA infrastructure to small/medium businesses. VMware refugees with two-server setups. The 90% that don't need Nutanix-scale but need better than Proxmox-on-two-nodes. Put a box down to run an app; if it ever needs more uptime, add another box plus an interconnect cable and it grows from N=1 to HA.
 
 ## Core design principles
 - When the orchestrator fails, nothing changes state. VMs keep running, DRBD keeps replicating.
@@ -14,7 +15,7 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - Say NO to unneeded complexity. Frameworks only work if you use them as intended — building on plain components avoids framework fights.
 - **All cluster orchestration goes through rqlite as sagas.** Every long-running operation (VM create, disk grow, DRBD attach, node join, cluster-DRBD membership change, weed-master reshuffle, SeaweedFS replica fix-up after a node returns, …) writes intent → executes idempotent steps → writes "done" — each step durable in rqlite. Power-loss at any step is recoverable: on boot, pick up where the `operation_steps` log says we left off. The ONE exception is recovering the rqlite arbiter itself, which is what the witness + arbiter-takeover protocol exists for. See [`docs/cluster-quorum-spec.md`](docs/cluster-quorum-spec.md) and [`docs/storage-architecture.md`](docs/storage-architecture.md).
 
-## Hardware — 0.1 Lab
+## Reference lab hardware
 - 2x GMKtec Zen4 mini PC, 32GB RAM, 1TB NVMe, 2x 2.5gbit NIC each
 - MikroTik 8-port 2.5gbit switch + 2x SFP+ (management/VM network only)
 - Direct ethernet cable between second NIC on each box (DRBD replication — no switch in this path)
@@ -22,18 +23,18 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - Separate box running Claude Code for development
 
 ## Software stack
-- **Base OS:** AlmaLinux 10.1. (Earlier drafts targeted 9 because DRBD-kmod against the 10.0 kernel had open issues; ELRepo's `kmod-drbd9x-9.3.x` against el10_1 resolves that.)
+- **Base OS:** AlmaLinux 10.1. ELRepo's `kmod-drbd9x-9.3.x` is built against the el10_1 kernel.
 - **Hypervisor:** KVM/QEMU/libvirt (standard AlmaLinux packages)
-- **Storage:** **One VG per node (`bedrock-vg`), one thinpool (`thinpool`).** Cluster singletons (rqlite arbiter + SeaweedFS filer + S3 IAM) live on a DRBD-replicated LV pair capped at 3 peers; per-VM DRBD LV pairs live alongside; the local SeaweedFS volume server gets one LV (NOT DRBD — SeaweedFS handles file-level replication via collections). Boot needs ~1.5 GB outside the VG (EFI + /boot); everything else is thin-provisioned and freely re-allocatable. TRIM/discard end-to-end. **One thin meta LV per DRBD resource**. See `docs/storage-architecture.md` for the full layout.
-- **Networking:** br0 bridge on management NIC for VM traffic. Mesh-aware overlay (`bedrock-net` daemon, on every node) for cluster-internal traffic — every NIC is a path candidate, the kernel routes per-peer through the best available physical link, DRBD multi-paths over the real per-NIC addresses. See `docs/06-mesh-network.md`. Cluster identity lives in RFC 6598 Shared Address Space (`100.64.0.0/10`, derived `/24` per cluster from `cluster_uuid`); per-NIC link addresses come from RFC 3927 IPv4 link-local assigned by NetworkManager. Operator plugs any cable into any port and the system figures out the rest.
-- **Orchestrator:** Python based. Most code should be python based. Only realtime critical items should potentially be rust components. e.q. a custom docker DRBD witness on Mikrotik, would probably be rust.
+- **Storage:** **One VG per node (`bedrock-vg`), one thinpool (`thinpool`).** Cluster singletons (rqlite arbiter + SeaweedFS filer + S3 IAM) live on a DRBD-replicated LV pair capped at `min(3, N)` peers; per-VM DRBD LV pairs live alongside; the local SeaweedFS volume server gets one LV (no DRBD — SeaweedFS handles file-level replication via collections). Boot needs ~1.5 GB outside the VG (EFI + /boot); everything else is thin-provisioned and freely re-allocatable. TRIM/discard end-to-end. **One thin meta LV per DRBD resource**. See `docs/storage-architecture.md`.
+- **Networking:** br0 bridge on the management NIC for VM traffic. The netd thread inside `bedrock-d` runs a mesh-aware overlay on every node for cluster-internal traffic — every NIC is a path candidate, the kernel routes per-peer through the best available physical link, DRBD multi-paths over the real per-NIC addresses. See `docs/06-mesh-network.md`. Cluster identity lives in RFC 6598 Shared Address Space (`100.64.0.0/10`, derived `/24` per cluster from `cluster_uuid`); per-NIC link addresses come from RFC 3927 IPv4 link-local assigned by NetworkManager. Operator plugs any cable into any port and the system figures out the rest.
+- **Orchestrator:** Python. Both halves of `bedrock-d` are Python — the netd thread (mesh, election, witness client, `.254` arbiter, routing) and the asyncio mgmt/orchestrator. The witness device (**BedRock Echo**) is separate firmware: ESP32 or a tiny container on a MikroTik.
 
 ## Why AlmaLinux (not Debian, not Ubuntu)
-- RHEL machine type ABI stability for safe live migration across updates
+- RHEL machine-type ABI stability for safe live migration across updates
 - 10-year lifecycle (to 2035 for version 10)
-- Binary-compatible upgrade path to RHEL if commercial support needed
-- Conservative repos prevent cowboys from `apt install`-ing random stuff on the hypervisor
-- DRBD/LINBIT explicitly recommend AlmaLinux as the CentOS replacement
+- Binary-compatible upgrade path to RHEL if commercial support is needed
+- Conservative repos keep random `apt install`-style packages off the hypervisor
+- LINBIT recommend AlmaLinux as the CentOS replacement for DRBD
 
 ## Why not Proxmox
 - Corosync required for clustering — can't do clusterless live migration
@@ -45,23 +46,26 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 
 - **One VG per node (`bedrock-vg`), one thinpool
   (`thinpool`)** holding everything: the DRBD-replicated
-  cluster-singleton LV pair (capped at 3 peers), DRBD LV pairs per
-  VM disk, and the local SeaweedFS volume LV. SeaweedFS does its
+  cluster-singleton LV pair (replica set `min(3, N)`), DRBD LV pairs
+  per VM disk, and the local SeaweedFS volume LV. SeaweedFS does its
   own file-level replication via collection policy; LVM doesn't
   need to slice by tier.
-- **One DRBD resource per VM disk**, one thin data LV +
-  one thin meta LV per resource. `max-peers=7` baked at create-md.
-  QEMU opens `/dev/drbd/by-res/vm-name-disk0/0` as raw block.
+- **One DRBD resource per VM disk** (`vm-<name>-disk0`), one thin
+  data LV (`bedrock-data-<r>`) + one thin meta LV (`bedrock-meta-<r>`)
+  per resource. `--max-peers=7` baked at create-md.
+  QEMU opens `/dev/drbd/by-res/vm-<name>-disk0/0` as raw block.
   Online grow = `lvextend meta` (if needed) + `lvextend data` +
   `drbdadm resize`; no downtime.
+- **VM disk by type:** **cattle** = one local thin LV (no DRBD, no
+  migrate); **pet** = 2-way DRBD; **vipet** = 3-way DRBD.
 - **`.254/32` cluster-singleton VIP** on loopback at all N
   (including N=1). Hosts rqlite arbiter, SeaweedFS filer:8888,
   mgmt HTTPS:8443. Failover moves the VIP + DRBD primary +
   filer + rqlite-arbiter atomically.
 - **SeaweedFS** for shared file/object storage: filer singleton on
-  `.254` (DRBD-backed leveldb3); weed-master Raft-3 on three
-  regular nodes (NOT on `.254`); weed-volume + weed-s3 on every
-  node bound `0.0.0.0`; every node FUSE-mounts the filer at
+  `.254` (DRBD-backed leveldb3); weed-master Raft on the `min(3, N)`
+  lowest-octet regular nodes (never on `.254`); weed-volume + weed-s3
+  on every node bound `0.0.0.0`; every node FUSE-mounts the filer at
   `/mnt/bedrock` pointing at `.254:8888`. Three collections —
   `scratch` (replication 000), `standard` (001, default),
   `critical` (002, 3 copies). S3 IAM identities live inside the
@@ -111,35 +115,44 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
   promotes at `MASTER_LOSS_MISSES = 10` (≈ 10 s), so the VIP and
   arbiter rqlite are released before any survivor takes them. There's
   never a window where two nodes both hold `.254`.
-- **No automatic failback.** Failed node returns as secondary,
-  re-syncs DRBD, and waits for the calm orchestrator's
+- **No automatic failback.** A returning node comes back as
+  secondary, re-syncs DRBD, and waits for the reactor's
   reconciliation pass.
-- **The calm orchestrator** (slower, deliberate) handles
-  arbiter-set membership changes, weed-master Raft re-shuffles,
-  and capacity-driven decisions — none of those are on the
+- **The reactor** (slower, deliberate, in `bedrock-d`'s
+  orchestrator) handles arbiter-set membership changes, weed-master
+  Raft re-shuffles, and capacity-driven decisions — none on the
   critical failover path.
 
-## Version roadmap
-- **0.1:** Manual install, scripts, working live migration + HA failover, Linux + Windows VMs. This document.
-- **0.5:** Reliability hardened. Power-down testing across all state machine paths. No backup yet.
-- **0.6:** Extensive random power-down tests across 2, 3, 4 node configurations with persistent storage.
-- **0.7:** PBS backup integration (full-read to start, dirty-bitmap optimization later if needed).
-- **1.0:** Production-ready. API, local dashboard, VM import (virt-v2v), VM export. Support offering.
-- **1.5:** ARM nodes for stateless/container workloads only (no live migration, no DRBD on ARM). x86 stays for pets.
-- **2.0:** SAN support mode (same orchestrator/witness, but storage from existing SAN instead of DRBD). Multi-site dashboard.
+## Per-VM failover — pet/vipet
+On a node that loses quorum, local pet/vipet VMs suspend ~20 s in.
+The next-in-line peer (by `vms.failover_order`) takes over ~35 s in:
+drbd disconnect → primary → record UUID → strong-read safety check →
+start → update `vms.host`. A VM still down **5 minutes after quorum
+loss** (clock from quorum loss, not from suspend) is killed. When
+quorum returns, a still-suspended VM is resumed. Cattle VMs do not
+fail over. See `bedrock_d/orchestrator/vm_failover.py`.
 
-## Build phases for 0.1
-1. **Base OS** — AlmaLinux 9 minimal on both nodes. Root SSH, static management IP, NTP, SELinux permissive, firewall off.
-2. **Networking** — Mgmt LAN over br0 (bridge over the first NIC, via MikroTik). All intra-cluster traffic (DRBD, SeaweedFS, libvirt migration) targets the per-node loopback /32 in the cluster's CGNAT /24 (100.X.Y.0/24, derived from `cluster_uuid` — see `installer/lib/cluster_addr.py`); the mesh layer (`bedrock-net`) routes those packets over whichever physical NIC has the best path.
-3. **Hypervisor** — Install KVM/QEMU/libvirt on both nodes. Verify libvirtd running.
-4. **Storage foundation** — LVM thin pool on NVMe. DRBD from ELRepo. Load kernel module.
-5. **First replicated volume** — Thin LV on both nodes, DRBD resource config, initialize and sync over direct link.
-6. **Linux VM on raw DRBD** — virt-install pointing QEMU at DRBD block device. Install guest, verify networking and guest agent.
-7. **Live migration** — Define VM on both nodes. Enable dual-primary, promote both, virsh migrate --live, demote source, disable dual-primary.
-8. **Script migration** — Single command wrapping the dual-primary/migrate/demote sequence. Test both directions under load.
-9. **HA failover** — Watchdog script using MikroTik as witness reference. Test by pulling power on active node. VMs restart on survivor.
-10. **Windows VM** — New DRBD resource, virtio drivers during install, validate live migration and power-yank failover.
-10.5. **TRIM verification** — Write/delete/fstrim in guest, confirm thin pool space reclaimed on host.
+## What ships today
+- Network install + offline ISO; growth path from N=1 to N≥2 HA by adding a box and an interconnect cable.
+- Live migration and witness-based HA failover, Linux and Windows VMs.
+- API + local web dashboard (HTTPS, operator-authed).
+- VM import (virt-v2v for OVA/Windows, qemu-img for the fast format-only path) and export (qemu-img convert to VMDK/VHD/VHDX).
+- Kopia-based VM backup/restore: one repository per cluster (S3 / S3-compatible / filesystem), per-VM snapshots keyed by cluster UUID so identity is stable across migration and failover; the mgmt master schedules maintenance. Driven via the API/dashboard.
+- Tested across 2/3/4-node configurations with persistent storage and random power-down across the state-machine paths.
+
+## Planned extensions
+- **ARM nodes** for stateless/container workloads only (no live migration, no DRBD on ARM); x86 stays for pets.
+- **SAN support mode** (same orchestrator/witness, storage from an existing SAN instead of DRBD); multi-site dashboard.
+
+## How a cluster is laid out
+1. **Base OS** — AlmaLinux 10.1 minimal. Root SSH, static management IP, NTP, SELinux permissive, firewall off.
+2. **Networking** — Mgmt LAN over br0 (bridge over the first NIC, via MikroTik). All intra-cluster traffic (DRBD, SeaweedFS, libvirt migration) targets the per-node loopback `/32` in the cluster's CGNAT `/24` (`100.X.Y.0/24`, derived from `cluster_uuid` — see `installer/lib/cluster_addr.py`); the netd thread routes those packets over whichever physical NIC has the best path.
+3. **Hypervisor** — KVM/QEMU/libvirt; libvirtd runs on every node.
+4. **Storage** — LVM thin pool on NVMe, DRBD from ELRepo.
+5. **Replicated volumes** — thin data + thin meta LV per DRBD resource, synced over the direct link.
+6. **VMs** — QEMU opens the raw DRBD block device (`/dev/drbd/by-res/<resource>/0`); guest agent + virtio.
+7. **Live migration** — single command wraps dual-primary → `virsh migrate --live` → demote source → disable dual-primary.
+8. **HA failover** — witness-confirmed quorum loss restarts pet/vipet VMs on a survivor.
 
 ## Competitive landscape
 - **Proxmox:** Corosync dependency makes two-node HA painful. Good product but opinionated framework.
@@ -153,9 +166,6 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - The orchestrator is the only shared logic, and it's KISS — if it crashes, everything freezes in last known-good state.
 
 ## Future considerations
-- **Backup:** PBS with proxmox-backup-client. Full-read re-chunk for 0.7, dirty-bitmap tracking if needed later. fsfreeze for consistency.
-- **VM import/export:** virt-v2v for VMware/Hyper-V import. qemu-img convert for export to VMDK/VHD/VHDX. Offramp documented prominently.
-- **Application services:** Start with Elestio BYOVM for managed open-source apps. Build native modules only for fundamental infra (PostgreSQL, MinIO, Redis, reverse proxy). Stay away from long tail.
-- **Multi-architecture:** ARM for stateless containers/immutable VMs only. No live migration on ARM. Cross-arch app replication only at logical level (pg_dump, not WAL streaming).
-- **Dashboard layers:** Local orchestrator API is ground truth. Business dashboard aggregates site APIs. Upper layer observes and alerts, never decides failover. Local layer never depends on anything above it.
-- ** local dashboard:** Very soon after this a webinterface needs to become available. Showing a no-nonsense management interface in a browser to initiate action manually. All action will also be available via API for further automation.
+- **Application services:** Elestio BYOVM for managed open-source apps. Native modules only for fundamental infra (PostgreSQL, MinIO, Redis, reverse proxy); stay away from the long tail.
+- **Multi-architecture:** ARM for stateless containers / immutable VMs only — no live migration on ARM, cross-arch replication only at the logical level (pg_dump, not WAL streaming).
+- **Dashboard layers:** the local orchestrator API is ground truth. A business dashboard aggregates site APIs; the upper layer observes and alerts, never decides failover. The local layer never depends on anything above it.

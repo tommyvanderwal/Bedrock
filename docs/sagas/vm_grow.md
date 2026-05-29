@@ -1,116 +1,112 @@
 # Saga: `vm_grow`
 
-**Module:** `bedrock_d/vm/grow.py`  
-**Class:** `VmGrow`
+**Code:** `bedrock_d/vm/grow.py` (class `VmGrow`, `@saga("vm_grow")`)
+**Sizing helpers:** `bedrock_d/vm/lvm.py`
 
-## Purpose
+## Summary
 
-Online-grow a VM's disk. DRBD does this in-place — no detach, no
-VM restart — by extending the underlying LV on every peer, telling
-DRBD to refresh its bitmap accounting, and updating the
-`drbd_resources` row.
+Online-grow one VM disk. DRBD extends in place — no detach, no remount, no
+VM restart — by extending the data LV (and the meta LV first, when the larger
+bitmap needs the room) on every peer, telling DRBD to re-read the device, and
+recording the new size in rqlite. The guest still grows its own partition/FS
+(`growpart` + `resize2fs`); that is a separate operator action this saga does
+not perform.
 
-Shrinking is **not** supported by this saga (DRBD doesn't shrink
-online; the operator would need to manually destroy + recreate the
-resource).
+Shrink is out of scope: DRBD does not shrink online. Recovery from an
+over-grow is destroy + recreate at the desired size + restore from backup.
 
-## Trigger
+- **Trigger:** `POST /api/operations` with `kind="vm_grow"` and params
+  `{"vm_name": ..., "new_gb": N[, "disk_index": 0]}`. The request body becomes
+  the saga `ctx`. (The dashboard's VM-settings page drives a separate inline
+  live-grow via `POST /api/vms/{vm_name}/compute` with `{"disk_gb": N}`; that
+  path is not this saga.)
+- **Where:** the saga executor inside `bedrock-d`. Step bodies shell out per
+  peer via `lvm._run_on` — local when the host is empty/localhost/this node,
+  SSH `root@<host>` otherwise.
+- **End state:** every peer's data LV (and meta LV if needed) is at `new_gb`,
+  DRBD reports the larger device, and `drbd_resources.data_size_bytes` /
+  `meta_size_bytes` reflect the new baseline.
 
-`POST /api/vms/{vm_name}/grow` with `{"new_disk_gb": N}` from the
-dashboard / CLI, or `POST /api/operations` with
-`kind="vm_grow"`.
-
-## Inputs (`ctx`)
-
-| key | type | meaning |
-|-----|------|---------|
-| `vm_name` | str | VM to grow |
-| `new_disk_gb` | int | New data LV size (must be ≥ current) |
-
-## Outputs (`ctx`)
-
-| key | filled by | meaning |
-|-----|-----------|---------|
-| `current_disk_gb` | `load_current_size` | Old size, recovered from rqlite |
-| `peers` | `load_current_size` | Peer list from `drbd_resources` |
-| `resource` | `load_current_size` | `vm-<vm_name>-disk0` |
-
-## Step overview
+**ctx in:** `vm_name` (str); `new_gb` (int, new *total* GiB, must be `>`
+current); `disk_index` (int, default 0 = boot disk).
+**ctx filled:** `resource` = `vm-<vm_name>-disk<idx>`; `old_gb` (current
+`data_size_bytes // GiB`); `peers` (node-name list).
 
 | # | Step | What it does |
 |---|------|--------------|
-| 1 | [`load_current_size`](#load_current_size) | Read `drbd_resources` row for `data_size_bytes`, derive `peers` |
-| 2 | [`validate_new_size`](#validate_new_size) | Refuse if shrink, refuse if equal, refuse if peer is unreachable |
-| 3 | [`lvextend_meta_on_peers`](#lvextend_meta_on_peers) | Grow meta LV if `meta_size_mb_for(new_disk_gb)` > current |
-| 4 | [`lvextend_data_on_peers`](#lvextend_data_on_peers) | `lvextend -L <new>G` on every peer's data LV |
-| 5 | [`drbd_resize`](#drbd_resize) | `drbdadm resize <resource>` on home node (one place; DRBD broadcasts the new size) |
-| 6 | [`update_drbd_resources_row`](#update_drbd_resources_row) | Update `data_size_bytes` in rqlite |
+| 1 | [`load_current_size`](#load_current_size) | Read the `drbd_resources` row for `data_size_bytes` and the `peers` JSON column |
+| 2 | [`validate_new_size`](#validate_new_size) | Refuse unless `new_gb > old_gb` |
+| 3 | [`lvextend_meta_on_peers`](#lvextend_meta_on_peers) | `lvextend` the meta LV to `meta_size_mb_for(new_gb)` on every peer |
+| 4 | [`lvextend_data_on_peers`](#lvextend_data_on_peers) | `lvextend -L <new_gb>G --no-resize-fs` the data LV on every peer |
+| 5 | [`drbd_resize`](#drbd_resize) | `drbdadm resize <resource>` on every peer |
+| 6 | [`update_drbd_resources_row`](#update_drbd_resources_row) | `UPDATE` `data_size_bytes` + `meta_size_bytes` in rqlite |
 
-## Revert
+## Detail
 
-No automated shrink. To revert (if a grow somehow needs to be
-undone before the new space is used): `lvremove` is destructive and
-unsafe. The supported recovery is:
-1. `vm_destroy` the VM
-2. Re-create with the desired (smaller) `disk_gb`
-3. Restore from backup
-
-## Idempotency / resume
-
-- `lvextend` is naturally idempotent (no-op if target ≤ current)
-- `drbdadm resize` is idempotent (no-op if DRBD already sees the
-  full LV size)
-- `update_drbd_resources_row` is `UPDATE` (no-op if value unchanged)
-
-A grow that crashes mid-saga can be re-run safely. The only
-"unrolled" state is the partial peer extend — peers that already
-got `lvextend` no-op next time; peers that didn't get the new size.
-
-## Step details
+Each step is idempotent. The executor records a `done` row per step in
+`operation_steps`; a crash resumes from the first step without one. The LVM
+grows run `lvextend ... || true` (`check=False`) and `drbd_resize` uses
+`check=False`, so "already at size" and benign re-resize results never abort a
+re-run.
 
 ### `load_current_size`
 
-Reads `drbd_resources WHERE name = "vm-<vm_name>-disk0"`:
-- `data_size_bytes` → `ctx["current_disk_gb"]`
-- `data_lv`, `meta_lv` (re-derive via `lvm.lv_names_for`)
-- Peer list — recovered by reading the .res file's `on <peer>`
-  blocks (the row doesn't store peers directly)
+`SELECT data_size_bytes, peers FROM drbd_resources WHERE name = ?` for
+`resource = vm-<vm_name>-disk<disk_index>`. Sets `ctx["resource"]`,
+`ctx["old_gb"]` (`data_size_bytes // 1 GiB`), `ctx["peers"]` (the `peers` JSON
+column, decoded). Raises `RuntimeError` if no row.
+
+- **Revert:** none (read-only).
+- **Idempotent:** pure read.
 
 ### `validate_new_size`
 
-Refuses if:
-- `new_disk_gb < current_disk_gb` (shrink — not supported)
-- `new_disk_gb == current_disk_gb` (no-op — refuse to spend
-  cycles on no work)
-- Any peer is unreachable via SSH (the grow MUST happen on all
-  peers atomically or DRBD ends up with inconsistent sizes)
+Raises `ValueError` if `new_gb <= old_gb`. Equal is rejected explicitly so the
+operator doesn't mistake a no-op for a grow; smaller is a shrink, which is
+unsupported. No reachability or peer checks here — an unreachable peer surfaces
+as an SSH failure in a later step.
+
+- **Revert:** none.
+- **Idempotent:** pure check.
 
 ### `lvextend_meta_on_peers`
 
-For each peer: compute `lvm.meta_size_mb_for(new_disk_gb)` and
-`lvextend -L <new_mb>M` if it's larger than the current meta LV
-size. Idempotent — `lvextend` no-ops if target ≤ current.
+For each peer: `lvm.lvextend_meta(host, resource, new_gb)` →
+`lvextend -L <meta>M <vg>/bedrock-meta-<resource>` where `<meta>` =
+`meta_size_mb_for(new_gb)`. Meta grows before data because a larger data
+device needs a larger DRBD per-peer bitmap; the bitmap must be able to describe
+the new size before `drbd_resize` reads it. Small grows often fit the existing
+meta LV, in which case LVM no-ops.
 
-The meta LV's required size scales with `max_peers × data_gb`, so
-large grows do need a matching meta-LV grow; small grows
-typically don't.
+- **Revert:** none (`lvreduce` on live DRBD meta is unsafe).
+- **Idempotent:** `lvextend` no-ops if target `<=` current.
 
 ### `lvextend_data_on_peers`
 
-For each peer: `lvextend -L <new_disk_gb>G --no-resize-fs
-bedrock/<data_lv>`. `--no-resize-fs` because DRBD will publish the
-new size to the kernel via `drbdadm resize` in the next step; the
-filesystem inside the VM owns its own resize ceremony.
+For each peer: `lvm.lvextend_data(host, resource, new_gb)` →
+`lvextend -L <new_gb>G --no-resize-fs <vg>/bedrock-data-<resource>`.
+`--no-resize-fs` because DRBD (not LVM) publishes the new size in the next
+step, and the guest owns its own in-VM filesystem resize.
+
+- **Revert:** none.
+- **Idempotent:** `lvextend` no-ops if target `<=` current.
 
 ### `drbd_resize`
 
-Run on the **home node only**. `drbdadm resize vm-<vm_name>-disk0`.
-DRBD reads the new LV size, recalculates bitmap accounting, and
-publishes the new device size. The peers' DRBD instances see the
-size change via the replication channel; no SSH ceremony needed for
-this step.
+For each peer: `drbdadm resize <resource>` (`check=False`). DRBD re-reads the
+now-larger data device, recalculates bitmap accounting, and publishes the new
+device size to the kernel. Online — no detach, no remount.
+
+- **Revert:** none.
+- **Idempotent:** no-op once DRBD already sees the full LV size.
 
 ### `update_drbd_resources_row`
 
 `UPDATE drbd_resources SET data_size_bytes = ?, meta_size_bytes = ?,
-updated_at = ? WHERE name = ?`. Bumps `bedrock_meta.revision`.
+updated_at = ? WHERE name = ?`, with `meta_size_bytes` recomputed from
+`meta_size_mb_for(new_gb)` and `updated_at` = epoch seconds. Deliberately last:
+until it commits, a re-run still reads the old `old_gb` and stays consistent;
+once it commits, the next grow uses the new size as its floor.
+
+- **Revert:** none.
+- **Idempotent:** `UPDATE` is a no-op when the values are unchanged.

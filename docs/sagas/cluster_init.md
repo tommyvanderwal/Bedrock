@@ -1,247 +1,252 @@
 # Saga: `cluster_init`
 
-**Module:** `bedrock_d/install/cluster_init.py`  
-**Class:** `ClusterInit`  
-**Entry:** `run_cluster_init(cluster_name, repo)`
+**Module:** `bedrock_d/install/cluster_init.py` — class `ClusterInit`
+**Entry:** `run_cluster_init(*, cluster_name=None, repo)`
 
-## Purpose
+## Summary
 
-First-time bring-up of a Bedrock cluster. Runs on a single node that
-becomes the founding master at N=1. Idempotent end-to-end — re-running
-``bedrock init`` after a crash resumes from the first incomplete step.
+**What:** first-time bring-up of a Bedrock cluster. Runs every step needed to
+turn a freshly-bootstrapped box into a founding master at N=1: identity, TLS PKI,
+local storage, single-node rqlite, schema + seed rows, the `bedrock-d` daemon,
+and the SeaweedFS object store.
 
-## Trigger
+**When:** the operator runs `bedrock init [--name <cluster>]` (`cmd_init` in
+`installer/bedrock`). The CLI calls `run_cluster_init()` in-process — there is no
+HTTP submission because rqlite, which the mgmt API needs, is the thing this saga
+brings up.
 
-`bedrock init [--name <cluster>]` CLI. The CLI invokes
-`run_cluster_init()` directly; there is no HTTP submission because
-rqlite isn't up yet — this saga IS what brings it up.
+**Where:** on the single node being initialised. Identity and progress live in
+local files until `start_rqlited`.
 
-No witness is configured here. The `witnesses` rqlite table starts
-empty; a 2-node cluster without an entry runs in "stay put" mode
-(current master holds `.254`, no auto-failover). Witnesses are
-added later via dashboard / API by writing a row into the
-`witnesses` table — no saga needed.
+**Backend:** `FileSagaBackend` at `/var/lib/bedrock/init-progress.json` (one
+operation row + per-step state). Steps 1-12 run before rqlite exists, so progress
+can't go to rqlite; the file is read on re-run so a half-completed init resumes
+from the first not-`done` step.
 
-The backend is the **file-based** `FileSagaBackend` at
-`/var/lib/bedrock/init-progress.json` (not rqlite); the
-backend switches to `RqliteSagaBackend` after this saga's
-`start_rqlited` step.
+**End state:** N=1 cluster — this node is `mgmt_master`, holds loopback octet 1,
+runs `bedrock-d` + single-node rqlite + the full SeaweedFS stack, and is ready to
+accept joins. The `witnesses` table is empty: a 2-node cluster with no witness
+stays put (current master holds `.254`, no auto-failover) until a witness row is
+written via dashboard/API.
 
-## Inputs (`ctx` keys set by the entry point)
+### Inputs (`ctx`)
 
-| key | required | type | meaning |
-|-----|----------|------|---------|
-| `cluster_name` | optional | str | Display tag (defaults to `bedrock-<hostname>`). The real identity is `cluster_uuid`, allocated by `allocate_identity`; the name is just for the dashboard, the mDNS TXT record, and `bedrock status`. Renamable later — see `bedrock cluster rename`. |
-| `repo` | required | str | URL or `file://` path of the install repo for fetching binaries. The CLI auto-fills this from the install location the bootstrap ran from (`get_repo()`); operators never type it. |
+| key | required | meaning |
+|-----|----------|---------|
+| `cluster_name` | optional | Display tag; defaults to `bedrock-<hostname>`. The real identity is `cluster_uuid`. Used by the dashboard, the mDNS TXT record, and `bedrock status`. Changed later via `bedrock cluster rename`. |
+| `repo` | required | URL or `file://` of the install repo for fetching binaries. The CLI auto-fills this from where bootstrap ran; operators never type it. |
 
-## Outputs (`ctx` keys filled by the saga's own steps)
+### Outputs (`ctx` keys set by the saga, also persisted to `state.json`)
 
-| key | filled by | meaning |
-|-----|-----------|---------|
-| `cluster_uuid` | `allocate_identity` | UUID4 generated at init time, immutable for the cluster's life |
-| `node_name` | `allocate_identity` | This node's bedrock-XXXXXX name |
-| `loopback_ip` | `allocate_identity` | This node's `100.X.Y.Z/32` on `lo` |
-| `cluster_key` | `allocate_identity` | 32-byte symmetric key (AEAD for witness slots, peer-auth gate) |
+| key | set by | meaning |
+|-----|--------|---------|
+| `cluster_uuid` | `allocate_identity` | UUID4, immutable for the cluster's life |
+| `node_name` | `allocate_identity` | this node's name (the system hostname) |
+| `loopback_ip` | `allocate_identity` | `100.X.Y.1/32` — master always gets octet 1 |
+| `mgmt_ip` | `allocate_identity` | this node's LAN IPv4 (first non-loopback) |
 
-## Step overview
+### Steps
 
 | # | Step | What it does |
 |---|------|--------------|
-| 1 | [`prepare_dirs`](#prepare_dirs) | Create `/etc/bedrock`, `/var/lib/bedrock`, `/opt/bedrock` |
-| 2 | [`allocate_identity`](#allocate_identity) | Pick cluster_uuid + node_name + loopback_ip + cluster_key |
-| 3 | [`write_cluster_key`](#write_cluster_key) | Atomic-write `cluster.key` (0600) |
-| 4 | [`write_bootstrap_cluster_json`](#write_bootstrap_cluster_json) | Minimal cluster.json scaffold so rqlited's env can render before rqlite is up |
-| 5 | [`install_obs_binaries`](#install_obs_binaries) | Fetch victoria-{metrics,logs}, exporters, vmagent, vlagent |
-| 6 | [`install_exporters`](#install_exporters) | Install node_exporter + vm_exporter |
-| 7 | [`write_obs_services`](#write_obs_services) | Render systemd units for the observability stack |
-| 8 | [`start_obs_services`](#start_obs_services) | Enable + start the exporters/agents |
-| 9 | [`provision_storage_n1`](#provision_storage_n1) | `tier_storage.setup_n1()` — thinpool + weed-volume LV + cluster-singleton dir |
-| 10 | [`bootstrap_cluster_ca`](#bootstrap_cluster_ca) | Generate the cluster TLS CA + sign this master's node cert + the arbiter cert |
-| 11 | [`render_rqlited_env`](#render_rqlited_env) | Write `/etc/bedrock/rqlited.env` |
-| 12 | [`start_rqlited`](#start_rqlited) | Enable + start `bedrock-rqlited.service` (single-node Raft) |
-| 13 | [`apply_schema`](#apply_schema) | Apply `bedrock_schema.sql` to the fresh rqlite |
-| 14 | [`seed_cluster_state`](#seed_cluster_state) | Insert cluster_info, this-node row, default operator |
-| 15 | [`mirror_tier_state`](#mirror_tier_state) | Push local tier_state rows into rqlite |
-| 16 | [`start_bedrock_d`](#start_bedrock_d) | Enable + start the unified daemon |
-| 17 | [`seaweedfs_install`](#seaweedfs_install) | Confirm `/usr/local/bin/weed` is present |
-| 18 | [`seaweedfs_configs`](#seaweedfs_configs) | Render seaweed env + master/filer/s3 configs |
-| 19 | [`seaweedfs_start_local`](#seaweedfs_start_local) | Start weed-master + weed-volume + weed-s3 |
-| 20 | [`seaweedfs_start_filer`](#seaweedfs_start_filer) | Start weed-filer on `.254` (cluster singleton) |
-| 21 | [`seaweedfs_init_collections`](#seaweedfs_init_collections) | Create scratch/standard/critical collections + buckets |
-| 22 | [`seed_iso_library`](#seed_iso_library) | Seed `/mnt/bedrock/iso/` with the bundled Alpine cloud image |
-
-## Revert
-
-There is no `cluster_init`-inverse saga. A node that wants to
-abandon its cluster identity runs `bedrock node reset` (see
-`tier_storage.node_reset_local()`) which tears down DRBD, removes
-the LVs, unmounts, wipes `/etc/bedrock`, and restores the box to a
-pre-init state. Use this only on the node being reset — it doesn't
-touch peers.
+| 1 | prepare_dirs | mkdir `/opt/bedrock/{bin,iso}`, `/var/lib/bedrock/{vm,vl}`, `/opt/bedrock/mgmt` |
+| 2 | allocate_identity | pick `cluster_uuid`, `node_name`, `loopback_ip` (.1), `mgmt_ip`; write `state.json` |
+| 3 | write_cluster_key | write `/etc/bedrock/cluster.key` (32 random bytes, 0600) |
+| 4 | write_bootstrap_cluster_json | minimal `cluster.json` scaffold so `rqlited.env` can render pre-rqlite |
+| 5 | install_obs_binaries | fetch `victoria-metrics` + `victoria-logs` |
+| 6 | install_exporters | install `node_exporter` + `vm_exporter` |
+| 7 | write_obs_services | render `bedrock-vm` + `bedrock-vl` units, `scrape.yml`, dashboard |
+| 8 | start_obs_services | `enable --now` `bedrock-vm` + `bedrock-vl` |
+| 9 | provision_storage_n1 | thinpool + weed-volume LV + cluster-singleton dir |
+| 10 | bootstrap_cluster_ca | cluster TLS CA + master node cert + arbiter cert |
+| 11 | render_rqlited_env | write `/etc/bedrock/rqlited.env` |
+| 12 | start_rqlited | `enable --now bedrock-rqlited`; poll until raft=Leader |
+| 13 | apply_schema | apply `bedrock_schema.sql` (`CREATE TABLE IF NOT EXISTS`) |
+| 14 | seed_cluster_state | seed `cluster_info`, this node, default operator, obs backends, `mgmt_master` |
+| 15 | mirror_tier_state | push the cluster singleton's tier row into rqlite |
+| 16 | start_bedrock_d | `enable --now bedrock-d` (orchestrator + netd take over) |
+| 17 | seaweedfs_install | confirm `/usr/local/bin/weed` is present |
+| 18 | seaweedfs_configs | render seaweed env + master/filer/s3 configs |
+| 19 | seaweedfs_start_local | start weed-master (if in Raft-3 set) + weed-volume + weed-s3 |
+| 20 | seaweedfs_start_filer | start weed-filer on `.254`; wait for s3 on :8333 |
+| 21 | seaweedfs_init_collections | configure path→collection→replication policies |
+| 22 | seed_iso_library | copy ISOs staged in `/opt/bedrock/iso/` into the filer's `/iso/` |
 
 ## Idempotency / resume
 
-Re-running `bedrock init` after a crash mid-step resumes from the
-first not-`done` step in `init-progress.json`. Each step's body
-opens with the idempotency check appropriate to its effect (e.g.
-`apply_schema` is `CREATE TABLE IF NOT EXISTS`; `start_rqlited`
-checks `systemctl is-active`). The saga can be safely re-run any
-number of times on the same node — the only thing that's
-"single-use" is the cluster_uuid + cluster_key allocated by
-`allocate_identity`, and that step persists them into state.json
-on first run, so re-runs read them back.
+Each step's first lines are its idempotency check (file exists, `systemctl
+is-active`, `CREATE … IF NOT EXISTS`, `INSERT OR REPLACE`). Re-running
+`bedrock init` after a crash skips every `done` step and continues from the first
+not-`done` one. A re-run on an already-complete init is a no-op. The only
+single-use values are `cluster_uuid` + `cluster.key`, persisted on first run so
+re-runs read them back.
+
+`ctx` is not persisted between runs. On resume the executor rebuilds it from the
+operation's `params`; `run_cluster_init` enriches `params` from `state.json`
+(`cluster_uuid`, `node_name`, `loopback_ip`, `mgmt_ip`) so resumed steps see what
+`allocate_identity` already wrote.
+
+## Revert
+
+There is no inverse saga. To return a node to its post-`bedrock bootstrap` state,
+`tier_storage.node_reset_local()` runs (over SSH from `bedrock storage
+remove-peer`, or directly via the hidden `bedrock storage _local-reset`): stop
+bedrock services, tear down DRBD + its `.res` files, unmount FUSE/DRBD/local LVs,
+drop fstab entries, remove the cluster + weed-volume LVs, remove
+`/opt/bedrock/{mgmt,iso,data}`, and truncate `state.json` to `{hardware,
+bootstrap_done}`. It preserves OS packages, the DRBD kernel module, `br0` + ring
+NICs, SSH keys, and the VG + thinpool. After it the box can `bedrock init` again
+or `bedrock join`. Idempotent; affects only the node it runs on.
 
 ## Step details
 
-### `prepare_dirs`
+### 1. `prepare_dirs`
+Creates `/opt/bedrock/bin`, `/var/lib/bedrock/{vm,vl}`, `/opt/bedrock/mgmt`, and
+`/opt/bedrock/iso`. **Revert:** dirs removed by `node_reset_local`. **Idempotent:**
+`mkdir -p`.
 
-Creates the directory layout under `/etc/bedrock`, `/var/lib/bedrock`,
-and `/opt/bedrock` with the right modes. No-op if the dirs already
-exist with the right modes; otherwise `mkdir -p` + `chmod`.
+### 2. `allocate_identity`
+Loads `state.json`, generates `cluster_uuid` (UUID4) if absent, sets
+`node_name` (the detected hostname), derives the cluster's `100.X.Y.0/24` from the
+UUID and assigns `loopback_ip = .1` (`cluster_addr.node_loopback_ip(uuid, 1)`),
+picks `mgmt_ip` (first non-loopback IPv4) and sets `mgmt_url =
+https://<mgmt_ip>:8443`, then saves `state.json`. **Revert:** identity cleared by
+`node_reset_local`. **Idempotent:** re-uses existing `cluster_uuid`/`node_name`.
 
-### `allocate_identity`
+### 3. `write_cluster_key`
+`daemon_setup.write_cluster_key()` writes `/etc/bedrock/cluster.key` (32 random
+bytes, 0600) — the AEAD key for witness slots and the peer-auth gate. **Revert:**
+removed with `/etc/bedrock` contents on reset. **Idempotent:** respects an
+existing file.
 
-Generates a fresh `cluster_uuid` (UUID4), derives the cluster's
-`100.X.Y.0/24` loopback prefix from the UUID, picks this node's
-`node_name` as the system hostname, and assigns it `loopback_ip =
-100.X.Y.1/32` (the master always gets octet 1 at init). Generates a
-32-byte `cluster_key` for AEAD on witness slots + peer-auth gate.
-All four values persist into `/etc/bedrock/state.json` so re-runs
-read them back instead of regenerating.
+### 4. `write_bootstrap_cluster_json`
+Writes a minimal `/etc/bedrock/cluster.json` with `cluster_uuid`, `cluster_name`,
+`mgmt_master = self`, this node, and empty `tiers`/`witnesses`/`vms`/… blocks.
+`cluster.json` is a local bootstrap file holding the rqlite peer list, read by
+`rqlite_setup.render_env_file()` at every boot (rqlite can't report its own peers
+before it starts). It is not a runtime projection — once rqlite is up, every
+consumer reads it via `cluster_state.load_cluster()`. **Revert:** removed on
+reset. **Idempotent:** written verbatim each run.
 
-### `write_cluster_key`
+### 5. `install_obs_binaries`
+Downloads `victoria-metrics` and `victoria-logs` from `<repo>/binaries/` into
+`/opt/bedrock/bin/`, `chmod 0755`. **Revert:** binaries removed on reset.
+**Idempotent:** skips a binary already present.
 
-Atomic-writes `/etc/bedrock/cluster.key` with mode 0600.
+### 6. `install_exporters`
+`exporters.install(repo)` fetches `node_exporter` + `vm_exporter.py` and writes
+their units. **Revert:** removed on reset. **Idempotent:** skips an existing
+`node_exporter`; re-fetches `vm_exporter.py` (cheap).
 
-### `write_bootstrap_cluster_json`
+### 7. `write_obs_services`
+Writes `scrape.yml` (node:9100, libvirt:9177), renders the `bedrock-vm`
+(VictoriaMetrics :8428) and `bedrock-vl` (VictoriaLogs :9428, syslog :5140) units,
+and installs the dashboard (`with_metrics=True`). **Revert:** units removed on
+reset. **Idempotent:** overwrites with current content (cheap).
 
-Writes a minimal `/etc/bedrock/cluster.json` scaffold containing
-`cluster_name`, `cluster_uuid`, this node, and empty `tiers` /
-`witnesses` / `vms` blocks. This is a **bootstrap-only** file: it
-gives `rqlite_setup.render_env_file()` something to read before rqlite
-is up. Once `start_rqlited` + `seed_cluster_state` land, rqlite is the
-authoritative store and every consumer reads it directly via
-`cluster_state.load_cluster()` — there is no steady-state `cluster.json`
-projection (that layer was removed 2026-05-26; only `state.json` is
-re-projected per revision).
+### 8. `start_obs_services`
+`systemctl enable --now bedrock-vm bedrock-vl`. **Revert:** stopped on reset.
+**Idempotent:** no-op if already active.
 
-### `install_obs_binaries`
+### 9. `provision_storage_n1`
+`tier_storage.setup_n1(write_rqlite=False)`: ensure the LVM thinpool, create the
+SeaweedFS volume LV (`bedrock-weed-volume`, 30G, XFS, no DRBD, mounted at
+`/var/lib/bedrock/seaweedfs/volumes`), and create the cluster-singleton directory
+`/var/lib/bedrock/cluster`. At N=1 the cluster singleton (arbiter rqlite + filer
+leveldb3 + S3 IAM) is a plain dir on the root FS; the
+[`cluster_tier_promote_master`](cluster_tier_promote_master.md) saga snapshots
+and restores its contents onto a DRBD volume at N=1→N=2 (XFS preserved
+byte-for-byte by external metadata), so paths are identical before and after.
+Records `tiers.cluster.mode = local` locally only; `write_rqlite=False` because
+rqlite isn't up — `mirror_tier_state` pushes it later. **Revert:** LVs/dir removed
+on reset. **Idempotent:** each helper checks existence first.
 
-Fetches the observability binaries (victoria-metrics, victoria-logs,
-vmagent, vlagent, vmbackup, vmrestore) from the install repo. Skips
-files already present at the right size in `/opt/bedrock/bin/`.
+### 10. `bootstrap_cluster_ca`
+Stands up the TLS PKI before rqlited starts (rqlited reads its certs at process
+start; no hot-reload). Ensures `/var/lib/bedrock/cluster`, generates the CA
+(`/var/lib/bedrock/cluster/ca/ca.{key,crt}`, master-only), ensures the peer-auth
+keypair, signs and installs the master's node cert (`/etc/bedrock/node.crt`,
+`/etc/bedrock/node.key.pem`, CA at `/etc/bedrock/ca.crt`), and signs the arbiter
+cert for `<prefix>.254` (`cluster_arbiter.ARBITER_OCTET`). The CA lives under
+`/var/lib/bedrock/cluster`, so it migrates onto the DRBD volume with the singleton
+on the N=1→N=2 promote. **Revert:** cert files removed on reset. **Idempotent:**
+CA/arbiter generators skip existing files; the node cert is re-signed each run
+(cheap, deterministic).
 
-### `install_exporters`
+### 11. `render_rqlited_env`
+`rqlite_setup.render_env_file()` writes `/etc/bedrock/rqlited.env` from
+`cluster.json` + `state.json`. The rqlite node-id is the loopback's last octet so
+it stays stable across reboots and joins. **Revert:** removed on reset.
+**Idempotent:** overwrites with the current rendering.
 
-Same pattern as `install_obs_binaries`, scoped to `node_exporter`
-and `vm_exporter`.
+### 12. `start_rqlited`
+`reset-failed` + `enable` + `restart bedrock-rqlited` (single-node Raft on this
+loopback), then polls `https://127.0.0.1:4001/status` over mTLS (node
+cert/key/CA) for up to 30 s until `store.raft.state == Leader`. **Fails loud** on
+timeout — the seed step needs a writable leader. **Revert:** stopped on reset.
+**Idempotent:** restart on a running rqlited is cheap.
 
-### `write_obs_services`
+### 13. `apply_schema`
+Applies `bedrock_schema.sql` to rqlite via `bedrock_d.state`. **Revert:** none
+needed (DB removed with the LV on reset). **Idempotent:** every statement is
+`CREATE TABLE IF NOT EXISTS`.
 
-Renders the systemd units for the obs stack into
-`/etc/systemd/system/`. Idempotent — units only re-rendered if
-their content would change.
+### 14. `seed_cluster_state`
+In one rqlite session: insert the singleton `cluster_info` row, register this node
+into `nodes` (with its SSH pubkey + `bedrock_pubkey`), set its loopback, seed the
+default operator (`root` / `admin`, changed later via `bedrock operator passwd`),
+set this node as the `metrics` + `logs` obs backend, and set `mgmt_master = self`.
+**Revert:** rows go away with the rqlite DB on reset. **Idempotent:** all writes
+are `INSERT OR REPLACE` / upsert.
 
-### `start_obs_services`
+### 15. `mirror_tier_state`
+`tier_storage.mirror_tier_state_to_rqlite()` pushes the cluster singleton's row
+(`mode=local`, `backend_path=/var/lib/bedrock/cluster`) into the rqlite `tiers`
+table so followers and future joiners see it. **Revert:** none needed.
+**Idempotent:** `INSERT OR REPLACE`.
 
-`systemctl enable --now` for each obs unit. No-op if the unit is
-already active.
+### 16. `start_bedrock_d`
+`daemon-reload` + `reset-failed` + `enable --now bedrock-d`. The unified daemon
+starts: its orchestrator tasks (`rqlite_subscriber`, `boot_orchestrator`,
+`no_quorum_responder`, `converge_retry`, `backup_scheduler`) and the netd thread
+begin running. **Revert:** stopped on reset. **Idempotent:** `enable --now`.
 
-### `provision_storage_n1`
+### 17. `seaweedfs_install`
+`seaweedfs.ensure_install()` verifies `/usr/local/bin/weed` (staged by
+`install.sh`) and creates the seaweed directory tree. **Revert:** dirs removed on
+reset. **Idempotent:** check + `mkdir -p`.
 
-Calls `tier_storage.setup_n1()`: ensure the LVM thinpool, create the
-SeaweedFS volume LV (`bedrock-weed-volume`, 30G, XFS, mounted at
-`/var/lib/bedrock/seaweedfs/volumes` — no DRBD), and create the
-cluster-singleton directory at `/var/lib/bedrock/cluster`. At N=1 the
-cluster singleton (arbiter rqlite + filer leveldb3 + S3 IAM) lives as
-a plain directory on the root FS; it flips to a DRBD primary via the
-[`cluster_tier_promote_master`](cluster_tier_promote_master.md) saga
-when the cluster grows to N=2 (the dir contents are snapshotted and
-restored onto the DRBD volume, XFS preserved byte-for-byte by external
-metadata). Records `tiers.cluster.mode = "local"` locally;
-`write_rqlite=False` here because rqlite isn't up yet — `mirror_tier_state`
-pushes it into rqlite later.
+### 18. `seaweedfs_configs`
+Renders `/etc/bedrock/seaweedfs.env`, `seaweedfs-master.toml`,
+`seaweedfs-filer.toml`, and `seaweedfs-s3.json`. **Revert:** removed on reset.
+**Idempotent:** overwrites with the current rendering.
 
-### `bootstrap_cluster_ca`
+### 19. `seaweedfs_start_local`
+`seaweedfs.promote_to_master_volume_host()`: weed-volume (:8080) and weed-s3
+(:8333) on every node; weed-master (:9333) only if this loopback is in the Raft-3
+master set (the lowest-octet nodes; at N=1 that is this node). **Revert:** stopped
+on reset. **Idempotent:** `enable --now`; stops/disables master if this node is
+not in the set.
 
-Calls `cluster_ca` + `peer_auth` to stand up the cluster's TLS PKI
-before rqlited starts (rqlited reads its cert files at process start —
-no hot-reload). Generates the CA (`/var/lib/bedrock/cluster/ca/ca.{key,crt}`,
-master-only), signs this master's per-node cert
-(`/etc/bedrock/node.crt`, `/etc/bedrock/node.key.pem`, replicated CA at
-`/etc/bedrock/ca.crt`), and signs the arbiter cert for the
-`.254` loopback. Idempotent — the CA/arbiter generators skip existing
-files; the master's node cert is re-signed each run (cheap, deterministic).
-The CA lives under `/var/lib/bedrock/cluster`, so it migrates onto the
-DRBD volume automatically on the N=1→N=2 promote.
+### 20. `seaweedfs_start_filer`
+`seaweedfs.promote_to_filer_host()` starts the filer singleton bound to
+`.254:8888` — at N=1 the master's own loopback alias. Then polls `127.0.0.1:8333`
+for up to 15 s so post-init smoke tests can PUT objects (logs a warning, does not
+fail, if s3 doesn't bind). **Revert:** stopped on reset. **Idempotent:** starting
+a running filer is a no-op.
 
-### `render_rqlited_env`
+### 21. `seaweedfs_init_collections`
+`seaweedfs.init_collections()` runs `weed shell fs.configure -apply` to map filer
+path prefixes to collection + replication: `/scratch/`→scratch/000,
+`/iso/ /templates/ /snapshots/`→standard, `/backups/`→critical. Replication scales
+with N (`standard` 000→001 at N≥2; `critical` →002 at N≥3), so an N=1 box can
+still take ISO/template uploads. **Revert:** none needed. **Idempotent:**
+`fs.configure -apply` overwrites the policy for the same prefix.
 
-Writes `/etc/bedrock/rqlited.env` with the per-node rqlite config.
-The node_id is derived from the loopback's last octet so it stays
-stable across reboots and joins.
-
-### `start_rqlited`
-
-`systemctl enable --now bedrock-rqlited` — single-node Raft cluster
-on this loopback. Polls `https://127.0.0.1:4001/status` (mTLS, using
-the node cert/key/CA from `bootstrap_cluster_ca`) until the Raft state
-reads `Leader`, then returns. Fails loud on a 30 s timeout — the seed
-step needs a writable leader.
-
-### `apply_schema`
-
-Loads `bedrock_schema.sql` and runs each `CREATE TABLE IF NOT EXISTS`
-through the rqlite client. Safe to re-run.
-
-### `seed_cluster_state`
-
-Inserts the singleton `cluster_info` row, registers this node into
-`nodes` (with its `bedrock_pubkey` + loopback), seeds the default
-operator (`root` / `admin` — to be changed via `bedrock operator
-passwd`), sets this node as `metrics`/`logs` obs backend, and sets
-`mgmt_master = self`. All upserts (`INSERT … ON CONFLICT DO UPDATE`).
-
-### `mirror_tier_state`
-
-Calls `tier_storage.mirror_tier_state_to_rqlite()` to push every
-locally-known tier_state row into the rqlite `tiers` table. Now
-followers and future joiners see the same view.
-
-### `start_bedrock_d`
-
-`systemctl enable --now bedrock-d`. This is the moment the
-orchestrator's `rqlite_subscriber` task begins running and the
-calm loop takes over.
-
-### `seaweedfs_install`
-
-`/usr/local/bin/weed` presence check. Already shipped via the ISO.
-
-### `seaweedfs_configs`
-
-Renders `/etc/bedrock/seaweedfs.env` + `seaweedfs-master.toml` +
-`seaweedfs-filer.toml` + `seaweedfs-s3.json`.
-
-### `seaweedfs_start_local`
-
-Starts `bedrock-weed-master`, `bedrock-weed-volume`, `bedrock-weed-s3`
-on this node. Filer comes next.
-
-### `seaweedfs_start_filer`
-
-Starts `bedrock-weed-filer`. The filer binds `.254:8888` — at N=1
-that means binding the master's own loopback alias.
-
-### `seaweedfs_init_collections`
-
-Runs `weed shell` commands to create the `scratch`, `standard`, and
-`critical` collections and their buckets (`scratch`, `iso`,
-`templates`, `snapshots`, `backups`). Idempotent — `weed shell` no-ops
-on already-existing collections.
-
-### `seed_iso_library`
-
-Copies the bundled Alpine cloud image into `/mnt/bedrock/iso/` so
-fresh installs have one ISO available for cattle/pet VMs without
-external dependencies.
+### 22. `seed_iso_library`
+`seaweedfs.seed_iso_library()` mounts the shared FUSE namespace if needed and
+copies any `*.iso` staged in `/opt/bedrock/iso/` (e.g. `virtio-win.iso` baked into
+the install ISO) into the filer's `/iso/` subtree, visible as
+`/mnt/bedrock/iso/<name>.iso` on every node. **Revert:** none needed. **Idempotent:**
+skips files already present; wrapped so a failure logs a warning rather than
+failing init.

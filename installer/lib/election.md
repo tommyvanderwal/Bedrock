@@ -1,108 +1,145 @@
-# `election.py`
+# installer/lib/election.py
 
-**Module purpose.** Pure-function weighted-vote election. Takes
-observable state (peer liveness + per-peer acks from netd's neighbour
-table, configured/valid witness counts, current `mgmt_master` from
-rqlite/cluster_state) and returns an `Election` outcome plus a
-`should_set_mgmt_master` flag.
+A pure, side-effect-free weighted-vote election for the cluster base layer. It
+decides whether this node is **Leader**, **Follower**, or in **NoQuorum**, given
+a snapshot of observable state (active node set, peer reachability, peer acks,
+witness counts, current mgmt_master). It carries no rqlite dependency because it
+is the thing that *recovers* rqlite: netd calls `compute()` on each election
+tick and feeds the outcome into the arbiter-takeover path
+(`lib/cluster_arbiter.py`), which is gated on a Leader result. The two marker
+helpers manage a sticky on-disk override that forces NoQuorum.
 
-No I/O. No state. Owns the tie-break rules so they can be
-unit-tested in isolation (and they are — `tests/test_election.py` +
-`tests/test_netd_phase_a.py` cover them).
+## Functions / Classes
 
-**Weighted-vote formula (100/1).** `100` votes per active cluster node
-+ `1` per *valid+confirmed* witness. `total_votes = 100·N_active_nodes
-+ N_configured_witnesses` (both from rqlite). Majority = `total // 2 +
-1`. At failover a candidate's tally = `100·(self + acking peers) +
-valid_witnesses`; in steady state (we are master / following a live
-master) the node term uses reachable members.
+### `class Outcome(str, Enum)`
+The three election results: `LEADER` (`"leader"`), `FOLLOWER` (`"follower"`),
+`NO_QUORUM` (`"noquorum"`).
 
-**Denominator rule.** ALL configured witnesses count in `total_votes`;
-only valid+confirmed ones add to `my_votes`. A configured-but-invalid
-witness therefore *raises* the majority bar and biases toward "do not
-fail over" (3 configured / 1 valid / 2 nodes → total=203, majority=102,
-lone survivor 100+1=101 < 102 → no takeover → safe).
+### `class Election` (frozen dataclass)
+The full result of one `compute()` call.
+- **Fields:** `outcome: Outcome`; `my_votes: int`; `total_votes: int`;
+  `majority: int`; `should_set_mgmt_master: bool`; `reachable_peers: tuple[str, ...]`;
+  `acking_peers: tuple[str, ...]` (default `()`); `reason: str` (default `""`, a
+  human-readable explanation of the decision).
+- `should_set_mgmt_master` is True only on a fresh self-promotion — it tells the
+  caller to write self as `mgmt_master` in rqlite as post-takeover bookkeeping.
+  It is NOT a takeover gate (the Leader outcome is).
 
-**Active acks, not reachability.** When the master is gone, a peer only
-contributes its 100 votes if it has ACKED this candidate in its
-node-to-node heartbeat — meaning the peer also lost the master AND found
-the candidate's advertised arbiter-DRBD UUID eligible (classified
-against the peer's own local 7-day UUID history via
-`lib.state.classify_arbiter_uuid`). The ack/eligibility decision is made
-per-peer in netd; `compute()` just tallies the `peer_acks` map.
+### `compute(*, self_name, self_loopback, peer_liveness, node_loopbacks, current_mgmt_master, n_configured_witnesses=0, n_valid_witnesses=0, peer_acks=None, no_quorum_marker_path=NO_QUORUM_MARKER) -> Election`
+One-shot election decision over the supplied snapshot. Pure: reads only its
+arguments and (the existence of) the marker file; writes nothing.
+- **In:**
+  - `self_name` — this node's name.
+  - `self_loopback` — this node's loopback `/32` IP; its last octet is the
+    tiebreak key (falls back to `node_loopbacks[self_name]` if empty).
+  - `peer_liveness` — `dict[node_name, bool]` reachability from netd's neighbour
+    table. Should exclude self; an entry for self is tolerated and forced to True.
+    Used only for the reachable set and the ack tally, never for the denominator.
+  - `node_loopbacks` — `dict[node_name, loopback_ip]` of the cluster's ACTIVE
+    nodes (already filtered to `state=='active'` and not maintenance by netd). Its
+    key set ∪ self is the election denominator.
+  - `current_mgmt_master` — name of the current mgmt_master, or `None` if unset.
+  - `n_configured_witnesses` — count of every witness in the rqlite `witnesses`
+    table; the full witness denominator term.
+  - `n_valid_witnesses` — witnesses that are both valid (a slot for every active
+    node) and confirmed (our own slot read back). Only these add to `my_votes`.
+  - `peer_acks` — `dict[node_name, bool]`; True iff that peer has acked THIS node
+    as master-to-be in its heartbeat (it lost the master AND found our advertised
+    arbiter-UUID eligible). Defaults to `{}`.
+  - `no_quorum_marker_path` — path checked for the sticky override (defaults to
+    `NO_QUORUM_MARKER`).
+- **Out:** an `Election`. No side effects.
 
-**"Known cluster member"** at the election level means a node whose
-loopback is in `cluster.json` AND has been observed by bedrock-net
-at least once (caller passes `peer_liveness` keyed only by
-ever-seen peers — see `netd.Daemon.ever_seen_peers`). Fresh
-joiners that haven't probed back aren't counted yet, so master
-doesn't go NoQuorum mid-join.
+### `set_no_quorum_marker(reason="") -> None`
+Drops the sticky no-quorum marker so subsequent `compute()` calls return
+`NO_QUORUM` regardless of vote tally.
+- **In:** `reason` — text written into the file (defaults to
+  `"election: no quorum\n"`).
+- **Out:** None. Side effect: creates `NO_QUORUM_MARKER` (and its parent dir).
+  **Idempotent** — if the file already exists it returns without touching it, so
+  the file's mtime is preserved. OSErrors are swallowed.
+
+### `clear_no_quorum_marker() -> None`
+Removes the marker (tolerating its absence).
+- **In:** none.
+- **Out:** None. Side effect: unlinks `NO_QUORUM_MARKER`; a missing file is
+  ignored.
+
+### `_loopback_octet(ip) -> int` (private)
+Parses the last dotted octet of an IP for the tiebreak; returns `9999` on any
+parse failure, so an unparseable address never wins the lowest-octet race.
 
 ## Constants
 
-- `NO_QUORUM_MARKER = Path("/run/bedrock-no-quorum")` — sticky
-  marker file. When present, `compute()` returns `NO_QUORUM`
-  regardless of vote tally, until `clear_no_quorum_marker()` is
-  called. Written when election goes NoQuorum + holddown;
-  `mgmt/orchestrator.no_quorum_responder` watches it and pauses
-  local VMs, then clears it after quorum returns.
-- `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1` — vote weights.
+- `NO_QUORUM_MARKER = Path("/run/bedrock-no-quorum")` — the sticky override file.
+- `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1` — the vote weights.
 
-## Enums + dataclasses
+## How it works
 
-- `Outcome` enum: `LEADER`, `FOLLOWER`, `NO_QUORUM`.
-- `Election(outcome, my_votes, total_votes, majority,
-  should_set_mgmt_master, reachable_peers, acking_peers, reason)` —
-  frozen dataclass returned by `compute`.
+Vote model is 100 per node, 1 per witness, so witnesses can break an exact
+node-tie but never overrule a real node:
 
-## Functions
+```
+total_votes   = 100 * n_nodes + 1 * n_configured_witnesses
+majority      = total_votes // 2 + 1
+witness_votes = 1 * min(n_valid_witnesses, n_configured_witnesses)
+```
 
-- `_loopback_octet(ip) -> int` — internal. Returns the last octet
-  of a `100.X.Y.Z` cluster-loopback as int, used for the
-  lowest-octet-wins tie-break. Returns 9999 on parse failure so a
-  malformed loopback can never accidentally be the "winner".
-- `compute(*, self_name, self_loopback, peer_liveness,
-  node_loopbacks, current_mgmt_master, n_configured_witnesses=0,
-  n_valid_witnesses=0, peer_acks=None,
-  no_quorum_marker_path=NO_QUORUM_MARKER) -> Election` — the only
-  public entry point. Pure function: no I/O, no state, no time.
+`n_nodes` is the ACTIVE-node count: `members = set(node_loopbacks) ∪ {self}`,
+i.e. every active node per rqlite plus self — NOT the heard-from set. This is the
+load-bearing guard. A master that RESTARTS during a partition still reads all
+active nodes from rqlite, so it sees `n_nodes = N`, stands alone below majority,
+and falls to NoQuorum (safe) instead of faking a one-node cluster. `peer_liveness`
+only feeds the reachable set (`members` whose liveness is True) and the ack tally.
 
-  Decision tree, in order:
-  1. **Sticky no-quorum override** — if `no_quorum_marker_path`
-     exists, immediately return `NO_QUORUM` with
-     `reason="no-quorum marker present (sticky)"`. The caller's
-     orchestrator `no_quorum_responder` waits for quorum recovery
-     before clearing it.
-  2. **Build the active-node set.** Include only nodes that are both
-     in `node_loopbacks` (registered in rqlite) AND keys in
-     `peer_liveness` (bedrock-net has observed them at least once).
-     Self is always added. New joiners not yet observed are skipped.
-  3. **Compute the denominator.** `total_votes = 100·N +
-     1·N_configured_witnesses`, `majority = total // 2 + 1`. Only
-     `min(n_valid_witnesses, n_configured_witnesses)` add to
-     `my_votes`.
-  4. **Already-master shortcut.** If `current_mgmt_master ==
-     self_name`: node term is `100·count(reachable)`; if that +
-     witnesses `< majority` go NoQuorum, else `LEADER,
-     should_set_mgmt_master=False`.
-  5. **Follower if current master is alive.** `Follower,
-     should_set_mgmt_master=False, reason="following X"`.
-  6. **Master is gone — the failover decision.** Node term is
-     `100·(self + acking peers)`. If `my_votes < majority` →
-     `NoQuorum` (not enough acks/witnesses). Otherwise the reachable
-     candidate with the lowest loopback octet promotes; others defer
-     (`Follower, reason="deferring to lower-octet"`).
-  7. **Else return `LEADER, should_set_mgmt_master=True`.** Caller
-     writes `bs.set_mgmt_master(self)` to rqlite (Raft enforces
-     single-writer in case two peers race). The actual takeover
-     (drbdadm primary + `.254` + filer + s3) is gated separately
-     by `cluster_arbiter.promote_to_arbiter_host()` per
-     `docs/cluster-quorum-spec.md` — election only decides
-     Leader/Follower; the takeover protocol decides whether it's
-     safe to flip `.254`.
-- `set_no_quorum_marker(reason)` — drop `/run/bedrock-no-quorum`
-  with the reason text. Best-effort: silently swallows OSError
-  (we don't want to crash the election tick if /run is read-only).
-- `clear_no_quorum_marker()` — unlink the marker, swallow
-  FileNotFoundError. Called by orchestrator's
-  `no_quorum_responder` after cleanup + quorum return.
+ALL configured witnesses count in `total_votes`; only valid+confirmed ones add to
+`my_votes`. A configured-but-invalid witness therefore *raises* the bar and biases
+toward "do not fail over" (3 configured / 1 valid / 2 nodes: total=203,
+majority=102, lone survivor 100+1=101 < 102 → no takeover → safe).
+
+The decision tree, in order:
+
+```
+no-quorum marker present?
+  └─ yes → NoQuorum (sticky; votes/totals all 0)
+  no
+   │
+current_mgmt_master == self?
+  └─ yes  my_votes = 100*|reachable| + witness_votes
+           my_votes < majority → NoQuorum ("master but only X/Y")
+           else                → Leader   ("already master")
+   │ no
+master_is_alive?  (current_mgmt_master set AND reachable)
+  └─ yes → Follower ("following <master>")    [acks irrelevant in steady state]
+   │ no   ── master gone / never set: the promote decision
+   │
+acking     = reachable peers (excl. self) whose peer_acks is True
+node_votes = 100 * (1 + |acking|)
+my_votes   = node_votes + witness_votes
+  my_votes < majority → NoQuorum ("master gone; have X/Y acks+witness")
+  else  ── have a quorum of acks → deterministic tiebreak:
+            lowest-loopback-octet reachable contender proposes;
+            anyone else → Follower ("deferring to lower-octet <winner>")
+            self is lowest → Leader, should_set_mgmt_master=True
+```
+
+Two distinct vote semantics. While a master is alive (or self is already master)
+the quorum check uses **reachability** (`100*|reachable|`) — Bedrock never seeks
+quorum to unseat a live master. Only once the master is gone does it switch to
+**active acks**: self plus each reachable peer that has explicitly acked this
+node. A peer acks only after it too has lost the master and judged our arbiter
+UUID eligible, so promotion requires affirmative agreement, not mere silence.
+
+The octet tiebreak ensures two simultaneously-quorate candidates don't both
+promote: the lowest-octet reachable contender is the sole proposer; everyone else
+defers a tick and acks it instead, converging on a single Leader.
+
+## Why
+
+The election is a pure function so netd can re-evaluate it cheaply every tick and
+so it has no rqlite dependency — it must keep working precisely when rqlite is the
+unavailable thing being recovered. The 100/1 asymmetry keeps a fleet of witnesses
+from ever overruling an actual node while still letting one tip an even split. The
+sticky marker is mtime-stable on purpose: `vm_failover`'s suspend timer reads that
+mtime as "when did this NoQuorum episode begin", so a per-tick rewrite would reset
+the clock and the timer would never expire.

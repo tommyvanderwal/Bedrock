@@ -1,85 +1,95 @@
 # mgmt-dashboard (FastAPI + Svelte)
 
-The mgmt half of `bedrock-d` serves the operator UI, answers
-REST/WebSocket API calls, proxies noVNC, and reads cluster state via
-parallel SSH fan-out. Mutating VM lifecycle ops (create/destroy/migrate/
-grow/convert) run through the orchestrator's saga executor
-(`bedrock_d/orchestrator/sagas`); the API writes intent to rqlite and the
-reactor converges each node, rather than the dashboard SSHing nodes to
-change state directly.
+The mgmt half of `bedrock-d` serves the operator UI, answers REST/WebSocket
+API calls, proxies noVNC, and aggregates live cluster state by SSH fan-out to
+every node. Mutating VM lifecycle ops (create / destroy / grow / migrate, and
+the cattle↔pet↔vipet HA-level change) go through the orchestrator: the API
+submits a saga or writes intent to rqlite, and the reactor converges each node.
+Operators never SSH a node to change state.
 
-**Source:** `mgmt/app.py`, plus `mgmt/ws.py` (WS hub),
-`mgmt/victoria.py` (VM/VL query client), `mgmt/vm_exporter.py` (also
-shipped to compute nodes), and the Svelte build under
-`mgmt/ui/build/`.
+**Source:** `mgmt/app.py` (core), with route modules `mgmt/routes_console.py`
+(VNC proxy + console redirect), `mgmt/routes_obs.py` (metrics/logs reads),
+`mgmt/routes_operations.py` (saga submit/retry/read), `mgmt/routes_iso.py`,
+`mgmt/routes_support.py`; plus `mgmt/ws.py` (WS hub), `mgmt/victoria.py`
+(VictoriaMetrics/VictoriaLogs query client), `mgmt/vm_exporter.py` (the
+`:9177` exporter that also runs on every compute node), and the Svelte build
+under `mgmt/ui/build/`.
 
-**Runs as:** part of `bedrock-d.service`, the unified Bedrock daemon.
-`bedrock-d` wires the shared cluster state into `mgmt/app.py`'s FastAPI app
-and calls `serve_main()`, which starts the dashboard on **two uvicorn
-listeners**:
+## Listeners
+
+`bedrock-d` wires the shared cluster state into `mgmt/app.py`'s FastAPI app and
+calls `serve_main()`, which binds two uvicorn listeners on one shared `app`:
 
 - **`0.0.0.0:8443` HTTPS** — operator dashboard + LAN-reachable mgmt API,
-  operator-authenticated. Port 80 redirects here via `bedrock-redirect`.
+  operator-authenticated (`lib/operator_auth.py`). Cert is the browser-trusted
+  `local-ip.co` wildcard, kept ≤30 days from expiry by the refresh timer.
+  Port 80 redirects here via `bedrock-redirect`.
 - **`127.0.0.1:8001` HTTP** — local CLI / intra-process endpoint, loopback
-  only and auth-exempt (local root is already privileged).
+  only and auth-exempt (local root is already privileged). The `bedrock` CLI,
+  rqlite_client, view_builder, etc. dial this.
 
-(When no TLS cert exists yet, the LAN listener falls back to bootstrap
-HTTP on `:8444`; a `bedrock-d` restart flips to `:8443` once the cert
-lands. `:8080` is **not** the dashboard — that's the SeaweedFS volume
-server, bound on every node.)
+When no TLS cert exists yet, the LAN listener binds bootstrap HTTP on
+`0.0.0.0:8444` so a joiner can fetch `/api/cluster` before the first cert; the
+next `bedrock-d` restart binds `:8443` once the cert lands. The bootstrap port
+is `:8444`, not `:8080`, because `weed-volume` owns `0.0.0.0:8080` on every
+node (which also covers loopback).
 
 ## Responsibilities
 
 ```
   HTTP / WebSocket server
-    - Static Svelte SPA at /
+    - Static Svelte SPA at /  (+ /novnc static for the noVNC client)
     - /api/* REST endpoints (see reference/api.md)
-    - /ws multiplexed WebSocket
-    - /vnc/{name} VNC TCP proxy
-    - /console/{name} → redirect to /novnc/vnc.html?path=vnc/<name>
-
-  Cluster orchestrator
-    - Fans out SSH via paramiko from the mgmt node
-    - Reads cluster topology from rqlite (cluster_state.load_cluster())
-    - Regenerates /opt/bedrock/scrape.yml on cluster-state change
-    - Restarts bedrock-vmagent so it re-reads the scrape config
+    - /ws multiplexed WebSocket (operator-token in query param)
+    - WS /vnc/{name} VNC TCP proxy           (routes_console.py)
+    - GET /console/{name} → redirect to /novnc/vnc.html?path=vnc/<name>
 
   State aggregator
-    - state_push_loop: every 3 s, SSH to every node in parallel
-      (ThreadPoolExecutor), assemble {nodes, vms, witness}, broadcast
-      on WS 'cluster' channel
-    - _last_state cache: served as-is to HTTP /api/cluster for
-      instant response (7 ms vs 650 ms uncached)
+    - state_push_loop: every 3 s, run build_cluster_state() in a worker
+      thread, store as _last_state, broadcast on WS 'cluster' channel
+    - _last_state cache: served as-is to GET /api/cluster for instant
+      response (no SSH on the request path)
+
+  Cluster scrape config
+    - load_cluster() reads topology from the local rqlite replica
+    - write_scrape_config() regenerates /opt/bedrock/scrape.yml and
+      restarts bedrock-vmagent (best-effort, --no-block) so it re-reads
 
   Log fan-out
-    - push_log() wrapper broadcasts on WS 'event' first, then inserts
-      into VictoriaLogs (so UI reacts instantly even if VL is slow)
+    - push_log() broadcasts on WS 'event' first, then inserts into
+      VictoriaLogs (UI reacts instantly even if VL is slow)
 ```
 
 ## Key functions
 
-| Function | Purpose |
+| Function (file) | Purpose |
 |---|---|
-| `build_cluster_state()` | The hot path. Parallel SSH to every node, assembles full cluster snapshot. |
-| `get_node_info(name, cfg)` | SSHes one node; returns load/mem/VMs/DRBD status. |
-| `get_vm_drbd_resource(host, vm)` | parses `virsh dumpxml` + `drbdsetup status --json` to find the resource name. |
-| `get_vm_vnc_port(host, vm)` | `virsh vncdisplay` → 5900+n. Used by /vnc/{vm} proxy. |
-| `_vm_migrate(vm, target)` | Orchestrates live migration (see actions/vm-migrate.md). |
-| `_vm_convert_upgrade` / `_downgrade` | Cattle↔pet↔vipet state machine (see actions/vm-convert.md). |
-| `write_scrape_config(cluster)` | Regenerates scrape.yml, restarts `bedrock-vmagent` to re-read it. |
-| `load_cluster()` | Cluster-wide topology from rqlite via `cluster_state.load_cluster()` (read-level `none`, works without quorum). |
-| `push_log(msg, ...)` | Both WS broadcast and VL insert — the only way app-level events reach the dashboard. |
-| `vnc_proxy` (WS handler) | TCP proxy browser ↔ VNC on the VM host. Subprotocol-aware for older noVNC clients. |
+| `build_cluster_state()` | Hot path. Parallel SSH fan-out to every node + VM, assembles `{nodes, vms, witness, topology}`. |
+| `get_node_info(name, cfg)` | One SSH call per node: VMs, DRBD status, load/mem/uptime/kernel, thinpools, switch + mesh neighbours. |
+| `get_vm_disks(host, vm)` | Parses `virsh dumpxml` to enumerate a VM's disks + backing LV / DRBD resource. |
+| `get_vm_vnc_port(host, vm)` | `virsh vncdisplay` → 5900+n. Used by the `/vnc/{name}` proxy. |
+| `api_vm_migrate(vm, req)` | Live-migrate via the `vm_migrate` saga (resolves source/target from rqlite, cycles dual-primary, records post-promote UUID). |
+| `_vm_set_ha_level(vm, type, ...)` | `POST /api/vms/{name}/ha-level`. Dispatches to `_vm_set_ha_level_up` / `_down` (cattle↔pet↔vipet, online via blockcopy or offline via XML rewrite). |
+| `load_cluster()` | Cluster topology from the local rqlite replica via `cluster_state.load_cluster()` (read level `none`, works without quorum). |
+| `get_witness_status()` | Witness panel data — configured `witnesses` map from cluster state. |
+| `write_scrape_config(cluster)` | Regenerates `scrape.yml`, restarts `bedrock-vmagent`. |
+| `push_log(msg, ...)` (`victoria.py`) | WS `event` broadcast + VL insert — the path app-level events reach the dashboard. |
+| `vnc_proxy` (`routes_console.py`) | WS↔raw-TCP proxy browser ↔ VNC on the VM host. Subprotocol-aware (`binary`) for noVNC clients. |
+
+Saga lifecycle ops (`vm_create`, `vm_destroy`, `vm_grow`, `vm_migrate`,
+`node_join`, `node_leave`, `cluster_init`, `cluster_tier_*`) are submitted via
+`POST /api/operations` (`routes_operations.py`) and run by the executor in
+`bedrock_d/orchestrator/sagas`.
 
 ## SSH model
 
-All cross-node calls go through a single pooled helper. Connections are
-cached per host (`_SSH_POOL`, guarded by `_SSH_POOL_LOCK`) and reused
-across calls; stale entries are dropped and reopened:
+State reads fan out over SSH from the serving node; all cross-node calls go
+through one pooled helper. Connections are cached per host (`_SSH_POOL`,
+guarded by `_SSH_POOL_LOCK`) and reused; stale entries are dropped and
+reopened:
 
 ```python
 def _ssh_connect(host):
-    # return a live pooled client if one exists, else open a new one
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     c.connect(host, username=SSH_USER, timeout=5,
@@ -88,11 +98,13 @@ def _ssh_connect(host):
     return c
 ```
 
-Auth is key-only: agent + keys via `allow_agent=True, look_for_keys=True`,
-using the `root@host` key mesh that `agent_install` fans out (every node
-holds every other node's pubkey). There is no password fallback. The
-`timeout=5` and `set_keepalive(20)` keep a single slow/dead node from
-stalling the parallel fan-out.
+Auth is key-only (`allow_agent`, `look_for_keys`) over the `root@host` key
+mesh `agent_install` fans out (every node holds every other node's pubkey); no
+password fallback. Pooling reuses one Transport per peer and opens channels on
+demand — without it the every-3-second probe loop across N nodes × mgmt
+processes overruns sshd's pre-auth queue and nodes flap Online/Offline.
+`timeout=5` + `set_keepalive(20)` keep one slow/dead node from stalling the
+parallel fan-out.
 
 ## Startup sequence
 
@@ -100,78 +112,67 @@ stalling the parallel fan-out.
   @app.on_event("startup")          (guarded by _STARTUP_LOCK — both the
                                      8443 and 8001 uvicorn threads fire it)
       _main_loop = asyncio.get_running_loop()
-      _last_state = seed from load_cluster() (rqlite; nodes online=false)
+      _last_state = seed from load_cluster()  (nodes online=false)
+      task_registry().wire(_main_loop, hub.broadcast)
       asyncio.create_task(state_push_loop())
       write_scrape_config(load_cluster())
-        - rewrites scrape.yml with current topology
-        - restarts bedrock-vmagent
-      orchestrator.start_all()       (rqlite_subscriber, no_quorum_responder,
-                                      boot_orchestrator, reactor, ...)
+      orchestrator.start_all()       (rqlite_subscriber, boot_orchestrator,
+                                      no_quorum_responder, reactor)
 ```
 
-Both uvicorn listeners share one `app`, so the startup hook runs on each
-thread; `_STARTUP_LOCK` + `_STARTUP_DONE` make it run exactly once.
-Seeding `_last_state` before any SSH happens means the dashboard renders
-instantly even if nodes are unreachable — tiles show "Offline" until
-the first state push repopulates them.
+Both listeners share one `app`, so the hook runs on each thread;
+`_STARTUP_LOCK` + `_STARTUP_DONE` make it run exactly once. Seeding
+`_last_state` from rqlite before any SSH means the sidebar renders host names
+instantly; tiles show "Offline" until the first 3 s state push repopulates them.
 
 ## Concurrency
 
-- **Main event loop**: FastAPI + WebSocket hub + state_push_loop
+- **Main event loop**: FastAPI + WebSocket hub + `state_push_loop`
   (`await asyncio.sleep(3)`).
-- **Per-request threads** (Starlette's `run_in_threadpool`): REST
-  handlers that do blocking I/O (paramiko SSH). Required because the
-  paramiko socket read blocks — serving this on the main loop would
-  freeze every other client.
-- **ThreadPoolExecutor in `build_cluster_state`**: parallelises SSH
-  to all nodes + all VMs. Each node costs ~250 ms to query
-  (virsh + drbdadm + lvs); sequential = 3 nodes × 250 ms + 3 VMs ×
-  150 ms ≈ 1.2 s; parallel = max(node, vm) ≈ 0.3 s. 3-node cluster
-  went from ~3 s to ~0.7 s on the wall clock.
-- **`asyncio.run_coroutine_threadsafe`** in `push_log`: the
-  orchestrator runs in worker threads (paramiko blocks them), but
-  `hub.broadcast` is async. The helper marshals the coroutine onto
-  the captured main loop so workers can push events without
-  blocking or touching the loop directly.
+- **Worker threads** (`run_in_executor` / Starlette `run_in_threadpool`):
+  anything that does blocking paramiko SSH. The paramiko socket read blocks, so
+  serving it on the main loop would freeze every other client.
+- **`ThreadPoolExecutor` in `build_cluster_state`**: parallelises SSH to all
+  nodes and all VMs; wall time is `max(node, vm)` instead of the sum.
+- **`asyncio.run_coroutine_threadsafe` in `push_log`**: the orchestrator and
+  request handlers run in worker threads, but `hub.broadcast` is async. The
+  helper marshals the coroutine onto the captured `_main_loop`:
   ```python
-  # order matters — WS first so browsers react while VL absorbs the insert
+  # WS first so browsers react while VL absorbs the insert
   entry = {"_msg": msg, "hostname": node, ..., "_time": strftime(...)}
   if _main_loop is not None:
       asyncio.run_coroutine_threadsafe(
           hub.broadcast("event", entry), _main_loop)
-  _vl_push_log(msg, node=node, app=app, level=level)   # 20 ms HTTP POST
+  _vl_push_log(msg, node=node, app=app, level=level)
   ```
 
-## Client subscriptions (how the Svelte side consumes this)
+## Client subscriptions (Svelte side)
 
 ```
   layout.svelte (onMount, once per browser session)
-     ws.connect()  →  ws://<host>/ws
+     ws.connect()  →  wss://<host>/ws?token=<operator-token>
      ws.on('cluster', msg)  → nodes/vms/witness stores update
      ws.on('event',   msg)  → events store prepends
      ws.on('vm.state', msg) → vm-level store patches (reserved)
 
-  Each page derives from the stores:
-     $nodes, $vms, $events, $witness
-
-     Recent Logs = seeded once via /api/logs + live from $events
+  Each page derives from $nodes, $vms, $events, $witness
+     Recent Logs = seeded via /api/logs + live from $events
      Tiles       = reactive on $vms / $nodes
      VM metrics  = fetched every 15 s from /api/metrics/vms
 ```
 
-One important Svelte 5 quirk is documented in the project memory: reading
-a store via `$storeName` inside `$derived(...)` does **not** track the
-store as a dependency. Use an explicit `events.subscribe(...)` in
-`onMount` that writes to a local `$state`, then derive from that.
+Svelte 5 quirk (project memory): reading a store via `$storeName` inside
+`$derived(...)` does **not** track it as a dependency. Use an explicit
+`events.subscribe(...)` in `onMount` that writes a local `$state`, then derive
+from that.
 
 ## Extending
 
-- **New action**: add the endpoint in app.py, push_log around it, add
-  a button in the Svelte page. The WS event lands live by virtue of
-  push_log; state updates follow on the next 3 s tick.
-- **New periodic metric**: extend `vm_exporter.py` (runs on every
-  compute node, auto-scraped). No VM scrape config change needed —
-  existing scrape job pulls `/metrics` from :9177.
-- **New sidebar section**: add a route under `mgmt/ui/src/routes/` and
-  a corresponding tree-header link in the layout. The layout's
-  `$nodes` / `$vms` are already reactive.
+- **New action**: add the endpoint in `app.py` (or the relevant `routes_*`
+  module), wrap `push_log` around it, add a button in the Svelte page. The WS
+  event lands live; state follows on the next 3 s tick.
+- **New periodic metric**: extend `vm_exporter.py` (runs on every compute
+  node, auto-scraped at `:9177/metrics`). No scrape-config change needed.
+- **New sidebar section**: add a route under `mgmt/ui/src/routes/` and a
+  tree-header link in the layout; `$nodes` / `$vms` are already reactive.
+```

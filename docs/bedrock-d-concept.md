@@ -1,34 +1,45 @@
 # `bedrock-d` — the unified Bedrock daemon (concept)
 
 One Python process per node owns every Bedrock cluster-decision code
-path. The CLI is a thin HTTP client.
+path. The CLI is a thin HTTP client to `127.0.0.1:8001`.
 
 ```
 bedrock-d process (1 per node)
-├── BedrockState           — one shared object, locks where needed
-├── netd thread            — mesh probes, election, witness IO
+├── BedrockState           — one shared object, locked where needed
+├── netd thread            — mesh probes, election, witness IO,
+│                            .254 arbiter, routing
 └── asyncio main loop
-    ├── FastAPI (8443 HTTPS LAN + 127.0.0.1:8001 loopback)
-    └── tasks: rqlite_subscriber, no_quorum_responder,
-                boot_orchestrator, converge_retry, backup_scheduler
+    ├── FastAPI: :8443 HTTPS (dashboard + LAN mgmt API)
+    │            127.0.0.1:8001 HTTP (local CLI, auth-exempt)
+    └── orchestrator tasks: rqlite_subscriber, boot_orchestrator,
+        no_quorum_responder, converge_retry, backup_scheduler,
+        cluster_tier_watcher, saga_resume, self_heal
 ```
 
-**Cluster comm**: rqlite (separate Raft process per node). All
-in-process subsystems read/write `BedrockState` directly — no
-`/run/bedrock/*.json` IPC any more.
+**Shared state, no file IPC**: every in-process subsystem reads/writes
+the single `BedrockState` object directly. Live cluster decisions cross
+no `/run/bedrock/*.json` boundary.
+
+**Cluster-wide state** lives in rqlite — a separate Raft process per
+node (`bedrock-rqlited`, mTLS HTTPS 4001 / Raft 4002). `bedrock-d`
+reads it via `cluster_state.load_cluster()` (read level `none`, so it
+works without quorum).
 
 **Stays separate** (third-party or external by design):
-rqlited, weed-*, vm/vl, vmagent/vlagent.
+`bedrock-rqlited`, `bedrock-weed-*`, vm/vl, vmagent/vlagent.
 
 **At arm's length** (cosmetic, no cluster decisions):
-bedrock-cert-refresh, bedrock-mdns, bedrock-redirect — their own
-small systemd units; `bedrock-d` neither imports nor owns them. It
-can lifecycle them via `systemctl` if we ever need that.
+`bedrock-cert-refresh.timer`, `bedrock-mdns`, `bedrock-redirect`
+(:80→:8443) — their own small systemd units; `bedrock-d` neither
+imports nor owns them, and can lifecycle them via `systemctl` if a
+need arises.
 
-**No watchdog**: single-daemon design means we troubleshoot
-a stuck bedrock-d directly via journalctl + systemctl restart.
+**No watchdog**: with one daemon, a stuck `bedrock-d` is diagnosed
+directly via `journalctl -u bedrock-d` + `systemctl restart`.
 
-**Failure model**: if `bedrock-d` crashes, systemd `Restart=on-failure`
-brings it back. Cluster topology recovers from rqlite (read via
-`cluster_state.load_cluster()`), and this node's identity/role from
-on-disk `state.json`. VMs/DRBD keep running through the brief gap.
+**Failure model**: on crash, systemd `Restart=on-failure` (3 s) brings
+`bedrock-d` back. Cluster topology rehydrates from rqlite via
+`cluster_state.load_cluster()`; this node's identity/role from on-disk
+`/etc/bedrock/state.json`. VMs and DRBD keep running through the gap.
+A netd-thread crash is logged but does not kill the process — the mgmt
+loop keeps serving the dashboard so the operator can diagnose.

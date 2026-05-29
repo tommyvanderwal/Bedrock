@@ -1,175 +1,201 @@
-# `mgmt/orchestrator.py`
+# mgmt/orchestrator.py
 
-**Module purpose.** The asyncio task set that runs inside the
-`bedrock-mgmt` FastAPI process on every node. Bridges the rqlite
-canonical state to local-disk effects:
+The management-plane orchestrator: a set of asyncio tasks running inside the
+bedrock-d mgmt process (one per node). It watches rqlite cluster state, projects
+this node's role to `state.json`, and converges local services — per-VM DRBD,
+libvirtd, the node's VMs, SeaweedFS, backup targets — to whatever rqlite says
+they should be. It also runs the no-quorum responder, the snapshot-diff reactor,
+the master-only backup scheduler, and the boot-time saga resume sweep.
+`start_all()` is the entry point, called from FastAPI's startup hook in
+`mgmt/app.py`; `attach_state(state)` binds it to the unified daemon's shared
+state object. Nothing here acts before netd's election establishes a quorum role.
 
-- Polls `bedrock_meta.revision` and rebuilds `cluster.json` +
-  `state.json` whenever it advances.
-- Calls `cluster_arbiter.converge()` on every revision tick AND
-  every 5 s timer (so transient promote failures, e.g. DRBD
-  primary refused while the isolated old master is still primary,
-  get retried).
-- Watches `/run/bedrock-no-quorum` and runs cleanup
-  (pause VMs) when it appears; waits for quorum to return before
-  clearing the marker.
-- Snapshot-diff reactor: on each revision transition,
-  derives "vm host changed", "vm destroyed", "backup_target added"
-  events from `prev → cur` snapshot diff and runs the matching
-  side-effects.
+## Functions / Classes
 
-`start_all()` is the entry point called from `mgmt/app.py`'s
-FastAPI startup hook. It spawns: `rqlite_subscriber`,
-`no_quorum_responder`, `boot_orchestrator`, `backup_scheduler`,
-`converge_retry`, `cluster_tier_watcher`, and the three
-`vm_failover` tasks.
+### `attach_state(state) -> None`
+Bind the unified daemon's shared state object so the subscriber, no-quorum
+responder, boot, converge-retry, and backup tasks read/write through it.
+- **In:** `state` → the shared `BedrockState` (has `snapshot`, `prev_snapshot`,
+  `last_log_idx`, `snapshot_lock`, `netd`, `netd_lock`).
+- **Out:** none. Sets module global `_STATE`; when unset, the tasks fall back to
+  module-level globals.
 
-## Constants
+### `get_snapshot() -> dict`
+Read-only access to the live in-memory cluster snapshot, for FastAPI handlers.
+- **Out:** the current snapshot dict (taken under `snapshot_lock` when attached).
 
-- `CLUSTER_JSON = /etc/bedrock/cluster.json`,
-  `STATE_JSON = /etc/bedrock/state.json`.
-- `NO_QUORUM_MARKER = /run/bedrock-no-quorum` — written by netd's
-  election layer on NoQuorum; cleared here after cleanup +
-  quorum recovery.
-- `NO_QUORUM_CLEANUP_TIMEOUT_S = 30.0` — cap on
-  `_run_no_quorum_cleanup`. No external watchdog reboots the node
-  in alpha/beta; the operator troubleshoots a stuck cleanup
-  directly.
+### `async rqlite_subscriber()`
+Task ①. Watches the rqlite `bedrock_meta.revision` counter; on each advance,
+rebuilds the snapshot and reconciles local state.
+- **Out:** runs forever. Per advance (via `_apply_revision`): updates the
+  in-memory snapshot, writes `state.json`, reconciles observability, regenerates
+  DRBD configs, runs `cluster_arbiter.converge()`, ensures the ISO-library FUSE
+  mount, and schedules `_reactor_diff`. Retries every 2 s if rqlite is
+  unreachable.
 
-## Globals
+### `async boot_orchestrator()`
+Task ②. One-shot at startup: wait for a settled quorum role, then start this
+node's local services.
+- **Out:** waits up to 120 s for a role. If `noquorum`/`""`/`unknown`, logs and
+  returns without starting anything. Otherwise calls `_start_local_services()`
+  and sets `_SERVICES_STARTED = True`.
 
-- `_SNAPSHOT` — live in-memory snapshot. Initialised empty,
-  refreshed by `_apply_revision` on every rqlite revision change.
-- `_LAST_LOG_IDX` — last seen rqlite revision (`bedrock_meta.revision`).
-- `_PREV_SNAPSHOT` — previous tick's snapshot, used by
-  `_reactor_diff` to compute transitions.
-- `_SERVICES_STARTED` — gate that suppresses the reactor until
-  the boot path has finished bringing up local services.
+### `async no_quorum_responder()`
+Task ③. Watches `/run/bedrock-no-quorum`. On appearance, pauses VMs, then waits
+for quorum to return before clearing the marker and reconciling.
+- **Out:** runs forever (1 s tick). On marker: runs `_run_no_quorum_cleanup`
+  (bounded by `NO_QUORUM_CLEANUP_TIMEOUT_S = 30 s`), then `_wait_for_role(..,
+  ignore_marker=True)`; on a settled role, unlinks the marker, runs
+  `_reconcile_paused_vms()` + `_start_local_services()`. On timeout/error it
+  loops and retries; never exits.
 
-## Functions
+### `async backup_scheduler()`
+Task ⑤. Master-only loop, 60 s tick: fires due scheduled backups.
+- **Out:** runs forever. Skips the tick unless `_is_leader()`. On a leader tick
+  (`_scheduler_tick`), evaluates each VM's `backup_schedule` against
+  `cron.should_fire_now` and spawns `_run_scheduled_backup` for due VMs.
 
-### Helpers
+### `async cluster_tier_watcher()`
+Calm-loop (10 s) that promotes the `cluster` singleton from local to DRBD once
+the cluster has ≥ 2 nodes.
+- **Out:** runs forever. Only when this node is mgmt-master, `len(nodes) >= 2`,
+  and tier `cluster` mode is not `drbd`: submits and synchronously executes the
+  `cluster_tier_promote_master` saga (peer = lowest-octet non-self node) via
+  `SagaExecutor`. Submits at most once per `peer@loopback` key.
 
-- `_self_node_name() -> str` — short read of
-  `state.json["node_name"]`.
-- `_running_vm_names() / _paused_vm_names()` — `virsh list
-  --state-{running,paused} --name`.
-- `_vm_drbd_resource(vm_name) -> str | None` — parses `virsh
-  dumpxml` for `/dev/drbdN`, maps to `/etc/drbd.d/*.res` to find
-  the resource name. Used by the recover path to know which DRBD
-  resource to drop to secondary when destroying a paused VM.
-- `_drbd_role(resource) -> str` — `Primary` / `Secondary` /
-  `Unknown`.
-- `get_snapshot() -> dict` — read-only access to `_SNAPSHOT` for
-  FastAPI handlers.
+### `async converge_retry()`
+Timer-based (5 s) re-run of `cluster_arbiter.converge()`, so a promote that
+failed during failover (peer not yet self-demoted) is retried even when no rqlite
+revision advances.
+- **Out:** runs forever; calls `cluster_arbiter.converge()` in a thread each tick.
 
-### ① rqlite_subscriber
+### `async saga_resume()`
+One-shot at boot: resume in-flight runtime saga operations owned by this node.
+- **Out:** waits up to 120 s for a settled role; skips if no quorum. Lists
+  inflight ops for this node via `RqliteSagaBackend.list_inflight_for`, and runs
+  `SagaExecutor.execute_one` for each — skipping `_LEADER_ONLY_SAGA_KINDS`
+  (`cluster_tier_promote_master`, `cluster_tier_join_peer`, `cluster_rename`,
+  `replica_repair`) unless this node is the leader.
 
-- `rqlite_subscriber()` — outer wrapper around `_subscriber_pass`
-  with reconnect on RqliteError; runs forever.
-- `_subscriber_pass(self_name)` — opens an rqlite client + a
-  `watch()` generator on `bedrock_meta.revision`; for each yielded
-  revision calls `_apply_revision`.
-- `_apply_revision(rc, revision, self_name)` — pure write
-  cascade:
-  1. `view_builder.build_snapshot(client=rc)` → new snapshot dict.
-  2. Atomic-write `cluster.json` (cluster-wide projection).
-  3. Atomic-write `state.json` (this-node projection: role,
-     loopback_ip, mgmt_url, witness_host).
-  4. `observability.reconcile(snapshot, self_name)` — converge
-     local vmagent/vlagent and (on the obs_backends nodes)
-     vmsingle/vlsingle to the snapshot.
-  5. `tier_storage.regen_drbd_configs_from_snapshot(snapshot)` —
-     re-render DRBD .res files on mesh path-table changes so
-     DRBD uses bedrock-net's chosen paths.
-  6. `cluster_arbiter.converge()` — promote/demote singletons
-     based on `state.json["role"]`.
-  7. `seaweedfs.ensure_iso_library_mount()` — refresh the FUSE
-     mount of the filer namespace at `/mnt/bedrock` when the
-     master moved (the `/iso/` subtree surfaces uploaded ISOs at
-     `/mnt/bedrock/iso/` cluster-wide).
-  8. Schedule `_reactor_diff(prev, cur, self_name)` on the event
-     loop.
+### `start_all() -> None`
+Spawn every orchestrator task on the running event loop. Called from FastAPI's
+startup hook.
+- **Out:** under a `threading.Lock`, idempotent — the second startup hook (the
+  two uvicorns on 8443 + 8001 run in separate threads) is a no-op. Creates tasks:
+  `rqlite_subscriber`, `no_quorum_responder`, `boot_orchestrator`,
+  `backup_scheduler`, `converge_retry`, `cluster_tier_watcher`, `saga_resume`,
+  `self_heal.self_heal_task`, and `vm_failover.start_failover_tasks()`.
 
-### ② boot_orchestrator
+### Private helpers
+- `_self_node_name()` → `node_name` from `state.json`, or `""`.
+- `_running_vm_names()` / `_paused_vm_names()` → `virsh list --state-running /
+  --state-paused --name` output as a list.
+- `_vm_drbd_resource(vm)` → DRBD resource backing a VM's disk, by matching the
+  `/dev/drbdN` minor in `virsh dumpxml` against `/etc/drbd.d/*.res`; `None` for
+  cattle (local LV).
+- `_vm_drbd_resources(vm)` → all `vm-<name>-disk*.res` resource names for a VM
+  (handles multi-disk); empty for cattle.
+- `_drbd_role(res)` → `'Primary'` / `'Secondary'` / `'Unknown'` via `drbdadm
+  role`.
+- `_bring_up_vm_drbd(vm)` → `drbdadm up` each of a VM's resources (idempotent; no
+  promote).
+- `_subscriber_pass` / `_apply_revision` → one subscriber lifecycle and one
+  revision-apply (snapshot rebuild + projections + reactor scheduling).
+- `_wait_for_role(timeout_s, ignore_marker=False)` → polls `cluster_state.
+  load_cluster()` until `mgmt_master` is set; returns `'leader'`/`'follower'`/
+  `'noquorum'`/`'unknown'`.
+- `_start_local_services()` → brings this node's services up to the rqlite-stated
+  set (read at level `strong`).
+- `_run_no_quorum_cleanup()` → `virsh suspend` every running VM.
+- `_reconcile_paused_vms()` → per paused VM, destroy stale copies or resume ours,
+  against a strong rqlite read.
+- `_reactor_diff(prev, cur, self_name)` → side-effects from prev→cur snapshot
+  transitions.
+- `_react_backup_target_set(tid, target)` → `kopia repository connect` for a
+  target locally.
+- `_is_leader()` → `True` iff rqlite (`cluster_info.mgmt_master`, level `none`)
+  names this node.
+- `_scheduler_tick`, `_last_scheduled_fire_time`, `_run_scheduled_backup` →
+  scheduler internals.
 
-- `boot_orchestrator()` — one-shot at mgmt startup. Calls
-  `_wait_for_role(120s)` to wait until cluster.json has a settled
-  `mgmt_master`. If timeout → role="unknown", logs and exits
-  (operator can investigate via journal). Else calls
-  `_start_local_services()` and sets `_SERVICES_STARTED = True`.
-- `_wait_for_role(timeout_s) -> str` — poll cluster.json until
-  `mgmt_master` is set. Returns "leader" if we are master,
-  "follower" otherwise. Returns "noquorum" if the marker is
-  present, "unknown" on timeout.
-- `_start_local_services()` — starts libvirtd, starts running
-  VMs that the snapshot says belong here, runs
-  `backup.configure_target_locally` for each registered
-  backup_target so kopia is connected on boot.
+## How it works
 
-### ③ no_quorum_responder
+Each node runs all of these as concurrent asyncio tasks; the in-memory snapshot
+is the shared spine. The rqlite subscriber is the only writer of the snapshot;
+everyone else reads it (or reads rqlite directly for authoritative decisions).
 
-- `no_quorum_responder()` — watches `NO_QUORUM_MARKER` once per
-  second. On appearance:
-  1. `_run_no_quorum_cleanup()` with NO_QUORUM_CLEANUP_TIMEOUT_S
-     cap.
-  2. **Wait for quorum to return** via
-     `_wait_for_role(120s)` — without this, the election
-     re-flagged NoQuorum next tick and we'd flap.
-  3. Clear the marker.
-  4. `_reconcile_paused_vms()` — destroy stale paused copies
-     of VMs the log says moved, resume the rest.
-  5. `_start_local_services()` again.
-- `_run_no_quorum_cleanup()` — for each running VM: `virsh
-  suspend`. Doesn't demote DRBD here (qemu's open FD would
-  EBUSY); that's done in `_reconcile_paused_vms` after destroying
-  stale copies.
-- `_reconcile_paused_vms()` — for each paused VM: if cluster
-  state says it moved to another host, `virsh destroy` + `drbdadm
-  secondary` the resource; if it's still ours, `virsh resume`.
+**Subscriber → snapshot → reconcile (Task ①).** `RqliteClient.watch` polls
+`bedrock_meta.revision` at ~500 ms. On each advance `_apply_revision` deep-copies
+the old snapshot to `prev`, rebuilds `cur` via `view_builder.build_snapshot`, and
+swaps them under `snapshot_lock`. It then projects this node's role + mgmt URL to
+`state.json` (atomic write), and runs a fixed reconcile chain — each step wrapped
+so one failure does not block the rest:
 
-### ④ reactor
+```
+revision advance
+   ├─ state.json projection      (_state_view → _atomic_write_json)
+   ├─ observability.reconcile     (vmagent/vlagent, conditional VM/VL)
+   ├─ tier_storage.regen_drbd_configs_from_snapshot   (mesh path change)
+   ├─ cluster_arbiter.converge()  (.254 VIP, arbiter rqlite, filer/s3; idempotent)
+   ├─ seaweedfs.ensure_iso_library_mount()  (mount follows the master /32)
+   └─ schedule _reactor_diff(prev, cur)   (call_soon_threadsafe → create_task)
+```
 
-- `_reactor_diff(prev, cur, self_name)` — derives transitions
-  from snapshot pairs and dispatches:
-  - VMs in `prev.vms` but not `cur.vms` → `virsh destroy +
-    undefine`.
-  - VMs whose `host` changed → if now ours, virsh start; if
-    moved away, virsh destroy local copy.
-  - backup_targets that appeared/changed → `_react_backup_target_set`.
-  (Critical-tier DRBD master transitions are owned by
-  `cluster_arbiter.converge`, not the reactor.)
-- `_react_backup_target_set(target_id, target)` — kopia
-  repository connect via `backup.configure_target_locally`.
+**Boot ordering (Task ②).** `boot_orchestrator` waits for `_wait_for_role`, then
+`_start_local_services` does, in order: `drbdadm up` every per-VM resource this
+node hosts (so `/dev/drbdN` exists before libvirtd opens it — promote is left to
+the failover/create paths to avoid dual-primary), start per-node SeaweedFS via
+`promote_to_master_volume_host`, start libvirtd, `virsh start` each VM that rqlite
+says is `host == self && state == running`, and connect each backup target. All
+reads here use rqlite level `strong` — a stale local replica could otherwise say
+a peer's taken-over VM still lives here and trigger a split-brain `virsh start`.
 
-### Periodic converge
+**No-quorum cycle (Task ③).** The marker file is dropped by netd's election when
+this node loses quorum.
 
-- `converge_retry()` — every 5 s, call `cluster_arbiter.converge()`
-  unconditionally. Catches the case where `_apply_revision`'s
-  converge failed (e.g. DRBD primary refused because the
-  isolated old master is still primary) and no new rqlite
-  revision arrives to re-trigger.
+```
+/run/bedrock-no-quorum appears
+   │
+   ├─ _run_no_quorum_cleanup      virsh suspend all running VMs   (≤30 s)
+   │      (DRBD is NOT demoted here — qemu's open FDs would EBUSY)
+   │
+   ├─ _wait_for_role(ignore_marker=True)
+   │      gate on mesh peer-liveness (any neighbour logged_up), then a
+   │      STRONG rqlite read of mgmt_master — not on the election outcome,
+   │      which stays NO_QUORUM while we still hold the marker (circular)
+   │
+   ├─ role settled (leader/follower) → unlink marker
+   │      else: sleep 10 s and loop (never return — that would strand
+   │      the marker + paused VMs)
+   │
+   ├─ _reconcile_paused_vms       per paused VM, STRONG read of vms:
+   │      not in log / host != self → virsh destroy + drbdadm secondary
+   │      host == self & running    → virsh resume (+ vm_failover.drop_suspended)
+   │
+   └─ _start_local_services       re-promote this node's services
+```
 
-### Backup scheduler
+**Reactor (Task ④).** `_reactor_diff` runs only after `_SERVICES_STARTED` — the
+boot path covers anything seen during catch-up. It derives transitions from
+`prev`→`cur`: VMs gone from `cur.vms` get `virsh destroy` + `undefine`; VMs whose
+`host` changed get `virsh start` (now ours) or `virsh destroy` (moved away); new
+or reconfigured `backup_targets` get a `kopia repository connect`. Critical-tier
+DRBD master transitions are not handled here — they belong to
+`cluster_arbiter.converge()`, run from the subscriber.
 
-- `backup_scheduler()` — runs only on the mgmt master (gated by
-  `_is_leader()`); polls per-VM backup schedules and fires
-  `_run_scheduled_backup(vm, target_id, sched)` via
-  `mgmt/backup.py`.
-- `_scheduler_tick()`, `_last_scheduled_fire_time`,
-  `_run_scheduled_backup` — implementation details.
-- `_is_leader() -> bool` — `mgmt_master == self_node_name()`.
+**Scheduler (Task ⑤).** `backup_scheduler` short-circuits on every non-leader
+tick because the leader is the single log writer; scheduling against any other
+node would double-fire or fail to append. `_scheduler_tick` evaluates each VM's
+`backup_schedule` with `cron.should_fire_now` (60-min grace), using
+`_last_scheduled_fire_time` (parsed from the newest matching `<prefix>-…` backup
+label) as last-fired, and guards re-entry with the `_SCHEDULED_INFLIGHT` set.
 
-## Lifecycle invariants
-
-- `_SERVICES_STARTED` gates the reactor so the first
-  rqlite-revision tick at boot doesn't fire side-effects
-  before `boot_orchestrator` has had a chance to bring up the
-  local services that the reactor depends on.
-- `cluster_arbiter.converge()` is called from BOTH
-  `_apply_revision` (revision-driven) AND `converge_retry` (5 s
-  timer). Idempotent — a no-op when state is already correct,
-  retries the failed step otherwise.
-- The no-quorum marker is cleared ONLY by `no_quorum_responder`
-  after cleanup + quorum return. netd's election keeps re-writing
-  it while NoQuorum persists.
+## Why
+Authoritative recovery decisions ("did failover happen — resume here or destroy
+the stale copy?") read rqlite at level `strong` to force a Raft round-trip,
+because a just-partitioned node's local replica lags and a stale `vms.host` would
+split-brain. The no-quorum responder gates on mesh peer-liveness rather than the
+election outcome, which is circular while this node still holds the marker.
+`start_all` uses a real lock because two uvicorns (8443 + 8001) fire the FastAPI
+startup hook from separate threads, and a naive flag would let every task start
+twice.

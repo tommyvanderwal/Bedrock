@@ -1,195 +1,237 @@
-# `seaweedfs.py`
+# installer/lib/seaweedfs.py
 
-**Module purpose.** Install + configure SeaweedFS. The locked v1.0
-topology (see `docs/storage-architecture.md`):
+SeaweedFS lifecycle helpers — Bedrock's S3 stack. The module renders all
+SeaweedFS config (master, filer, s3, env), checks the binary is installed, and
+starts/stops the SeaweedFS sub-roles on a node. The volume server + s3 gateway
+run on every node; the master is a Raft set on the lowest-octet nodes; the filer
+plus its s3 are a singleton that rides the `.254` cluster VIP. Install paths and
+the orchestrator call the config renderers + `promote_to_master_volume_host`; the
+filer promote/demote pair is driven by `cluster_arbiter` alongside the arbiter
+rqlite move. It reads membership from `cluster_state.load_cluster()` +
+`/etc/bedrock/state.json` and never writes rqlite. Per-collection replication
+policy is set separately, via `weed shell` — the Bedrock CLI exposes it as
+`bedrock storage tier <name> replication=…`.
 
-- **`weed-filer`** (port 8888) — POSIX namespace + S3 IAM
-  identities, single leveldb3 on the DRBD-replicated tier-critical
-  volume. Runs **only on the current arbiter-host** bound to
-  `.254/32`. Failover = DRBD primary handoff + filer restart on the
-  new host.
-- **`weed-master`** (port 9333) — Raft-3 across exactly three
-  regular cluster nodes (NOT on `.254`). Membership persisted in
-  the rqlite table `seaweed_master_membership` and reshuffled by
-  the **calm orchestrator loop** when a master-bearing node
-  leaves. Re-shuffles are deliberate (resource-aware), not on the
-  failover-critical path.
-- **`weed-volume`** (port 8080) — bytes. Runs on **every** node,
-  bound `0.0.0.0`. Data dir lives in the local `tier-bulk` and
-  `tier-fast` thinpools (`bedrock-weed-volume-bulk` and
-  `-fast` LVs); volume server registers per-LV mount with the
-  master so the master's topology view is per-disk.
-- **`weed-s3`** (port 8333) — S3 API gateway. Runs on **every**
-  node, bound `0.0.0.0`. Authenticates against IAM identities
-  stored inside the filer DB (`-iam.filerBucketsPath=/buckets`),
-  so the S3 gateway needs filer reachability — which is always at
-  `.254:8888`.
-- **`weed mount`** (FUSE) — every node mounts the filer at
-  `/mnt/bedrock` pointing at `.254:8888`. Same mount unit on every
-  node — no per-node templating.
+Key paths and ports (module constants):
+- `weed` binary: `/usr/local/bin/weed` (`WEED_BIN`).
+- Local storage: `/var/lib/bedrock/seaweedfs/{volumes,master}`.
+- Filer metadata (leveldb3): `/var/lib/bedrock/cluster/seaweedfs/` (on the
+  cluster-singleton DRBD volume, so it moves with the master role).
+- Config: `/etc/bedrock/seaweedfs-master.toml`, `/etc/seaweedfs/filer.toml`,
+  `/etc/bedrock/seaweedfs-s3.json`, `/etc/bedrock/seaweedfs.env`.
+- Ports: master 9333 / grpc 19333; volume 8080 / grpc 18080; filer 8888 / grpc
+  18888; s3 8333.
+- `FUSE_MOUNTPOINT = /mnt/bedrock`; FUSE-mount unit `bedrock-fuse-mount.service`.
 
-Three collections back the three replication policies:
+## Functions / Classes
 
-| Collection | Replication code | Copies | Avail at N≥ | Purpose                |
-|------------|------------------|--------|-------------|------------------------|
-| `scratch`  | `000`            | 1      | 1           | RAID0; ephemeral.      |
-| `standard` | `001`            | 2      | 2           | Default; ISOs, templates. |
-| `critical` | `002`            | 3      | 3           | Customer backups.       |
+### `ensure_install() -> None`
+Verify `weed` is present and create the local directory tree.
+- **In:** none.
+- **Out:** `None`. Raises `RuntimeError` if `/usr/local/bin/weed` is missing.
+  `mkdir -p` (mode 0755) on `SEAWEEDFS_HOME`, `VOLUME_DIR`, `MASTER_DIR`.
+  Idempotent.
 
-## Constants
+### `write_master_config() -> None`
+Render `/etc/bedrock/seaweedfs-master.toml`.
+- **In:** none (reads cluster snapshot + state.json indirectly).
+- **Out:** `None`. Writes the master.toml (`[master.maintenance] scriptInterval`
+  + `[master.replication] defaultReplication`). Raises `RuntimeError` if this
+  node's loopback IP is unknown. `defaultReplication` is `000` at N≤1, else
+  `001`. Deterministic / idempotent across nodes.
 
-- `WEED_BIN = /opt/bedrock/bin/weed`.
-- `SEAWEEDFS_HOME = /var/lib/bedrock/seaweedfs` — local-FS root for
-  master raft data (`master/raft/`).
-- `FILER_HOME = /var/lib/bedrock/cluster/seaweedfs` —
-  DRBD-replicated filer leveldb3 + S3 IAM bucket files. Mount of
-  `/dev/drbd1101` (tier-critical) lives at
-  `/var/lib/bedrock/cluster`; this dir is the filer's subtree of
-  it. Moves with the arbiter role.
-- `VOLUME_DATA_DIRS = ["/var/lib/bedrock/weed-volume-fast",
-  "/var/lib/bedrock/weed-volume-bulk"]` — mount points for the two
-  local volume LVs.
-- `MASTER_TOML = /etc/bedrock/seaweedfs-master.toml`.
-- `FILER_TOML = /etc/seaweedfs/filer.toml`.
-- `S3_CONFIG = /etc/bedrock/seaweedfs-s3.toml`.
-- `SEAWEED_ENV = /etc/bedrock/seaweedfs.env` (consumed by all
-  systemd units).
-- `MASTER_PORT = 9333`, `VOLUME_PORT = 8080`,
-  `FILER_PORT = 8888`, `S3_PORT = 8333`.
-- `FUSE_MOUNTPOINT = /mnt/bedrock` — uniform FUSE mount on every
-  node. Subdirs `iso/`, `templates/`, `snapshots/`, `backups/`,
-  `scratch/` map to filer buckets bound to collections via
-  `weed shell` (`fs.configure -locationPrefix=/iso/
-  -collection=standard -replication=001`, etc.).
+### `write_filer_config() -> None`
+Render `/etc/seaweedfs/filer.toml` pinning the leveldb3 metadata store.
+- **In:** none.
+- **Out:** `None`. Writes filer.toml with `[leveldb3] enabled=true` and
+  `dir = /var/lib/bedrock/cluster/seaweedfs`; `mkdir -p` on `FILER_HOME` and the
+  toml's parent dir.
 
-## Functions
+### `write_env_file(*, volume_max: int = 50, disk_type: str = "") -> None`
+Render `/etc/bedrock/seaweedfs.env`, consumed by every `weed` systemd unit.
+- **In:** `volume_max` → max volumes per directory; `disk_type` → operator class
+  for this node's volume server (`ssd`/`hdd`).
+- **Out:** `None`. Atomic write (tmp + `os.replace`) of `SEAWEED_LOOPBACK_IP`,
+  `SEAWEED_FILER_VIP` (`.254`), `SEAWEED_MASTER_PEERS` and `SEAWEED_FILER_MASTERS`
+  (both the Raft master `ip:9333` list, or `none`), `SEAWEED_VOLUME_DISK_TYPE`,
+  `SEAWEED_VOLUME_MAX`. Raises `RuntimeError` if loopback IP unknown. Idempotent.
 
-### Bootstrap
+### `write_s3_config() -> None`
+Render `/etc/bedrock/seaweedfs-s3.json` with an `admin` + `anonymous` identity.
+- **In:** none.
+- **Out:** `None`. Writes JSON: `admin` with derived credentials and actions
+  `[Admin, Read, Write, List, Tagging]`, and `anonymous` (no credentials) with
+  `[Read, Write, List, Tagging]`. `mkdir -p` on the parent dir. Admin creds are
+  derived from `/etc/bedrock/cluster.key` (see `_derive_admin_credentials`).
 
-- `ensure_install()` — checks `/opt/bedrock/bin/weed` exists.
-  install.sh stages it from the ISO payload; this function raises
-  a clear error if it's missing.
+### `is_filer_active() -> bool`
+- **In:** none. **Out:** `True` if `bedrock-weed-filer.service` is active
+  (`systemctl is-active --quiet`).
 
-### Membership rules (calm orchestrator owns these)
+### `promote_to_filer_host() -> None`
+Start the filer + s3 gateway on this node.
+- **In:** none. **Out:** `None`. `systemctl reset-failed` then `start` of
+  `bedrock-weed-filer.service` and `bedrock-weed-s3.service`. Idempotent. Called
+  by `cluster_arbiter.promote_to_arbiter_host()` after the cluster-singleton
+  volume is mounted.
 
-- `_select_master_set(cluster_nodes) -> list[str]` — pure
-  function. Given the current cluster's node list, returns the
-  three nodes that SHOULD be the weed-master Raft set. Default:
-  the three lowest-octet loopbacks. Tie-broken by node name.
-  Smaller clusters: N=1 → 1 master, N=2 → 1 master (no Raft;
-  single-leader), N≥3 → 3 masters. Called by the calm orchestrator
-  loop on cluster-membership changes; NEVER by netd.
-- `seaweed_master_membership` table in rqlite — authoritative set
-  of master nodes. Written by the orchestrator when
-  `_select_master_set` output differs from current state.
-- `is_master_node(node_name) -> bool` — reads the table.
+### `demote_filer_host() -> None`
+Stop the filer + s3 gateway on this node.
+- **In:** none. **Out:** `None`. `systemctl stop` of s3 then filer. Idempotent.
+  Called by `cluster_arbiter.demote_arbiter_host()` before the volume unmounts.
 
-### Config rendering
+### `reconcile_master_config() -> None`
+Re-render the env file + master.toml from the current cluster snapshot.
+- **In:** none. **Out:** `None`. Calls `write_env_file()` then
+  `write_master_config()`; swallows `RuntimeError` (cluster.json not ready,
+  retried on the next revision). Called by the orchestrator's revision-watcher.
 
-- `write_master_config()` — render `seaweedfs-master.toml` with
-  the current `seaweed_master_membership` list as Raft peers,
-  default replication `001`, three collection definitions (scratch
-  / standard / critical).
-- `write_filer_config()` — render `filer.toml` with `[leveldb3]
-  dir = /var/lib/bedrock/cluster/seaweedfs` and
-  `master = "<vip>:9333"` (where `<vip>` is the cluster's mgmt
-  VIP form — `100.X.Y.254` is the filer's bind, but the filer's
-  master client points at one of the actual master loopbacks,
-  rendered from the membership table).
-- `write_s3_config()` — render `seaweedfs-s3.toml` with
-  `iam.filerBucketsPath = "/buckets"` so identities live in the
-  filer DB. No sidecar identities.json.
-- `write_env_file(*, role_set)` — render `seaweedfs.env` with the
-  per-role binds:
-  - `SEAWEED_MASTER_BIND` = node's loopback IP (when this node is
-    a master) else empty.
-  - `SEAWEED_MASTER_PEERS` = comma-list of the master set's
-    `ip:9333`. Empty when N=1 and this node is sole master.
-  - `SEAWEED_VOLUME_BIND = 0.0.0.0` — always.
-  - `SEAWEED_S3_BIND = 0.0.0.0` — always.
-  - `SEAWEED_FILER_BIND` = `<vip>` only on the arbiter-host; the
-    filer service starts on `.254` after the DRBD mount.
-  - `SEAWEED_FUSE_FILER = <vip>:8888` — for the per-node mount
-    unit. Identical on every node.
+### `promote_to_master_volume_host() -> None`
+Enable/start the always-on volume + s3 units, and the master unit only if this
+node is in the Raft set.
+- **In:** none. **Out:** `None`. `systemctl reset-failed` on all four weed units,
+  then `enable --now` for `bedrock-weed-volume` + `bedrock-weed-s3` on every node.
+  If this node's loopback is in `_master_set()`, `enable --now`
+  `bedrock-weed-master`; otherwise `disable --now` it. Idempotent. Called by
+  install / orchestrator on every node.
 
-### Role transitions
+### `ensure_iso_library_mount() -> None`
+Install + (re)start the FUSE-mount unit that mounts the filer at `/mnt/bedrock`.
+- **In:** none. **Out:** `None`. Writes `/etc/systemd/system/bedrock-fuse-mount.service`
+  (a `Type=simple` service running `weed mount -filer=<.254>:8888 -dir=/mnt/bedrock
+  -allowOthers -dirAutoCreate`); `daemon-reload` only when the unit text changed;
+  `enable --no-block` then `start`/`restart --no-block`. `mkdir -p` on
+  `/mnt/bedrock`. Never blocks the caller (weed retries internally).
 
-- `promote_to_master_volume_host()` — called from
-  `mgmt_install.install_full` (init) and `agent_install.install`
-  (join). If this node is in `seaweed_master_membership`:
-  `systemctl enable --now bedrock-weed-master`. Always:
-  `systemctl enable --now bedrock-weed-volume bedrock-weed-s3
-  bedrock-weed-mount`. Idempotent; safe to re-run on every
-  orchestrator reconcile.
-- `promote_to_filer_host()` — called by
-  `cluster_arbiter.promote_to_arbiter_host` AFTER the DRBD volume
-  is mounted at `/var/lib/bedrock/cluster`. Starts
-  `bedrock-weed-filer`. The s3 gateway is **already** running
-  (it's a per-node always-on service), but it'll start serving
-  meaningful requests only once the filer at `.254:8888` is up.
-- `demote_filer_host()` — called by
-  `cluster_arbiter.demote_arbiter_host` BEFORE unmounting the
-  DRBD volume. Stops `bedrock-weed-filer` only. The per-node
-  weed-s3 keeps running — it'll error gracefully once the filer
-  endpoint vanishes; clients retry against the new arbiter-host
-  via the same `.254:8888` URL.
-- `is_filer_active() -> bool` — short `systemctl is-active` check.
+### `init_collections() -> None`
+One-shot per cluster: configure the five path policies via `weed shell`.
+- **In:** none. **Out:** `None`. Runs `weed shell -master <first-master>:9333`
+  feeding five `fs.configure ... -apply` commands; returns early (logging a
+  warning) if the weed binary is missing or `_master_set()` is empty.
+  Replication is clamped to what the cluster size can satisfy. Idempotent
+  (`-apply` overwrites the prior config for the same `locationPrefix`). Called
+  from the `seaweedfs_init_collections` cluster_init step.
 
-### FUSE mount (uniform across nodes)
+### `seed_iso_library(source_dir: Path = Path("/opt/bedrock/iso")) -> None`
+Copy staged ISOs into the filer's `/iso/` subtree.
+- **In:** `source_dir` → directory of `*.iso` files to seed.
+- **Out:** `None`. Returns early if `source_dir` is absent/not a dir or holds no
+  ISOs. Ensures the FUSE mount is up (`ensure_iso_library_mount()` if
+  `/mnt/bedrock` is not a mount), `mkdir -p /mnt/bedrock/iso`, then `cp -n` each
+  ISO that is not already present. Idempotent. Runs on the arbiter-host after the
+  filer is up.
 
-- `ensure_fuse_mount()` — renders + applies
-  `/etc/systemd/system/mnt-bedrock.mount`. Target:
-  `weedfs#<vip>:8888/` mounted at `/mnt/bedrock`. Identical on
-  every node — no per-node loopback substitution. Restarts on
-  `.254`-VIP transitions are handled by the filer URL itself
-  being constant; the mount only blips if the filer is briefly
-  down during failover.
-- `seed_iso_library(src_dir)` — copy any local ISOs (e.g.
-  virtio-win.iso staged from the install payload) into
-  `/mnt/bedrock/iso/` via the FUSE mount or via the S3 gateway.
+### Private helpers (mechanical)
+`_read_cluster()` / `_read_state()` load the cluster snapshot (via
+`cluster_state.load_cluster()`) and `/etc/bedrock/state.json`, returning `{}` on
+any error. `_peer_loopbacks()` returns other nodes' loopback IPs in sorted order;
+`_my_loopback()` this node's; `_loopback_octet(ip)` the last octet (9999 on parse
+failure) as the sort key. `_n_cluster_nodes()` clamps the node count to ≥1.
+`_master_set()` returns the deterministic Raft master member set. `_filer_vip()`
+derives `100.X.Y.254` from the local loopback. `_derive_admin_credentials()`
+returns `(access_key, secret_key)`. `_systemctl(action, unit)` / `_svc_active(unit)`
+wrap `systemctl`.
 
-### Collection setup (one-shot at cluster init)
+## How it works
 
-- `init_collections()` — called once when N=1 starts up. Runs
-  `weed shell` against the local master:
-  ```
-  fs.configure -locationPrefix=/scratch/   -collection=scratch  -replication=000 -apply
-  fs.configure -locationPrefix=/iso/       -collection=standard -replication=001 -apply
-  fs.configure -locationPrefix=/templates/ -collection=standard -replication=001 -apply
-  fs.configure -locationPrefix=/snapshots/ -collection=standard -replication=001 -apply
-  fs.configure -locationPrefix=/backups/   -collection=critical -replication=002 -apply
-  ```
-  Idempotent; safe to re-run.
+**Topology this module enforces:**
 
-### Helpers
+```
+              ┌──────────── every node ─────────────┐
+              │  weed-volume  (0.0.0.0:8080)         │   stores file bytes
+              │  weed-s3      (0.0.0.0:8333)         │   S3 gateway
+              └──────────────────────────────────────┘
+   weed-master ── Raft set, lowest-octet nodes:
+        N=1 → 1 master    N=2 → 1 master    N≥3 → 3 masters
+   weed-filer + its s3 ── singleton on the .254 cluster VIP
+        (leveldb3 metadata on the cluster-singleton DRBD volume,
+         so it rides the master role; promote/demote via cluster_arbiter)
+```
 
-- `_systemctl(action, *units)` — subprocess wrapper.
-- `_read_cluster() / _read_state()` — short JSON reads.
-- `_vip_address() -> str` — derives `100.X.Y.254` from
-  `state.json`'s cluster CGNAT.
+**Master subset selection.** SeaweedFS master uses Raft, which refuses an
+even-numbered peer set. Both selectors sort all loopbacks by last octet and pick
+a deterministic subset:
 
-## What this module is NOT responsible for
+```
+sorted loopbacks (by last octet) = [lo0, lo1, lo2, lo3, ...]
+  N <= 1  → [lo0]                 (self only)
+  N == 2  → [lo0]                 (lowest-octet only; single-node Raft)
+  N >= 3  → [lo0, lo1, lo2]       (lowest 3)
+```
+`write_master_config` computes its peer list as "largest odd ≤ N" (so N=4 → 3,
+N=5 → 5), while `_master_set` — which env rendering and the start logic use —
+caps strictly at 3. They agree for N≤3 and pin the master count that the units
+actually run to at most 3. Because every node sorts the same loopback list, each
+node renders an identical master.toml and agrees on the same master set without
+coordination. A node not in the set still runs as a volume-only peer.
 
-- **Master Raft membership decisions.** Calm orchestrator only.
-  This module only consumes `seaweed_master_membership` from
-  rqlite and runs the appropriate systemd actions; it never picks
-  who's a master.
-- **Filer placement.** The filer follows the arbiter VIP; the
-  arbiter VIP is owned by `cluster_arbiter.py` per
-  `docs/cluster-quorum-spec.md`. This module's `promote_to_filer_host`
-  is just a thin wrapper around `systemctl start
-  bedrock-weed-filer` AFTER the DRBD mount succeeded.
-- **Replication-code policy decisions.** Three collections, three
-  fixed codes (000/001/002), set once at `init_collections`.
-  Operators can `weed shell` to add more collections; not a
-  Bedrock-managed feature.
+**Config rendering guards.** The renderers that need this node's loopback IP
+(`write_master_config`, `write_env_file`) raise `RuntimeError` when state.json
+has no `loopback_ip`, so config never gets written with a blank bind address.
+`reconcile_master_config()` is the only caller that swallows that error — it is
+fired by the revision-watcher and simply retries on the next cluster revision.
+`write_env_file` writes via tmp + `os.replace` so a concurrent reader never sees
+a half-written env file.
 
-## Failure modes
+**Replication clamping.** Replication must be satisfiable by the live node count
+or SeaweedFS hangs writes at volume-assign time. Both the cluster default
+(`write_master_config`: `000` at N≤1 else `001`) and the per-path policies
+(`init_collections`) follow the same rule:
 
-| Symptom                                  | Where to look                                          |
-|------------------------------------------|--------------------------------------------------------|
-| S3 returns 503 right after failover      | Filer not up yet on new arbiter-host; `journalctl -u bedrock-weed-filer` |
-| Volume server doesn't register with master | `SEAWEED_MASTER_PEERS` env points at a node that left; orchestrator needs to re-render env on master-set change |
-| FUSE mount returns ENOTCONN              | Filer at `.254:8888` is down (during arbiter failover); auto-recovers when filer comes back |
-| IAM auth fails on every S3 request       | `iam.filerBucketsPath` not configured; identities living in sidecar JSON instead of filer DB |
-| Master Raft loses quorum                 | Calm orchestrator hasn't re-shuffled `seaweed_master_membership` after a node left; check rqlite table |
+```
+            N=1     N=2     N>=3
+scratch     000     000     000
+iso/        000     001     001     (standard)
+templates/  000     001     001
+snapshots/  000     001     001
+backups/    000     001     002     (critical)
+```
+This keeps e.g. `/iso/` from being pinned to `001` on an N=1 box, which would
+brick every ISO upload.
+
+**Start/stop sequencing.** `promote_to_master_volume_host()` always
+`reset-failed`s the four weed units first (a unit that crash-looped before the
+env file existed otherwise sits in `StartLimitBurst`), then `enable --now`s
+volume + s3 unconditionally, then `enable --now` (in-set) or `disable --now`
+(out-of-set) the master. All `systemctl` calls use `check=False` and silence
+stderr — the unit files have an empty `WantedBy=`, so `enable` prints "no
+installation config" while still creating the runtime symlink that `--now`
+needs. The filer pair is started/stopped separately by
+`promote_to_filer_host` / `demote_filer_host`, which `cluster_arbiter` calls
+when the `.254` VIP and its DRBD volume move:
+
+```
+  arbiter promote: mount cluster-singleton DRBD → promote_to_filer_host()
+                       (reset-failed → start filer → start s3)
+  arbiter demote:  demote_filer_host() → unmount cluster-singleton DRBD
+                       (stop s3 → stop filer)
+```
+
+**Shared FUSE namespace.** `ensure_iso_library_mount()` installs a
+`Type=simple` service running `weed mount` against `<.254>:8888`. Every node
+points at the same VIP, so the mount target string is stable when the
+arbiter-host flips — the VIP moves and the FUSE client auto-reconnects. The unit
+is only rewritten + `daemon-reload`ed when its text changes, and all start/enable
+calls use `--no-block` so the caller never waits on the mount coming up. libvirt
+then sees `/mnt/bedrock/iso/<name>.iso` as a local path, replicated cluster-wide
+by the volume servers.
+
+**Admin credentials.** `_derive_admin_credentials()` reads
+`/etc/bedrock/cluster.key` (32 random bytes; a trailing newline on a 33-byte file
+is trimmed) and derives `access_key` (first 20 hex of
+`sha256("bedrock-s3-access\0" + key)`) and `secret_key` (full hex of
+`sha256("bedrock-s3-secret\0" + key)`). The two domain-tagged hashes mean leaking
+one doesn't reveal the other, and every node derives the same admin identity from
+the shared key. When the key file is absent (very early bootstrap) it falls back
+to fixed testbed creds `("bedrock-admin", "bedrock-admin-secret")`.
+
+**CLI entry point.** Running the module directly takes one subcommand:
+`config` (default: `ensure_install` + `write_env_file` + the four `write_*`
+renderers), `promote`, `demote`, or `reconcile`. Errors print to stderr and exit
+non-zero.
+
+## Why
+The volume + s3 gateway run everywhere so any node can serve S3 and store bytes,
+while the filer is a single writer on the VIP — pointing every FUSE mount and S3
+client at `.254` keeps namespace metadata consistent and lets it follow the
+master role over DRBD without changing any client's target address.

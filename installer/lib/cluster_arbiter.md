@@ -1,105 +1,164 @@
-# `cluster_arbiter.py`
+# installer/lib/cluster_arbiter.py
 
-**Module purpose.** Owns the imperative "this node should/should
-not host the cluster singletons" transitions. The cluster
-singletons are:
+Moves the cluster-singleton services onto whichever node `bedrock-d`'s realtime
+layer (netd's election + witness) has elected mgmt master. The singletons are the
+arbiter rqlite daemon (a second `rqlited` co-resident with the master, supplying a
+third Raft voter), plus the SeaweedFS filer + S3 owned via `seaweedfs.py`. The
+arbiter's data lives on a shared DRBD volume named `cluster` mounted at
+`/var/lib/bedrock/cluster`, and its network identity is a secondary
+`100.X.Y.254/32` on `lo`. This module is the actuator: it DRBD-promotes the
+volume, mounts it, binds `.254`, starts the arbiter service, and starts the filer
+— and the exact reverse on demote. It is called from the orchestrator's
+`converge()` reconcile tick and from `boot_orchestrator`; netd calls
+`ensure_lms_if_last_standing()` each Leader tick. The takeover path touches the
+witness and local commands (`drbdadm`, `ip`, `mount`, `systemctl`, debugfs) only
+— never rqlite, because rqlite is the service being recovered.
 
-- the `tier-critical` DRBD volume mounted at `/var/lib/bedrock/cluster`
-- the **arbiter rqlite** instance (a separate `rqlited` on ports
-  4011/4012, bound to the .254 VIP)
-- the `.254/32` master VIP on `lo`
-- the SeaweedFS **filer** (which needs `/var/lib/bedrock/cluster/seaweedfs/`
-  to be the same leveldb3 on whichever node currently holds master).
-  **Not** the S3 gateway — that runs on every node bound `0.0.0.0`
-  and authenticates against IAM identities living inside the
-  filer DB. See `docs/storage-architecture.md`.
+## Functions / Classes
 
-`converge()` is the idempotent entry point called from
-`mgmt/orchestrator.rqlite_subscriber` every rqlite-revision change
-AND from `mgmt/orchestrator.converge_retry` every 5 s. It reads
-`state.json["role"]` ("mgmt+compute" or "compute") to decide
-should-host, and `arbiter_status()` to decide am-host. If they
-disagree, it calls `promote_to_arbiter_host()` or
-`demote_arbiter_host()`.
+### `attach_state(state) -> None`
+Wire `bedrock-d`'s shared `BedrockState` into the module global `SHARED_STATE`.
+- **In:** `state` — the live daemon state (`last_election_outcome`, `netd_ws`, `netd.peer_hb`).
+- **Out:** None. Sets the module global so the rest of the module reads netd's election outcome and witness handle directly.
 
-The "should-host" question is answered by `state.json["role"]`,
-which the orchestrator's subscriber regenerates from rqlite's
-`cluster_info.mgmt_master` on every revision tick. Election in
-bedrock-net is what flips `cluster_info.mgmt_master`; that
-propagates via Raft to state.json on every node, which flips
-`converge()` here.
+### `arbiter_loopback_ip() -> str`
+Derive this cluster's arbiter `100.X.Y.254` address.
+- **In:** none.
+- **Out:** dotted IP string, or `""` if `cluster_uuid` is not yet readable. Reads `cluster_info.cluster_uuid` from local rqlite (level `none`, no quorum) and combines `cluster_addr.cluster_loopback_prefix(uuid)` with octet `254`.
 
-## Constants
+### `promote_to_arbiter_host() -> dict`
+Take over hosting the cluster singletons on this node. Idempotent — safe on every role tick; already-done steps no-op.
+- **In:** none.
+- **Out:** `arbiter_status()` dict. Side effects: at N>=2 runs the witness takeover protocol, then `drbdadm primary cluster` (with `--force` fallback), `mount`, creates `ARBITER_DATA` (mode 0700), `ip addr add .254/32 dev lo`, `rqlite_setup.render_arbiter_env_file()`, starts `bedrock-rqlited-arbiter.service`, `seaweedfs.promote_to_filer_host()`, then writes `cluster_info.mgmt_master`. At N=1 (no cluster DRBD): creates dirs, binds `.254`, promotes the filer, writes `mgmt_master`.
 
-- `TIER_RESOURCE = "tier-critical"` — DRBD resource name.
-- `MOUNT_POINT = Path("/var/lib/bedrock/cluster")` — where the
-  DRBD device is mounted on the master.
-- `ARBITER_DATA = MOUNT_POINT / "rqlite-arbiter"` — arbiter
-  rqlite's data dir (lives on the DRBD volume so it follows the
-  master).
-- `ARBITER_SVC = "bedrock-rqlited-arbiter.service"`.
+### `demote_arbiter_host() -> dict`
+Stop hosting the singletons; reverse of promote. Idempotent.
+- **In:** none.
+- **Out:** `arbiter_status()` dict. Side effects: `seaweedfs.demote_filer_host()`, `ip addr del .254/32`, and when cluster DRBD is present also stops `bedrock-rqlited-arbiter.service`, unmounts, `drbdadm secondary cluster`. Finally clears this node's witness LMS bit (`set_own_slot(..., tag=0)`) when netd is wired.
 
-## Functions
+### `arbiter_status() -> dict`
+Read-only snapshot of local hosting state. No side effects.
+- **In:** none.
+- **Out:** `{drbd_role, mounted, ip_present, service_active, loopback_ip}` from `drbdadm role`, `mountpoint -q`, `ip addr show lo`, `systemctl is-active`, and `arbiter_loopback_ip()`.
 
-- `_run(cmd, check=False, timeout=30) -> (rc, stdout, stderr)` —
-  internal subprocess wrapper that captures + returns; never raises
-  unless `check=True`.
-- `arbiter_loopback_ip() -> str` — returns `100.X.Y.254` derived
-  from this cluster's CGNAT prefix (see `cluster_addr.py`).
-  Returns `""` if `state.json` is missing.
-- `_drbd_role() -> str` — `Primary` / `Secondary` / `Unknown`.
-- `_drbd_resource_exists() -> bool` — true iff
-  `/etc/drbd.d/tier-critical.res` exists AND `drbdadm status
-  tier-critical` returns 0. False at N=1 before `bedrock storage
-  promote`.
-- `_cluster_size() -> int` — count of nodes in cluster.json.
-- `_drbd_promote()` — `drbdadm primary tier-critical`. If that
-  fails with "Need access to UpToDate data" (peer unreachable
-  during failover), retries with `drbdadm -- --force primary` —
-  the takeover protocol (`docs/cluster-quorum-spec.md`) has already
-  verified `slot[prev_master].marker == local drbdadm current-uuid`
-  before this function is called, so the local data IS UpToDate
-  even if DRBD can't reach the peer to confirm.
-- `_drbd_secondary()` — `drbdadm secondary tier-critical`. Idempotent
-  failure (already secondary) is logged but not raised.
-- `_is_mounted(path) -> bool` — `findmnt -n -T <path>` returns 0.
-- `_mount()` — resolves the DRBD device via `drbdadm sh-dev`, then
-  `mount /dev/drbdN /var/lib/bedrock/cluster`. No-op if already
-  mounted.
-- `_umount()` — lazy unmount of `/var/lib/bedrock/cluster`. No-op
-  if not mounted.
-- `_arbiter_ip_present() -> bool` — checks `ip -4 addr show lo`
-  for the .254/32 line.
-- `_ip_add() -> str` — adds `.254/32` to lo. Treats "File exists"
-  as success (idempotent).
-- `_ip_del()` — removes `.254/32` from lo. Idempotent.
-- `_svc_active(unit) -> bool` — `systemctl is-active --quiet`.
-- `_svc_start(unit)` / `_svc_stop(unit)` — `systemctl start/stop`.
-- `promote_to_arbiter_host() -> dict` — main promote sequence:
-  - N=1 mode (no `tier-critical.res`): ensure `MOUNT_POINT`
-    directory exists, ensure `ARBITER_DATA` dir exists. Start
-    SeaweedFS filer + s3 (`seaweedfs.promote_to_filer_host`). No
-    .254 VIP at N=1.
-  - N≥2 mode: `drbdadm primary` → mount → ensure
-    `ARBITER_DATA` mode 0700 → `_ip_add()` (.254) → render
-    `/etc/bedrock/rqlited-arbiter.env` → start the arbiter rqlite
-    unit → start filer + s3.
-  Returns `arbiter_status()` at the end.
-- `demote_arbiter_host() -> dict` — exact reverse:
-  - Stop filer + s3 first (they hold the mount open).
-  - Stop arbiter rqlite.
-  - `_ip_del()` (.254).
-  - `_umount()`.
-  - `drbdadm secondary tier-critical`.
-- `arbiter_status() -> dict` — snapshot: `{drbd_role, mounted,
-  ip_present, service_active, ...}`. Used by `converge()` to
-  decide if we're currently hosting.
-- `i_should_host_arbiter() -> bool` — `True` iff
-  `state.json["role"]` contains "mgmt". The rqlite subscriber is
-  what flips this; election only writes mgmt_master, the rest
-  cascades.
-- `converge() -> dict` — read should-host + am-host. If
-  should AND not am → `promote_to_arbiter_host`. If not should
-  AND am → `demote_arbiter_host`. Else return current status.
-  Idempotent and safe to call on every rqlite revision + every
-  5 s timer tick.
+### `i_should_host_arbiter() -> bool`
+Decide whether this node should currently host the singletons.
+- **In:** none.
+- **Out:** `True`/`False`. Reads `SHARED_STATE.last_election_outcome` first: `leader`→True, `noquorum`/`follower`→False. When it is `""`/`init` (or no shared state) falls back to `state.json["role"]` containing `mgmt`.
+
+### `converge() -> dict`
+Single-shot reconcile: actuate local hosting state to match `i_should_host_arbiter()`. Called from the orchestrator's `converge_retry` tick and from `boot_orchestrator` after the role settles.
+- **In:** none.
+- **Out:** result of `promote_to_arbiter_host()`, `demote_arbiter_host()`, or `arbiter_status()` when already in the desired state. No direct rqlite write — only transitively via promote's `mgmt_master` write.
+
+### `ensure_lms_if_last_standing(ws) -> bool`
+H6: when this node is Leader, hosting, has no fresh peer, and the witness is valid+confirmed, claim last-man-standing. Called from netd's Leader branch each tick.
+- **In:** `ws` — netd's witness handle.
+- **Out:** `True` iff it (re)asserted LMS this call. Side effect: `witness.set_own_slot(ws, marker=<local DRBD UUID>, tag=TAG_LMS)` then readback (3 × 1.5 s). No-op while any peer heartbeat is fresh, while not hosting, while the witness isn't valid+confirmed, or when the own slot already holds `lms=1`.
+
+Private helpers: `_run` (subprocess capture, never raises); DRBD steps `_drbd_role`, `_drbd_resource_exists` (gates on the `cluster-drbd-ready` marker), `_cluster_size`, `_drbd_promote`, `_drbd_secondary`; mount steps `_is_mounted` (uses `mountpoint -q`), `_mount` (resolves device via `drbdadm sh-dev`), `_umount`; IP steps `_arbiter_ip_present`, `_ip_add`, `_ip_del`; service steps `_svc_active`, `_svc_start`, `_svc_stop`; `_run_takeover_protocol` (the 5-step witness gate); `_set_mgmt_master_after_promote`; `_self_node_name`; `_fresh_peer_hbs`; `_peer_claims_master_now`; `_cold_boot_uuid_ok`; `_last_known_master_node_id`; `_read_local_drbd_uuid` (debugfs `data_gen_id`, fallback `drbdadm dump-md`).
+
+Run as a script (`python3 cluster_arbiter.py <cmd>`) the module exposes a manual operator CLI: `status` (default), `promote`, `demote`, `converge`. It prints the resulting `arbiter_status()` dict as JSON and exits non-zero on error.
+
+## How it works
+
+The realtime layer decides; this module actuates. `converge()` reads
+`i_should_host_arbiter()` and compares it to actual local state from
+`arbiter_status()`:
+
+```
+should_host & not host-complete  -> promote_to_arbiter_host()
+not should_host & host-partial   -> demote_arbiter_host()
+otherwise                        -> return status (no-op)
+```
+
+`host-complete` (skip promote) requires every singleton up; `host-partial` (fire
+demote) is true if any piece is up — so a follower with a stale `.254` left from a
+prior role is always cleaned up.
+
+**N=1 vs N>=2.** `_drbd_resource_exists()` returns true only once `tier_storage`
+has written the local `cluster-drbd-ready` marker. While false (N=1, or mid
+N=1→N=2 transition), promote skips every DRBD step and runs the singletons on the
+local FS, still binding `.254` so client URLs are uniform from day one. Gating on
+the marker — not on a parsed `.res` file — keeps `tier_storage` the sole owner of
+the N=1→N=2 transition, so the arbiter never fires a premature `drbdadm primary`
+or mounts an empty volume before the N=1 snapshot is restored.
+
+**Promote ordering (N>=2):**
+
+```
+takeover protocol (witness, steps 1-5)   <- refuses promote if it fails
+  drbdadm primary cluster  (--force fallback if peer unreachable)
+  mount /dev/drbdN -> /var/lib/bedrock/cluster
+  mkdir rqlite data (0700)
+  ip addr add .254/32 dev lo
+  render_arbiter_env_file
+  start bedrock-rqlited-arbiter.service
+  seaweedfs.promote_to_filer_host()
+  _set_mgmt_master_after_promote          <- RESULT, written last
+```
+
+An idempotent fast-path skips the witness protocol when DRBD is already Primary
+AND the mount is present AND `.254` is bound (the common case on repeated converge
+ticks).
+
+**mgmt_master is a result, not a trigger.** netd's election DRIVES the promote;
+`mgmt_master` in rqlite is written only at the end, by
+`_set_mgmt_master_after_promote()`, and only once `arbiter_status()` confirms
+hosting (N>=2: service_active + ip_present + DRBD Primary; N=1: filer active +
+ip_present). If that write fails because rqlite is still electing, the next
+converge tick re-promotes (no-op) and retries — no deadlock, because the promote
+never gates on `mgmt_master` already being set.
+
+**Takeover protocol (`_run_takeover_protocol`, rqlite-free):**
+
+```
+no shared state / netd not running -> allow (boot fallback)
+peer claims master (fresh HB)      -> DEFER (steal-back guard)
+last_master is None or == me:
+    cold-boot UUID check stale     -> REFUSE
+    N>=2 & cold-boot patience left -> DEFER (30s)
+    else                           -> ALLOW (first/self promote)
+last_master is another node:
+    witness unreachable, N>=3      -> ALLOW (rqlite quorum covers it)
+    witness unreachable, N<=2      -> REFUSE
+    slot[M] missing                -> REFUSE (INV-7 worst-case)
+    slot[M] fresh                  -> REFUSE (cluster healthy elsewhere)
+    slot[M] stale & lms=1          -> REFUSE (operator must clear LMS)
+    slot[M] stale & lms=0:
+        local DRBD UUID != marker  -> REFUSE (divergence)
+        else: set own slot lms+marker, read back (3x1.5s) -> ALLOW
+```
+
+The steal-back guard (`_peer_claims_master_now`) reads netd's in-memory `peer_hb`:
+if any peer's heartbeat is fresh (within `PEER_HB_FRESH_S` = 2 s) and advertises
+itself as `believed_master`, this node defers rather than steal the role back from
+a live survivor. Cold-boot patience defers the first promote for
+`COLD_BOOT_PATIENCE_S` (30 s) at N>=2 so a slower peer can converge cleanly.
+`_cold_boot_uuid_ok` refuses only when it can prove the local DRBD generation is
+stale: the witness still holds this node's own slot, its marker differs from the
+local UUID, and `state.classify_arbiter_uuid` reports that local UUID superseded.
+
+**DRBD `--force`.** `_drbd_promote()` first tries a plain `drbdadm primary`; on a
+failover the previous primary is unreachable, so DRBD refuses with "Need access to
+UpToDate data". Since the election + witness DRBD-UUID match already authorized
+this node as master, it retries with `--force`.
+
+**LMS lifecycle.** `tag.lms=1` never times out. The arbiter owns the bit:
+`ensure_lms_if_last_standing()` sets it when this node is the only one left, and
+`demote_arbiter_host()` clears it (`tag=0`) on self-demote so a future survivor's
+takeover can proceed. If the node dies before that clear lands at the witness, the
+slot stays `lms=1` and an operator override is required.
+
+**Reading the local DRBD UUID.** `_read_local_drbd_uuid()` reads DRBD9's debugfs
+`data_gen_id` while the resource is up (the takeover case), falling back to
+`drbdadm dump-md` for a detached resource.
+
+## Why
+
+The witness + local commands are the only inputs on the takeover path because the
+arbiter rqlite is the very service being recovered — making rqlite a precondition
+would deadlock at N=2, where rqlite cannot form quorum until the arbiter being
+decided about is running. `.254` lives on `lo` as a `/32` so rqlite and clients
+see a constant address across master moves; the IP simply changes which node's
+`lo` it sits on.
