@@ -16,10 +16,20 @@ what *recovers* rqlite — see EXECUTION-PLAN BAD-1):
     7 days so a long-dead generation can't veto forever.
 """
 import json
+import os
 import time
 from pathlib import Path
 
 STATE_FILE = Path("/etc/bedrock/state.json")
+# Local bootstrap cluster snapshot (written at init/join, read by
+# rqlite_setup at boot). NOT the old runtime projection — it survives
+# the rename window that can lose state.json, so it is our self-heal
+# source for this node's identity. See recover_identity_from_cluster_json.
+CLUSTER_JSON_FILE = Path("/etc/bedrock/cluster.json")
+
+# The identity fields a node MUST have to bring up netd + rqlite. Every
+# one of these is reconstructable from CLUSTER_JSON_FILE + the hostname.
+_IDENTITY_KEYS = ("cluster_uuid", "node_name", "loopback_ip")
 
 # How long a UUID observation is retained for eligibility decisions.
 UUID_HISTORY_RETENTION_S = 7 * 24 * 3600
@@ -33,7 +43,17 @@ UUID_SUPERSEDED = "superseded"  # seen, but a later UUID superseded it — REFUS
 
 def load() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (OSError, ValueError):
+            # 0-byte / truncated / corrupt JSON. This happens when a
+            # power-loss lands in save()'s rename window (amplified
+            # under writeback-qcow2 in the testbed; observed sim-4
+            # 2026-05-29). Treat as missing so callers can self-heal
+            # from cluster.json (recover_identity_from_cluster_json)
+            # instead of crashing. Do NOT unlink — recovery overwrites
+            # it atomically, and unlinking would race other readers.
+            return {}
     return {}
 
 
@@ -63,7 +83,7 @@ def save(state: dict):
             f"Caller stack: {_summarize_stack()}"
         )
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    import os, tempfile
+    import tempfile
     fd, tmp_path = tempfile.mkstemp(
         prefix=f".{STATE_FILE.name}.", suffix=".tmp",
         dir=str(STATE_FILE.parent))
@@ -100,6 +120,92 @@ def _summarize_stack() -> str:
     frames = traceback.extract_stack()[-5:-2]
     return " <- ".join(f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}"
                        for f in frames)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Self-heal: rebuild a lost state.json from the local cluster.json
+# ─────────────────────────────────────────────────────────────────
+
+def _read_cluster_json() -> dict:
+    try:
+        return json.loads(CLUSTER_JSON_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def recover_identity_from_cluster_json(state: dict | None = None) -> dict:
+    """Reconstruct this node's lost identity fields from the local
+    cluster.json + hostname, persisting the repair. Returns the
+    (possibly repaired) state dict.
+
+    Why this is needed: state.json can be lost to a 0-byte truncation
+    when a power-loss lands in save()'s atomic-rename window (rare on
+    real disks with the fsync in save(); reproducible under the
+    testbed's writeback-qcow2 + back-to-back `virsh destroy`). Without
+    self-heal, a single lost state.json BRICKS the node — netd's
+    load_state() and rqlite_setup.render_env_file() both refuse to
+    start with node_name='' / loopback_ip='', and bedrock-rqlited
+    crash-loops to systemd's start-limit (observed sim-4 2026-05-29
+    no-witness/reboot test).
+
+    cluster.json survives that window — it is written once at init/join,
+    not on every netd tick — and carries everything we need: top-level
+    cluster_uuid / cluster_name, and per-node loopback_ip + role keyed
+    by node name under `nodes`. We key on the hostname (which is the
+    Bedrock node_name and never changes).
+
+    Recovery-only fields are intentionally NOT restored from cluster.json:
+      * believed_master — left unset; the election/witness re-derives it
+        on the next tick (a stale hint would be worse than none).
+      * arbiter_uuid_history — restarts empty. An empty history makes a
+        candidate classify as UNSEEN (votable). That is acceptable: the
+        HARD promotion gate is the live `drbdadm current-uuid` exact
+        match against the witness marker (INV-5), which reads DRBD's own
+        metadata (intact on this node), not state.json. The history is a
+        defence-in-depth election filter that degrades gracefully here.
+    """
+    if state is None:
+        state = load()
+    # Already healthy — nothing to do.
+    if all(state.get(k) for k in _IDENTITY_KEYS):
+        return state
+
+    cluster = _read_cluster_json()
+    nodes = cluster.get("nodes") or {}
+    my_name = state.get("node_name") or os.uname().nodename
+    me = nodes.get(my_name) or {}
+
+    repaired = dict(state)
+    repaired["node_name"] = my_name
+    if not repaired.get("cluster_uuid") and cluster.get("cluster_uuid"):
+        repaired["cluster_uuid"] = cluster["cluster_uuid"]
+    if not repaired.get("cluster_name") and cluster.get("cluster_name"):
+        repaired["cluster_name"] = cluster["cluster_name"]
+    if not repaired.get("loopback_ip") and me.get("loopback_ip"):
+        repaired["loopback_ip"] = me["loopback_ip"]
+    if not repaired.get("role") and me.get("role"):
+        repaired["role"] = me["role"]
+    # A node with recovered identity has clearly completed bootstrap.
+    repaired.setdefault("bootstrap_done", True)
+
+    # Only persist if we actually recovered the full identity AND
+    # changed something. If cluster.json couldn't supply the essentials
+    # (e.g. it too is missing), leave state as-is and let the caller
+    # surface the error rather than writing a half-repaired file.
+    if repaired != state and all(repaired.get(k) for k in _IDENTITY_KEYS):
+        save(repaired)
+        return repaired
+    return repaired
+
+
+def load_or_recover() -> dict:
+    """load(), self-healing from cluster.json if the identity is
+    incomplete (lost/corrupt state.json). The boot-path entry point for
+    netd + rqlite_setup."""
+    st = load()
+    if not all(st.get(k) for k in _IDENTITY_KEYS):
+        st = recover_identity_from_cluster_json(st)
+    return st
 
 
 # ─────────────────────────────────────────────────────────────────

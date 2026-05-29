@@ -223,7 +223,7 @@ def test_kill_task_skips_recovered_vm(suspended_file, monkeypatch):
         return (1, "", "unexpected")
 
     monkeypatch.setattr(vmf, "_virsh", fake_virsh)
-    monkeypatch.setattr(vmf, "KILL_AFTER_SUSPEND_S", 1)
+    monkeypatch.setattr(vmf, "KILL_AFTER_QUORUM_LOSS_S", 1)
     monkeypatch.setattr(vmf, "TICK_S", 0.01)
 
     async def run_one_tick():

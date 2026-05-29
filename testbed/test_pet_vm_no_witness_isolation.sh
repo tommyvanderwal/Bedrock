@@ -273,20 +273,41 @@ for n in "${OTHER_SIMS[@]}"; do
 done
 ISOLATE_T0=$(date +%s)
 
-note "wait T+330s (5.5 min — past KILL_AFTER_SUSPEND_S=300s)"
-sleep 60
-note "  T+60s — sim-1 should be paused"
-vm_paused_on "$PET_NAME" 1 && pass "sim-1 paused at T+60s" || note "sim-1 not paused yet"
-sleep 270   # total 330s
-elapsed=$(($(date +%s) - ISOLATE_T0))
-note "elapsed T+${elapsed}s — checking kill"
-
-step "B.2. Verify sim-1 killed the suspended pet VM (virsh destroyed it)"
-# After kill, VM is neither running nor paused on sim-1
-if vm_running_on "$PET_NAME" 1 || vm_paused_on "$PET_NAME" 1; then
-    mark_fail "sim-1 did NOT kill the suspended pet VM after 5+ min"
+# The kill clock runs KILL_AFTER_QUORUM_LOSS_S=300s from QUORUM LOSS, NOT
+# from suspend (Tommy 2026-05-29: "the VM is turned off 5 min after the
+# connection is lost; from ~20s it gets suspended first"). Quorum loss ≈
+# this isolation moment; netd marks no-quorum ~10s later (detection), and
+# the kill fires on a 5s tick — so expect the kill ~300-320s from ISOLATE_T0.
+# We confirm the intermediate suspend, then poll a [290s, 360s] kill window
+# anchored on ISOLATE_T0 (the earlier flake checked once at exactly T+330s
+# and raced the kill).
+note "poll up to 90s for sim-1 to suspend the pet (intermediate step)"
+SUSPEND_T0=""
+for _ in $(seq 1 18); do
+    if vm_paused_on "$PET_NAME" 1; then SUSPEND_T0=$(date +%s); break; fi
+    sleep 5
+done
+if [ -z "$SUSPEND_T0" ]; then
+    mark_fail "sim-1 did not suspend the pet VM within 90s of isolation"
 else
-    pass "sim-1 killed (virsh destroyed) the pet VM after 5min suspend"
+    pass "sim-1 suspended the pet VM at T+$((SUSPEND_T0 - ISOLATE_T0))s (within the 5-min kill window)"
+    note "wait until T+290s from quorum loss, then poll the kill window to T+360s"
+    # Sleep until just before the 300s-from-quorum-loss threshold.
+    while [ $(($(date +%s) - ISOLATE_T0)) -lt 290 ]; do sleep 5; done
+    step "B.2. Verify sim-1 killed the pet VM ~5min after quorum loss"
+    killed=""
+    while [ $(($(date +%s) - ISOLATE_T0)) -lt 360 ]; do
+        if ! vm_running_on "$PET_NAME" 1 && ! vm_paused_on "$PET_NAME" 1; then
+            killed=1; break
+        fi
+        sleep 5
+    done
+    kill_at=$(($(date +%s) - ISOLATE_T0))
+    if [ -n "$killed" ]; then
+        pass "sim-1 killed (virsh destroyed) the pet VM at T+${kill_at}s from quorum loss (~300s target)"
+    else
+        mark_fail "sim-1 did NOT kill the pet VM within T+360s of quorum loss"
+    fi
 fi
 
 step "B.3. Restore"

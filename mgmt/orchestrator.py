@@ -200,8 +200,10 @@ def get_snapshot() -> dict:
 
 async def rqlite_subscriber():
     """Watch the rqlite cluster-state store's revision counter; on
-    every advance, rebuild the snapshot, project to cluster.json +
-    state.json, run the reactor on the snapshot diff.
+    every advance, rebuild the snapshot, project this node's role/URL
+    to state.json, run the reactor on the snapshot diff. (cluster.json
+    is no longer a runtime projection — consumers read rqlite directly
+    via cluster_state.load_cluster(); see _apply_revision.)
 
     Poll-based (per rqlite's HTTP semantics) at ~500ms cadence; the
     reactor sees one consolidated revision-advance per tick even if
@@ -363,10 +365,10 @@ async def boot_orchestrator():
 
 async def _wait_for_role(timeout_s: float,
                          ignore_marker: bool = False) -> str:
-    """Poll cluster.json until we have a quorum-recorded mgmt_master.
-    Returns 'leader' if we are master, 'follower' if a peer is, or
-    'noquorum' / 'unknown' on timeout. cluster.json is written by the
-    rqlite subscriber every tick from the canonical rqlite state, so
+    """Poll rqlite (via cluster_state.load_cluster) until we have a
+    quorum-recorded mgmt_master. Returns 'leader' if we are master,
+    'follower' if a peer is, or 'noquorum' / 'unknown' on timeout. The
+    cluster state is read straight from the local rqlite replica, so
     this becomes 'follower' or 'leader' as soon as quorum is back.
 
     `ignore_marker=True`: skip the NO_QUORUM_MARKER early-return. Used
@@ -451,6 +453,26 @@ async def _start_local_services():
             if vm.get("host") == self_name and vm.get("state") == "running"]
     for vm_name in ours:
         _bring_up_vm_drbd(vm_name)
+
+    # Per-node SeaweedFS: weed-volume + weed-s3 run on EVERY node, and
+    # weed-master on the Raft-3 set. Those units have `WantedBy=` empty
+    # by design (role-aware, not blanket boot-enabled), and were only
+    # ever started from the install/join paths — so nothing restarts
+    # them after a reboot/power-loss. Without this call a cold boot
+    # leaves S3/object storage down on this node (the .254 filer is
+    # separately owned by cluster_arbiter). promote_to_master_volume_host
+    # is idempotent and role-aware (handles the master set + reset-failed).
+    try:
+        try:
+            from lib import seaweedfs as _sw
+        except ImportError:                       # source-tree layout
+            from installer.lib import seaweedfs as _sw  # type: ignore
+        log.info("services: starting per-node SeaweedFS "
+                 "(weed-volume + weed-s3, + weed-master if in the Raft-3 set)")
+        _sw.promote_to_master_volume_host()
+    except Exception as e:
+        log.warning("services: seaweedfs start failed "
+                    "(will retry on next role change): %s", e)
 
     # libvirtd only after the DRBD devices its VMs need are up.
     log.info("services: starting libvirtd")

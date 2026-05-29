@@ -131,13 +131,30 @@ def render_env_file(
 
     my_node = state.get("node_name", "")
     my_loopback = state.get("loopback_ip", "")
+
+    if not my_node or not my_loopback:
+        # state.json may have been lost to a 0-byte truncation (power-loss
+        # in save()'s rename window) while cluster.json survived. Rather
+        # than crash-loop the rqlited unit forever (node bricked, observed
+        # sim-4 2026-05-29), self-heal this node's identity from
+        # cluster.json + hostname, then re-read.
+        try:
+            from . import state as _state_mod
+            _state_mod.recover_identity_from_cluster_json()
+        except Exception:
+            pass
+        state = _read_json(state_path)
+        my_node = state.get("node_name", "")
+        my_loopback = state.get("loopback_ip", "")
+
     my_role = state.get("role", "")
 
     if not my_node or not my_loopback:
         raise RuntimeError(
             f"rqlite_setup: cannot render env yet — "
             f"node_name={my_node!r} loopback_ip={my_loopback!r}. "
-            f"Run after state.json is populated (post-init/join)."
+            f"Run after state.json is populated (post-init/join). "
+            f"(cluster.json self-heal could not supply identity either.)"
         )
 
     # rqlite node-id MUST be stable across the cluster's lifetime —

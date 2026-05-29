@@ -21,8 +21,9 @@ loopback IP." The short version:
     any interface that's enslaved to a bridge (bridge ports get no
     /32 because the bridge itself is the routable endpoint).
   * In-memory gossip is realtime; only durable transitions get
-    appended to the bedrock-rust log: LINK_UP after 5 s continuous,
-    LINK_DOWN after 30 s silent, LINK_QUALITY is rate-limited first
+    recorded to rqlite (the `paths` table, master-side): LINK_UP after
+    5 s continuous, LINK_DOWN after DOWN_HYSTERESIS_S (10 s) silent,
+    LINK_QUALITY is rate-limited first
     (max once per QUALITY_REFRESH_S = 60 s) AND change-sensitive
     second (≥25% speed bucket change). Order matters: we never
     emit a quality event sooner than the gate, even on a big change.
@@ -655,7 +656,7 @@ class Daemon:
     # `sweep_hysteresis` dropping silent neighbours from `neighbours`,
     # so the election layer can distinguish "joiner not yet probed
     # back" (never seen → don't count for quorum) from "known peer
-    # gone silent ≥30 s" (seen → count for quorum at False liveness).
+    # gone silent ≥DOWN_HYSTERESIS_S (10 s)" (seen → count for quorum at False liveness).
     ever_seen_peers: set = field(default_factory=set)
     # Map nic → IPv4 address (link-local from NM, or DHCP for the LAN side)
     nic_addrs: dict = field(default_factory=dict)
@@ -903,11 +904,21 @@ def load_state() -> tuple[bytes, str, str, str]:
 
     if not STATE_JSON.exists():
         raise RuntimeError(f"missing {STATE_JSON} — run `bedrock bootstrap` first")
-    state = json.loads(STATE_JSON.read_text())
+    # state.json can be a 0-byte/corrupt truncation after a power-loss in
+    # save()'s rename window — a bare json.loads() here used to crash the
+    # whole netd thread (observed sim-4 2026-05-29). Load defensively and
+    # self-heal this node's identity from the surviving cluster.json before
+    # giving up, so a lost state.json no longer bricks consensus.
+    try:
+        from . import state as _state
+    except ImportError:                      # running outside the package
+        import state as _state               # type: ignore
+    state = _state.load_or_recover()
     cluster_uuid = state.get("cluster_uuid") or ""
     my_node = state.get("node_name") or os.uname().nodename
     if not cluster_uuid:
-        raise RuntimeError("state.json has no cluster_uuid — not in a cluster")
+        raise RuntimeError("state.json has no cluster_uuid — not in a cluster "
+                           "(cluster.json self-heal found none either)")
     my_loopback = state.get("loopback_ip") or ""
     return cluster_key, cluster_uuid, my_node, my_loopback
 
@@ -1087,7 +1098,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
 
     # 2. Peer liveness from netd's own neighbour table. Seed with
     # every ever-seen peer at False — sweep_hysteresis drops peers
-    # from d.neighbours after 30 s of silence, but the election layer
+    # from d.neighbours after DOWN_HYSTERESIS_S (10 s) of silence, but the election layer
     # still needs to count them as cluster members (otherwise an
     # isolated master sees n_nodes=1 and stays "quorate"). The live
     # entries below overwrite to True wherever there's a logged-up

@@ -6,9 +6,11 @@ Three async tasks, each independently safe to run continuously:
       When this node has been marked "no quorum" for ≥ 20 s,
       virsh-suspend every locally-running pet/vipet VM. Suspended
       state is held in RAM (no disk writes) and persisted to a
-      local file with a suspend timestamp so the kill timer
-      survives bedrock-d restarts. Cattle VMs are not suspended
-      (local LV, no failover meaning).
+      local file keyed by the QUORUM-LOSS timestamp (the no-quorum
+      marker's mtime), so the kill timer counts 5 min from the
+      connection drop — not from suspend — and survives bedrock-d
+      restarts. Cattle VMs are not suspended (local LV, no failover
+      meaning).
 
   ② takeover_after_peer_down_task
       For every peer whose last heartbeat is ≥ 35 s old AND we have
@@ -26,9 +28,10 @@ Three async tasks, each independently safe to run continuously:
         f. UPDATE vms SET host = me so the cluster knows.
 
   ③ kill_suspended_after_5min_task
-      Suspended VMs older than 5 minutes get virsh-destroyed and
-      removed from the local-state file. They've been taken over
-      elsewhere by now; the local memory copy is just consuming RAM.
+      Any VM still down 5 minutes after quorum was lost gets
+      virsh-destroyed and removed from the local-state file. They've
+      been taken over elsewhere by now; the local memory copy is just
+      consuming RAM.
 
 The 15 s gap between suspend (T+20) and takeover (T+35) is by design:
 the dying node has up to ~5 s after the no-quorum signal to issue
@@ -74,7 +77,14 @@ TAKEOVER_AFTER_PEER_DOWN_S = 35.0    # T+35: surviving node promotes
                                      #       (5 s extra over T+30 lets DRBD
                                      #        in-flight writes settle before
                                      #        the new primary disconnects)
-KILL_AFTER_SUSPEND_S       = 5 * 60  # T+5min: kill if still suspended
+KILL_AFTER_QUORUM_LOSS_S   = 5 * 60  # kill 5 min after QUORUM LOSS (not after
+                                     # suspend): the clock starts when the
+                                     # connection drops (no-quorum marker mtime),
+                                     # and the ~20 s suspend happens *within*
+                                     # that window, not added to it. Per Tommy:
+                                     # "when the connection is lost, the VM is
+                                     # turned off after 5 minutes; from ~20 s it
+                                     # gets suspended first."
 
 TICK_S = 5.0     # all three tasks run on this cadence
 
@@ -105,11 +115,12 @@ def _self_node_name() -> str:
 
 
 def _load_suspended_record() -> dict[str, float]:
-    """Load the {vm_name: suspend_ts} map. Returns {} on any error.
-    This file is the persistent state that lets the kill timer
-    survive bedrock-d restarts: a VM suspended at T0 stays in the
+    """Load the {vm_name: quorum_loss_ts} map. Returns {} on any error.
+    The timestamp is the QUORUM-LOSS episode start (no-quorum marker
+    mtime), NOT the suspend time. This file is the persistent state that
+    lets the kill timer survive bedrock-d restarts: a VM stays in the
     record until either resumed (we remove the entry) or killed at
-    T0+5min."""
+    quorum_loss_ts + 5min."""
     if not SUSPENDED_VMS_FILE.exists():
         return {}
     try:
@@ -374,8 +385,8 @@ async def suspend_on_no_quorum_task():
                     dirty = True
                     log.warning(
                         "vm_failover: suspended VM %r at no-quorum age "
-                        "%.1fs (kill at marker+%ds if no recovery)",
-                        vm, marker_age, KILL_AFTER_SUSPEND_S,
+                        "%.1fs (kill at quorum-loss+%ds if no recovery)",
+                        vm, marker_age, KILL_AFTER_QUORUM_LOSS_S,
                     )
                 else:
                     log.error(
@@ -386,22 +397,25 @@ async def suspend_on_no_quorum_task():
             # mgmt/orchestrator's no_quorum_responder pauses them in
             # its own cleanup pass — without this adoption step, the
             # kill_suspended_after_5min_task never sees them.
-            # Use _now() (not marker_mtime) — the actual virsh-suspend
-            # happened at the most-recent marker reappearance, but
-            # bedrock-d may have just restarted onto a long-standing
-            # marker, in which case marker_mtime is much older than
-            # the actual suspend and using it would kill the VM
-            # immediately on adoption.
-            now = _now()
+            # Anchor to marker_mtime (= quorum-loss episode start), the
+            # SAME anchor as the path-1 suspend above. The kill clock
+            # runs 5 min from QUORUM LOSS, not from suspend/adoption, so
+            # both paths must use the marker time (Tommy 2026-05-29). The
+            # marker is idempotent (created once per no-quorum episode by
+            # election.set_no_quorum_marker, cleared by netd on quorum
+            # return), so its mtime is the partition start even if
+            # bedrock-d restarted mid-partition — a VM still paused 5 min
+            # after the connection dropped is overdue and correctly
+            # killed, regardless of when this daemon adopted it.
             for vm in paused:
                 if vm in record:
                     continue
-                record[vm] = now
+                record[vm] = marker_mtime
                 dirty = True
                 log.warning(
                     "vm_failover: adopted already-paused VM %r "
-                    "(kill at +%ds if no recovery)", vm,
-                    KILL_AFTER_SUSPEND_S,
+                    "(kill at quorum-loss+%ds if no recovery)", vm,
+                    KILL_AFTER_QUORUM_LOSS_S,
                 )
             if dirty:
                 _save_suspended_record(record)
@@ -574,13 +588,15 @@ async def takeover_after_peer_down_task():
 
 
 async def kill_suspended_after_5min_task():
-    """Every TICK_S: any VM in the suspended-vms record older than
-    KILL_AFTER_SUSPEND_S gets virsh-destroyed and removed from the
-    record. They have been taken over elsewhere by now; this is
-    just memory cleanup."""
+    """Every TICK_S: any VM whose record entry (the quorum-loss episode
+    start = no-quorum marker mtime) is older than KILL_AFTER_QUORUM_LOSS_S
+    gets virsh-destroyed and removed from the record. The clock runs from
+    QUORUM LOSS, not from suspend — a VM that has been unreachable 5 min
+    after the connection dropped has long since been taken over elsewhere,
+    and the frozen local copy is just consuming RAM."""
     log.info(
         "vm_failover: kill_suspended_after_5min_task started "
-        "(kill threshold = %ds)", KILL_AFTER_SUSPEND_S,
+        "(kill threshold = %ds from quorum loss)", KILL_AFTER_QUORUM_LOSS_S,
     )
     while True:
         await asyncio.sleep(TICK_S)
@@ -590,7 +606,7 @@ async def kill_suspended_after_5min_task():
                 continue
             now = _now()
             to_kill = [vm for vm, ts in record.items()
-                       if (now - ts) >= KILL_AFTER_SUSPEND_S]
+                       if (now - ts) >= KILL_AFTER_QUORUM_LOSS_S]
             if not to_kill:
                 continue
             for vm in to_kill:
@@ -612,9 +628,9 @@ async def kill_suspended_after_5min_task():
                 rc_v, _, err = _virsh("destroy", vm)
                 if rc_v == 0:
                     log.warning(
-                        "vm_failover: killed VM %r after %ds suspended "
+                        "vm_failover: killed VM %r %ds after quorum loss "
                         "(taken over on a peer by now; freeing memory)",
-                        vm, KILL_AFTER_SUSPEND_S,
+                        vm, KILL_AFTER_QUORUM_LOSS_S,
                     )
                 else:
                     log.error(

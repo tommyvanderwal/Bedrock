@@ -262,8 +262,8 @@ def cmd_join(args):
     print(f"  master:         {cluster_info.get('mgmt_url') or node_ip}")
     print(f"  existing nodes: {len(cluster_info.get('nodes', []))}")
     print()
-    print("Approve this fingerprint on the cluster dashboard (or via")
-    print(f"  `bedrock join approve` on the master).")
+    print("Approve this fingerprint on the cluster dashboard")
+    print(f"  ({cluster_info.get('mgmt_url') or node_ip} → Cluster → pending joins).")
     if not args.yes:
         ans = input("Continue? [Y/n] ").strip().lower()
         if ans == "n":
