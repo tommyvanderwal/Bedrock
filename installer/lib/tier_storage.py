@@ -183,6 +183,11 @@ WEED_VOLUME_MOUNT = Path("/var/lib/bedrock/seaweedfs/volumes")
 # matches cluster_arbiter.MOUNT_POINT. The filer leveldb3 + arbiter
 # rqlite data live under it so they follow the master via DRBD handoff.
 CLUSTER_MOUNT = Path("/var/lib/bedrock/cluster")
+# Local marker: written once the cluster-singleton DRBD transition is
+# complete + N=1 data restored. cluster_arbiter gates its election-driven
+# promote on this so it defers to us during the transition (paths must
+# agree with cluster_arbiter.CLUSTER_DRBD_MARKER).
+CLUSTER_DRBD_MARKER = Path("/etc/bedrock/cluster-drbd-ready")
 
 STATE_JSON   = Path("/etc/bedrock/state.json")
 
@@ -1285,6 +1290,17 @@ def promote_local_to_drbd_master(resource: str, peers: list[dict]) -> None:
     drbd_mount = str(CLUSTER_MOUNT)
     drbd_dev = f"/dev/drbd{minor}"
 
+    # Idempotent: if the resource is already up, Primary, and the mount is
+    # live, a re-run (cluster_tier_watcher auto-promote already ran, or an
+    # operator re-issued `bedrock storage promote`) must NOT try to umount
+    # the now-busy mount or re-snapshot live data. Treat as done.
+    _st = subprocess.run(["drbdadm", "status", resource],
+                         capture_output=True, text=True)
+    if (_st.returncode == 0 and "Primary" in _st.stdout
+            and run_ok(f"mountpoint -q {drbd_mount}")):
+        print(f"  [tier] {resource} already Primary + mounted — promote is a no-op")
+        return
+
     # 1. Create the data + meta LV pair. The meta LV is thin external
     #    metadata (one per resource, like every Bedrock DRBD resource);
     #    the data LV is a fresh thin LV the snapshot is restored into.
@@ -1443,6 +1459,9 @@ def transition_to_n2_master(self_loopback_ip: str, peer: dict) -> dict:
     promote_local_to_drbd_master(CLUSTER_RESOURCE, peers)
     set_tier_state(CLUSTER_RESOURCE, mode="drbd", master=self_name,
                    peers=[p["name"] for p in peers])
+    # Transition complete (DRBD up + N=1 data restored): release the
+    # election-driven arbiter promote to take over (.254 + arbiter rqlite).
+    CLUSTER_DRBD_MARKER.write_text("drbd\n")
 
     return {"peers": peers}
 
@@ -1455,6 +1474,9 @@ def transition_to_n2_peer(self_loopback_ip: str, master: dict,
     """
     print("  [tier] N=2 peer transition: join cluster-singleton DRBD secondary")
     join_drbd_peer(CLUSTER_RESOURCE, peers)
+    # This node is now part of the cluster-singleton DRBD tier — let its
+    # cluster_arbiter host the singleton on a future failover.
+    CLUSTER_DRBD_MARKER.write_text("drbd\n")
 
 
 def promote_cluster_to_3way(third_peer: dict) -> None:

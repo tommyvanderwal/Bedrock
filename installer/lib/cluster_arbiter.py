@@ -54,6 +54,14 @@ MOUNT_POINT     = Path("/var/lib/bedrock/cluster")
 ARBITER_DATA    = MOUNT_POINT / "rqlite"
 ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
 
+# Local marker tier_storage writes ONCE the N=1->N=2 cluster-singleton DRBD
+# transition is complete (resource up + N=1 data restored). The election-
+# driven promote gates on this so it defers to tier_storage during the
+# transition instead of racing its create-md/up/restore. Local + persistent
+# => readable during failover (INV-6: no rqlite on the takeover path).
+# Path MUST agree with tier_storage.CLUSTER_DRBD_MARKER.
+CLUSTER_DRBD_MARKER = Path("/etc/bedrock/cluster-drbd-ready")
+
 # Reserved arbiter octet at the top of the cluster /24, per D-05.
 # Derivation of the cluster_byte itself lives in cluster_addr; we just
 # combine here.
@@ -155,12 +163,19 @@ def _drbd_role() -> str:
 
 
 def _drbd_resource_exists() -> bool:
-    """True if `cluster` is a configured DRBD resource on this
-    node. False at N=1 (no DRBD needed — singleton services run
-    directly on the local FS) or before the tier is set up by the
-    install path."""
-    rc, _, _ = _run(["drbdadm", "dump", TIER_RESOURCE])
-    return rc == 0
+    """True once tier_storage has finished setting up + handing off the
+    cluster-singleton DRBD tier (the `cluster-drbd-ready` marker exists).
+
+    Deliberately NOT `drbdadm dump` (config-file parse): that is true the
+    instant tier_storage writes the .res — mid-transition, before
+    `drbdadm up` — so the election-driven promote would fire a premature
+    `drbdadm primary` ("Unknown resource", spammed every tick) and could
+    even mount the empty DRBD volume before tier_storage restores the N=1
+    snapshot (data-loss race). Gating on the marker makes tier_storage the
+    sole owner of the N=1->N=2 transition; cluster_arbiter only takes over
+    (.254 + arbiter rqlite) once the data is in place. False at N=1 and
+    during the transition. Local marker => failover-safe (no rqlite)."""
+    return CLUSTER_DRBD_MARKER.exists()
 
 
 def _cluster_size() -> int:
