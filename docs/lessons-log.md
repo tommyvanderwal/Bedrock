@@ -1895,3 +1895,52 @@ Guarded against regression by
 (`s3ReaderCacheDownloaderLimit=256`, ~2 GiB worst case) and the prefetch
 count (`DefaultPrefetchCount=4`) are both hardcoded in weed 4.25 with no
 flag — so `GOMEMLIMIT` is the *only* lever for the s3 read path.
+
+## L46 — rqlite CDC is the central loop's event trigger: leader-only, loopback, env-generator-routed
+**2026-05-30** · commit 7558c46
+
+**Context:** the central event loop (`ClusterStateSource`,
+[[project_central_event_loop]]) detects rqlite changes on a 0.5s poll
+*floor*. CDC is the fast path that makes detection event-driven instead of
+poll-bound. Wiring rqlite v10's native CDC end-to-end surfaced four things
+worth not relearning:
+
+1. **`-cdc-config` takes the endpoint URL directly** — not only a config
+   file. `rqlited -help`: *"Set CDC HTTP endpoint, or path to CDC config
+   file."* So `-cdc-config http://127.0.0.1:8001/api/internal/cdc` is the
+   whole wiring; pointing it at the **loopback** bedrock-d listener means
+   **no TLS** (the config-file form is only needed for mTLS / tuning). The
+   defaults are sane: `max_batch_size=10`, `max_batch_delay=200ms`,
+   retries indefinitely with backoff — so a momentarily-down endpoint
+   loses no events and never storms.
+
+2. **CDC is LEADER-ONLY by construction.** Only the current Raft leader
+   transmits. So configure `-cdc-config` **uniformly on every node** (it
+   follows failover automatically — a new leader starts transmitting with
+   zero per-node difference). Proof on the testbed: the leader logs
+   `cdc fanout: nudged 3/3 peers` per commit; every follower logs **none**.
+   Do NOT try to enable it "only on the leader" — leadership moves.
+
+3. **The flag MUST go through the env generator, never a hand-edit.**
+   `bedrock-rqlited.service` runs `ExecStartPre=rqlite_setup.py
+   --render-env` before *every* start, which rewrites `rqlited.env` from
+   scratch ([[lesson_rqlited_execstartpre_overrides_env]]). So the CDC flag
+   lives in `render_env_file()`'s env dict (`BEDROCK_RQLITED_CDC_FLAG`) +
+   `${BEDROCK_RQLITED_CDC_FLAG}` in the unit's ExecStart. A manual env edit
+   would be silently clobbered on the next restart. The **arbiter** rqlited
+   is deliberately left without CDC — it is the separate witness store, not
+   cluster state.
+
+4. **Fan-out is best-effort and that is the FULL handling**
+   ([[feedback_fail_loud_no_silent_catch]]): the leader's `/api/internal/cdc`
+   (loopback-guarded) wakes its own loop, then signed-POSTs `check-now` to
+   every peer's mesh `loopback_ip:8443`. A peer it can't reach converges via
+   its **own poll floor** — the always-on correctness backstop — so a
+   per-peer failure logs loud + skips; only a total enumerate failure logs
+   ERROR. CDC is the speed-up; poll is correctness.
+
+**Regression check:** rqlited must start clean *with* the flag (validated
+across a quorum-gated rolling restart, rev kept advancing); the leader must
+log `cdc fanout` while followers do not; a fresh install must render the
+flag via ExecStartPre on first boot (CDC POSTs simply retry until
+bedrock-d's :8001 is up — they must never block rqlited startup).

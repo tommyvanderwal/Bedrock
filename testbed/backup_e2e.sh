@@ -52,6 +52,29 @@ for i in $(seq 1 18); do
   sleep 10
 done
 
+echo "=== $(date) CDC fast-path: leader rqlited transmits, fans out to peers (fresh install) ==="
+# Find the Raft leader, confirm its rqlited carries -cdc-config, and that its
+# bedrock-d logs the fan-out while followers do not (CDC is leader-only).
+CDC_OK=0
+for i in $(seq 1 12); do
+  LEADER=""; FANOUT=0; FOLL_FANOUT=0; CDCFLAG=0
+  for s in 1 2 3 4; do ip=$(ip_of $s); [ -z "$ip" ] && continue
+    lip=$(ssh $SSHO root@"$ip" 'python3 -c "import json;print(json.load(open(\"/etc/bedrock/state.json\"))[\"loopback_ip\"])"' 2>/dev/null)
+    state=$(ssh $SSHO root@"$ip" "curl -s --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt https://$lip:4001/status 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get(\"store\",{}).get(\"raft\",{}).get(\"state\",\"\"))'" 2>/dev/null)
+    n=$(ssh $SSHO root@"$ip" 'journalctl -u bedrock-d --since "2 min ago" --no-pager 2>/dev/null | grep -c "cdc fanout"' 2>/dev/null)
+    if [ "$state" = "Leader" ]; then
+      LEADER="sim-$s"; FANOUT=${n:-0}
+      ssh $SSHO root@"$ip" 'grep -q "cdc-config" /proc/$(pgrep -f "/usr/local/bin/rqlited")/cmdline 2>/dev/null || pgrep -af rqlited | grep -q cdc-config' 2>/dev/null && CDCFLAG=1
+    else
+      FOLL_FANOUT=$((FOLL_FANOUT + ${n:-0}))
+    fi
+  done
+  echo "[$i] leader=$LEADER cdc-flag=$CDCFLAG leader-fanouts(2m)=$FANOUT follower-fanouts=$FOLL_FANOUT"
+  [ -n "$LEADER" ] && [ "$CDCFLAG" = 1 ] && [ "${FANOUT:-0}" -ge 1 ] && [ "$FOLL_FANOUT" = 0 ] && { CDC_OK=1; echo "✓ CDC ACTIVE (leader transmits + fans out 3/3; followers silent)"; break; }
+  sleep 10
+done
+[ "$CDC_OK" = 1 ] || echo "!! CDC NOT confirmed on fresh install — check rqlited -cdc-config + bedrock-d :8001"
+
 echo "=== $(date) create pet VM kbtest ==="
 ssh $SSHO root@"$M" 'bedrock vm create kbtest --type pet --ram 512 --disk 1 2>&1 | tail -2' 2>/dev/null
 for t in $(seq 1 24); do sleep 5; r=$(ssh $SSHO root@"$M" "$RQ -d '[\"SELECT state,host FROM vms WHERE vm_name=\\\"kbtest\\\"\"]'" 2>/dev/null | python3 -c "import sys,json;v=json.load(sys.stdin)['results'][0].get('values');print(v[0] if v else 'none')" 2>/dev/null); up=$(ssh $SSHO root@"$M" 'drbdadm status vm-kbtest-disk0 2>/dev/null|grep -c UpToDate' 2>/dev/null); echo "[$t] vm=$r UpToDate=$up"; echo "$r" | grep -q running && [ "${up:-0}" -ge 2 ] && break; done
