@@ -49,6 +49,8 @@ cp installer/configs/bedrock-*.service "$TMPDIR/" 2>/dev/null
 EXPECT_ORCH=$(md5sum mgmt/orchestrator.py | cut -d' ' -f1)
 EXPECT_STATE=$(md5sum installer/lib/state.py | cut -d' ' -f1)
 EXPECT_VMFAIL=$(md5sum bedrock_d/orchestrator/vm_failover.py | cut -d' ' -f1)
+EXPECT_BACKUP=$(md5sum mgmt/backup.py | cut -d' ' -f1)
+EXPECT_APP=$(md5sum mgmt/app.py | cut -d' ' -f1)
 SYNC_FAIL=0
 
 for n in "${TARGETS[@]}"; do
@@ -83,10 +85,14 @@ print(get_mgmt_ip($n) or '')
         GOT_ORCH=\$(md5sum /opt/bedrock/mgmt/orchestrator.py 2>/dev/null | cut -d' ' -f1)
         GOT_STATE=\$(md5sum /usr/local/lib/bedrock/lib/state.py 2>/dev/null | cut -d' ' -f1)
         GOT_VMFAIL=\$(md5sum /usr/local/lib/bedrock/bedrock_d/orchestrator/vm_failover.py 2>/dev/null | cut -d' ' -f1)
+        GOT_BACKUP=\$(md5sum /opt/bedrock/mgmt/backup.py 2>/dev/null | cut -d' ' -f1)
+        GOT_APP=\$(md5sum /opt/bedrock/mgmt/app.py 2>/dev/null | cut -d' ' -f1)
         VOK=1
         [ \"\$GOT_ORCH\"   = \"$EXPECT_ORCH\"   ] || { echo \"  ✗ VERIFY: orchestrator.py mismatch (\$GOT_ORCH != $EXPECT_ORCH)\"; VOK=0; }
         [ \"\$GOT_STATE\"  = \"$EXPECT_STATE\"  ] || { echo \"  ✗ VERIFY: state.py mismatch\"; VOK=0; }
         [ \"\$GOT_VMFAIL\" = \"$EXPECT_VMFAIL\" ] || { echo \"  ✗ VERIFY: vm_failover.py mismatch\"; VOK=0; }
+        [ \"\$GOT_BACKUP\" = \"$EXPECT_BACKUP\" ] || { echo \"  ✗ VERIFY: backup.py mismatch (\$GOT_BACKUP != $EXPECT_BACKUP)\"; VOK=0; }
+        [ \"\$GOT_APP\"    = \"$EXPECT_APP\"    ] || { echo \"  ✗ VERIFY: app.py mismatch\"; VOK=0; }
         [ \$VOK = 1 ] && echo \"  ✓ deploy verified\" || { echo \"  ✗ DEPLOY VERIFY FAILED — stale code\"; exit 7; }
         systemctl daemon-reload
         if [ $RESTART = 1 ]; then

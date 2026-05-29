@@ -639,6 +639,29 @@ def _verify_repo_block_hash(target_id: str) -> None:
     log.info("backup: repo block hash = %s (≥256-bit, accepted)", hash_name)
 
 
+def _ensure_local_connection(target_id: str, target: dict) -> None:
+    """Make sure the kopia repo for `target_id` is connected on THIS node.
+    Backup/restore sagas run on the VM's home node, which may not have run
+    the target-set reactor yet (joined later / rebooted / became the new
+    mgmt-master); without a live connection kopia fails "repository is not
+    connected". Idempotent — kopia connect is a no-op if already connected."""
+    try:
+        configure_target_locally(
+            target_id, target.get("kind", "kopia-s3"),
+            s3_endpoint=target.get("s3_endpoint", ""),
+            s3_bucket=target.get("s3_bucket", ""),
+            s3_region=target.get("s3_region", ""),
+            s3_disable_tls=bool(target.get("s3_disable_tls")),
+            s3_disable_tls_verification=bool(
+                target.get("s3_disable_tls_verification")),
+            filesystem_path=target.get("filesystem_path", ""),
+            override_source_prefix=target.get("override_source_prefix", ""),
+            cache_directory=target.get("cache_directory", ""),
+        )
+    except Exception as e:
+        log.warning("ensure_connection[%s]: %s", target_id, e)
+
+
 # ── public: run a backup ─────────────────────────────────────────────────
 
 def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
@@ -681,6 +704,12 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
     target = (cluster.get("backup_targets") or {}).get(target_id)
     if target is None:
         raise RuntimeError(f"backup target {target_id!r} not configured")
+
+    # Ensure THIS node's kopia repo connection is live. A backup saga runs
+    # on the VM's home node, which may not have run the target-set reactor
+    # (joined later / rebooted / new mgmt-master) — without a connection
+    # `kopia snapshot create` fails "repository is not connected".
+    _ensure_local_connection(target_id, target)
 
     nodes = cluster.get("nodes") or {}
     home_node_name = vm.get("host") or ""
@@ -1138,6 +1167,12 @@ def run_restore_to_ha(target_id: str, vm_name: str, *,
             f"then restore.")
     home = vm.get("host") or _self_node_name()
     ssh_host = (cluster.get("nodes") or {}).get(home, {}).get("host") or home
+
+    # Ensure this node's kopia repo connection is live before restoring.
+    target = (cluster.get("backup_targets") or {}).get(target_id)
+    if target is None:
+        raise RuntimeError(f"backup target {target_id!r} not configured")
+    _ensure_local_connection(target_id, target)
 
     if not kopia_snapshot_id:
         backups = list(vm.get("backups") or [])   # newest first
