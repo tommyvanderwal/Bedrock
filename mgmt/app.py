@@ -2904,7 +2904,10 @@ class BackupRunRequest(BaseModel):
 
 class RestoreRequest(BaseModel):
     target_id: str = "main"
-    kopia_snapshot_id: str
+    # Empty → restore the VM's NEWEST recorded backup. run_restore_to_ha
+    # resolves vms[<name>].backups[0] when this is blank, so the common
+    # "restore latest" case needs no snapshot id from the operator.
+    kopia_snapshot_id: str = ""
     dest_node: Optional[str] = None
     target_lv_path: Optional[str] = None
 

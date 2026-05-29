@@ -38,6 +38,13 @@ trap 'rm -rf "$TMPDIR"' EXIT
 tar czf "$TMPDIR/lib.tgz" --exclude=__pycache__ --exclude='*.pyc' -C installer lib
 tar czf "$TMPDIR/mgmt.tgz" --exclude=__pycache__ --exclude='*.pyc' -C mgmt .
 tar czf "$TMPDIR/bedrock_d.tgz" --exclude=__pycache__ --exclude='*.pyc' bedrock_d
+# Staged payload tarball: a top-level `mgmt/` archive that REPLACES the
+# ISO-baked /var/lib/bedrock-install/mgmt.tar.gz. node_join's
+# step_pre_extract_mgmt untars THAT file over /opt/bedrock during a join,
+# so without this refresh a join silently reverts the synced code to the
+# (older) ISO version. Format must match pre_extract's
+# `tar xzf … -C /opt/bedrock --strip-components=0` → top-level `mgmt/`.
+tar czf "$TMPDIR/mgmt_staged.tgz" --exclude=__pycache__ --exclude='*.pyc' mgmt
 cp installer/bedrock "$TMPDIR/bedrock"
 cp installer/bedrock-d "$TMPDIR/bedrock-d"
 cp installer/configs/bedrock-*.service "$TMPDIR/" 2>/dev/null
@@ -67,6 +74,7 @@ print(get_mgmt_ip($n) or '')
     # Push everything in one scp + extract pass
     scp -q -o StrictHostKeyChecking=no \
         "$TMPDIR/lib.tgz" "$TMPDIR/mgmt.tgz" "$TMPDIR/bedrock_d.tgz" \
+        "$TMPDIR/mgmt_staged.tgz" \
         "$TMPDIR/bedrock" "$TMPDIR/bedrock-d" \
         "$TMPDIR"/bedrock-*.service \
         "root@$ip:/tmp/" 2>&1 | sed 's/^/  /'
@@ -77,6 +85,11 @@ print(get_mgmt_ip($n) or '')
         mkdir -p /opt/bedrock/mgmt
         tar xzf /tmp/mgmt.tgz -C /opt/bedrock/mgmt/
         tar xzf /tmp/bedrock_d.tgz -C /usr/local/lib/bedrock/
+        # Refresh the staged payload so a future \`bedrock join\`
+        # pre_extract installs THIS code, not the stale ISO version.
+        if [ -d /var/lib/bedrock-install ]; then
+            cp /tmp/mgmt_staged.tgz /var/lib/bedrock-install/mgmt.tar.gz
+        fi
         for s in /tmp/bedrock-*.service; do
             [ -f \"\$s\" ] && cp \"\$s\" /etc/systemd/system/
         done
@@ -93,6 +106,12 @@ print(get_mgmt_ip($n) or '')
         [ \"\$GOT_VMFAIL\" = \"$EXPECT_VMFAIL\" ] || { echo \"  ✗ VERIFY: vm_failover.py mismatch\"; VOK=0; }
         [ \"\$GOT_BACKUP\" = \"$EXPECT_BACKUP\" ] || { echo \"  ✗ VERIFY: backup.py mismatch (\$GOT_BACKUP != $EXPECT_BACKUP)\"; VOK=0; }
         [ \"\$GOT_APP\"    = \"$EXPECT_APP\"    ] || { echo \"  ✗ VERIFY: app.py mismatch\"; VOK=0; }
+        # Verify the STAGED payload (what a future join re-extracts) also
+        # carries current backup.py — else a join silently reverts code.
+        if [ -f /var/lib/bedrock-install/mgmt.tar.gz ]; then
+            STG_BACKUP=\$(tar xzOf /var/lib/bedrock-install/mgmt.tar.gz mgmt/backup.py 2>/dev/null | md5sum | cut -d' ' -f1)
+            [ \"\$STG_BACKUP\" = \"$EXPECT_BACKUP\" ] || { echo \"  ✗ VERIFY: STAGED mgmt.tar.gz backup.py stale (\$STG_BACKUP != $EXPECT_BACKUP)\"; VOK=0; }
+        fi
         [ \$VOK = 1 ] && echo \"  ✓ deploy verified\" || { echo \"  ✗ DEPLOY VERIFY FAILED — stale code\"; exit 7; }
         systemctl daemon-reload
         if [ $RESTART = 1 ]; then

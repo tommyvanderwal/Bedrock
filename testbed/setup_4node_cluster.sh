@@ -170,6 +170,11 @@ else
 fi
 
 echo
+# NOTE: No post-cluster re-sync needed. The initial `sync-to-sims
+# --restart` (step 1, before cluster formation) refreshes the staged
+# /var/lib/bedrock-install/mgmt.tar.gz, so each `bedrock join`'s
+# step_pre_extract_mgmt installs CURRENT code — no stale-code clobber,
+# and no disruptive all-nodes restart after DRBD is up.
 echo "${C_G}━━ 4-node DRBD-promoted cluster ready ━━${C_0}"
 echo "Run: testbed/test_pet_vm_failover.sh"
 echo "Echo stub PID: $ECHO_PID  (log: $ECHO_LOG)"
