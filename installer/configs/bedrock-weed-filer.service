@@ -32,8 +32,11 @@ ExecStart=/usr/local/bin/weed filer \
 
 Restart=on-failure
 RestartSec=3s
-MemoryHigh=192M
-MemoryMax=256M
+# Filer streams chunk data + caches metadata in the backup/restore data
+# path. Too-low MemoryHigh throttles it via mem_cgroup_handle_over_high
+# (see bedrock-weed-s3.service; RCA 2026-05-29). MemoryMax caps, not reserves.
+MemoryHigh=1G
+MemoryMax=2G
 
 ProtectSystem=strict
 ProtectHome=true

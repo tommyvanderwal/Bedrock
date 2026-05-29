@@ -26,8 +26,14 @@ ExecStart=/usr/local/bin/weed s3 \
 
 Restart=on-failure
 RestartSec=3s
-MemoryHigh=128M
-MemoryMax=192M
+# The s3 gateway prefetches whole chunks (up to 8 MiB each) into its
+# readerCache during backup/restore. A too-low MemoryHigh makes the kernel
+# throttle every allocation (mem_cgroup_handle_over_high) and read
+# throughput collapses to ~25 KB/s WITHOUT recovering until restart
+# (RCA 2026-05-29). Size for the prefetch working set; MemoryMax only caps
+# the ceiling, it does not reserve, so idle steady-state stays small.
+MemoryHigh=1G
+MemoryMax=2G
 
 ProtectSystem=strict
 ProtectHome=true
