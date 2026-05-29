@@ -37,6 +37,21 @@ for i in $(seq 1 12); do
 done
 [ "$HEALTHY" = 1 ] || echo "!! SeaweedFS NOT healthy after gate — backup likely to fail"
 
+echo "=== $(date) OBSERVABILITY auto-converge (no manual restart): vlagent+vmagent on ALL nodes + 2 backends each ==="
+for i in $(seq 1 18); do
+  ag=0; vmb=0; vlb=0
+  for s in 1 2 3 4; do ip=$(ip_of $s); [ -z "$ip" ] && continue
+    va=$(ssh $SSHO root@"$ip" 'systemctl is-active bedrock-vmagent 2>/dev/null' 2>/dev/null)
+    la=$(ssh $SSHO root@"$ip" 'systemctl is-active bedrock-vlagent 2>/dev/null' 2>/dev/null)
+    [ "$va" = active ] && [ "$la" = active ] && ag=$((ag+1))
+    [ "$(ssh $SSHO root@"$ip" 'systemctl is-active bedrock-vm 2>/dev/null' 2>/dev/null)" = active ] && vmb=$((vmb+1))
+    [ "$(ssh $SSHO root@"$ip" 'systemctl is-active bedrock-vl 2>/dev/null' 2>/dev/null)" = active ] && vlb=$((vlb+1))
+  done
+  echo "[$i] agents(vm+vl) on $ag/4 nodes | vm-backends=$vmb vl-backends=$vlb"
+  [ "$ag" -eq 4 ] && [ "$vmb" -ge 2 ] && [ "$vlb" -ge 2 ] && { echo "✓ OBS CONVERGED (agents on all 4, 2 backends each) — no manual restart"; break; }
+  sleep 10
+done
+
 echo "=== $(date) create pet VM kbtest ==="
 ssh $SSHO root@"$M" 'bedrock vm create kbtest --type pet --ram 512 --disk 1 2>&1 | tail -2' 2>/dev/null
 for t in $(seq 1 24); do sleep 5; r=$(ssh $SSHO root@"$M" "$RQ -d '[\"SELECT state,host FROM vms WHERE vm_name=\\\"kbtest\\\"\"]'" 2>/dev/null | python3 -c "import sys,json;v=json.load(sys.stdin)['results'][0].get('values');print(v[0] if v else 'none')" 2>/dev/null); up=$(ssh $SSHO root@"$M" 'drbdadm status vm-kbtest-disk0 2>/dev/null|grep -c UpToDate' 2>/dev/null); echo "[$t] vm=$r UpToDate=$up"; echo "$r" | grep -q running && [ "${up:-0}" -ge 2 ] && break; done
