@@ -33,6 +33,17 @@ WANTEDBY_EXEMPT = {
     "bedrock-d.service",
     "bedrock-mdns.service",
     "bedrock-redirect.service",
+    # bedrock-rqlited: the per-node consensus FOUNDATION. It must
+    # auto-start at boot INDEPENDENTLY of bedrock-d (which only READS
+    # rqlite for its election). The cluster_init/node_join saga starts
+    # it ONCE; on a later reboot nothing else would — and bedrock-d
+    # can't bootstrap it from a lost state.json (circular). Observed
+    # sim-1 2026-05-29: master reboot → rqlited never came back →
+    # whole-node deadlock. It is installed disabled and the saga
+    # `systemctl enable`s it once rqlited.env is rendered, so it only
+    # auto-starts post-init. (NOT bedrock-rqlited-arbiter — that's the
+    # floating singleton, started by cluster_arbiter on the master.)
+    "bedrock-rqlited.service",
     # bedrock-vg-loop boots at local-fs-pre.target (LVM activation),
     # not multi-user.target — separately checked.
 }

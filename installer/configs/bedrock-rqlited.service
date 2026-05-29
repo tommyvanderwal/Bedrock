@@ -84,7 +84,12 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-# bedrock-d's saga executor enables + starts this. Empty WantedBy so
-# `systemctl enable` becomes a no-op at install time; the saga turns
-# us on when the env file + state.json are ready.
-WantedBy=
+# The per-node rqlited is the consensus FOUNDATION — it must come up at
+# boot independently of bedrock-d (which READS rqlite for its election).
+# Otherwise a master reboot deadlocks: an empty/lost state.json stops
+# bedrock-d bootstrapping → it never starts rqlited → no rqlite → no
+# recovery (observed sim-1 2026-05-29). Installed disabled; the
+# cluster_init / node_join sagas `systemctl enable` this once
+# rqlited.env is rendered, so it auto-starts on every later boot. The
+# ExecStartPre re-renders rqlited.env from state.json each boot.
+WantedBy=multi-user.target

@@ -70,7 +70,20 @@ def save(state: dict):
     try:
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(state, indent=2))
+            f.flush()
+            os.fsync(f.fileno())          # data durable BEFORE the rename
         os.replace(tmp_path, str(STATE_FILE))
+        # fsync the directory so the rename itself survives a crash.
+        # Without this, an unclean reboot can leave a 0-byte state.json
+        # (the rename is journaled but the tmp file's data blocks aren't)
+        # — observed on sim-1 2026-05-29 after a master reboot mid-sync,
+        # which then deadlocked rqlited's env-render. tmp+rename is atomic
+        # vs concurrent readers; fsync makes it durable vs power loss.
+        _dfd = os.open(str(STATE_FILE.parent), os.O_DIRECTORY)
+        try:
+            os.fsync(_dfd)
+        finally:
+            os.close(_dfd)
     except Exception:
         try:
             os.unlink(tmp_path)
