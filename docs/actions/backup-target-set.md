@@ -38,13 +38,13 @@ its locally-resident VMs.
 `s3_*` fields are only used for `kind=kopia-s3`. `filesystem_path` is
 only used for `kind=kopia-fs`. The three credential fields
 (`s3_access_key`, `s3_secret_key`, `encryption_password`) are
-**never** persisted to the cluster log; they get propagated as files
-to every node and the log only records connection metadata.
+**never** persisted to rqlite; they get propagated as files to every
+node and rqlite only records connection metadata.
 
 ## Preconditions
 
-- Caller is on the mgmt master (other nodes don't append log entries).
-- bedrock-rust IPC socket reachable at `/run/bedrock-rust.sock`.
+- Caller is on the mgmt master (other nodes don't write cluster state).
+- rqlite reachable (the master is a Raft voter with a leader).
 - Passwordless `root@<peer>` SSH from the master (mesh from join).
 - For new repos: target storage exists and the access keys can write
   to it. For existing repos: the encryption password matches.
@@ -94,9 +94,10 @@ to every node and the log only records connection metadata.
          │
          │ Failure here → 400 Bad Request with kopia error message.
          │
-  T+1.5  ── (3) record in cluster log ──
+  T+1.5  ── (3) record in rqlite ──
          │
-         │ bedrock-rust IPC: append BACKUP_TARGET_SET entry
+         │ bedrock_state.backup_target_set(...)  → rqlite mutation,
+         │   bumps bedrock_meta.revision
          │   {target_id, kind, s3_endpoint, s3_bucket, s3_region,
          │    s3_disable_tls, s3_disable_tls_verification,
          │    filesystem_path, override_source_prefix,
@@ -106,25 +107,25 @@ to every node and the log only records connection metadata.
          │
   T+1.6  Return 200 {
          │   "status": "ok",
-         │   "log_index": <N>,
+         │   "revision": <N>,
          │   "target_id": <id>,
          │   "warnings": [...]
          │ }
          │
-  (async) Every other node's mgmt subscriber sees the new entry,
-          folds it into cluster.json, and the orchestrator's
-          reactor (`_react_backup_target_set`) runs
-          configure_target_locally on that node. Boot-time
-          reconcile in `_start_local_services` covers the same
-          targets at mgmt restart.
+  (async) Every other node's rqlite_subscriber sees the revision
+          advance, projects the new target, and the orchestrator's
+          reactor (`_reactor_diff` → `_react_backup_target_set`) runs
+          configure_target_locally on that node. Boot-time reconcile
+          in `_start_local_services` covers the same targets at
+          bedrock-d restart.
 ```
 
 ## Why this exact order
 
-1. **Secrets first, then connect, then log.** Connecting needs the
-   password file; appending the log entry needs the connect to have
+1. **Secrets first, then connect, then record.** Connecting needs the
+   password file; writing the rqlite row needs the connect to have
    succeeded (otherwise peers' reactors will fail too — at least the
-   master must be known-good before broadcasting).
+   master must be known-good before broadcasting via the revision).
 2. **Password protection.** Overwriting `/etc/bedrock/backup.key`
    makes existing snapshots unreadable. The default refuses overwrite
    unless `force_password_overwrite=true` — a deliberate destructive
@@ -148,8 +149,8 @@ to every node and the log only records connection metadata.
 | `400 encryption_password supplied but … already exists` | Trying to silently rotate the kopia password | Either omit `encryption_password` (keep current) or pass `force_password_overwrite=true` (destroys access to existing backups). |
 | `400 backup target uses block hash X which is not in …allow-list` | Repo was created with `--block-hash=HMAC-SHA256-128` or similar | Rebuild the repo: `kopia repository create … --block-hash=BLAKE2B-256` from a fresh empty bucket. Bedrock refuses by design — see `lesson_kopia_e2e_setup.md`. |
 | `400 kopia connect failed: …InvalidAccessKeyId…` | Wrong S3 access key | Verify creds in the storage admin UI; resubmit. |
-| `200` with `warnings: ["S3 credentials not deployed to: <node>(Failure)"]` | Master can't SFTP to a peer; usually missing root SSH key in peer authorized_keys | Fix the SSH mesh, then resubmit. The cluster-log entry already fired so peers' reactors will retry on next mgmt restart via boot reconcile. |
-| Peers stay unconnected after a `200 ok` | Their reactors run only when `_SERVICES_STARTED=True`; if they were catching up the log at submit time the entry was folded but reactor was a no-op | `systemctl restart bedrock-mgmt` on the affected peer triggers `_start_local_services` reconcile. |
+| `200` with `warnings: ["S3 credentials not deployed to: <node>(Failure)"]` | Master can't SFTP to a peer; usually missing root SSH key in peer authorized_keys | Fix the SSH mesh, then resubmit. The rqlite row already landed, so peers' reactors will retry on next bedrock-d restart via boot reconcile. |
+| Peers stay unconnected after a `200 ok` | Their reactors run only when `_SERVICES_STARTED=True`; if they were still catching up at submit time the target was projected but the reactor was a no-op | `systemctl restart bedrock-d` on the affected peer triggers `_start_local_services` reconcile. |
 
 ## Operator perspective
 

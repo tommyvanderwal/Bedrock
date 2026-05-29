@@ -98,7 +98,7 @@ redundancy). At some later point the **calm orchestration loop**
 promotes a non-arbiter node into the arbiter set: allocate its
 cluster-DRBD LV pair, `drbdadm new-peer`, initial sync, mark it as
 a candidate for `.254` ownership. Tracked in rqlite table
-`cluster_drbd_membership(node_name, joined_at)`.
+`cluster_drbd_membership(node_name, joined_at, updated_at)`.
 
 **This promotion is NOT on the critical-failover path.** See
 [Two-loop split](#two-loop-split-critical-vs-calm) below — picking
@@ -147,7 +147,7 @@ crash-safe orchestration for free.
 CREATE TABLE IF NOT EXISTS operations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL,     -- e.g. "vm_create", "disk_grow",
-                                     --      "tier_critical_promote",
+                                     --      "cluster_tier_promote",
                                      --      "weed_master_reshuffle"
     target_node   TEXT,              -- node that runs this; NULL = any
     params        TEXT NOT NULL,     -- JSON payload
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS operation_steps (
 ```
 
 The orchestrator owns these tables. Per-resource state tables
-(`drbd_resources`, `tier_critical_membership`,
+(`drbd_resources`, `cluster_drbd_membership`,
 `seaweed_master_membership`) are the *outcomes* a saga writes;
 in-flight progress lives in `operations` + `operation_steps`.
 
@@ -222,9 +222,10 @@ One VIP, one set of singleton services, one current host:
 ```
 
 `/var/lib/bedrock/cluster/` is the on-disk root; it's the mount of
-`/dev/drbd1101` (the tier-critical DRBD resource). Filer's
-`leveldb3` dir, rqlite's data dir, and S3 IAM bucket files all live
-under here, so one DRBD failover hands off everything atomically.
+`/dev/drbd1101` (the `cluster` singleton DRBD resource, minor 1101).
+Filer's `leveldb3` dir, rqlite's data dir, and S3 IAM bucket files
+all live under here, so one DRBD failover hands off everything
+atomically.
 
 Locked at all N including N=1. Even a single-node bootstrap binds
 `.254`; this keeps client config (the FUSE mount target, the mgmt URL)
@@ -235,7 +236,7 @@ the cluster grows from 1 to 2.
 
 ```
 .254  (cluster-singleton)
-└── weed-filer    :8888    leveldb3 on DRBD/tier-critical
+└── weed-filer    :8888    leveldb3 on the cluster singleton DRBD volume
                             (POSIX namespace + S3 IAM identities)
 
 every regular node (NOT .254)
@@ -325,47 +326,56 @@ configures a separate kopia/restic repo against an external endpoint
 
 | Service           | Port | Bind          | Notes                                   |
 |-------------------|------|---------------|-----------------------------------------|
-| mgmt HTTPS        | 8443 | `.254`        | Operator UI + bedrock CLI               |
-| rqlited per-node  | 4001 | node loopback | client + Raft on same port (rqlite v8+) |
-| rqlited arbiter   | 4011 | `.254`        | 3rd-voter Raft member                   |
+| mgmt HTTPS        | 8443 | `0.0.0.0`     | Operator UI + LAN API (operator-authed); reached at `.254` |
+| mgmt local HTTP   | 8001 | `127.0.0.1`   | local CLI / intra-process (auth-exempt) |
+| rqlited per-node  | 4001 / 4002 | node loopback | HTTP API (4001, HTTPS mTLS) + Raft (4002) |
+| rqlited arbiter   | 4011 / 4012 | `.254`  | 3rd-voter Raft member (HTTPS mTLS + Raft) |
 | weed-master       | 9333 | node loopback | Raft-3 across selected nodes            |
 | weed-volume       | 8080 | `0.0.0.0`     | bytes; every node                       |
 | weed-filer        | 8888 | `.254`        | namespace + IAM; singleton              |
 | weed-s3           | 8333 | `0.0.0.0`     | S3 API; every node                      |
-| bedrock-echo      | 12321 (UDP) | LAN  | witness K/V (passive)                   |
-| netd probes       | 7732 (UDP/mcast) | 239.7.7.7 | mesh discovery                  |
-| DRBD              | 7700-7799 | per-link IP | per-resource ports allocated by config |
+| bedrock-echo      | 12321 (UDP) | LAN  | witness K/V (passive; ChaCha20-Poly1305 AEAD) |
+| netd probes       | 7732 (UDP/mcast) | 239.7.7.7 | mesh discovery (HMAC-SHA256)    |
+| DRBD              | 7700-7799 | per-link IP | per-resource ports (7700 + minor − 1100) |
 
-The mgmt port is **8443 only**. The earlier 8080 collision (mgmt vs
-weed-volume) is closed: mgmt is HTTPS-only on 8443, weed-volume owns
-8080.
+The mgmt dashboard/API is **HTTPS on 8443** (plus the loopback-only
+HTTP CLI listener on 8001). The earlier 8080 collision (mgmt vs
+weed-volume) is closed: weed-volume owns 8080.
 
 ## rqlite schema (storage-related tables)
 
+Abridged; the source of truth is
+[`installer/lib/bedrock_schema.sql`](../installer/lib/bedrock_schema.sql).
+
 ```sql
--- One row per DRBD resource (cluster + per-VM)
+-- One row per DRBD resource (cluster singleton + per-VM)
 CREATE TABLE IF NOT EXISTS drbd_resources (
-    name              TEXT PRIMARY KEY,    -- e.g. "tier-critical", "vm-foo-disk0"
-    minor             INTEGER NOT NULL,    -- DRBD minor number
+    name              TEXT PRIMARY KEY,    -- e.g. "cluster", "vm-foo-disk0"
+    minor             INTEGER NOT NULL,    -- DRBD minor number (cluster = 1101)
     data_lv           TEXT NOT NULL,       -- e.g. "bedrock-data-vm-foo-disk0"
     meta_lv           TEXT NOT NULL,       -- e.g. "bedrock-meta-vm-foo-disk0"
-    thinpool          TEXT NOT NULL,       -- "tier-critical" | "tier-fast" | "tier-bulk"
+    thinpool          TEXT NOT NULL DEFAULT 'thinpool',  -- one pool per node
     data_size_bytes   INTEGER NOT NULL,
     meta_size_bytes   INTEGER NOT NULL,
     max_peers         INTEGER NOT NULL DEFAULT 7,
-    created_at        INTEGER NOT NULL
+    peers             TEXT NOT NULL DEFAULT '[]',  -- JSON node_name set
+    current_uuid      TEXT NOT NULL DEFAULT '',    -- last Primary DRBD UUID
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
 );
 
--- Membership of the 3-peer tier-critical set
-CREATE TABLE IF NOT EXISTS tier_critical_membership (
+-- Which nodes carry the cluster-singleton DRBD resource (capped at 3)
+CREATE TABLE IF NOT EXISTS cluster_drbd_membership (
     node_name         TEXT PRIMARY KEY,
-    joined_at         INTEGER NOT NULL
+    joined_at         INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
 );
 
 -- Membership of the Raft-3 weed-master group
 CREATE TABLE IF NOT EXISTS seaweed_master_membership (
     node_name         TEXT PRIMARY KEY,
-    joined_at         INTEGER NOT NULL
+    joined_at         INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
 );
 ```
 
@@ -374,28 +384,32 @@ write them directly.
 
 ## Lifecycle interactions (summary)
 
-- **Cluster init (N=1)**: create three thinpools; create
-  `bedrock-data-cluster` + `bedrock-meta-cluster`; `drbdadm create-md
-  --max-peers=7`; start single-node DRBD primary; mount
-  `/var/lib/bedrock/cluster`; bind `.254`; start rqlite (single-node)
-  + filer + S3 + mgmt; start weed-volume + weed-s3 on local; weed
-  FUSE-mount `127.0.0.1:8888` → `/mnt/bedrock` (only N=1 special case
-  for the mount target; flips to `.254:8888` once N≥2).
-- **Cluster grow (N=2)**: new node creates thinpools; allocates
-  tier-critical LV pair; `drbdadm new-peer`; initial sync; joins
-  weed-volume + weed-s3 + weed-mount. tier-critical now has 2 peers.
-- **Cluster grow (N=3)**: new node allocates tier-critical LV pair;
+- **Cluster init (N=1)**: create the node thinpool; create the local
+  weed-volume LV; the `cluster` singleton is just a directory on the
+  root FS at `/var/lib/bedrock/cluster` (mode `local`, **no DRBD
+  yet**); bind `.254`; start rqlite (single-node) + filer + S3 + mgmt;
+  start weed-volume + weed-s3 on local; weed FUSE-mount
+  `127.0.0.1:8888` → `/mnt/bedrock` (only N=1 special case for the
+  mount target; flips to `.254:8888` once N≥2).
+- **Cluster grow (N=2)**: the existing node promotes its local
+  `cluster` directory onto DRBD — allocate `bedrock-data-cluster` +
+  `bedrock-meta-cluster`, `drbdadm create-md --max-peers=7`,
+  snapshot+restore the N=1 contents onto the DRBD volume. The new node
+  creates its thinpool and `cluster` LV pair; `drbdadm new-peer`;
+  initial sync; joins weed-volume + weed-s3 + weed-mount. The
+  `cluster` singleton now has 2 peers.
+- **Cluster grow (N=3)**: new node allocates the `cluster` LV pair;
   becomes the 3rd peer. weed-master Raft-3 group now full. rqlite
   promotes to 3-voter Raft.
-- **Cluster grow (N>3)**: new node creates thinpools; joins
-  weed-volume + weed-s3 + weed-mount; does **NOT** get a
-  tier-critical LV pair — the 3-peer cap holds. Node is eligible for
-  promotion into the arbiter set only if a current arbiter-bearer
-  leaves.
+- **Cluster grow (N>3)**: new node creates the thinpool; joins
+  weed-volume + weed-s3 + weed-mount; does **NOT** get a `cluster`
+  LV pair — the 3-peer cap (`cap_singleton_peers`) holds. Node is
+  eligible for promotion into the arbiter set only if a current
+  arbiter-bearer leaves.
 - **Node leave (arbiter-bearer)**: orchestrator picks a replacement
-  from the non-arbiter pool; new node allocates LV pair, joins
-  tier-critical, initial-sync. Leave is held until the new peer is
-  UpToDate.
+  from the non-arbiter pool; new node allocates the LV pair, joins
+  the `cluster` singleton, initial-sync. Leave is held until the new
+  peer is UpToDate.
 - **VM disk grow** (`bedrock vm grow`): `lvextend
   bedrock-meta-vm-foo` if needed, `lvextend bedrock-data-vm-foo`,
   `drbdadm resize` on all peers. Online, ~seconds.

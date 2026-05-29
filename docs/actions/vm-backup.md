@@ -45,8 +45,8 @@ Each disk lands in the kopia repo as its own snapshot under a
 per-disk source line (`<prefix>:<vm>:<target_dev>`, e.g.
 `<uuid>:vms:web1:vda`, `<uuid>:vms:web1:vdb`). Dedup still works
 per-disk because chunks are content-addressed independently. The
-cluster log's `BACKUP_DONE` entry carries the `disks[]` list so
-restore puts every disk back at the same LV path it came from.
+`vm_backups` rqlite row carries the `disks[]` list so restore puts
+every disk back at the same LV path it came from.
 
 ## Sequence
 
@@ -54,7 +54,7 @@ restore puts every disk back at the same LV path it came from.
   T=0    POST /api/vms/NAME/backup  {"target_id":"main", "label":"v1"}
          │
          │ load_cluster() — find vm + target metadata
-         │   → vm not in cluster.json   → 404
+         │   → vm not present           → 404
          │   → target_id not configured → 400
          │
          │ task = task_registry().create("vm.backup", …)
@@ -113,21 +113,21 @@ restore puts every disk back at the same LV path it came from.
   T+...  ssh home_node: lvremove -f /dev/<vg>/<snap_lv>
          │   (always — ran in `finally`, also on failure)
          │
-  T+done bedrock-rust IPC: append BACKUP_DONE
-         │   {vm, target_id, kopia_snapshot_id, source_node,
-         │    bytes_added, duration_s, label, ts_index=N}
+  T+done bedrock_state.backup_done(vm, target_id, disks=[...],
+         │   source_node, duration_s, label, fs_freeze_used)
+         │   → INSERT vm_backups row (ts_index = the bumped revision)
          │
          │ task.succeed(); WS broadcast on 'task' channel.
          │
-         │ The fold rule prepends this entry to vm["backups"] in
-         │ cluster.json; `/api/vms/<vm>/backups` reflects it on the
-         │ next request, dashboard tile updates via the next state
-         │ tick or operator refresh.
+         │ The projection prepends this row to vm["backups"];
+         │ `/api/vms/<vm>/backups` reflects it on the next request,
+         │ dashboard tile updates on the next revision tick or
+         │ operator refresh.
 ```
 
-On failure: bedrock-rust IPC append `BACKUP_FAILED` with `{vm,
-target_id, reason, source_node, label}`; fold writes
-`vm["last_backup_error"]`. lvremove still runs.
+On failure: `bedrock_state.backup_failed(vm, target_id, reason,
+source_node, label)` writes the error into rqlite; the projection
+surfaces it as `vm["last_backup_error"]`. lvremove still runs.
 
 ## Why this exact order
 
@@ -151,36 +151,35 @@ target_id, reason, source_node, label}`; fold writes
 
 ## Log lines
 
-**Success (cluster log, structural):**
+**Success (rqlite `vm_backups` row):**
 
 ```
-BACKUP_DONE
-  vm=<name> target_id=main kopia_snapshot_id=<32-hex>
+vm=<name> target_id=main primary_kopia_id=<32-hex>
   source_node=<node-name> bytes_added=<N> duration_s=<f>
-  label=<label> ts_index=<idx>
+  label=<label> ts_index=<rev>  disks=[...]
 ```
 
-**Failure:**
+**Failure (rqlite, surfaced as `vm["last_backup_error"]`):**
 
 ```
-BACKUP_FAILED
-  vm=<name> target_id=main reason=<short>
+vm=<name> target_id=main reason=<short>
   source_node=<node-name> label=<label>
 ```
 
-**push_log (VictoriaLogs side, also visible in dashboard logs feed):**
+**Daemon journal (`journalctl -u bedrock-d`):**
 
 ```
-backup[<vm>]: lvcreate snapshot /dev/<vg>/<snap>
-backup[<vm>]: dd | kopia snapshot create (stdin-file)
-backup[<vm>] done: kopia=<id>, <N> bytes added, <f>s
+backup[<vm>]: <n> disk(s) to back up: …
+backup[<vm>]: snapshot phase (freeze + lvcreate × <n>)
+backup[<vm>]: kopia stream disk <dev> ← /dev/<vg>/<snap>
+backup[<vm>] done: <n> disk(s), <N> bytes added total, <f>s, …
 ```
 
 ## Failure modes and recovery
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| Task ends `failed` with `can't resolve SSH host for VM <name>` | VM record missing `host` field, or master can't SSH to peer | Check `cluster.json` shows the VM under the right node; ensure SSH mesh is healthy. |
+| Task ends `failed` with `can't resolve SSH host for VM <name>` | VM record missing `host` field, or master can't SSH to peer | Check `bedrock status` / `/api/cluster` shows the VM under the right node; ensure SSH mesh is healthy. |
 | Task ends `failed` with `Volume group "<vg>" has insufficient free space` | Thin pool exhausted; snapshot couldn't COW | Free up space (delete unused snapshots / VMs) and retry. Snapshots only need COW space for the *changed* sectors during the backup window, so larger pools rarely hit this. |
 | Task ends `failed` with `unsupported source: …` | kopia 0.21 quirk if `--stdin-file` got dropped from the cmd | Check `mgmt/backup.py` — see [`lesson_kopia_e2e_setup.md`](../lessons-log/2026-05-04-kopia-e2e.md). |
 | Task `succeeded` but `bytes_added=0` even on a fresh disk | Repo already has all those chunks (e.g. backing up the same Alpine image twice — dedup wins) | Expected. Look at `kopia content stats` on the master to see total repo size. |
@@ -196,8 +195,10 @@ backup[<vm>] done: kopia=<id>, <N> bytes added, <f>s
   Backing up the same disk a second time (no changes) typically
   uploads 0 new bytes; only the new manifest takes ~1 KB.
 - A backup of a running VM captures the LV state at the
-  `lvcreate --snapshot` instant. The inner filesystem can be in a
-  journal-replay-needed state; on restore + boot, the guest kernel
+  `lvcreate --snapshot` instant. When `qemu-guest-agent` is reachable
+  bedrock wraps the snapshot in `virsh domfsfreeze`/`domfsthaw`, so the
+  inner filesystem is quiesced and the backup is filesystem-consistent
+  (`fs_freeze_used=true` on the row). Without an agent it falls through
+  to a crash-consistent snapshot; on restore + boot the guest kernel
   replays the journal and recovers cleanly for typical Linux FSes
-  (ext4, xfs). Quiescing the guest first (e.g. via qemu-guest-agent
-  fs-freeze) makes this fully clean — v1.x optional addition.
+  (ext4, xfs).

@@ -24,8 +24,8 @@ and [`docs/storage-architecture.md`](../storage-architecture.md#everything-goes-
 |------|------|--------------|-------------|
 | [`cluster_init`](cluster_init.md) | `bedrock_d/install/cluster_init.py` | `bedrock init` CLI | n/a — initial state |
 | [`node_join`](node_join.md) | `bedrock_d/install/node_join.py` | `bedrock join` CLI | [`node_leave`](node_leave.md) |
-| [`node_leave`](node_leave.md) | `bedrock_d/install/node_leave.py` | `bedrock node leave` (on master) | n/a — terminal |
-| [`cluster_tier_promote_master`](cluster_tier_promote_master.md) | `bedrock_d/install/cluster_tier.py` | orchestrator `cluster_tier_watcher` task | manual (`bedrock storage demote-critical`, not yet implemented) |
+| [`node_leave`](node_leave.md) | `bedrock_d/install/node_leave.py` | `bedrock node leave <node>` (on any surviving node, not the target itself) | n/a — terminal |
+| [`cluster_tier_promote_master`](cluster_tier_promote_master.md) | `bedrock_d/install/cluster_tier.py` | orchestrator `cluster_tier_watcher` task | manual (`tier_storage.drbd_demote_to_local()` helper; not yet wrapped as a saga) |
 | [`cluster_tier_join_peer`](cluster_tier_join_peer.md) | `bedrock_d/install/cluster_tier.py` | last step of `node_join` | drops out automatically when peer leaves |
 | [`cluster_rename`](cluster_rename.md) | `bedrock_d/cluster/rename.py` | `bedrock cluster rename <new-name>` | run again with the previous name |
 | [`vm_create`](vm_create.md) | `bedrock_d/vm/create.py` | `POST /api/vms` | [`vm_destroy`](vm_destroy.md) |
@@ -62,9 +62,10 @@ Each per-saga doc follows the same shape:
   rebuilds ctx from the operation's `params`, then re-runs each
   not-`done` step. Any data that needs to survive a crash and be
   available to a *later* step in a *resumed* run must come from
-  `params` (the durable input dict) or be re-derived from on-disk
-  state (state.json / cluster.json / rqlite). See
-  `_enrich_params_from_state` in `node_join.py` for the pattern.
+  `params` (the durable input dict) or be re-derived from durable
+  state (`/etc/bedrock/state.json` or rqlite — read via
+  `cluster_state.load_cluster()`). See `_enrich_params_from_state`
+  in `node_join.py` for the pattern.
 
 ## Cross-links
 

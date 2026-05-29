@@ -21,8 +21,9 @@ Plaintext fields (msgpack):
   tag:         u8 bitflag,         # bit 0 = lms ("last man standing")
                                    # bits 1-7 = reserved (must be 0)
   marker:      bytes,              # "most relevant marker" for this slot's
-                                   # purpose. For the arbiter slot:
-                                   # drbdadm current-uuid tier-critical (hex)
+                                   # purpose. For the arbiter slot: the
+                                   # `cluster` resource's DRBD current-UUID
+                                   # (hex), read via debugfs data_gen_id
   marker_kind: u8,                 # 1 = drbd-arbiter-uuid (others reserved)
 }
 ```
@@ -31,7 +32,7 @@ Plaintext fields (msgpack):
 
 `tag` as a bitflag (not a string) lets us add future flags (e.g. maintenance, draining) without a wire bump. Today only bit 0 = `lms` is defined.
 
-`marker` is the "single most relevant state fingerprint" for what the slot guards. Today only the arbiter slot is exercised; its marker is the tier-critical DRBD `current-uuid`. The witness doesn't interpret marker bytes; readers do.
+`marker` is the "single most relevant state fingerprint" for what the slot guards. Today only the arbiter slot is exercised; its marker is the `cluster` singleton's DRBD `current-uuid`. The witness doesn't interpret marker bytes; readers do.
 
 ## Wire protocol (envelope)
 UDP/12321 (echo) or atomic file write `slot-<NN>.bin` (fileshare). Either way:
@@ -90,14 +91,14 @@ P is a node whose local election (mesh peer-liveness only) says it should become
    - Stale AND `tag.lms == 1`                 → M went solo and never cleared the LMS bit. **REFUSE takeover.** LMS does not time out — see INV-7. Operator must clear M's LMS via the explicit override command (see `docs/operator-overrides.md`) before any peer can claim.
    - Fresh AND `tag.lms == 0`                 → M is alive, the mesh is just flapping locally. P stays follower.
    - Fresh AND `tag.lms == 1`                 → M is the legitimate last-man-standing. P stays follower.
-3. **Local DRBD freshness check** — read `drbdadm current-uuid tier-critical`. Decrypt M's slot, read `marker` (M's last-known DRBD UUID).
+3. **Local DRBD freshness check** — read the `cluster` resource's current-UUID (via debugfs `data_gen_id`, `drbdadm dump-md` fallback for a detached resource — `cluster_arbiter._read_local_drbd_uuid()`; note `drbdadm current-uuid` does not exist in DRBD 9.x). Decrypt M's slot, read `marker` (M's last-known DRBD UUID).
    - **EXACT MATCH** between P's local UUID and `slot[M].marker` → P's local data is identical to M's last witness-published state → safe to take over.
    - Mismatch → P missed writes M did before dying. **Refuse to promote.** Log clearly, surface to operator. Manual `drbdadm invalidate` on P (or wait for M to come back) is the only way out.
 4. **Write own slot `tag.lms = 1`** with current local `(ts_writer, drbd_uuid)`.
 5. **Read it back from the NEXT witness reply.** Decrypt own slot. Verify `tag.lms == 1` AND `marker == local drbd_uuid` AND `ts_writer` is the one we just wrote. If not (write packet lost) → retry step 4. Refuse to promote after 3 failed retries.
 6. **Promote, in order:**
-   - `drbdadm primary tier-critical`
-   - `mount /dev/drbd1101 /var/lib/bedrock/cluster`
+   - `drbdadm primary cluster`
+   - `mount $(drbdadm sh-dev cluster) /var/lib/bedrock/cluster`
    - `ip addr add 100.X.Y.254/32 dev lo`
    - `systemctl start bedrock-rqlited-arbiter`
    - start filer + s3.
@@ -107,7 +108,7 @@ Same protocol, abbreviated path, applies when the current master M itself loses 
 
 ## Arbiter self-demote protocol
 A node currently arbiter-host self-demotes when its local election (mesh peer-liveness + witness reachability) concludes NoQuorum for ≥ 5 ticks (≈ 5 s), OR step 3 of takeover refuses with UUID mismatch on a fresh boot:
-1. Stop filer + s3 → stop `bedrock-rqlited-arbiter` → `ip addr del 100.X.Y.254/32` → unmount → `drbdadm secondary tier-critical`.
+1. Stop filer + s3 → stop `bedrock-rqlited-arbiter` → `ip addr del 100.X.Y.254/32` → unmount → `drbdadm secondary cluster`.
 2. Write own slot `tag.lms = 0`. This write requires the witness to be reachable. If the write fails (witness unreachable), the LMS bit stays set on the witness and the cluster is now in a stuck-LMS state — see INV-7. Retry on every subsequent election tick for as long as we are demoted-but-still-running. If we shut down or die before the write lands, operator intervention is required (see `docs/operator-overrides.md` "Clear stuck LMS"). Do not assume the slot will time out — it will not.
 
 Order matters: services down before the network state changes. INV-1 forbids `.254` on two nodes simultaneously even for a tick.
@@ -115,7 +116,7 @@ Order matters: services down before the network state changes. INV-1 forbids `.2
 ## Cold-boot protocol
 Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` present:
 1. Send a probe + heartbeat. Wait up to 5 s for any reply.
-2. If a reply landed: decrypt slot[self]. Compare its `marker` against local `drbdadm current-uuid tier-critical`:
+2. If a reply landed: decrypt slot[self]. Compare its `marker` against the local `cluster` resource's current-UUID (debugfs `data_gen_id`):
    - Match → up-to-date. Eligible for arbiter-host (election still decides whether to take over).
    - Local older → cluster advanced without us. Refuse to promote, stay follower until reconciled.
    - Local newer → we crashed mid-write before publishing. Allowed; re-publish via next heartbeat.
@@ -126,7 +127,7 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 
 ### A — master loses peer AND witness ("isolated alone")
 - M's writes stop landing on witness. M's slot ages.
-- M's local election: 10 self of (10+10+1 = 21), majority 11 → NoQuorum → after ≈ 5 s streak, M self-demotes. M is now off; nothing running.
+- M's local election: 100 self of (100+100+1 = 201), majority 101 → NoQuorum → after ≈ 5 s streak, M self-demotes. M is now off; nothing running.
 - Survivor P sees mesh peer M gone, slot[M] stale, `tag.lms == 0`. P runs the takeover protocol. UUID match (P was a healthy Secondary up to M's last write) → P promotes.
 
 ### B — master loses peer only, keeps witness ("last man standing")
@@ -139,13 +140,13 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 
 ### D — witness gone, peer alive
 - Both nodes lose witness contact; own-slot writes silently fail.
-- Mesh election: 10+10 = 20 of 20+0 = 20, majority 11. Each side sees the other reachable → quorate. Cluster keeps running on current master. No takeover attempted (witness reachability is a precondition for the takeover protocol's step 5 readback).
+- Mesh election: 100+100 = 200 of 200+0 = 200, majority 101. Each side sees the other reachable → quorate. Cluster keeps running on current master. No takeover attempted (witness reachability is a precondition for the takeover protocol's step 5 readback).
 
 ### E — N=2, no witness, peer gone (full split, no witness)
-- Each side: 10 of 20, below majority. Both NoQuorum → both self-demote. Cluster halts safely. Operator decides which side to bring up.
+- Each side: 100 of 200, below majority (101). Both NoQuorum → both self-demote. Cluster halts safely. Operator decides which side to bring up.
 
 ### F — cold-boot one node with cluster advanced elsewhere
-- Local `drbdadm current-uuid` < `slot[self].marker` → refuse to promote. Either sync from peer (DRBD will do this automatically once peer reachable) or operator-reconcile.
+- Local `cluster` current-UUID (debugfs `data_gen_id`) < `slot[self].marker` → refuse to promote. Either sync from peer (DRBD will do this automatically once peer reachable) or operator-reconcile.
 
 ## Invariants
 - **INV-1** — at most one node holds `.254` at a time. Enforced by: takeover refuses on fresh-other-slot (step 2), refuses on UUID mismatch (step 3), requires own-write readback (step 5) before promoting (step 6). Self-demote stops services before any cluster-visible state change (step 1).
@@ -187,22 +188,14 @@ Node N starts up with `/etc/bedrock/cluster.key` + `/etc/bedrock/state.json` pre
 | AEAD nonce size | 12 bytes (96 bits) | ChaCha20-Poly1305 default |
 | Poly1305 auth tag | 16 bytes | standard |
 
-## What this spec replaces in the current code
-| concept | today | target (this spec) |
-|---|---|---|
-| transport security | HMAC-SHA256-truncated-16 over msgpack body | AEAD (ChaCha20-Poly1305) over body; nonce in envelope |
-| witness role | active arbiter (`blessed_master`, claim accept/reject, 15 s holddown) | passive K/V slot store |
-| who writes what | every node `send_claim` competes; witness picks a winner | every node writes its own slot only |
-| takeover gate | wait for "bless" to age out, then send claim, hope it's accepted | inspect peer slot + local UUID equality + flip own tag + readback |
-| freshness clock | witness's clock (via `peers: {node: age_ms}` map) | writer's clock, reader compares to own clock |
-| takeover depends on | rqlite cluster.json for `mgmt_master` | nothing in rqlite; pure witness + local commands |
-| cold-boot DRBD check | not implemented | exact UUID match against slot.marker |
+## Implementation
+This spec is implemented and in production. The pieces live in:
+- `installer/lib/witness.py` — passive K/V slots (`slots: dict[int, Slot]`), `set_own_slot(tag, marker)` writer, `read_slot(node_id)` against the latest reply, AEAD-msgpack wire format on UDP 12321.
+- `installer/lib/election.py` — decides leader/follower/NoQuorum from mesh peer-liveness + witness votes; vote weights `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1`.
+- `installer/lib/cluster_arbiter.py` — `promote_to_arbiter_host` runs takeover steps 1–6 in order (no `set_mgmt_master` on the critical path); `demote_arbiter_host` writes `tag.lms = 0` at the end.
+- `testbed/bedrock_echo_stub.py` — Python BedRock Echo witness for the testbed: a pure encrypted K/V slot server, no claim/bless logic.
 
-Files affected (all four):
-- `installer/lib/witness.py` — replace `blessed_*` state with `slots: dict[int, Slot]`. Replace `send_claim` with `write_own_slot(tag, marker)`. Provide `read_slot(node_id) -> Slot|None` against the latest reply. Switch wire format from HMAC-msgpack to AEAD-msgpack.
-- `installer/lib/election.py` — drop `witness_blessed_master/at_ms/holddown_ms`. Election decides leader/follower from mesh peer-liveness only. The takeover protocol moves to `cluster_arbiter`.
-- `installer/lib/cluster_arbiter.py` — `promote_to_arbiter_host` runs takeover steps 1–6 in order. NO `bs.set_mgmt_master` call inside this function. `demote_arbiter_host` writes `tag.lms = 0` at the end.
-- `testbed/bedrock_echo_stub.py` — strip all claim/blessed logic. Becomes a pure encrypted K/V slot server. Roughly half the line count.
+The transport is AEAD (ChaCha20-Poly1305) over the msgpack body with the nonce in the envelope; the witness is a passive per-node K/V slot store (no `blessed_master`, no claim accept/reject, no holddown); each node writes only its own slot; takeover gates on peer-slot inspection + exact local UUID equality + own-slot readback; freshness uses the writer's clock compared against the reader's own clock; and the takeover path consults nothing in rqlite — it is pure witness + local commands. (Note: mesh probes/adverts on UDP 7732/7733 still use HMAC-SHA256 over the cluster_key — only the *witness* moved to AEAD.)
 
 ## Out of scope (today)
 - Multi-witness quorum reads + writes (planned post-v1.0; wire protocol already permits multiple endpoints in `WitnessState.discovered`).

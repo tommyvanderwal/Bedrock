@@ -38,7 +38,7 @@ from the dashboard / CLI, or `POST /api/operations` with
 | 1 | [`validate_request`](#validate_request) | Confirm VM running on source, target in peer set, source != target |
 | 2 | [`enable_dual_primary`](#enable_dual_primary) | `drbdadm net-options --allow-two-primaries=yes` on both peers |
 | 3 | [`drbd_primary_on_target`](#drbd_primary_on_target) | `drbdadm primary` on the target |
-| 4 | [`virsh_migrate_live`](#virsh_migrate_live) | `virsh migrate --live --persistent` from source to target |
+| 4 | [`virsh_migrate_live`](#virsh_migrate_live) | `virsh migrate --live --persistent` (no `--undefinesource` — source stays a failover target) |
 | 5 | [`drbd_secondary_on_source`](#drbd_secondary_on_source) | `drbdadm secondary` on the source |
 | 6 | [`disable_dual_primary`](#disable_dual_primary) | `drbdadm net-options --allow-two-primaries=no` |
 | 7 | [`update_vms_host`](#update_vms_host) | `UPDATE vms SET host = ? WHERE vm_name = ?` |
@@ -103,16 +103,19 @@ step).
 
 ### `virsh_migrate_live`
 
-`virsh migrate --live --persistent --undefinesource
-<source_qemu_uri> <target_qemu_uri> <vm_name>` from the source.
-QEMU's live migration copies dirty RAM pages in iterations until
-the working set is small enough to pause-copy-resume in <100 ms.
-Disk I/O continues during migration — both sides read+write the
-same DRBD bytes locally because of dual-primary.
+`virsh migrate --live --verbose --unsafe --persistent
+<source_qemu_uri> <target_qemu_uri> <vm_name>` from the source
+(see `bedrock_d/vm/migrate.py`). QEMU's live migration copies dirty
+RAM pages in iterations until the working set is small enough to
+pause-copy-resume in <100 ms. Disk I/O continues during migration —
+both sides read+write the same DRBD bytes locally because of
+dual-primary.
 
-`--persistent` ensures the domain is defined on the target;
-`--undefinesource` removes it from the source after a successful
-migrate.
+`--persistent` ensures the domain is defined on the target.
+There is deliberately **no `--undefinesource`**: the domain stays
+defined on the source so the source remains a ready failover target
+for the VM (matching the pet/vipet failover model). The source is
+demoted to DRBD Secondary in the next step instead.
 
 ### `drbd_secondary_on_source`
 

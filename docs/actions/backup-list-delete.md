@@ -1,10 +1,10 @@
 # List & delete backups (per-VM and cluster-wide)
 
-Read-only history per VM is folded into `cluster.json` on every
-`BACKUP_DONE` log entry; deletion drops a kopia snapshot manifest
-plus appends a `BACKUP_DELETED` entry so the dashboard reflects the
-removal. Underlying chunk GC happens later, during the master's
-scheduled `kopia maintenance run`.
+Read-only history per VM lives in rqlite: every backup is a `vm_backups`
+row, projected into each VM's `backups` list by `cluster_state.load_cluster()`.
+Deletion drops a kopia snapshot manifest, then records a `backup_deleted`
+mutation in rqlite so the dashboard reflects the removal. Underlying chunk
+GC happens later, during the master's scheduled `kopia maintenance run`.
 
 **Triggered by:**
 
@@ -21,8 +21,9 @@ scheduled `kopia maintenance run`.
 `mgmt/app.py:api_backups_list_all`,
 `mgmt/app.py:api_vm_backup_delete`,
 `mgmt/backup.py:list_backups_for_vm`,
-`mgmt/backup.py:delete_backup`,
-`installer/lib/view_builder.py` BACKUP_* fold rules.
+`installer/lib/bedrock_state.py:backup_deleted` (rqlite mutation),
+`installer/lib/view_builder.py` (projects `vm_backups` rows into
+`vm["backups"]`, newest-first, capped at 200).
 
 ## List response
 
@@ -47,9 +48,9 @@ scheduled `kopia maintenance run`.
 }
 ```
 
-The list is **kept in cluster.json**, capped at the most recent 200
-entries per VM. Older entries are still in the kopia repo and the
-cluster log; the cap exists to keep cluster.json size bounded.
+The list is projected from the `vm_backups` rqlite rows, capped at the
+most recent 200 entries per VM. Older entries are still in the kopia repo
+and in rqlite; the cap exists only to bound the projected snapshot size.
 
 ## Sequence — per-VM list
 
@@ -94,7 +95,7 @@ into one timeline. The `/backups` page in the dashboard polls this
 every 15 s and renders the table with per-row `Restore` and
 `Delete` buttons. `vm_present=False` is reserved for v1.x when we
 surface "orphan" snapshots from `kopia snapshot list` whose source
-VM has been deleted from the cluster log.
+VM has been deleted from rqlite.
 
 ## Sequence — delete
 
@@ -113,20 +114,20 @@ VM has been deleted from the cluster log.
          │   - the underlying content blobs persist until
          │     `kopia maintenance run` GCs them on the master
          │
-  T+0.5  bedrock-rust IPC: append BACKUP_DELETED
-         │   {vm, target_id, kopia_snapshot_id, reason}
+  T+0.5  bedrock_state.backup_deleted(vm, target_id, snapid, reason)
+         │   → rqlite mutation, bumps bedrock_meta.revision
          │
-         │ Fold rule filters that snapshot out of vm["backups"].
+         │ The projection then drops that snapshot from vm["backups"].
          │
          │ Return 200 { "status":"ok", "kopia_snapshot_id":"<id>" }
 ```
 
 ## Why this order
 
-1. **Drop manifest first, log second.** If the kopia delete failed,
-   we don't want a `BACKUP_DELETED` in the cluster log claiming a
-   snapshot is gone when it isn't. The fold rule would then hide it
-   from the UI but the data would still be billed for in S3.
+1. **Drop manifest first, record second.** If the kopia delete failed,
+   we don't want a `backup_deleted` row in rqlite claiming a snapshot is
+   gone when it isn't. The projection would then hide it from the UI but
+   the data would still be billed for in S3.
 2. **Manifest delete is fast and reversible-ish** — kopia stores
    "tombstone" manifests until maintenance compaction. If the
    operator regrets the delete *before* the next `maintenance run`,
@@ -144,9 +145,9 @@ VM has been deleted from the cluster log.
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `400 backup target …  not configured` | Caller sent a target_id that doesn't exist | Use `GET /api/backup/targets` to find valid ids. |
-| `500 delete failed: kopia: error: snapshot manifest <id> not found` | Snapshot already deleted (or never existed) | Refresh the list — it should already be gone from cluster.json. |
+| `500 delete failed: kopia: error: snapshot manifest <id> not found` | Snapshot already deleted (or never existed) | Refresh the list — it should already be gone from the projection. |
 | Snapshot disappears from `/api/vms/.../backups` but kopia repo still shows it under `kopia snapshot list` | maintenance hasn't run yet | Expected. Kopia maintenance runs on a configurable schedule (default weekly on the master). To force: `ssh master kopia maintenance run --full`. |
-| List endpoint returns 0 backups for a VM that was definitely backed up | cluster.json projection lag (mgmt restart in flight, or rust IPC catch-up) | Wait 1–2 seconds; the subscriber will fold the BACKUP_DONE entry. If still empty, check `journalctl -u bedrock-mgmt` for subscriber errors. |
+| List endpoint returns 0 backups for a VM that was definitely backed up | rqlite projection lag (bedrock-d restart in flight, or subscriber catching up) | Wait 1–2 seconds; the `rqlite_subscriber` will project the new `vm_backups` row. If still empty, check `journalctl -u bedrock-d` for subscriber errors. |
 
 ## Operator perspective
 
@@ -154,10 +155,10 @@ VM has been deleted from the cluster log.
   dict read.
 - **Delete is fast** (sub-second usually) — kopia just drops a
   manifest. Storage savings show up after maintenance GC.
-- **Cap of 200 entries per VM in cluster.json**: older backups stay
-  in the kopia repo and are findable via `kopia snapshot list
-  <override-source>`; bedrock just doesn't display them in the UI.
-  v1.x will add a "load older" pager.
+- **Cap of 200 entries per VM in the projection**: older backups stay
+  in the kopia repo and the `vm_backups` table, and are findable via
+  `kopia snapshot list <override-source>`; bedrock just doesn't display
+  them in the UI. v1.x will add a "load older" pager.
 - The `last_backup_error` field is sticky — a successful subsequent
   backup does NOT clear it. The UI shows it as a yellow banner with
   the timestamp so operators know the most recent failure even if

@@ -1,24 +1,15 @@
 # Architecture
 
-> **⚠ Sections of this doc are out of date.** Specifically, the
-> witness model described here (HTTPS on 9443, HMAC, active
-> blessing) and the `bedrock-rust` references are superseded.
-> Current authoritative sources:
-> - **Witness + arbiter takeover:**
->   [`cluster-quorum-spec.md`](cluster-quorum-spec.md) (passive
->   AEAD K/V slot store on UDP/12321; exact-UUID takeover gate).
-> - **Storage stack:**
->   [`storage-architecture.md`](storage-architecture.md)
->   (three thinpools, per-resource thin meta LV, SeaweedFS
->   topology, three collections).
-> - **Daemon unification:**
->   [`daemon-unification.md`](daemon-unification.md) (single
->   `bedrock-d` Python process; no separate bedrock-rust /
->   bedrock-netd / bedrock-mgmtd / bedrock-orchd).
->
-> The system layout, ports, and data-flow sections below are
-> still useful as a high-level orientation; trust the linked docs
-> for the load-bearing details.
+This is the high-level orientation. For load-bearing detail, see:
+- **Witness + arbiter takeover:**
+  [`cluster-quorum-spec.md`](cluster-quorum-spec.md) (passive
+  AEAD K/V slot store on UDP/12321; exact-UUID takeover gate).
+- **Storage stack:**
+  [`storage-architecture.md`](storage-architecture.md)
+  (LVM thinpool, per-resource thin meta LV, SeaweedFS topology).
+- **Daemon unification:**
+  [`daemon-unification.md`](daemon-unification.md) (single
+  `bedrock-d` Python process — netd thread + mgmt/orchestrator asyncio).
 
 Bedrock runs on every node. There is no external control plane; each node is
 self-sufficient and can become the management node in a pinch. A node has
@@ -26,8 +17,8 @@ three roles, which can overlap:
 
 - **compute** — runs VMs (KVM + DRBD)
 - **mgmt** — runs the dashboard, metrics, logs, and cluster state
-- **witness** — passive K/V slot store (bedrock-echo on ESP32 or
-  a tiny container on a MikroTik); UDP/12321, AEAD-encrypted. See
+- **witness** — passive K/V slot store (BedRock Echo on an ESP32 or
+  a tiny container on a MikroTik); UDP/12321, ChaCha20-Poly1305 AEAD. See
   [`cluster-quorum-spec.md`](cluster-quorum-spec.md).
 
 A 3-node cluster typically looks like this:
@@ -41,11 +32,11 @@ A 3-node cluster typically looks like this:
     │ DRBD 9.3                                         │ br0        │
     │ node_exporter :9100   vm_exporter :9177          ├────────────┤
     │ VictoriaMetrics :8428  VictoriaLogs :9428        │            │
-    │ FastAPI + Svelte (mgmt-dashboard) :8080          │            │
+    │ FastAPI + Svelte (mgmt-dashboard) :8443 HTTPS    │            │
     │ Cockpit :9090                                    │            │
     └──────────────────────────────────────────────────┘            │
                           ▲                                         │
-                          │ SSH (cluster.json)                      │
+                          │ rqlite consensus (4001/4002)            │
                           │ Prometheus scrape (9100/9177)           │
                           │ VictoriaLogs syslog :5140               │
                           │                                         │
@@ -143,15 +134,16 @@ Operator (browser)                       mgmt node (node1)
         │                                        │  │    now ~0.7 s)        │
         │                                        │  └─────────┬─────────────┘
         │   ws.on('event', ...)  ◀ instant       │            │
-        │ <═══════════════════════════════════ │            │   SSH
+        │ <═══════════════════════════════════ │            │   load_cluster()
         │   (push_log: WS first, VL second)      │  ┌─────────▼─────────┐
-        │                                        │  │ /etc/bedrock/     │
-        │   POST /api/vms/X/convert              │  │   cluster.json    │
-        │ ─────────────────────────────────────> │  └───────────────────┘
+        │                                        │  │ rqlite (Raft):    │
+        │   POST /api/vms/X/convert              │  │ nodes, vms,       │
+        │ ─────────────────────────────────────> │  │ drbd_resources    │
+        │                                        │  └───────────────────┘
         │                                        │
         │                                        │   ┌─ orchestrator ─┐
-        │                                        │ ──│ SSH to each    │
-        │                                        │   │ cluster node   │
+        │                                        │ ──│ saga / reactor │
+        │                                        │   │ on each node:  │
         │                                        │   │ drbdadm,       │
         │                                        │   │ lvcreate,      │
         │                                        │   │ virsh ...      │
@@ -164,30 +156,35 @@ Operator (browser)                       mgmt node (node1)
 ```
 
 The operator never talks to compute nodes directly. All state-changing actions
-go **through mgmt → rqlite write → orchestrator reactor**. The canonical
-state store is **rqlite** (Raft-replicated SQLite, see
-[`01-rqlite-state-store.md`](01-rqlite-state-store.md)); `/etc/bedrock/cluster.json`
-is a regenerated cache projection of the rqlite tables and is
-rewritten on every revision change. Compute nodes are stateless
-orchestration targets that observe rqlite changes via the
-`rqlite_subscriber` task and converge their local state accordingly.
+go **through mgmt → rqlite write → orchestrator saga/reactor**. The canonical
+(and only) cluster state store is **rqlite** (Raft-replicated SQLite, see
+[`01-rqlite-state-store.md`](01-rqlite-state-store.md)); code reads topology
+directly via `cluster_state.load_cluster()` (rqlite read-level `none`, so it
+works even without quorum). There is no `cluster.json` cache file — it was
+deleted 2026-05-26. Compute nodes are stateless orchestration targets that
+observe rqlite changes and converge their local state accordingly; the only
+per-node local cluster file is `/etc/bedrock/state.json` (this-node identity).
 
 The earlier "bedrock-rust hash-chained log" model was retired in the
-post-0.8-alpha rewrite. bedrock-rust itself was subsequently
-removed; its responsibilities (election, witness IO, self-demote on NoQuorum)
-moved into the netd thread inside `bedrock-d`. See
+post-0.8-alpha rewrite, and `bedrock-rust` itself was deleted. Its
+responsibilities (election, witness IO, self-demote on NoQuorum, the `.254`
+arbiter, routing) now live in the **netd thread inside `bedrock-d`**. See
 [`daemon-unification.md`](daemon-unification.md) and
 [`cluster-quorum-spec.md`](cluster-quorum-spec.md).
 
 ## Components in one paragraph each
 
-### mgmt dashboard (`mgmt/app.py`, port 8080)
+### mgmt dashboard (`mgmt/app.py`, ports 8443 HTTPS + 8001 loopback)
 
-FastAPI server with an embedded WebSocket hub. Serves the Svelte build, exposes
-a small REST API for actions (`/api/vms/{name}/{start,shutdown,migrate,convert}`,
-`/api/nodes/register`), and pushes live state every 3s on the `cluster`
-channel plus instant log events on the `event` channel. Proxies noVNC
-WebSockets at `/vnc/{vm}` to the VM's host:VNC-port (see
+FastAPI server (run by `bedrock-d`) with an embedded WebSocket hub. It runs two
+uvicorn listeners: **8443 HTTPS** (`0.0.0.0`) for the operator dashboard + LAN
+mgmt API (operator-authenticated, Ed25519; see `installer/lib/operator_auth.py`),
+and **127.0.0.1:8001 HTTP** for the local CLI / intra-process API (loopback is
+auth-exempt). It serves the Svelte build, exposes a REST API for actions
+(`/api/vms/{name}/{start,shutdown,migrate,convert}`, `/api/nodes/register`),
+and pushes live state every 3s on the `cluster` channel plus instant log
+events on the `event` channel. Proxies noVNC WebSockets at `/vnc/{vm}` to the
+VM's host:VNC-port (see
 [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md)).
 
 ### VictoriaMetrics + VictoriaLogs (ports 8428 / 9428)
@@ -217,26 +214,32 @@ Ports = `7000 + minor`. See [`storage-architecture.md`](storage-architecture.md)
 ### bedrock CLI (`installer/bedrock`)
 
 Entry point on each node. Subcommands: `bootstrap`, `init`, `join`, `status`,
-`node`, `vm`. Reads `/etc/bedrock/state.json` (this-node state) and calls
-into `installer/lib/*.py` for the heavy lifting. Fetched at install time from
-the install repo (the dev box or another serving `installer/` over HTTP).
+`node`, `vm`. For VM lifecycle ops it is a thin HTTP client to the local mgmt
+API on `127.0.0.1:8001`; install/join paths read `/etc/bedrock/state.json`
+(this-node state) and call into `installer/lib/*.py` for the heavy lifting.
+Fetched at install time from the install repo (the dev box or another serving
+`installer/` over HTTP).
 
-### witness (optional, port 9443)
+### witness (optional, UDP 12321)
 
-Tiny Rust container (on MikroTik or any small box) that 2-of-3 quorum
-logic on each cluster node polls for liveness. Not part of this repo —
-referenced as an external host in `cluster.json`.
+**BedRock Echo** — a passive K/V slot store (one slot per node, keyed by the
+node's loopback last octet; slot 254 = arbiter VIP). Each cluster node writes
+its slot and reads peers' slots over UDP/12321 using ChaCha20-Poly1305 AEAD
+(msgpack payload, shared `cluster.key`). The witness never decides anything; it
+just holds state for the election + arbiter-takeout logic in `bedrock-d`'s netd
+thread. Runs on an ESP32 or a tiny container on a MikroTik — not part of this
+repo; configured as a witness host in rqlite. See
+[`cluster-quorum-spec.md`](cluster-quorum-spec.md).
 
 ## Directory layout on a mgmt+compute node
 
 ```
 /etc/bedrock/
     state.json            per-node identity, mgmt_url, loopback_ip, hardware
-    cluster.json          cluster topology — nodes (with loopback_ip),
-                          witnesses, tiers, paths (mesh path table)
-    cluster.key           32-byte HMAC key (bedrock-net probes + Echo witness)
-    daemon.toml           bedrock-rust config; regenerated on every snapshot
-                          change by mgmt/orchestrator's subscriber
+                          (the ONLY local cluster-related file; cluster
+                          topology lives in rqlite, not on disk)
+    cluster.key           32-byte shared key (HMAC-SHA256 for bedrock-net
+                          probes/adverts; AEAD key for the Echo witness)
     installer.env         BEDROCK_REPO=... (used by bedrock CLI subcommands)
 
 /opt/bedrock/
@@ -260,11 +263,19 @@ referenced as an external host in `cluster.json`.
     vm-<name>-disk0.res   per-VM resource, written by mgmt during convert
 
 /etc/systemd/system/
-    bedrock-mgmt.service    FastAPI dashboard
-    bedrock-vm.service      VictoriaMetrics
-    bedrock-vl.service      VictoriaLogs
-    node-exporter.service
-    vm-exporter.service
+    bedrock-d.service          unified daemon (netd thread + mgmt/orchestrator
+                               asyncio); starts the dashboard, VictoriaMetrics,
+                               VictoriaLogs, and exporters
+    bedrock-rqlited.service    per-node rqlite (consensus foundation)
+    bedrock-rqlited-arbiter.service   arbiter rqlite voter on .254 (started on
+                                      takeover)
+    bedrock-weed-master.service       SeaweedFS master (Raft)
+    bedrock-weed-volume.service       SeaweedFS volume (every node)
+    bedrock-weed-filer.service        SeaweedFS filer (on .254, DRBD-backed)
+    bedrock-weed-s3.service           SeaweedFS S3 gateway
+    bedrock-mdns.service       mDNS responder
+    bedrock-redirect.service   HTTP :80 → HTTPS :8443
+    bedrock-cert-refresh.service      TLS cert renewal
 
 /root/.ssh/
     id_ed25519, id_ed25519.pub   cluster identity
@@ -278,12 +289,13 @@ files on compute-only nodes.
 
 ## The 10-second mental model
 
-1. Every node runs KVM + DRBD + exporters.
-2. One node additionally runs the mgmt dashboard, which is the single
-   source of cluster truth.
+1. Every node runs `bedrock-d`, KVM + DRBD, and exporters.
+2. Cluster truth lives in rqlite (Raft-replicated); the mgmt dashboard
+   (active on whichever node holds `.254`) renders it.
 3. The mgmt dashboard pushes state to browsers over WebSocket every 3 s,
    and pushes log events the instant they happen.
-4. Operator actions (convert, migrate, etc.) are orchestrated by the mgmt
-   node fanning out via SSH. Compute nodes carry no orchestration logic.
+4. Operator actions (convert, migrate, etc.) write rqlite; the orchestrator
+   saga/reactor converges each node. Compute nodes observe rqlite and act
+   locally — they carry no operator-facing orchestration logic.
 5. Data lives in DRBD, which replicates synchronously over the 100.X.Y
    ring. VMs pivot between nodes via `virsh migrate` without touching disk.

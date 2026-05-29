@@ -1,7 +1,8 @@
 # Exporters (node_exporter + vm_exporter)
 
-Every node runs two Prometheus-style exporters. VictoriaMetrics on the
-mgmt node scrapes both every 10 seconds.
+Every node runs two Prometheus-style exporters. `bedrock-vmagent` on each
+node scrapes both every 10 seconds and remote-writes into the cluster's
+VictoriaMetrics backend.
 
 ## node_exporter (port 9100)
 
@@ -17,9 +18,13 @@ Stock Prometheus `node_exporter` v1.8.2. Emits standard host metrics:
 Run as `node-exporter.service`:
 
 ```ini
+[Unit]
+After=network.target
+
 [Service]
 ExecStart=/opt/bedrock/bin/node_exporter --web.listen-address=:9100
 Restart=always
+RestartSec=3
 ```
 
 Source binary: `installer/binaries/node_exporter`, installed on every
@@ -27,7 +32,7 @@ node by `installer/lib/exporters.py`.
 
 ## vm_exporter (port 9177)
 
-Bedrock-specific ~100-line Python exporter (`mgmt/vm_exporter.py`, also
+Bedrock-specific ~200-line Python exporter (`mgmt/vm_exporter.py`, also
 shipped as `installer/binaries/vm_exporter.py`). Uses only Python
 stdlib; no extra deps.
 
@@ -38,45 +43,49 @@ virsh domstats --cpu-total --balloon --block --interface --state --raw
 drbdsetup status --json
 ```
 
-Emits text-format metrics like:
+Emits text-format metrics like (all VM series are `bedrock_vm_*`, all DRBD
+series `bedrock_drbd_*`):
 
 ```
-# HELP libvirt_domain_state VM state (1=running)
-# TYPE libvirt_domain_state gauge
-libvirt_domain_state{vm="webapp1"} 1
+# HELP bedrock_vm_state VM state (1=running)
+bedrock_vm_state{vm="webapp1"} 1
 
-# HELP libvirt_domain_cpu_time_seconds Total CPU time used by the VM
-# TYPE libvirt_domain_cpu_time_seconds counter
-libvirt_domain_cpu_time_seconds{vm="webapp1"} 31694.058
+# HELP bedrock_vm_cpu_time_ns Total CPU time used by the VM (ns)
+bedrock_vm_cpu_time_ns{vm="webapp1"} 31694058000000
 
-# HELP libvirt_domain_block_write_iops Write IOPS per block device
-libvirt_domain_block_write_iops{vm="webapp1",device="vda"} 12
+# HELP bedrock_vm_disk_write_reqs Write requests per block device
+bedrock_vm_disk_write_reqs{vm="webapp1",disk="0"} 12
 
-# HELP drbd_resource_role 1=Primary, 0=Secondary, -1=unknown
-drbd_resource_role{resource="vm-webapp1-disk0"} 1
+# HELP bedrock_drbd_role role as a label, value always 1
+bedrock_drbd_role{resource="vm-webapp1-disk0",role="Primary"} 1
 
-# HELP drbd_disk_state 1=UpToDate, 0=anything else
-drbd_disk_state{resource="vm-webapp1-disk0",peer="self"} 1
-drbd_disk_state{resource="vm-webapp1-disk0",peer="bedrock-sim-2"} 1
+# HELP bedrock_drbd_disk_state local disk state (state label, value 1)
+bedrock_drbd_disk_state{resource="vm-webapp1-disk0",minor="1000",state="UpToDate"} 1
 
-# HELP drbd_sync_percent Ongoing resync progress (0-100)
-drbd_sync_percent{resource="vm-webapp1-disk0",peer="bedrock-sim-3"} 22.1
+# HELP bedrock_drbd_out_of_sync_kb KiB still to resync to a peer
+bedrock_drbd_out_of_sync_kb{resource="vm-webapp1-disk0",peer="bedrock-sim-2"} 4096
 ```
 
 Run as `vm-exporter.service`:
 
 ```ini
-[Service]
-ExecStart=/usr/bin/python3 /opt/bedrock/bin/vm_exporter.py
+[Unit]
 After=libvirtd.service
 Wants=libvirtd.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/bedrock/bin/vm_exporter.py
+Restart=always
+RestartSec=3
 ```
 
 ## Deployment
 
-Both services are installed on every node by `installer/lib/exporters.py`
-at `bedrock init` (for the mgmt+compute node) and at `bedrock join`
-(for every compute node).
+Both services keep their own systemd units and are installed on every node
+by `installer/lib/exporters.py:install()`. It runs from the cluster-init
+saga's `install_exporters` step on the first node and the node-join saga's
+`install_exporters` step on every subsequent node (idempotent — it
+checks-and-skips files already on disk).
 
 ```python
 # installer/lib/exporters.py
@@ -84,6 +93,9 @@ def install(repo: str):
     mkdir /opt/bedrock/bin
     curl <repo>/binaries/node_exporter → /opt/bedrock/bin/; chmod 755
     curl <repo>/binaries/vm_exporter.py → /opt/bedrock/bin/; chmod 755
+    # also fetch the obs binaries (vmagent, vlagent, vmbackup,
+    # vmrestore, victoria-metrics, victoria-logs) so any node can be
+    # promoted to a backend slot later; observability.py owns their units
     write /etc/systemd/system/node-exporter.service
     write /etc/systemd/system/vm-exporter.service
     systemctl daemon-reload
@@ -96,17 +108,17 @@ def install(repo: str):
   specific libvirt connection mode.
 - We needed DRBD metrics in the same series; most libvirt exporters
   don't do DRBD.
-- A ~100-line Python file is readable by anyone on the team; adding a
+- A ~200-line Python file is readable by anyone on the team; adding a
   new metric is 2 lines.
 
 ## Reading metrics directly
 
 ```bash
 curl http://<node>:9100/metrics | grep node_load
-curl http://<node>:9177/metrics | grep drbd_resource_role
+curl http://<node>:9177/metrics | grep bedrock_drbd_role
 
-# Or via VM (pre-aggregated):
-curl 'http://<mgmt>:8428/api/v1/query?query=up{job="libvirt"}'
+# Or via VictoriaMetrics on the metrics backend node:
+curl 'http://<vm-backend>:8428/api/v1/query?query=up{job="libvirt"}'
 ```
 
 ## Failure modes
@@ -128,9 +140,9 @@ def collect_vm_metrics():
     lines = []
     ...
     # existing: CPU, balloon, block, interface
-    lines.append("# HELP libvirt_domain_new_metric My new thing")
-    lines.append("# TYPE libvirt_domain_new_metric gauge")
-    lines.append(f'libvirt_domain_new_metric{{vm="{dom}"}} {value}')
+    lines.append("# HELP bedrock_vm_new_metric My new thing")
+    lines.append("# TYPE bedrock_vm_new_metric gauge")
+    lines.append(f'bedrock_vm_new_metric{{vm="{dom}"}} {value}')
     return lines
 ```
 

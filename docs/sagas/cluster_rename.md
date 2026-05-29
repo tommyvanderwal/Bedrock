@@ -8,8 +8,8 @@
 Change the cluster's display name. The cluster's real identity is
 `cluster_uuid` (immutable for the cluster's life); this saga
 updates the friendly `cluster_name` tag that surfaces in the
-dashboard, `bedrock status`, the mDNS TXT record, and
-`cluster.json` / `state.json` on every node.
+dashboard, `bedrock status`, the mDNS TXT record, and every node's
+`state.json` projection.
 
 ## Trigger
 
@@ -59,10 +59,13 @@ automatically:
 
 | Consumer | Path | Latency |
 |---|---|---|
-| `cluster.json` on every node | `rqlite_subscriber` → `view_builder._cluster_view` | ≤2 s |
 | `state.json` on every node | `rqlite_subscriber` → `view_builder._state_view` | ≤2 s |
 | mDNS TXT record | `mdns_responder.cluster_identity()` polls state.json every 60 s | ≤60 s |
-| Dashboard / `bedrock status` | reads `cluster.json` per request | next request |
+| Dashboard / `bedrock status` | reads rqlite directly via `cluster_state.load_cluster()` per request | next request |
+
+(`cluster.json` is no longer a steady-state projection — that layer
+was removed 2026-05-26; consumers read rqlite directly. Only
+`state.json` is re-projected on each revision.)
 
 Nothing keys off `cluster_name` for routing or security; the
 `cluster_uuid` is the load-bearing field everywhere
@@ -79,7 +82,7 @@ Strips whitespace from `new_name`, then refuses if:
 - `re.fullmatch(r"^[A-Za-z0-9_.-]{1,64}$", new_name)` is False.
 
 The allowed-char policy avoids characters that would need
-escaping in cluster.json, the mDNS TXT record, shell-rendered
+escaping in JSON state files, the mDNS TXT record, shell-rendered
 log lines, or systemd unit paths.
 
 ### `write_rqlite_cluster_info`
@@ -89,4 +92,5 @@ Calls `bedrock_state.set_cluster_name(new_name)` which is a single
 wrapped in the standard `_bump_and_close` so `bedrock_meta.revision`
 ticks forward. The bump is what wakes every node's
 `rqlite_subscriber` task — the subscriber then re-projects
-`cluster.json` and `state.json` via `view_builder`.
+`state.json` via `view_builder._state_view`. Other consumers read
+the new name straight from rqlite on their next request.

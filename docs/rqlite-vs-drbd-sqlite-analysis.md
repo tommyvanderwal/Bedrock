@@ -1,4 +1,13 @@
-# rqlite vs SQLite-on-DRBD — analysis (draft, then validate)
+# rqlite vs SQLite-on-DRBD — analysis (historical)
+
+> **Outcome:** rqlite stays. This is the historical decision record for the
+> "should we drop rqlite and put cluster state on a DRBD-backed SQLite file?"
+> question. The gain/loss comparison below is kept as the rationale; rqlite is
+> the shipped design. Note that the old per-node `cluster.json` projection
+> referenced in some loss arguments no longer exists — cluster state is read
+> directly from rqlite via `cluster_state.load_cluster()` (read-level `none`,
+> works without quorum); the arguments still hold for "local-replica reads on
+> every node," which `load_cluster()` provides.
 
 ## Method
 Draft candidate gain/loss claims. For each, mark VALIDATED, INVALID,
@@ -76,11 +85,12 @@ The `bedrock_meta.revision` counter + watch loop in rqlite_client.py
 is elegant for HTTP polling. SQLite-on-DRBD needs file-watch or
 distributed-lock invalidation.
 
-### L10 — "view_builder.rebuild() projection model changes"
-Today every node generates its local cluster.json from its local
-rqlited via view_builder. With SQLite-on-DRBD, only the master
-can rebuild; cluster.json on followers needs a different push
-mechanism.
+### L10 — "Local projection model changes"
+Every node reads cluster topology from its local rqlite replica
+(`cluster_state.load_cluster()`, read-level `none`). With
+SQLite-on-DRBD, only the master holds the file mounted; followers
+would need a push mechanism or a remote dial to learn who the
+master / peers are.
 
 ### L11 — "Loss of async replication"
 Per the audit: at N=2 with master A and follower B, B reads its
@@ -197,17 +207,17 @@ future loss; not load-bearing. DROP from main list.
 
 ### L9 — VALIDATED
 Audit confirms the revision-counter watch loop is the
-propagation mechanism for "cluster state changed, regenerate
-cluster.json on every node." Without rqlite, this needs a new
-mechanism. Real work. Keep.
+propagation mechanism for "cluster state changed, re-read it on
+every node." Without rqlite, this needs a new mechanism. Real
+work. Keep.
 
 ### L10 — VALIDATED (related to L2 + L9)
-view_builder.rebuild() reading local rqlite to write local
-cluster.json+state.json on EVERY node is exactly how follower
-nodes know who the master is, who the peers are, etc. Without
-local rqlite, followers can't autonomously rebuild. Either they
-mount the master's SQLite read-only (not how DRBD works without
-shared-disk filesystem), or master pushes cluster.json to peers
+Every node reading its local rqlite replica
+(`cluster_state.load_cluster()`) is exactly how follower nodes
+learn who the master is, who the peers are, etc. Without local
+rqlite, followers can't autonomously read this. Either they mount
+the master's SQLite read-only (not how DRBD works without a
+shared-disk filesystem), or the master pushes topology to peers
 via mesh (new mechanism). Keep, but it's the same loss as L2
 restated for a specific code path. Merge into L2.
 

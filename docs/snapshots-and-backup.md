@@ -3,9 +3,9 @@
 A long, deliberate think before any code. The goal is to land on
 **one** snapshot mechanism that works the same for cattle (local LV-
 thin) and pet/vipet (DRBD over LV-thin), captures application-
-consistent state when the guest cooperates, replays cleanly through
-the cluster log, and gives backup tools a stable read surface they
-can stream from.
+consistent state when the guest cooperates, converges cleanly on
+every node from cluster state in rqlite, and gives backup tools a
+stable read surface they can stream from.
 
 ---
 
@@ -121,20 +121,20 @@ operator who just wanted a backup.
    operator: bedrock vm snapshot create my-pet --label nightly --quiesce
         │
         ▼
-   master's mgmt API:
+   mgmt API (8001 loopback CLI → 8443 LAN):
         ① validate VM exists, not already snapshotting, etc.
-        ② append snapshot_create_intent to the log:
+        ② write a snapshot intent to rqlite (vm_intents row):
            { vm: my-pet, label: nightly,
              ts: 2026-05-04T10:00:00Z,
              quiesce: true,
              requested_by: <user>,
              primary_node: <where DRBD primary lives> }
-        ③ return 202 + intent_log_index to caller
+        ③ return 202 + intent id to caller
         │
-        ▼ replication
+        ▼ rqlite replication (Raft)
         │
    ▼ ONLY on the DRBD-primary node (master in single-master setups):
-   reactor sees snapshot_create_intent + primary_node == self
+   the orchestrator reactor observes the intent + primary_node == self
         │
         ▼
    if quiesce: virsh domfsfreeze my-pet
@@ -149,7 +149,7 @@ operator who just wanted a backup.
    if quiesce: virsh domfsthaw my-pet
         │
         ▼
-   append snapshot_created log entry:
+   record the snapshot in rqlite:
      { vm: my-pet, label: nightly, ts: ...,
        primary_node: <self>,
        disks: [{lv: vm-my-pet-disk0,
@@ -157,7 +157,7 @@ operator who just wanted a backup.
                 bytes: <thin pool delta>}] }
 
    ── On the DRBD secondary node:
-   reactor sees snapshot_create_intent → primary_node != self → NO-OP
+   reactor observes the intent → primary_node != self → NO-OP
    The peer's underlying LV is byte-identical to the primary's
    (Protocol C, modulo acked writes), but we DON'T take a local
    snapshot there. The snapshot is one LV on one node.
@@ -219,11 +219,11 @@ snapshots).
 ```
   ① bedrock vm shutdown my-cattle
   ② bedrock vm snapshot restore my-cattle --label nightly
-  ③ master appends snapshot_restore_intent
+  ③ mgmt writes a snapshot-restore intent to rqlite
   ④ home node's reactor:
        lvconvert --merge almalinux/vm-my-cattle-disk0-nightly-<ts>
        (origin LV ends up at the snapshot's content; snap consumed)
-  ⑤ append snapshot_restored
+  ⑤ record snapshot_restored in rqlite
   ⑥ bedrock vm start my-cattle
 ```
 
@@ -231,21 +231,21 @@ snapshots).
 ```
   ① bedrock vm shutdown my-pet              (no IO on the resource)
   ② bedrock vm snapshot restore my-pet --label nightly
-  ③ master appends snapshot_restore_intent
-  ④ DRBD-primary node's reactor:
-       drbdadm secondary tier-pet-disk      (no FDs left after step 1)
-       drbdadm down tier-pet-disk           (release the LV)
+  ③ mgmt writes a snapshot-restore intent to rqlite
+  ④ DRBD-primary node's reactor (resource = vm-my-pet-disk0):
+       drbdadm secondary vm-my-pet-disk0    (no FDs left after step 1)
+       drbdadm down vm-my-pet-disk0         (release the LV)
        lvconvert --merge bedrock/vm-my-pet-disk0-nightly-<ts>
-       drbdadm up tier-pet-disk             (DRBD reads the LV again)
-       drbdadm primary --force tier-pet-disk
-       drbdadm new-current-uuid --clear-bitmap tier-pet-disk
+       drbdadm up vm-my-pet-disk0           (DRBD reads the LV again)
+       drbdadm primary --force vm-my-pet-disk0
+       drbdadm new-current-uuid --clear-bitmap vm-my-pet-disk0
               (mark our content authoritative; peer becomes "outdated"
                and DRBD will resync to it)
-       drbdadm primary tier-pet-disk
+       drbdadm primary vm-my-pet-disk0
   ⑤ DRBD-secondary node:
-       (no log-driven action needed — DRBD's resync brings its LV
+       (no reactor action needed — DRBD's resync brings its LV
         in line with our merged content automatically)
-  ⑥ append snapshot_restored
+  ⑥ record snapshot_restored in rqlite
   ⑦ bedrock vm start my-pet                 (resync continues in
                                               background; no impact
                                               on the primary's IO)
@@ -268,7 +268,8 @@ snapshot — that's the §3 trade-off we deliberately didn't take.
   bedrock vm clone-from-snapshot src-vm --label nightly --as new-vm
 ```
 
-- Master appends `vm_create_intent` for new-vm
+- mgmt writes a `vm_create` intent for new-vm to rqlite (run via the
+  VM-create saga)
 - For each disk of src-vm: `lvcreate --thin --name vm-new-vm-diskN`
   pre-populated from the snapshot (`dd` from snapshot to new LV, or
   `lvconvert --type thin` tricks)
@@ -287,19 +288,19 @@ heavy writes can consume the whole thin pool in days.
 
 **Bedrock's controls:**
 
-1. **Per-VM retention policy** in cluster.json (a VM's metadata):
+1. **Per-VM retention policy** in rqlite (part of the VM's metadata):
    - `keep_last_n`: e.g. 7 nightly + 4 weekly + 12 monthly
    - `max_age_days`: drop snapshots older than this regardless
-   - mgmt enforces by appending `snapshot_deleted` log entries on a
-     timer.
+   - mgmt enforces by removing snapshots + recording the deletion in
+     rqlite on a timer.
 
 2. **Thin-pool fill alarm** — when data%/meta% on the thin pool
    crosses 80%, mgmt logs an alert + refuses new snapshot creation
    until space is freed.
 
-3. **No undisclosed snapshots** — every snapshot exists because of
-   a `snapshot_created` log entry. Operators can see them in the
-   dashboard; orphaned LVs from manual `lvcreate` will be flagged.
+3. **No undisclosed snapshots** — every snapshot is recorded in
+   rqlite when created. Operators can see them in the dashboard;
+   orphaned LVs from manual `lvcreate` will be flagged.
 
 ---
 
@@ -320,14 +321,14 @@ delete it:
   bedrock vm backup my-pet --target pbs://backup.example/datastore-1
         │
         ▼
-   ① snapshot create (--quiesce) → snapshot_created log entry
+   ① snapshot create (--quiesce) → snapshot recorded in rqlite
    ② mount snapshot LV read-only at /var/lib/bedrock/backup-staging/<vm>
         OR: pass /dev/bedrock/vm-my-pet-disk0-bk-<ts> as a block device
    ③ proxmox-backup-client backup \
         my-pet-disk0.img:/dev/bedrock/vm-my-pet-disk0-bk-<ts> \
         --repository pbs://...
    ④ lvremove the snapshot                              (← "discard")
-   ⑤ append backup_completed log entry { target, size, ts, vm }
+   ⑤ record backup_completed in rqlite { target, size, ts, vm }
 ```
 
 That's the basic loop the user asked about: **make → PBS reads →
@@ -340,7 +341,7 @@ exists. For an unattended nightly run it's typically a few minutes.
   job and force-removes them.
 - Each backup task has a timeout. If `proxmox-backup-client` doesn't
   finish in N hours, the task aborts and the snapshot is removed.
-- backup-failed and backup-aborted are log entries too — an
+- backup-failed and backup-aborted are recorded in rqlite too — an
   abandoned snapshot is observable, not silent.
 
 ### 6b. Borg / Restic
@@ -357,7 +358,7 @@ block), so we either:
   — works if the VM has a single FS;
 - Or for raw-block backup: `borg create ... --read-special /dev/bedrock/snap`
 
-### 6c. Object storage (S3 / Garage)
+### 6c. Object storage (S3 / SeaweedFS)
 
 Stream the snapshot block-by-block to object storage:
 
@@ -578,7 +579,7 @@ how to send it.** Specifically:
   used. We get the local-IO savings; PBS handles the wire and the
   storage.
 
-The tag we attach to each backup_completed log entry includes the
+The tag we record on each backup_completed row includes the
 method used (`full` / `thin_delta` / `qemu_bitmap`) so the operator
 can see what happened at any point in history.
 
@@ -597,9 +598,9 @@ adaptive logic catches the case and falls back to FULL.
 
 ### 6d. Bedrock-native backup tier (v1.x)
 
-The scratch tier is already Garage S3 in N≥2 clusters. A logical
-roadmap step:
-- `bedrock backup target add s3://garage-internal/backups`
+Bedrock already runs an internal SeaweedFS S3 gateway (`bedrock-weed-s3`,
+port 8333) in N≥2 clusters. A logical roadmap step:
+- `bedrock backup target set s3://seaweed-internal/backups`
 - `bedrock vm backup-policy my-pet --schedule '0 3 * * *' --target s3://...`
 - mgmt runs cron-like; takes snapshots; ships diffs; rotates.
 
@@ -618,7 +619,7 @@ diverges:
 | Multi-disk atomicity | "Create snapshot of all disks" inside VM scope | Same | Same | Same | One fsfreeze window wraps all `lvcreate` calls |
 | Quiescence | VSS / VMware Tools | NGT (Nutanix Guest Tools) | qemu-guest-agent | Vendor agent | **qemu-guest-agent** (the same tool everyone else uses) |
 | Multi-replica | vSAN replicates blocks + snap blocks | Cassandra distributes snap metadata + blocks | Ceph RBD replication carries snaps | SCRIBE handles it | **One snapshot on the DRBD-primary side** — no fragile two-peer coordination. Backup tools ship offsite for redundancy; revert pays a DRBD resync. See §3. |
-| Storage cost | Operator monitors datastore | Cluster automatically rebalances | Ceph balanced; pool quotas | Vendor manages | Per-VM retention in cluster.json + thin-pool fill alarm |
+| Storage cost | Operator monitors datastore | Cluster automatically rebalances | Ceph balanced; pool quotas | Vendor manages | Per-VM retention in rqlite + thin-pool fill alarm |
 | CBT / changed-block | CBT (proprietary, internal) | Internal track-changed-extents | Ceph RBD `--diff` between snaps | Internal | **`thin_dump` / `thin_delta`** — Linux's own CBT-equivalent on thin pools |
 | Backup integration | Veeam/Commvault hook into CBT | Native + 3rd-party | Native PBS | Vendor backup | Snapshot is the read surface; any tool that can read a block device or a mounted FS works |
 
@@ -644,56 +645,66 @@ diverges:
 
 ---
 
-## 8. Log entries we need
+## 8. State in rqlite
 
-Three new entry types to add to `installer/lib/log_entries.py`:
+Cluster state lives in rqlite (Raft-replicated SQLite), written
+through `installer/lib/bedrock_state.py` — the module that replaced
+the old hash-chained `log_entries.py` append path. Snapshots are
+work-queue intents plus a per-VM record:
 
 ```
-  SNAPSHOT_CREATE_INTENT   { vm, label, ts, quiesce, requested_by, disks }
-  SNAPSHOT_CREATED         { vm, label, ts, nodes, disks: [{lv, snap, bytes}] }
-  SNAPSHOT_DELETED         { vm, label, ts, reason }
+  snapshot-create intent   { vm, label, ts, quiesce, requested_by, disks }
+  snapshot record          { vm, label, ts, nodes, disks: [{lv, snap, bytes}] }
+  snapshot delete          { vm, label, ts, reason }
 ```
 
-`view_builder.fold_into` adds a `snapshots` field per VM:
-`vms[name].snapshots = [{label, ts, disks}, ...]`. The reactor
-on every node materialises (creates/merges/deletes) the snapshot
-LVs locally based on these entries.
+The orchestrator reactor on every node observes these (via
+`cluster_state.load_cluster()`) and materialises
+(creates/merges/deletes) the snapshot LVs locally where it holds
+the disk LV.
 
-For backup orchestration:
-```
-  BACKUP_STARTED           { vm, target, ts, snapshot_label }
-  BACKUP_COMPLETED         { vm, target, ts, size_bytes, snapshot_label }
-  BACKUP_FAILED            { vm, target, ts, reason }
-```
-
-These can ship in a later phase; not load-bearing for the snapshot
-mechanics.
+Backup orchestration already lands in rqlite tables today
+(`bedrock_schema.sql`): `backup_targets` (configured repos),
+`vm_backups` (per-VM backup history with the Kopia snapshot ids per
+disk), and the `vm_intents` work queue (backup/restore ride the same
+INTENT → OUTCOME pattern as VM lifecycle ops; a dedicated
+`backup_intents` table is a planned convention, not yet created). The
+per-VM `last_backup_error` / `last_restore` / `last_restore_err`
+columns on the `vms` table carry the most recent outcomes for the
+dashboard.
 
 ---
 
 ## 9. Implementation order
 
-Phase A (small, fast — v1.0.x):
-- `lib/log_entries.py`: SNAPSHOT_CREATE_INTENT / SNAPSHOT_CREATED /
-  SNAPSHOT_DELETED constructors.
-- `view_builder.fold_into`: track per-VM snapshots list.
+Backup already shipped: `mgmt/backup.py` (the Kopia wrapper, see
+§9c-bis) drives `bedrock backup target set` + `bedrock vm backup` /
+`restore`, recording state in the rqlite `backup_targets` /
+`vm_backups` tables. The VM-snapshot LV subsystem below is the
+remaining piece.
+
+Phase A (snapshot subsystem):
+- `bedrock_state.py`: snapshot-create / snapshot record / snapshot
+  delete writers (rqlite, replacing the old `log_entries.py`
+  constructors).
 - `mgmt/snapshots.py`: `create_snapshot(vm, label, quiesce)`,
   `delete_snapshot(vm, label)`, `list_snapshots(vm)`. Each runs the
-  corresponding lvm/virsh commands and appends the right log entry.
-- `mgmt/orchestrator.py::_reactor`: handle SNAPSHOT_CREATE_INTENT
-  (run lvcreate --snapshot locally if this node has the disk LV).
+  corresponding lvm/virsh commands and records the result in rqlite.
+- `mgmt/orchestrator.py::_reactor_diff`: handle a snapshot-create
+  intent (run lvcreate --snapshot locally if this node has the disk
+  LV).
 - `mgmt/app.py`: `/api/vms/{vm}/snapshots` endpoints.
 - CLI: `bedrock vm snapshot {create,list,delete,restore}`.
 
-Phase B (v1.1):
-- `bedrock vm backup` to PBS / Borg / S3 — the snapshot becomes a
-  mounted read surface; the backup tool runs against it.
+Phase B (already shipped — Kopia backup):
+- `bedrock vm backup` / `restore` to S3 / S3-compatible / FS via
+  Kopia (`mgmt/backup.py`).
 - Retention policy enforcement (timer in mgmt).
 - Thin-pool fill alarms.
 
-Phase C (v1.2 or later):
+Phase C (later):
 - Differential / changed-block backup using `thin_delta`.
-- Bedrock-native backup tier on Garage S3.
+- Two-repo hot+cold tier via `kopia repository sync-to`.
 - Clone-from-snapshot.
 
 ---
@@ -771,7 +782,7 @@ disaster recovery. Worth spelling out:
    │          │  proxmox-backup-   │                    │          │
    │          │  client over LAN   │                    │          │
    │          │                    │                    │          │
-   │   cluster.json carries:                                       │
+   │   rqlite carries:                                             │
    │     backup.local_pbs = { url, datastore, api-token, fp }      │
    │     backup.offsite   = { url, datastore, api-token, fp }      │
    │     backup.encryption_key_path = /etc/bedrock/backup.key      │
@@ -849,7 +860,7 @@ disaster recovery. Worth spelling out:
 **Encryption key handling:**
 
 The per-datastore encryption key is the **single thing the operator
-must keep out-of-band**. It is **not** stored in the cluster log
+must keep out-of-band**. It is **not** stored in rqlite
 (which is otherwise the source of truth). Mechanics:
 
 - Master generates the key on first PBS setup (`proxmox-backup-client
@@ -1182,7 +1193,7 @@ For our orchestrator, this means:
   ① mgmt: find target's recent snapshot of my-vm at the requested ts.
   ② lvcreate the target LV.
   ③ tool restores chunks → LV. Hot-tier fast; cold-tier slower.
-  ④ define libvirt VM; log; (optional) start.
+  ④ define libvirt VM; record the vm row in rqlite; (optional) start.
 ```
 
 Same flow regardless of which tool is the backend. The local fast
@@ -1261,9 +1272,9 @@ rich VM-aware dashboard.
 mgmt's CLI surface stays backend-agnostic:
 
 ```
-  bedrock backup target add cold-s3 --type kopia --repo s3://... --password-file /etc/...
-  bedrock backup target add prod-pbs --type pbs   --url ... --token ... --key /etc/...
-  bedrock backup target add archive  --type restic --repo s3://... --password-file ...
+  bedrock backup target set cold-s3 --type kopia --repo s3://... --password-file /etc/...
+  bedrock backup target set prod-pbs --type pbs   --url ... --token ... --key /etc/...
+  bedrock backup target set archive  --type restic --repo s3://... --password-file ...
 
   bedrock vm backup my-pet --target cold-s3
   bedrock vm restore my-pet --from cold-s3 --snapshot 2026-05-04T02:00
@@ -1285,7 +1296,7 @@ remote tier provides DR.
 
 The reverse of backup. PBS streams chunks; we provide an LV-thin
 target; bytes land on the LV. Then we define the libvirt VM and
-log it.
+record it in rqlite.
 
 **Cattle (single LV, single node):**
 
@@ -1299,7 +1310,7 @@ log it.
         --target /dev/almalinux/vm-my-cattle-disk0
         (PBS streams chunks; client writes them to the block device)
    ④ define libvirt VM XML — disk path = /dev/almalinux/vm-my-cattle-disk0
-   ⑤ append vm_create_intent + vm_created log entries
+   ⑤ record vm_create intent + vm record in rqlite
    ⑥ (optional) virsh start
 ```
 
@@ -1311,14 +1322,15 @@ log it.
         lvcreate -V <size>G --thin -n vm-my-pet-disk0 bedrock/thinpool
         proxmox-backup-client restore <id> my-pet-disk0.img \
           --target /dev/bedrock/vm-my-pet-disk0
-   ③ append a tier-side log entry assigning a fresh DRBD minor + node-ids.
+   ③ write a DRBD-resource record to rqlite assigning a fresh DRBD
+      minor + node-ids.
    ④ on peer(s): lvcreate the matching empty LV (same size, --thin).
-   ⑤ on home: drbdadm create-md tier-vm-my-pet (using the new resource def);
+   ⑤ on home: drbdadm create-md vm-my-pet-disk0 (using the new resource def);
               drbdadm up; drbdadm primary --force.
               DRBD's initial sync starts, copying our restored content
               to the peer's empty LV.
    ⑥ define libvirt VM XML — disk path = /dev/drbdN.
-   ⑦ append vm_create_intent + vm_created.
+   ⑦ record vm_create intent + vm record in rqlite.
    ⑧ (optional) virsh start.
 ```
 
@@ -1331,7 +1343,7 @@ local + degraded-peer the whole time.
 **Cross-cluster restore (DR):**
 
 Identical flow on a fresh cluster. The new cluster has its own
-LV pool, its own DRBD config, its own log. PBS doesn't care which
+LV pool, its own DRBD config, its own rqlite state. PBS doesn't care which
 cluster it's serving — backups are data-only, no cluster identity
 embedded. As long as the new cluster has network reach + credentials
 to PBS, `bedrock vm restore` works. This is also how you'd lift-and-
@@ -1385,7 +1397,7 @@ is:
   warms its cache as it does work. No shared cache needed.
 - **Encryption key is the one out-of-band secret** the operator
   carries across clusters. Lives at `/etc/bedrock/backup.key`,
-  mode 0600, never in the cluster log.
+  mode 0600, never in rqlite.
 - **Content-hash floor: ≥256 bits, no exceptions.** Kopia's dedup is
   content-addressed — a chunk is identified by its hash and a
   collision means a wrong-blob restore. Bedrock creates new repos

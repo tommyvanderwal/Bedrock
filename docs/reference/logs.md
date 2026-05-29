@@ -13,7 +13,7 @@ which avoids the "I don't see my event" debugging rabbit hole.
    │      a. WebSocket 'event' broadcast  (instant to all browsers) │
    │      b. VictoriaLogs HTTP insert     (persistent, queryable)   │
    │                                                                │
-   │    Examples: migrate success, convert steps, node registered.  │
+   │    Examples: migrate success, convert steps, join approved.   │
    └───────────────────────────────────────────────────────────────┘
 
    ┌───────────────────────────────────────────────────────────────┐
@@ -46,7 +46,8 @@ Grep the code: `grep -n "push_log(" mgmt/app.py`. Full list:
 
 | Source | Trigger | Message format | Level |
 |---|---|---|---|
-| `register_node` | `POST /api/nodes/register` | `Node {name} ({host}) registered with cluster` | info |
+| `join_request` | `POST /api/join/request` | `join request: {name} ({host}) fp={fp}` | info |
+| `join_approve` | `POST /api/join/approve` | `operator {user} approved join {name} ({host})` | info |
 | `_vm_start` | `POST /api/vms/{n}/start` | `VM {vm_name} started on {target}` | info |
 | `_vm_shutdown` | `POST /api/vms/{n}/shutdown` | `VM {vm_name} shutdown requested on {host}` | info |
 | `_vm_poweroff` | `POST /api/vms/{n}/poweroff` | `VM {vm_name} powered off on {host}` | warn |
@@ -65,7 +66,7 @@ Grep the code: `grep -n "push_log(" mgmt/app.py`. Full list:
 |  |  | `Create VM {n}: virt-install (vcpus=., ram=.MB, iso=.)` | info |
 |  |  | `Created VM {n} on {host} (cattle, ...vCPU, ...MB, ...GB, priority=., cpu_shares=.)` | info |
 | `_vm_delete` | `DELETE /api/vms/{n}` | `Deleted VM {n} (was on {nodes})` | warn |
-| `api_upload_iso` | `POST /api/isos/upload` | `ISO uploaded: {name} ({N} MB)` | info |
+| `api_upload_iso` | `POST /api/isos` | `ISO uploaded: {name} ({N} MB)` | info |
 | `api_delete_iso` | `DELETE /api/isos/{n}` | `ISO deleted: {name}` | info |
 
 All entries carry:
@@ -109,11 +110,11 @@ The dashboard is the closest to `tail -f` for push_log events. For the
 systemd journal of any service:
 
 ```bash
-# mgmt app — uvicorn access + tracebacks + paramiko chatter
-ssh <mgmt-node> 'journalctl -u bedrock-mgmt -f'
+# mgmt app + netd/orchestrator — uvicorn access, tracebacks, paramiko chatter
+ssh <node> 'journalctl -u bedrock-d -f'
 
-# VictoriaMetrics — scrape errors, reload confirmations
-ssh <mgmt-node> 'journalctl -u bedrock-vm -f'
+# rqlite — consensus, leader changes
+ssh <node> 'journalctl -u bedrock-rqlited -f'
 
 # DRBD kernel messages
 ssh <any-node> 'journalctl -kf | grep drbd'
@@ -142,8 +143,8 @@ seeded history is fetched once on mount — after that the panel is
 
 ## Log retention
 
-- **VictoriaLogs**: 90 days by default (`-retention=90d` in
-  `bedrock-vl.service`). Storage at `/opt/bedrock/data/vl/`.
+- **VictoriaLogs**: 90 days by default (`-retentionPeriod=90d`).
+  Storage at `/opt/bedrock/data/vl/`.
 - **VictoriaMetrics**: 90 days (`-retentionPeriod=90d`). Storage at
   `/opt/bedrock/data/vm/`.
 - **systemd journal**: per-unit defaults (usually size-capped, ~1 GB).

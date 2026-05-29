@@ -132,7 +132,7 @@ blockcopy blows up.
 - Broadcasts are marshalled onto the main loop with
   `asyncio.run_coroutine_threadsafe(hub.broadcast(...))`, same pattern as
   `push_log`.
-- Restart caveat: the registry is in-memory. If `bedrock-mgmt` restarts
+- Restart caveat: the registry is in-memory. If `bedrock-d` restarts
   mid-convert, the in-flight tasks are orphaned. The next state tick will
   reconcile reality (the VM either did or didn't end up converted); no
   automatic resume today.

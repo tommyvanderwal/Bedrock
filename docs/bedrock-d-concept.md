@@ -8,7 +8,7 @@ bedrock-d process (1 per node)
 ├── BedrockState           — one shared object, locks where needed
 ├── netd thread            — mesh probes, election, witness IO
 └── asyncio main loop
-    ├── FastAPI (8443 HTTPS + 8080 loopback)
+    ├── FastAPI (8443 HTTPS LAN + 127.0.0.1:8001 loopback)
     └── tasks: rqlite_subscriber, no_quorum_responder,
                 boot_orchestrator, converge_retry, backup_scheduler
 ```
@@ -22,13 +22,13 @@ rqlited, weed-*, vm/vl, vmagent/vlagent.
 
 **At arm's length** (cosmetic, no cluster decisions):
 bedrock-cert-refresh, bedrock-mdns, bedrock-redirect — their own
-small systemd units. bedrock-d can lifecycle them via `systemctl`
-when needed.
+small systemd units; `bedrock-d` neither imports nor owns them. It
+can lifecycle them via `systemctl` if we ever need that.
 
 **No watchdog**: single-daemon design means we troubleshoot
 a stuck bedrock-d directly via journalctl + systemctl restart.
 
 **Failure model**: if `bedrock-d` crashes, systemd `Restart=on-failure`
-brings it back. State recovers from rqlite + on-disk
-state.json/cluster.json. VMs/DRBD keep running through the brief
-gap.
+brings it back. Cluster topology recovers from rqlite (read via
+`cluster_state.load_cluster()`), and this node's identity/role from
+on-disk `state.json`. VMs/DRBD keep running through the brief gap.

@@ -9,17 +9,17 @@ to bet on. In rough order of "how hard would real hardware bite us."
 
 ## 1. The "only mgmt master writes LINK_*" workaround
 
-Right now followers' bedrock-net keeps a complete in-memory neighbour
-table for routing decisions but doesn't append LINK_UP/DOWN/QUALITY to
-the log. Single-writer is preserved. Cost: the cluster.json paths
-section reflects only paths the master has observed (master ↔ each peer);
+Right now followers' netd keeps a complete in-memory neighbour
+table for routing decisions but doesn't record LINK_UP/DOWN/QUALITY to
+rqlite. Single-writer is preserved. Cost: the path data in rqlite
+reflects only paths the master has observed (master ↔ each peer);
 inter-peer paths (sim-2 ↔ sim-3) don't show up.
 
 This is fine for routing — the routing decisions are local and based on
 the in-memory table — but it means the dashboard can't honestly draw
 "sim-2 to sim-3 is via mesh-1, 10 Gbps." The fix is straightforward
 (followers POST observations to `/api/path-event` on the master, master
-appends), but I haven't built it yet. Worth doing in v1.1.
+writes to rqlite), but I haven't built it yet. Worth doing in v1.1.
 
 **Real-hardware implication**: dashboard topology view will be
 master-centric. Operator sees "I'm reachable to everyone" on the master,
@@ -81,22 +81,17 @@ slave — same logic applies. Tested on the testbed; not stress-tested
 on, say, a bond-on-top-of-NICs or a VLAN-on-bond config. Both should
 work, neither is verified.
 
-## 5. systemd start-limit on bedrock-rust
+## 5. systemd restart thrash on rapid state changes (historical)
 
-During init, mgmt_install appends 4-5 log entries in <1 s. The
-orchestrator's subscriber fires `render_from_snapshot` after each,
-restarting bedrock-rust if daemon.toml changed. Default systemd
-start-limit (5 starts in 10 s) hits and bedrock-rust refuses to start.
-
-I bumped the limit to 20/60 via a service drop-in. The real fix is
-debouncing in the orchestrator (collect log-entries-arrived signals
-for ~250 ms, render once, restart at most once per debounce window).
-Untouched in this commit cycle.
-
-**Real-hardware implication**: works fine for normal operation. If a
-flapping witness or a misbehaving peer causes thrashing log entries,
-the bedrock-rust restart loop could hit the limit. Worth fixing
-before scale-up.
+This one is moot under the unified `bedrock-d`. Historically, during
+init mgmt_install drove several cluster-state changes in <1 s, and the
+orchestrator's subscriber re-rendered config and restarted a separate
+daemon after each, tripping the default systemd start-limit (5 starts
+in 10 s). Now mesh/election/routing all live inside the long-running
+`bedrock-d` netd thread, so there is no per-change daemon restart to
+thrash. The general lesson stands: debounce config re-renders (collect
+state-changed signals for ~250 ms, render once) if any future actuation
+restarts a unit on every change.
 
 ## 6. The `struct.pack("4sLi", ...)` bug
 
@@ -117,15 +112,19 @@ hit the same way on real boxes. Already fixed.
 
 ## 7. Hysteresis windows
 
-Currently 5 s up, 30 s down (demo-tuned, not production-tuned). 5 s up
-means a flap that recovers in <5 s never logs anything — fine. 30 s
-down means a real cable cut takes 30 s to surface as a LINK_DOWN entry
-— the gossip layer reacts in <1 s for routing, but the cluster.json
-visibility lags.
+Currently 5 s up (`UP_HYSTERESIS_S`), 10 s down (`DOWN_HYSTERESIS_S`).
+The down window was 30 s originally but got shortened to 10 s so the
+election self-marks NoQuorum inside the failover window (a 30 s down
+hysteresis left the isolated master's `.254` hanging well past the
+assertion). 5 s up means a flap that recovers in <5 s never logs
+anything — fine. 10 s down means a real cable cut takes 10 s to surface
+as a LINK_DOWN entry — the gossip layer reacts in <1 s for routing, but
+the rqlite-backed dashboard visibility lags by the hysteresis window.
 
-Real production probably wants 10 s up, 60 s down. I haven't
-benchmarked the tradeoff. Anti-flap penalty in the metric calc isn't
-implemented yet (mentioned in the design but skipped in v1).
+These are still demo-tuned, not benchmarked across real hardware; the
+up window in particular hasn't been tuned. Anti-flap penalty in the
+metric calc isn't implemented yet (mentioned in the design but skipped
+in v1).
 
 ## 8. No path-quality measurement
 
@@ -160,18 +159,19 @@ USB4-in-real-life often gets IPv6 link-local with no IPv4 by default;
 operators would have to assign IPv4 explicitly. Worth following up if
 the v1.0 target is "MS-S1 boxes via USB4 cables out of the box."
 
-## 10. bedrock-rust IPC restart-resilience
+## 10. cross-daemon IPC restart-resilience (obsolete)
 
-The `emit_link_event` retry-on-IPC-error path works (verified by
-intentional bedrock-rust restarts). What's not tested: IPC connection
-that hangs forever (e.g. deadlocked rust daemon). Right now we'd block
-on the rust_ipc.Daemon().__enter__() call indefinitely. A timeout
-context manager would be ~10 lines and worth adding.
+This concern is gone with the unified daemon. It used to describe the
+`emit_link_event` retry path against a separate Rust daemon over IPC,
+where a hung/deadlocked peer process could block the netd loop
+indefinitely. There is no longer a second daemon or an IPC boundary:
+mesh, election, and routing run in the same `bedrock-d` process as
+in-memory function calls, so there is no IPC connection to hang on.
 
 ## 11. Loopback /32 collisions if init/join races
 
-The race in mgmt's loopback allocation is fixed (read used set from
-the log, not cluster.json), but the window only closes for a single
+The race in mgmt's loopback allocation is fixed (read the used set
+from rqlite's `nodes` table), but the window only closes for a single
 mgmt master. If two nodes simultaneously decide they're the master
 (post-failover, before consensus settles), they could both try to
 allocate /32s for joiners. The single-writer invariant is supposed to
@@ -191,45 +191,45 @@ prevent this, but I haven't constructed a test for it.
 **Not tested**:
 - Real USB4 hardware
 - Two-node clusters (only ran 4-node)
-- Witness integration with the mesh layer
-- DRBD using the loopback fallback path block (Phase 6 deferred)
+- DRBD using the loopback fallback path block under real all-direct-paths-down
 - VM live migration over a mesh path that gets pulled mid-flight
 - Cluster scale beyond 4 nodes
 - IPv6
 - Async return paths (rp_filter=2 is set but no test verified it does
   what we expect under real asymmetry)
 
-## 13. bedrock-rust peer dialing — RESOLVED 2026-05-11
+## 13. consensus peer dialing — RESOLVED 2026-05-11
 
-The external code review (2026-05-11) flagged this:
-`installer/lib/daemon_setup.py::render_from_snapshot` and
-`mgmt/app.py::register_node` both built bedrock-rust peer addresses
-from `n.get("drbd_ip") or n.get("host", "")`, which meant cluster-
-protocol log replication rode the mgmt LAN regardless of what the
-mesh layer had discovered. DRBD storage replication got the full
-mesh benefit; the cluster-protocol log didn't.
+The external code review (2026-05-11) flagged that consensus peer
+addresses were built from `n.get("drbd_ip") or n.get("host", "")`,
+which meant cluster-protocol replication rode the mgmt LAN regardless
+of what the mesh layer had discovered. DRBD storage replication got
+the full mesh benefit; the consensus traffic didn't.
 
-**Fix landed**: both functions now use the preference chain
-`loopback_ip → drbd_ip → host`. bedrock-rust dials each peer at
-its `/32` cluster identity; the kernel route to that identity picks
-the best physical NIC via bedrock-net's metric-ordered routing.
-Multi-path failover is now uniform across DRBD and bedrock-rust.
+**Fix landed**: peer addressing uses the preference chain
+`loopback_ip → drbd_ip → host`, so each peer is dialed at its `/32`
+cluster identity and the kernel route picks the best physical NIC via
+the mesh's metric-ordered routing. Multi-path failover is uniform
+across DRBD and consensus replication. (After the May-2026 rewrite the
+consensus layer is rqlite over the `/32` identities; the loopback-first
+preference chain carried over unchanged.)
 
 The legacy fallbacks (drbd_ip / host) stay in the preference chain
 so clusters that pre-date the mesh layer keep working, and N=1
 clusters whose master genuinely has no loopback yet (mid-init race)
 still get a dialable address.
 
-## 14. The big "design choice I'd revisit"
+## 14. The big "design choice I'd revisit" — RESOLVED (May-2026 rewrite)
 
-The bedrock-net daemon is a separate Python process. Reasonable for v1
-because it isolates the netlink/multicast stuff from bedrock-rust's
-hot path. But it means we have TWO daemons now per node maintaining
-similar state (bedrock-rust knows peers, bedrock-net knows neighbours,
-they don't share). Long-term, this should probably collapse into
-bedrock-rust — the gossip transport, hysteresis, route emission could
-all live there. Doing it in Python first was the right call to iterate
-fast; the Rust port is a v1.x cleanup item.
+This used to call out a two-daemon split (a separate Python mesh daemon
+alongside the old Rust consensus daemon) with each maintaining its own
+peer/neighbour state and no sharing. The May-2026 rewrite collapsed
+everything into a single Python daemon, `bedrock-d`: mesh discovery,
+latency, route emission, election, and witness IO all run in its netd
+thread, sharing in-memory state directly with the asyncio
+mgmt/orchestrator side. No second process, no IPC, no duplicated state.
+The earlier "port the mesh into the consensus daemon" cleanup item is
+done — just in Python, and the Rust daemon is gone.
 
 ## What I'm confident in
 
@@ -283,26 +283,23 @@ Final cleaned 4-node testbed:
 
 ## Known issue surfaced during the run (not a blocker, worth noting)
 
-- After init, the mgmt master's log had NODE_LOOPBACK entries for 3
-  of 4 nodes — one was lost because the register endpoint's log
-  append silently swallowed an IPC connection error (bedrock-rust
-  was momentarily restarting via the orchestrator's render-on-entry
-  loop). The joiner still got its loopback_ip in the register
-  response and claimed it on `lo`; cross-loopback ping works
-  (16/16). But cluster.json's nodes section shows only 3 loopback
-  IPs because the missing entry never replicated. Easy fix: retry
-  the append in register up to N times with exponential backoff.
-  Untouched in this commit cycle.
+- After init, the mgmt master had loopback entries for 3 of 4 nodes
+  — one was lost because the register endpoint's write silently
+  swallowed a connection error to the (then-separate) consensus
+  daemon, which was momentarily restarting via the orchestrator's
+  render-on-change loop. The joiner still got its loopback_ip in the
+  register response and claimed it on `lo`; cross-loopback ping works
+  (16/16). But the recorded nodes set showed only 3 loopback IPs
+  because the missing entry never replicated. Easy fix: retry the
+  register write up to N times with exponential backoff. (Both the
+  separate-daemon restart loop and the swallowed-write window are
+  gone under the unified `bedrock-d` + rqlite consensus.)
 
 ## Next moves
 
 1. Fix the multicast-bridge-forwarding for real hardware (querier or
    broadcast fallback).
-2. Implement followers' POST-to-master so cluster.json shows
-   inter-peer paths.
+2. Implement followers' POST-to-master so the dashboard topology
+   (backed by rqlite) shows inter-peer paths.
 3. Real RTT + speed measurement in probes.
-4. Phase 6 (DRBD config regen on path-table change) is still pending
-   and is the obvious next thing to wire up — DRBD doesn't see the
-   mesh yet.
-5. Two-node test on the testbed (wasn't covered).
-6. orchestrator debouncing for the bedrock-rust restart loop.
+4. Two-node test on the testbed (wasn't covered).

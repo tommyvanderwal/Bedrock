@@ -68,12 +68,13 @@ sibling disk, cross-node disaster restore).
          │   target_lv_path = body.target_lv_path OR
          │                    first <source dev='…'/> from virsh dumpxml
          │
-  T+0.2  ssh home_node, single shell script with `set -o pipefail`:
+  T+0.2  ssh dest (ssh_host), single shell script with `set -o pipefail`:
          │
          │   . /etc/bedrock/backup-credentials/<id>.env
          │   export KOPIA_PASSWORD="$(cat /etc/bedrock/backup.key)"
          │
-         │   mnt=/run/bedrock-restore-<vm>-<ms>
+         │   (per disk in the snapshot's disks[] plan:)
+         │   mnt=/run/bedrock-restore-<vm>-<target_dev>-<ms>
          │   mkdir -p $mnt
          │
          │   kopia --config-file=/etc/bedrock/kopia/<id>.config \
@@ -105,14 +106,15 @@ sibling disk, cross-node disaster restore).
          │   - dd writes 4 MiB blocks to the LV with conv=sparse —
          │     keeps holes sparse on the LV thin pool side.
          │
-  T+done bedrock-rust IPC: append RESTORE_DONE
-         │   {vm, target_id, kopia_snapshot_id, dest_node, duration_s}
+  T+done bedrock_state.restore_done(vm, target_id, kopia_snapshot_id,
+         │   dest_node, duration_s)  → rqlite, bumps revision
          │
          │ task.succeed(); WS broadcast.
-         │ vm["last_restore"] populated by the fold rule.
+         │ vm["last_restore"] populated by the projection.
 ```
 
-On failure: `RESTORE_FAILED` written to log + `vm["last_restore_error"]`.
+On failure: `bedrock_state.restore_failed(...)` writes to rqlite and
+the projection surfaces `vm["last_restore_error"]`.
 
 ## Why this exact order
 
@@ -139,26 +141,26 @@ On failure: `RESTORE_FAILED` written to log + `vm["last_restore_error"]`.
 
 ## Log lines
 
-**Success (cluster log):**
+**Success (rqlite, surfaced as `vm["last_restore"]`):**
 
 ```
-RESTORE_DONE
-  vm=<name> target_id=main kopia_snapshot_id=<id>
+vm=<name> target_id=main kopia_snapshot_id=<id>
   dest_node=<node-name> duration_s=<f>
 ```
 
-**Failure:**
+**Failure (rqlite, surfaced as `vm["last_restore_error"]`):**
 
 ```
-RESTORE_FAILED
-  vm=<name> target_id=main kopia_snapshot_id=<id>
+vm=<name> target_id=main kopia_snapshot_id=<id>
   reason=<short> dest_node=<node-name>
 ```
 
-**push_log:**
+**Daemon journal (`journalctl -u bedrock-d`):**
 
 ```
-restore[<vm>] from kopia=<id> done: <last 200 chars of kopia stdout>
+restore[<vm>]: <n> disk(s) to restore: …
+restore[<vm>]: kopia mount <id> → dd <target_lv>
+restore[<vm>] done: <n> disk(s) in <f>s
 ```
 
 ## Failure modes and recovery

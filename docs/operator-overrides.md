@@ -63,12 +63,17 @@ step 2) will refuse for every surviving peer until the cluster
 stops treating the dead node as a member.
 
 **Why this is the primary path.** The cluster's slot-read logic
-ignores any witness slot for a node not in the local `rqlite `nodes` table`
-(and the rqlite `nodes` table). So removing the dead node from
-cluster membership — the routine `node leave` saga — *also*
-removes the LMS-veto effect without ever writing to the witness.
-The witness still stores the encrypted slot until 72 h retention
-drops it; the cluster just stops looking at it.
+ignores any witness slot for a node not in the rqlite `nodes` table.
+`witness.drain_replies` filters every reply against `ws.member_ids`
+(refreshed each netd tick from rqlite via
+`cluster_state.load_cluster()`), so a slot whose `node_id` is no
+longer a member is dropped before it can count. Removing the dead
+node from cluster membership — the routine `node leave` saga —
+therefore *also* removes the LMS-veto effect without ever writing to
+the witness. The witness is a passive last-write slot store with no
+expiry, so the dead node's encrypted slot persists there indefinitely
+(nothing overwrites it); the cluster just stops looking at it once the
+node_id leaves `ws.member_ids`.
 
 **Why no "clear LMS bit" override exists.** Writing `tag.lms = 0`
 on behalf of a dead node would mean impersonating that node at
@@ -88,8 +93,9 @@ the cluster.
   the cluster's last successful DRBD sync to it is lost. This
   is likely — LMS was set precisely because the surviving peer
   was already gone when this node went solo.
-- A surviving node has DRBD `tier-critical` in a usable state
-  (UpToDate, even if behind the lost LMS-holder's last writes).
+- A surviving node has the DRBD `cluster` singleton resource in a
+  usable state (UpToDate, even if behind the lost LMS-holder's last
+  writes).
 
 **CLI shape.** Uses the existing `bedrock node leave` saga but
 with the operator-accept-data-loss flag (currently used only for
@@ -114,20 +120,20 @@ bedrock node leave --target <node-name> \
    name.
 5. Write `operator_override` audit row to rqlite.
 6. Run the existing `node_leave` saga: `DELETE /remove` on rqlite
-   to drop the voter, remove the row from the `nodes` table,
-   propagate rqlite `nodes` table snapshot to surviving members.
-7. Surviving nodes' next election tick: target node-id is no
-   longer in rqlite `nodes` table → witness slot for that node-id is
-   ignored regardless of `tag.lms`. Takeover can proceed.
+   to drop the voter and remove the row from the `nodes` table.
+7. Surviving nodes' next netd tick: each node refreshes
+   `ws.member_ids` from rqlite, the target node-id is no longer a
+   member → its witness slot is dropped in `drain_replies`
+   regardless of `tag.lms`. Takeover can proceed.
 
-**Cluster.json membership filter dependency.** This override
-relies on the rqlite `nodes` table filter being implemented in
-`installer/lib/witness.py drain_replies`. **Filter is currently
-not implemented** — flagged as a follow-up code change. Until
-it's in place, even after `node leave` succeeds, surviving
-nodes' read_slot() will still return the dead node's entry and
-the takeover will refuse. The filter needs to be added before
-this override is effective.
+**Membership-filter dependency (satisfied).** This override relies
+on the rqlite `nodes` table filter in
+`installer/lib/witness.py:drain_replies`, which is implemented:
+`drain_replies` skips any slot whose `node_id` is not in
+`ws.member_ids`, and netd plumbs `member_ids` from rqlite each tick.
+Once `node leave` removes the node from the `nodes` table, surviving
+nodes stop counting its stale `lms=1` slot on the next tick and the
+takeover unblocks.
 
 ## Override: Re-key witness identity
 
@@ -136,7 +142,8 @@ this override is effective.
   data corruption) and the cluster needs a deterministic clean
   start rather than a worst-case-assumed limbo.
 - After a stuck-LMS decommission, the operator wants the witness
-  to actually forget the old slot rather than wait 72 h.
+  to actually drop the old slot rather than rely on the membership
+  filter ignoring it.
 - The `cluster.key` is suspected compromised.
 
 **What it does.** Generates a new `cluster_uuid` and/or

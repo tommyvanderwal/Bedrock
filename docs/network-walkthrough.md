@@ -146,7 +146,7 @@ same NIC keeps the same address across reboots.
 ### Why we need both layers
 
 When the dashboard says "connect to node B", we want it to write
-`https://100.104.109.2:8080` — that always works regardless of
+`https://100.104.109.2:8443` — that always works regardless of
 which cables are healthy. The Linux kernel handles the actual
 choice of cable, because:
 
@@ -160,20 +160,21 @@ choice of cable, because:
     next-best entry. Instantly. No application restart, no
     reconnect logic.
 
-The cluster log (which is a separate Raft-style replicated log
-that records "node B has joined", "node B's loopback IP is …")
-tells the daemon *who is a member*. It does **not** tell anyone
-which cable to use; that's decided fresh every second from
-in-memory state.
+Cluster membership (which records "node B has joined", "node B's
+loopback IP is …") lives in rqlite, the cluster's Raft-replicated
+SQLite store. It tells the daemon *who is a member*. It does **not**
+tell anyone which cable to use; that's decided fresh every second
+from in-memory state.
 
 ---
 
 ## 3. The three jobs
 
-`bedrock-net` is a small daemon that runs on every node. It does
-three things, each on its own channel, each independent of the
-other two. If any one of the three breaks, the cluster doesn't
-fall apart — the other two keep working.
+`bedrock-net` is the mesh layer — a thread inside the `bedrock-d`
+daemon that runs on every node. It does three things, each on its
+own channel, each independent of the other two. If any one of the
+three breaks, the cluster doesn't fall apart — the other two keep
+working.
 
 ```
    ┌─────────────────────┬────────────────────┬─────────────────────┐
@@ -224,7 +225,7 @@ is marked `logged_up` — *now* it counts as a real path. This
 delay is called **hysteresis** and exists because a flapping
 cable should not produce 30 events per minute.
 
-If the probes stop coming for **30 seconds**, the link is
+If the probes stop coming for **10 seconds**, the link is
 declared down.
 
 ### Job 2: Latency — "How fast?"
@@ -496,11 +497,11 @@ Now we can walk through what actually happens when a node powers
 on, in time order.
 
 ```
-   t = 0 s   ─┬─  bedrock-net.service starts
+   t = 0 s   ─┬─  bedrock-d starts the netd thread
               │
               │   ├─  Reads /etc/bedrock/cluster.key   (32-byte HMAC key)
               │   ├─  Reads /etc/bedrock/state.json   (cluster_uuid, node_name)
-              │   ├─  Reads /etc/bedrock/cluster.json (loopback_ip)
+              │   ├─  Reads loopback_ip from rqlite via cluster_state.load_cluster()
               │   ├─  Adds 100.X.Y.N/32 to lo  (identity)
               │   ├─  Opens UDP socket on port 7732   (discovery in/out)
               │   └─  Opens UDP socket on port 7733   (advertisement in/out)
@@ -530,9 +531,8 @@ on, in time order.
               │   continuously for 5 seconds.
               │
               │   `logged_up` becomes true.
-              │   On the mgmt master, a LINK_UP entry is appended to the
-              │   cluster log so the rest of the cluster knows this path
-              │   exists.
+              │   On the mgmt master, the LINK_UP observation is recorded
+              │   to rqlite so the dashboard can draw this path.
               │   `emit_routes` installs:
               │       • /32 link-local host route to the peer's per-cable IP
               │       • /32 route to the peer's loopback IP via that link,
@@ -638,7 +638,7 @@ direct) is already known via B's own advertisements.
 ### What happens when the A↔B cable is cut?
 
   * **t=0**: cable yanked.
-  * **t≤30 s**: A's daemon stops seeing discovery probes from B
+  * **t≤10 s**: A's daemon stops seeing discovery probes from B
     on that cable. Hysteresis countdown.
   * Meanwhile, A's *other* cables to B (if any) still work — the
     kernel route table for B has additional backup entries at
@@ -646,14 +646,14 @@ direct) is already known via B's own advertisements.
     auto-fails-over to the next-best. **Sub-second.** The
     application (libvirt, DRBD, dashboard) sees no error; the
     TCP connection keeps going.
-  * **t=30 s**: LINK_DOWN hysteresis fires for that specific
+  * **t=10 s**: LINK_DOWN hysteresis fires for that specific
     cable. The /32 route for that cable is removed. The route to
     B's loopback via that cable is also removed. Other cables to
     B keep their routes.
 
 If A and B had **only that one cable**, then:
 
-  * **t=30 s**: LINK_DOWN fires.
+  * **t=10 s**: LINK_DOWN fires.
   * The daemon checks if any transit path to B exists. It
     looks at `best_transit_paths[B]`. If C's last advertisement
     (≤6 s old) listed a path to B, it's still in there.
@@ -666,8 +666,8 @@ If A and B had **only that one cable**, then:
 Say B is power-cycled. From A's point of view:
 
   * t=0: B is gone.
-  * t≤30 s: probes stop on every cable. Same hysteresis as before.
-  * t=30 s: one LINK_DOWN event fires per cable to B (so four
+  * t≤10 s: probes stop on every cable. Same hysteresis as before.
+  * t=10 s: one LINK_DOWN event fires per cable to B (so four
     in our 4-cable example). The /32 routes to B's loopback all
     disappear.
   * Meanwhile, B's advertisements stop arriving. After 6 s the
@@ -691,9 +691,9 @@ happens?":
    │ Failure                 │ How detected  │ Recovery                 │
    ├─────────────────────────┼───────────────┼──────────────────────────┤
    │ One cable unplugged     │ LINK_DOWN     │ Kernel uses backup       │
-   │                         │ at 30 s OR    │ /32 route immediately;   │
+   │                         │ at 10 s OR    │ /32 route immediately;   │
    │                         │ ICMP timeouts │ daemon cleans up         │
-   │                         │ before that   │ metadata at 30 s.        │
+   │                         │ before that   │ metadata at 10 s.        │
    ├─────────────────────────┼───────────────┼──────────────────────────┤
    │ Cable cut silently      │ ICMP echoes   │ Same as above — once     │
    │ (link still "up" but    │ stop coming   │ ICMP loss is detectable, │
@@ -708,7 +708,7 @@ happens?":
    ├─────────────────────────┼───────────────┼──────────────────────────┤
    │ Node power-cycle        │ Probes stop   │ Witness arbitration      │
    │                         │ on every NIC; │ kicks in for cluster     │
-   │                         │ 30 s LINK_DOWN│ membership; mesh-side    │
+   │                         │ 10 s LINK_DOWN│ membership; mesh-side    │
    │                         │ ×N            │ withdraws all routes     │
    │                         │               │ to that node.            │
    ├─────────────────────────┼───────────────┼──────────────────────────┤
@@ -763,14 +763,13 @@ Real-world examples of why that matters:
 Three independent channels means three independent failure
 domains. No cascade.
 
-The same logic applies to the cluster log. The log knows which
-nodes are members; the mesh knows which cables work. The mesh
-does **not** read the log to decide routing, and the log does
-**not** depend on routing being optimal. If the log gets stuck
-(consensus dies — say, two-of-four nodes are offline) the mesh
-keeps routing around the survivors. If the mesh gets confused,
-the log keeps recording membership. Each layer can survive the
-other being broken.
+The same logic applies to the membership store. rqlite knows which
+nodes are members; the mesh knows which cables work. The mesh does
+**not** read rqlite to decide routing, and rqlite does **not** depend
+on routing being optimal. If consensus stalls (say, two-of-four nodes
+are offline) the mesh keeps routing around the survivors. If the mesh
+gets confused, rqlite keeps recording membership. Each layer can
+survive the other being broken.
 
 ---
 
@@ -853,10 +852,9 @@ on the mgmt node so a post-mortem inspection without the mgmt
 service running is still possible. The live data is reachable
 via `GET /api/topology`.
 
-**It is never folded into `cluster.json`.** That file is reserved
-for materialised cluster-log state — things the cluster has
-reached consensus on (membership, master role, loopback
-assignment). Switch identity is per-node local reality; it
+**It is never written to rqlite.** The consensus store is reserved
+for state the cluster has agreed on (membership, master role,
+loopback assignment). Switch identity is per-node local reality; it
 doesn't need cluster consensus, so it stays out.
 
 From this rollup a question like
@@ -923,7 +921,7 @@ operators want.
               (per-node live view; mgmt master            (durable cluster-wide
               scrapes + rolls up in-memory                  history; queries via
               for the dashboard; never                       LogsQL — including for
-              folded into cluster.json)                      dead-node lookups)
+              written to rqlite)                             dead-node lookups)
 ```
 
 ## 10. What an operator actually sees
@@ -934,10 +932,11 @@ healthy.
 
 ### Health-at-a-glance: the status line
 
-`bedrock-net` prints a one-liner every 30 seconds:
+The netd thread prints a one-liner every 30 seconds (look under the
+`bedrock-d` unit; the lines carry a `bedrock-net:` tag):
 
 ```bash
-journalctl -u bedrock-net | grep status
+journalctl -u bedrock-d | grep status
 ```
 
 You should see something like:
@@ -963,7 +962,7 @@ Translation:
     exist as live failover candidates.)
 
 If `neighbours` drops or `advertisers` shrinks, something has
-broken. The cluster log + the dashboard health page will tell
+broken. rqlite membership + the dashboard health page will tell
 you what.
 
 ### The address layer
@@ -1064,17 +1063,18 @@ If after 30 seconds you still see `neighbours=0`:
 
 ```
    ┌───────────────────────────────────────────────────────────────────┐
-   │                       cluster.json                                │
+   │                       rqlite (per node)                           │
    │                                                                   │
    │  "who is a member, what is their loopback IP, what tier are       │
-   │   they in" — the cluster log, replicated via bedrock-rust         │
+   │   they in" — the `nodes` table, Raft-replicated SQLite,           │
+   │   read via cluster_state.load_cluster()                           │
    │                                                                   │
    │   (membership-of-record; NOT routing-of-record)                   │
    └─────────────────┬─────────────────────────────────────────────────┘
                      │  consulted at startup + on every join/leave
                      ▼
    ┌───────────────────────────────────────────────────────────────────┐
-   │                       bedrock-net daemon (per node)               │
+   │             bedrock-d netd thread (per node)                      │
    │                                                                   │
    │   ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────┐ │
    │   │ Job 1: Discovery │  │ Job 2: Latency   │  │ Job 3: Routes   │ │
@@ -1113,17 +1113,17 @@ If after 30 seconds you still see `neighbours=0`:
    ┌───────────────────────────────────────────────────────────────────┐
    │                       Linux kernel routing                        │
    │                                                                   │
-   │   DRBD, libvirt, NFS, SSH, dashboard, bedrock-rust …              │
+   │   DRBD, libvirt, NFS, SSH, dashboard, rqlite …                    │
    │   all of them just say "talk to 100.104.109.2" and the kernel     │
    │   picks the right cable, fails over for free, recovers in         │
    │   sub-second time. None of them know any of this exists.          │
    └───────────────────────────────────────────────────────────────────┘
 ```
 
-That's the whole picture. The cluster log decides *who is a
-member*; the mesh layer decides *how to reach them*; the kernel
-decides *which cable to use right now*; and the application
-layer doesn't know or care about any of it.
+That's the whole picture. rqlite decides *who is a member*; the
+mesh layer decides *how to reach them*; the kernel decides *which
+cable to use right now*; and the application layer doesn't know or
+care about any of it.
 
 ---
 
@@ -1136,5 +1136,5 @@ layer doesn't know or care about any of it.
 | Open issues, edge cases the design is aware of | `docs/mesh-network-v1-uncertainties.md` |
 | Past surprises and what was learned from them | `docs/lessons-log.md` |
 | How DRBD's multi-path config is built from these routes | `installer/lib/tier_storage.py::regen_drbd_configs_from_snapshot` |
-| The actual Python that runs this daemon | `installer/lib/netd.py` |
+| The actual Python that runs the mesh layer (bedrock-d's netd thread) | `installer/lib/netd.py` |
 | The cluster identity address derivation | `installer/lib/cluster_addr.py` |

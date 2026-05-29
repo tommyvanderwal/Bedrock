@@ -1,173 +1,185 @@
 # Start a new cluster (`bedrock init`)
 
-Turns a bootstrapped node into the first node of a new cluster. Downloads
-and starts the full mgmt stack (FastAPI + Svelte + VM + VL + exporters),
-generates a cluster UUID, writes `/etc/bedrock/cluster.json` with this
-node pre-registered, and prints the dashboard URL.
+Turns a bootstrapped node into the founding node of a new cluster at N=1.
+This is the saga that *brings up* the cluster's control plane: it allocates
+the cluster identity, provisions local (N=1) storage, starts the single
+unified daemon `bedrock-d`, brings up rqlite (the Raft-replicated SQLite
+that holds all cluster state), seeds the schema, starts SeaweedFS, and
+prints the dashboard URL.
 
 **Triggered by:** operator on a bootstrapped node:
 
 ```bash
-bedrock init [--name CLUSTER_NAME] [--witness HOST]
+bedrock init [--name CLUSTER_NAME]
 ```
 
-**Source:** `installer/bedrock:cmd_init`, `installer/lib/mgmt_install.py`,
-`installer/lib/exporters.py`.
+The CLI (`installer/bedrock`) is a thin client: `cmd_init` calls
+`mgmt_install.install_full()`, which delegates straight to
+`run_cluster_init()` (there is no HTTP submission — this saga is what
+brings rqlite up). Witnesses are NOT configured here; they are added
+later via the dashboard / API by writing a row into the rqlite `witnesses`
+table.
+
+**Source:** `installer/bedrock:cmd_init`,
+`installer/lib/mgmt_install.py:install_full` (delegates to the saga),
+`bedrock_d/install/cluster_init.py` (the `ClusterInit` saga — see
+[`docs/sagas/cluster_init.md`](../sagas/cluster_init.md)).
 
 ## Preconditions
 
 - `bedrock bootstrap` ran successfully (`/etc/bedrock/state.json` has
   `bootstrap_done: true`).
-- This node is **not** already a member of a cluster (`cluster_uuid` not
-  set in state).
+- This node is **not** already a member of a cluster. The saga backend
+  (`/var/lib/bedrock/init-progress.json`) is the source of truth for
+  "is init done?"; a completed `cluster_init` op short-circuits, while a
+  failed/in-flight one resumes from the first incomplete step.
 - Repo (the one in `/etc/bedrock/installer.env`) is still reachable — init
-  fetches binaries and the mgmt tarball.
+  fetches binaries and the dashboard build.
 
 ## Sequence
 
+`run_cluster_init()` runs an ordered list of idempotent `@step`s via the
+saga executor. The backend is the **file-based** `FileSagaBackend` (rqlite
+isn't up yet — steps 1–11 run before `start_rqlited`), switching to the
+rqlite-backed executor afterwards. Top-to-bottom:
+
 ```
   T=0    bedrock init --name <cluster_name>
+         │  cmd_init guards → run_cluster_init(cluster_name, repo)
          │
-         │ (state.load, guards)
+   1. prepare_dirs              /etc/bedrock, /var/lib/bedrock, /opt/bedrock
+   2. allocate_identity         cluster_uuid (uuid4), node_name, loopback_ip
+                                100.<X>.<Y>.1/32 (master = octet 1; prefix
+                                derived from sha256(cluster_uuid), RFC 6598),
+                                + 32-byte cluster_key (AEAD witness slots +
+                                peer-auth gate). All persisted to state.json.
+   3. write_cluster_key         atomic-write /etc/bedrock/cluster.key (0600)
+   4. write_bootstrap_cluster_json
+                                minimal /etc/bedrock/cluster.json so netd
+                                can start; OVERWRITTEN by the rqlite
+                                projection after seed_cluster_state
+   5. install_obs_binaries      curl <repo>/binaries/{victoria-metrics,
+                                victoria-logs} → /opt/bedrock/bin
+                                (the VM/VL backends); skips present files
+   6. install_exporters         exporters.install(): node_exporter +
+                                vm_exporter, plus the OBS_BINS agents
+                                (vmagent, vlagent, vmbackup, vmrestore, …)
+   7. write_obs_services        write bedrock-vm + bedrock-vl units +
+                                scrape.yml + stage the dashboard build
+   8. start_obs_services        enable --now bedrock-vm + bedrock-vl
+                                (the VictoriaMetrics/VictoriaLogs backends;
+                                 the exporters were already enabled in
+                                 step 6 by exporters.install())
+   9. provision_storage_n1      tier_storage.setup_n1(): thinpool + tier LVs
+                                + XFS + mounts. At N=1 the `cluster`
+                                singleton resource lives on a local thin LV;
+                                it flips to DRBD when the cluster grows.
+  10. bootstrap_cluster_ca      cluster CA + node cert for rqlite mTLS
+  11. render_rqlited_env        /etc/bedrock/rqlited.env (node_id = loopback
+                                last octet, stable across reboots/joins)
+  12. start_rqlited             enable --now bedrock-rqlited (single-node
+                                Raft); polls until it reports Leader (itself)
+  13. apply_schema              bedrock_schema.sql (CREATE TABLE IF NOT EXISTS)
+  14. seed_cluster_state        INSERT cluster_info, this node into `nodes`,
+                                set mgmt_master=self, seed default operator
+  15. mirror_tier_state         push local tier_state rows into rqlite `tiers`
+  16. start_bedrock_d           enable --now bedrock-d — the unified daemon:
+                                netd thread (mesh/election/witness/.254) +
+                                asyncio orchestrator + mgmt API (8443 HTTPS,
+                                8001 loopback). rqlite_subscriber starts here.
+  17-22. seaweedfs_*            install/configs/start master+volume+s3, start
+                                filer on .254, init collections + buckets,
+                                seed the bundled Alpine image into /mnt/bedrock/iso
          │
-  T+0.1  mgmt_install.install_full(cluster_name, witness=None, repo)
-         │
-         │  1. mkdir /opt/bedrock/{bin,data/vm,data/vl,mgmt}
-         │
-         │  2. IF /opt/bedrock/bin/victoria-metrics absent:
-         │       curl <repo>/binaries/victoria-metrics  → bin/
-         │       chmod 755
-         │     (same for victoria-logs)
-         │
-         │  3. curl <repo>/mgmt.tar.gz → /tmp, extract into /opt/bedrock/mgmt
-         │     pip3 install -q fastapi uvicorn paramiko websockets pydantic
-         │
-         │  4. write /opt/bedrock/scrape.yml  (this node only, by IP)
-         │
-         │  5. exporters.install(repo)  ──────────────────┐
-         │       curl <repo>/binaries/node_exporter       │
-         │       curl <repo>/binaries/vm_exporter.py      │
-         │       write /etc/systemd/system/{node,vm}-exporter.service
-         │       systemctl daemon-reload                  │
-         │       systemctl enable --now node-exporter vm-exporter
-         │                                                 │
-         │  6. write /etc/systemd/system/bedrock-{mgmt,vm,vl}.service
-         │     systemctl enable --now bedrock-vm bedrock-vl bedrock-mgmt
-         │
-         │  7. update state.json:                           │
-         │       cluster_name, cluster_uuid (random uuid4), │
-         │       role=mgmt+compute, node_id=0, mgmt_ip,     │
-         │       mgmt_url=http://<ip>:8080, witness_host=self│
-         │       loopback_ip=100.<X>.<Y>.1                  │
-         │       (derived from sha256(cluster_uuid) per     │
-         │        cluster_addr.node_loopback_ip;            │
-         │        RFC 6598 Shared Address Space)            │
-         │                                                   │
-         │  8. write /etc/bedrock/cluster.json:              │
-         │     { cluster_name, cluster_uuid,                 │
-         │       nodes: { <hostname>: { host, drbd_ip,       │
-         │                              loopback_ip, ...}}}  │
-         │                                                   │
-         │  8a. systemctl enable --now bedrock-net.service   │
-         │      (mesh discovery + per-NIC link-local via NM, │
-         │      per-peer kernel routes, panic-neighbour      │
-         │      catch-all; see docs/06-mesh-network.md)      │
-         │                                                   │
-  T+~30s print "Dashboard: http://<ip>:8080"
-         │
-  T+~32s (bedrock-mgmt service starts)
-         │    on_event('startup'):
-         │      _main_loop = asyncio.get_running_loop()
-         │      _last_state seeded from cluster.json
-         │      state_push_loop scheduled (3s interval)
-         │      write_scrape_config(load_cluster())  →  /-/reload
-         │
-  T+~35s first state push loop tick:
-         │    - SSH to localhost (self) via key-auth
-         │    - virsh list --all/--running  →  "no VMs"
-         │    - drbdadm status  →  "no resources defined!"  (expected)
-         │    - loadavg, meminfo, uptime
-         │    - broadcast("cluster", {...})  → no subscribers yet
-         │    - _last_state ← this snapshot
+  T+~30s print "Dashboard: https://<ip>:8443"
 ```
+
+(The orchestrator's `rqlite_subscriber` then polls `bedrock_meta.revision`
+and projects state to disk on each advance. There is no separate
+`bedrock-mgmt` service — the dashboard + mgmt API live inside `bedrock-d`.
+VictoriaMetrics and VictoriaLogs DO run as their own units —
+`bedrock-vm.service` (:8428) and `bedrock-vl.service` (:9428/:5140),
+written by `write_obs_services` and started by `start_obs_services` — and
+the exporters are `node-exporter.service` / `vm-exporter.service`.)
 
 ## Log lines emitted
 
-**stdout during init:**
+**stdout during init** (one line per step plus the final summary):
 
 ```
 === Bedrock Init (new cluster) ===
 
 Creating cluster: <name>
-  Fetching victoria-metrics...
-  Fetching victoria-logs...
-  Installing dashboard application...
-  Fetching node_exporter...
-  Fetching vm_exporter...
-  Starting services...
-  Cluster UUID: <uuid>
-  Mgmt URL:     http://<ip>:8080
+  ... (per-step progress)
+  Setting up storage tiers (N=1: local LV thin)...
 
 Cluster <name> initialised.
-Dashboard: http://<ip>:8080
+Dashboard: https://<ip>:8443
 ```
 
 **Systemd journals (`journalctl -u <service>`):**
 
-- `bedrock-vm`: `reading scrape configs from "/opt/bedrock/scrape.yml"`
-- `bedrock-vl`: `started VictoriaLogs at :9428`
-- `bedrock-mgmt`: uvicorn startup + `INFO: Application startup complete.`
+- `bedrock-rqlited`: Raft bootstrap + "Leader" once consensus is reached
+- `bedrock-d`: orchestrator startup + `rqlite_subscriber: starting`
 - `node-exporter`, `vm-exporter`: listening on 9100 / 9177
 
-**VictoriaLogs:** no entries yet — `push_log` has nothing to say during init.
-First entry arrives when the first node joins (see
-[`join-cluster.md`](join-cluster.md)) or a VM action fires.
+**VictoriaLogs:** no entries yet — nothing pushes during init. First entry
+arrives when the first node joins (see [`join-cluster.md`](join-cluster.md))
+or a VM action fires.
 
 ## Why this order
 
-1. **Binaries before systemd units**: the units `ExecStart=` the binary
-   paths; missing binary = unit fails on first start.
-2. **scrape.yml before `bedrock-vm` unit**: VM reads the config on startup
-   (there is no "wait and retry" loop in VM for missing config; it would
-   start with an empty scrape set and you'd miss early samples).
-3. **exporters before the first state push**: the push loop asks VM for
-   "up" presence of each node; a scrape slot with no exporter = `up=0`,
-   which the dashboard renders as "offline".
-4. **cluster.json last**: it gates `load_cluster()` — anything that runs
-   before that falls back to the hardcoded `FALLBACK_NODES` (the physical
-   lab IPs), which would confuse the dashboard for a few seconds.
+1. **Identity before everything**: `allocate_identity` fixes the
+   cluster_uuid, loopback /32, and cluster_key that every later step (and
+   every peer) depends on. Persisted to state.json so resumes read them back.
+2. **Binaries before systemd units**: the units `ExecStart=` the binary
+   paths; a missing binary = unit fails on first start.
+3. **Storage + CA before rqlite**: rqlited needs its node cert (mTLS on
+   4001) and its data directory; `provision_storage_n1` + `bootstrap_cluster_ca`
+   run first.
+4. **rqlite before schema/seed**: `start_rqlited` must report Leader before
+   `apply_schema` / `seed_cluster_state` can write. The saga polls Raft
+   state, not just HTTP-up.
+5. **bedrock-d after the seed**: the daemon's `rqlite_subscriber` expects a
+   schema'd, seeded store; starting it earlier would just spin on an empty DB.
 
 ## Failure modes
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `Already a member of cluster <x>` | state.json has `cluster_uuid` from a previous run | `rm /etc/bedrock/state.json /etc/bedrock/cluster.json` and re-init (only safe if no VMs exist yet). |
+| `Cluster <x> already initialised (saga completed)` | `init-progress.json` has a completed `cluster_init` op | Intended guard. To truly start over, run `bedrock node reset` (tears down DRBD/LVs, wipes `/etc/bedrock`) — only safe if no VMs exist. |
 | `curl <repo>/binaries/victoria-metrics` 404 | Repo missing artefacts | `ls installer/binaries/` on repo host; rebuild if empty. |
-| `systemctl enable --now bedrock-mgmt` fails | FastAPI deps missing (pip in air-gap) | Install manually: `pip3 install fastapi uvicorn paramiko websockets pydantic`, then `systemctl restart bedrock-mgmt`. |
-| Dashboard 200s but `/api/cluster` returns `{"nodes": {}}` | `_last_state` still empty because SSH to self failed | Check `/root/.ssh/authorized_keys` contains `/root/.ssh/id_ed25519.pub` for self-auth (the testbed setup script adds this; bare-metal `init` should add it too — see [`components/mgmt-dashboard.md`](../components/mgmt-dashboard.md)). |
+| `rqlited didn't reach Leader within 30s` | rqlited can't bootstrap (cert/env/port) | `journalctl -u bedrock-rqlited`; check `/etc/bedrock/rqlited.env` + node cert under `/etc/bedrock`. |
+| `bedrock-d` won't start | mgmt deps missing (pip in air-gap) | Install manually: `pip3 install fastapi uvicorn paramiko websockets pydantic`, then `systemctl restart bedrock-d`. |
+| Dashboard 200s but `/api/cluster` returns `{"nodes": {}}` | rqlite seed didn't land, or subscriber hasn't projected yet | Wait a revision tick; check `journalctl -u bedrock-d | grep rqlite_subscriber` and `bedrock status` (which dials `127.0.0.1:8001`). |
 
 ## Post-init state
 
 ```
   Node state:
-    /etc/bedrock/state.json   cluster_uuid, role=mgmt+compute, node_id=0
-    /etc/bedrock/cluster.json { nodes: { this-node: {...} } }
+    /etc/bedrock/state.json   cluster_uuid, role, node identity, mgmt_url
+    rqlite (bedrock_meta + cluster_info + nodes + tiers + …)
+      — authoritative cluster state, read via cluster_state.load_cluster()
 
   Services running:
-    bedrock-vm    VictoriaMetrics   :8428
-    bedrock-vl    VictoriaLogs      :9428, syslog :5140
-    bedrock-mgmt  FastAPI+Svelte    :8080
-    node-exporter                   :9100
-    vm-exporter                     :9177
-    libvirtd                        (local socket)
-    cockpit.socket                  :9090
+    bedrock-rqlited   per-node Raft store   :4001 (HTTPS mTLS) / :4002 (Raft)
+    bedrock-d         unified daemon        :8443 (HTTPS dashboard+API),
+                                            :8001 (loopback CLI/API)
+    bedrock-vm        VictoriaMetrics       :8428
+    bedrock-vl        VictoriaLogs          :9428 / :5140 (syslog)
+    bedrock-weed-*    SeaweedFS master/volume/filer/s3
+    node-exporter                           :9100
+    vm-exporter                             :9177
+    libvirtd                                (local socket)
 
   Dashboard URL:
-    http://<node-ip>:8080
+    https://<node-ip>:8443
     → sidebar shows 1 host, 0 VMs
 ```
 
 ## What's next
 
 - Create a cattle VM (`bedrock vm create foo --type cattle`) — works on 1 node.
-- Or add a second node with [`join-cluster.md`](join-cluster.md) to unlock pet.
+- Or add a second node with [`join-cluster.md`](join-cluster.md) to unlock pet
+  (the master's `cluster_tier_promote_master` flips the `cluster` singleton to
+  DRBD at N=2).

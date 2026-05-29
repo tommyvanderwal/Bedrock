@@ -203,12 +203,13 @@ docs as they're substantively changed:
 - `installer/lib/os_setup.py` — base OS configuration (SELinux,
   firewall, br0)
 - `installer/lib/exporters.py` — Prometheus/VictoriaMetrics exporters
-- `installer/lib/vm.py` — VM lifecycle (cattle / pet / vipet)
-- `installer/lib/storage_install.py` — older RustFS-era storage
-  installer (likely to be deprecated; mark as such if so)
+- `installer/lib/tier_storage.py` — per-node thinpool + per-resource
+  DRBD/thin-meta layout, cluster-singleton peer capping
 - `installer/lib/discovery.py` — cluster discovery
-- `bedrock-failover.py` — HA failover orchestrator (high-priority for
-  reviewer attention)
+- `installer/lib/election.py` / `netd.py` / `witness.py` — the
+  failover stack inside `bedrock-d`'s netd thread (weighted vote,
+  mesh routing, BedRock Echo witness; high-priority for reviewer
+  attention)
 - `testbed/spawn.py` — testbed manager (libvirt provisioning)
 - `installer/bedrock` — main CLI (per-subcommand mini-spec is fine
   here)

@@ -7,10 +7,10 @@
 
 Peer-side counterpart to
 [`cluster_tier_promote_master`](cluster_tier_promote_master.md). Runs
-on a non-master node once the master has promoted the critical tier
-to DRBD. Allocates the peer's local LV pair, configures DRBD as a
-Secondary, and lets the initial sync carry the master's filer
-leveldb3 + arbiter rqlite data over.
+on a non-master node once the master has promoted the cluster-singleton
+tier (DRBD resource `cluster`) to DRBD. Allocates the peer's local LV
+pair, configures DRBD as a Secondary, and lets the initial sync carry
+the master's filer leveldb3 + arbiter rqlite data over.
 
 > Note: the [`node_join`](node_join.md) saga has an **inline**
 > step also called `cluster_tier_join_peer` that does the same work
@@ -36,15 +36,15 @@ leveldb3 + arbiter rqlite data over.
 
 | key | filled by | meaning |
 |-----|-----------|---------|
-| `_peers` | `wait_master_drbd` | The `tiers.critical.peers` list as recorded by the master |
-| `_master` | `wait_master_drbd` | Current `mgmt_master` from cluster.json |
+| `_peers` | `wait_master_drbd` | The `tiers.cluster.peers` list as recorded by the master |
+| `_master` | `wait_master_drbd` | Current `mgmt_master` from the rqlite snapshot |
 
 ## Step overview
 
 | # | Step | What it does |
 |---|------|--------------|
-| 1 | [`wait_master_drbd`](#wait_master_drbd) | Poll cluster.json for `tiers.critical.mode == "drbd"` (master finished its promote) |
-| 2 | [`join_as_secondary`](#join_as_secondary) | Allocate LV pair, write .res, `drbdadm up` as Secondary, await initial sync |
+| 1 | [`wait_master_drbd`](#wait_master_drbd) | Poll rqlite for `tiers.cluster.mode == "drbd"` (master finished its promote) |
+| 2 | [`join_as_secondary`](#join_as_secondary) | Cap to the singleton replica set, allocate LV pair, write .res, `drbdadm up` as Secondary, await initial sync |
 
 ## Revert
 
@@ -53,13 +53,13 @@ cluster ([`node_leave`](node_leave.md) on the master). To
 manually drop the peer's DRBD attachment without leaving the
 cluster, the operator can:
 
-1. `drbdadm down tier-critical`
-2. `drbdadm wipe-md tier-critical`
-3. `lvremove bedrock/bedrock-data-tier-critical bedrock/bedrock-meta-tier-critical`
+1. `drbdadm down cluster`
+2. `drbdadm wipe-md cluster`
+3. `lvremove bedrock/bedrock-data-cluster bedrock/bedrock-meta-cluster`
 
 The master then sees the peer as `Connecting` indefinitely in its
-DRBD status — the cluster keeps running but tier-critical
-redundancy drops to 1.
+DRBD status — the cluster keeps running but cluster-singleton
+redundancy drops by one.
 
 ## Idempotency / resume
 
@@ -77,8 +77,9 @@ incremental, not from-scratch.
 
 ### `wait_master_drbd`
 
-Polls cluster.json every 2 s for `tiers.critical.mode == "drbd"`.
-Times out after `wait_timeout_s` seconds (default 120).
+Polls the rqlite snapshot (via `cluster_state.load_cluster()`) every
+2 s for `tiers.cluster.mode == "drbd"`. Times out after
+`wait_timeout_s` seconds (default 120).
 
 Carries forward into ctx:
 - `_peers`: the peer list the master wrote — used to rebuild the
@@ -93,21 +94,25 @@ for the promote saga's error.
 
 ### `join_as_secondary`
 
-Reads cluster.json's `tiers.critical.peers`, builds a full peer
-list (master + every recorded peer + self), and calls
-`tier_storage.transition_to_n2_peer()`. That helper:
+Reads the rqlite snapshot's `tiers.cluster.peers`, builds a full peer
+list (every recorded peer + self), then caps it to the singleton
+replica set via `tier_storage.cap_singleton_peers()` — the
+cluster-singleton DRBD is at most `min(3, N)`-way (lowest-octet
+nodes). A 4th+ node not in the capped set logs a skip and returns
+(it hosts per-VM DRBD + the weed-volume LV, but not the singleton).
+Otherwise it calls `tier_storage.transition_to_n2_peer(self_loopback_ip,
+master, peers)`, which:
 
-1. Unmounts `/var/lib/bedrock/local/critical` (if mounted) and
-   drops the fstab line — the local LV stops being the primary
-   source of truth on this node.
-2. Calls `join_drbd_peer("critical", peers)` which:
-   a. Ensures `bedrock-data-tier-critical` and
-      `bedrock-meta-tier-critical` LVs exist on this peer (creates
-      if not — same size as master)
-   b. Writes the same `/etc/drbd.d/tier-critical.res` as the master
+1. Unmounts the node's local cluster-singleton dir (if mounted) and
+   drops the fstab line — the local copy stops being the source of
+   truth on this node.
+2. Calls `join_drbd_peer("cluster", peers)` which:
+   a. Ensures `bedrock-data-cluster` and `bedrock-meta-cluster` LVs
+      exist on this peer (creates if not — same size as master)
+   b. Writes the same `/etc/drbd.d/cluster.res` as the master
       (mesh blocks for every peer pair)
    c. `drbdadm create-md` if not already configured
-   d. `drbdadm up tier-critical` — becomes Secondary
+   d. `drbdadm up cluster` — becomes Secondary
 3. DRBD's initial sync runs in the background, carrying the
    master's data onto this peer. Status visible via
-   `drbdadm status tier-critical` on either side.
+   `drbdadm status cluster` on either side.

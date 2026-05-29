@@ -12,6 +12,11 @@ BEDROCK_REPO=http://<repo-host>:8000 \
   curl -sSL http://<repo-host>:8000/install.sh | bash
 ```
 
+The download payload now includes the full lib tree, the `bedrock-d`
+unified daemon, the `mgmt/` package, and the rqlite/SeaweedFS/kopia
+binaries — bootstrap stages them all so `init`/`join` need no further
+fetches beyond the obs binaries.
+
 **Source files:** `installer/install.sh`, `installer/bedrock` (subcommand
 `bootstrap`), `installer/lib/{hardware,os_setup,packages}.py`.
 
@@ -31,9 +36,13 @@ BEDROCK_REPO=http://<repo-host>:8000 \
        │ 2. dnf install -y python3 python3-pip curl                  │
        │ 3. mkdir /usr/local/lib/bedrock/lib                         │
        │ 4. curl → /usr/local/bin/bedrock  (Python CLI)              │
-       │ 5. curl → /usr/local/lib/bedrock/lib/{hardware,os_setup,    │
-       │       packages,exporters,mgmt_install,agent_install,vm,     │
-       │       workload,discovery,state,__init__}.py                 │
+       │ 5. curl → /usr/local/lib/bedrock/lib/*.py  (the LIB_FILES   │
+       │       list in install.sh: hardware, os_setup, packages,     │
+       │       exporters, discovery, state, mgmt_install,            │
+       │       agent_install, tier_storage, daemon_setup,            │
+       │       bedrock_state, view_builder, cluster_state, netd,     │
+       │       rqlite_*, seaweedfs, peer_auth, operator_auth, …)     │
+       │       + the bedrock-d daemon + mgmt/ tree                   │
        │ 6. write /etc/bedrock/installer.env  (BEDROCK_REPO=...)     │
        │ 7. exec /usr/local/bin/bedrock bootstrap                    │
        └─────────────────────────────────────────────────────────────┘
@@ -119,8 +128,8 @@ dnf and nmcli logs go to the systemd journal: `journalctl -u dnf-automatic`,
 The node has everything installed, but no cluster yet:
 
 - `/etc/bedrock/state.json` contains `bootstrap_done: true`, `hardware: {...}`.
-- `/etc/bedrock/cluster.json` does **not** exist yet.
-- No DRBD resources, no VMs, no running mgmt services.
+- No cluster identity yet (no `cluster_uuid`); rqlite is not running.
+- No DRBD resources, no VMs, no `bedrock-d` / `bedrock-rqlited` services.
 
 Next: [`init-cluster.md`](init-cluster.md) (first node) or
 [`join-cluster.md`](join-cluster.md) (every other node).

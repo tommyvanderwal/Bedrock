@@ -1,25 +1,35 @@
 # HTTP and WebSocket API
 
-The mgmt process (`bedrock-mgmt.service`, port 8080) exposes both a REST
-API for actions and a single WebSocket for real-time state.
+The mgmt API runs inside `bedrock-d` on every node. It exposes a REST API for
+actions and a single WebSocket for real-time state, on two listeners:
+
+- **`0.0.0.0:8443` (HTTPS)** — the operator dashboard + LAN-reachable API.
+  Operator-authenticated (see [Authentication](#authentication)).
+- **`127.0.0.1:8001` (HTTP)** — the local CLI / intra-process endpoint that
+  the `bedrock` CLI dials. Auth-exempt (loopback is trusted local root).
 
 ## Discovery / state
 
 | Method | Path | Returns | Notes |
 |---|---|---|---|
-| GET | `/cluster-info` | `{cluster_name, cluster_uuid, nodes: [names], mgmt_url, witness_host}` | Used by `bedrock join` to learn cluster identity |
+| GET | `/cluster-info` | `{cluster_name, cluster_uuid, nodes: [names], mgmt_url, witness_host}` | Used by `bedrock join` to learn cluster identity. `nodes`/`cluster_name`/`cluster_uuid` come from `load_cluster()` (rqlite); `mgmt_url`/`witness_host` from local `state.json`. |
 | GET | `/api/cluster` | full state: `{nodes, vms, witness}` | Served from **cached `_last_state`** — instant, updated every 3 s |
-| GET | `/api/nodes` | `cluster.json` nodes object | |
+| GET | `/api/nodes` | the cluster `nodes` object | Sourced from rqlite via `load_cluster()` — same dict shape as the old `cluster.json` projection. |
 
-## Node registration
+## Node join
 
-| Method | Path | Body | Returns |
-|---|---|---|---|
-| POST | `/api/nodes/register` | `{name, host, drbd_ip?, role?}` | `{status, cluster, nodes: [...], peer_ips: [...]}` |
+The old `/api/nodes/register` REST endpoint is gone; joining a node now runs
+through the signed **join-handshake** flow (`bedrock join` → mgmt master).
+On approval the handshake records the new node's identity into rqlite
+(`node_register` + `node_loopback`) and ships `cluster.key`; topology is never
+written to a local file.
 
-Side effects: appends to `/etc/bedrock/cluster.json`, regenerates
-`/opt/bedrock/scrape.yml`, POSTs `/-/reload` to VictoriaMetrics,
-pushes `Node X (...) registered with cluster` log event.
+| Method | Path | Body | Returns | Auth |
+|---|---|---|---|---|
+| POST | `/api/join/request` | `{node_name, host, bedrock_pubkey, x25519_eph_pubkey, ssh_pubkey}` | `{request_id, fingerprint}` | unauth (joiner has no identity yet) |
+| GET | `/api/join/status?id=...` | — | approval status for a request | unauth |
+| GET | `/api/join/pending` | — | list of pending join requests | operator |
+| POST | `/api/join/approve` | `{request_id}` | `{status}` | operator |
 
 ## ISO library
 
@@ -176,8 +186,17 @@ REST endpoints return:
 WebSocket frames never "error" — the server closes the connection
 with a close code on fatal faults; the client auto-reconnects after 2 s.
 
+## Authentication
+
+The LAN listener (`0.0.0.0:8443`) is **operator-authenticated**. Auth is
+Ed25519-based (see `installer/lib/operator_auth.py`); `_auth_middleware` /
+`require_operator` in `mgmt/app.py` enforce it on every non-public route.
+
+The loopback listener (`127.0.0.1:8001`) is **auth-exempt** — local root is
+already privileged, and the `bedrock` CLI dials it directly. A handful of
+routes are public on both listeners (`/`, `/login`, `/api/login`,
+`/cluster-info`, `/health`, `/api/join/request`, `/api/join/status`).
+
 ## Content types
 
-All JSON bodies: `application/json`. No authentication today — the
-dashboard assumes the mgmt network is trusted. Adding auth is a
-hardening follow-up.
+All JSON bodies: `application/json`.

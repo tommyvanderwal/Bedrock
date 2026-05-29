@@ -1,7 +1,7 @@
 # Bedrock — Project Reference
 
 ## What it is
-Local infrastructure HA platform. One single, 2 in HA or more in HA x86 nodes running KVM/QEMU on AlmaLinux 9, with per-VM DRBD block device replication, live migration via temporary dual-primary, and a simple witness-based failover orchestrator. No corosync, no PVE, no cluster frameworks. Just assembled LEGO from mature Linux components.
+Local infrastructure HA platform. One single, 2 in HA or more in HA x86 nodes running KVM/QEMU on AlmaLinux 10, with per-VM DRBD block device replication, live migration via temporary dual-primary, and a simple witness-based failover orchestrator. No corosync, no PVE, no cluster frameworks. Just assembled LEGO from mature Linux components.
 
 ## Target market
 MSPs shipping a single or HA infrastructure to small/medium businesses. VMware refugees with two-server setups. The 90% that don't need Nutanix-scale but need better than Proxmox-on-two-nodes.
@@ -95,18 +95,22 @@ Growth path from 1 single box into 2 with HA is crucial for the 1.0 release vers
 - **No "blessing", no claim acceptance, no holddown.** The witness
   has zero logic — it stores last-write per slot and returns all
   slots on every reply. All decisions are local to each node.
-- **Weighted-vote election** (`10 × N_nodes + 1 if witness alive`)
-  decides Leader / Follower / NoQuorum on every node's 1 Hz tick.
+- **Weighted-vote election** (`100 × N_active_nodes + 1 per valid
+  witness`) decides Leader / Follower / NoQuorum on every node's
+  1 Hz tick. A witness only adds its vote when it is reachable AND
+  its reply reflects our own last write (valid + confirmed).
 - **Arbiter takeover protocol:** before becoming the new
   `.254`-host, the candidate node inspects the previous master's
-  slot, verifies its local `drbdadm current-uuid tier-critical`
-  exactly matches the slot's `marker` field, flips its own slot's
-  `lms` bit, reads back from the next witness reply, then
+  slot, verifies its local `drbdadm current-uuid` for the `cluster`
+  singleton exactly matches the slot's `marker` field, flips its
+  own slot's `lms` bit, reads back from the next witness reply, then
   promotes. Refuses to promote on UUID mismatch.
 - **Self-demote on NoQuorum:** the current `.254`-host stops
-  services and releases the VIP after 5 consecutive NoQuorum
-  ticks (≈ 5 s), BEFORE any cluster-visible state change. So
-  there's never a window where two nodes both hold `.254`.
+  services and releases the VIP after `SELF_DEMOTE_MISSES = 9`
+  consecutive NoQuorum ticks (≈ 9 s) — one second before a survivor
+  promotes at `MASTER_LOSS_MISSES = 10` (≈ 10 s), so the VIP and
+  arbiter rqlite are released before any survivor takes them. There's
+  never a window where two nodes both hold `.254`.
 - **No automatic failback.** Failed node returns as secondary,
   re-syncs DRBD, and waits for the calm orchestrator's
   reconciliation pass.

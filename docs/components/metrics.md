@@ -1,23 +1,31 @@
 # Metrics + Logs (VictoriaMetrics + VictoriaLogs)
 
-The mgmt node runs two Victoria* processes. Together they handle the
-entire metric + log pipeline — no Prometheus, no Loki, no Grafana
-needed. Both persist to `/opt/bedrock/data/` and survive restarts.
+Bedrock ships its own metric + log pipeline — no Prometheus, no Loki, no
+Grafana needed. The stack is HA: **every node runs lightweight agents**
+(`bedrock-vmagent` + `bedrock-vlagent`) that scrape locally and forward,
+while **two designated backend nodes** run the full storage engines
+(`bedrock-vm` / VictoriaMetrics and `bedrock-vl` / VictoriaLogs). The
+observability reconciler (`installer/lib/observability.py`) decides which
+nodes hold the backend slots from the `obs_backends` rqlite state and
+starts/stops the units accordingly. Backends persist to
+`/opt/bedrock/data/` and survive restarts.
 
 ## VictoriaMetrics (VM) — port 8428
 
-Runs as `bedrock-vm.service`:
+Runs as `bedrock-vm.service` on the metrics backend node(s), unit written
+by the reconciler:
 
 ```
 ExecStart=/opt/bedrock/bin/victoria-metrics
   -storageDataPath=/opt/bedrock/data/vm
-  -promscrape.config=/opt/bedrock/scrape.yml
   -retentionPeriod=90d
   -httpListenAddr=:8428
 ```
 
-Scrapes two exporter jobs across every node registered in
-`cluster.json`:
+VM no longer scrapes directly — `bedrock-vmagent` (on every node) owns the
+scrape loop and remote-writes into VM. The agent reads
+`/opt/bedrock/scrape.yml`, which targets two exporter jobs across every
+node in the cluster (topology from rqlite, not a flat file):
 
 ```yaml
 scrape_configs:
@@ -42,47 +50,59 @@ scrape_configs:
 The scrape config is **regenerated automatically** by
 `mgmt/app.py:write_scrape_config()` whenever:
 
-1. A node registers (`/api/nodes/register`).
-2. The mgmt app starts up.
+1. Cluster state changes (`save_cluster()` calls it with the rqlite
+   snapshot).
+2. The mgmt app starts up (`startup()` calls it with `load_cluster()`).
 
-Regeneration writes the file, then POSTs `http://127.0.0.1:8428/-/reload`
-so VM picks up the new targets without restart.
+Regeneration writes `scrape.yml`, then `systemctl restart --no-block
+bedrock-vmagent.service` so the agent re-reads the targets.
 
-### Why the HTTP reload path (not SIGHUP)
+### Why restart vmagent (not SIGHUP, not VM `/-/reload`)
 
-Empirically, `pkill -HUP victoria-metrics` did not cause VM to re-read
-its scrape config in the installed version. The `/-/reload` endpoint
-does, and is documented as the supported mechanism. `write_scrape_config`
-uses that.
+The scrape config consumer is `bedrock-vmagent`, not VictoriaMetrics. On
+the shipped vmagent build SIGHUP terminates the process instead of
+reloading, so `write_scrape_config` restarts the unit. vmagent's
+persistent on-disk queue means a sub-second restart drops zero scrapes.
+The restart is fired non-blocking (`--no-block`) so a slow `systemctl`
+can't stall FastAPI startup; if the unit isn't present yet at early init,
+the reconciler starts vmagent later with the fresh `scrape.yml` already
+on disk.
 
 ### Queries the dashboard makes
+
+Dashboard wrappers live in `mgmt/routes_obs.py`:
 
 | Endpoint | PromQL pattern |
 |---|---|
 | `/api/v1/query?query=up` | `up` |
-| `/api/metrics/nodes` (dashboard wrapper) | rate of `node_cpu_seconds_total{mode!="idle"}`, `node_memory_*`, `node_network_*_bytes_total` |
-| `/api/metrics/vms` | `libvirt_domain_cpu_time`, `libvirt_domain_block_*`, `libvirt_domain_interface_*` |
-| `/api/metrics/drbd` | `drbd_resource_role`, `drbd_disk_state`, `drbd_sync_percent` |
+| `/api/metrics/nodes` | `node_cpu_seconds_total{mode="idle"}` (inverted), `node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes`, `node_network_{receive,transmit}_bytes_total{device="br0"}` |
+| `/api/metrics/vms` | `bedrock_vm_cpu_time_ns`, `bedrock_vm_disk_{read,write}_reqs`, `bedrock_vm_disk_write_time_ns` |
+| `/api/metrics/drbd` | `bedrock_drbd_sent_kb`, `bedrock_drbd_received_kb`, `bedrock_drbd_out_of_sync_kb` |
 
 ## VictoriaLogs (VL) — port 9428, syslog 5140
 
-Runs as `bedrock-vl.service`:
+Runs as `bedrock-vl.service` on the logs backend node(s), unit written by
+the reconciler:
 
 ```
 ExecStart=/opt/bedrock/bin/victoria-logs
   -storageDataPath=/opt/bedrock/data/vl
   -httpListenAddr=:9428
-  -syslog.listenAddr.tcp=:5140
+  -syslog.listenAddr.tcp=:5141
 ```
+
+(The backend listens on syslog `:5141`; the per-node `bedrock-vlagent`
+owns the `:5140` syslog ingest and dual-writes to both VL backends, so
+the two can coexist on a node that is both an agent and a backend.)
 
 Two ingress paths:
 
 1. **JSON lines from mgmt** (`push_log()` → HTTP POST
    `/insert/jsonline`). This is where every Bedrock application event
    goes — see [reference/logs.md](../reference/logs.md).
-2. **Syslog from cluster nodes** (TCP :5140, RFC 5424). Opt-in today;
-   future auto-configured via rsyslog on join. Would capture kernel,
-   systemd, libvirtd, qemu, drbd kernel events.
+2. **Syslog from cluster nodes** (TCP :5140, RFC 5424), forwarded by
+   `bedrock-vlagent` on each node. Captures kernel, systemd, libvirtd,
+   qemu, drbd kernel events.
 
 Dashboard reads via `/select/logsql/query`:
 
@@ -119,10 +139,10 @@ forward-compatible across recent Victoria* versions.
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| Dashboard metrics tiles all "--" | VM not running, or first scrape hasn't hit yet | `systemctl status bedrock-vm`; wait 10 s after restart. |
-| Only one node's metrics visible | scrape.yml out of sync with cluster.json | Re-trigger: restart `bedrock-mgmt` (startup calls `write_scrape_config`). |
+| Dashboard metrics tiles all "--" | VM not running, or first scrape hasn't hit yet | `systemctl status bedrock-vm` on the metrics backend; wait 10 s after restart. |
+| Only one node's metrics visible | scrape.yml out of sync with cluster topology | Re-trigger: restart `bedrock-d` (startup calls `write_scrape_config`), or restart `bedrock-vmagent`. |
 | `up` metric = 0 for an exporter | exporter process down, or firewall | Check `systemctl status node-exporter` on that node. |
-| Log panel stops updating | bedrock-mgmt or WS dropped | Browser auto-reconnects every 2 s; check `bedrock-mgmt.service`. |
+| Log panel stops updating | bedrock-d or WS dropped | Browser auto-reconnects every 2 s; check `bedrock-d.service`. |
 | Old push_log entries gone | beyond 90 d retention | Increase `-retentionPeriod` in bedrock-vl.service, restart. |
 
 ## What's on disk

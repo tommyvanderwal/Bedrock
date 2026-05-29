@@ -176,9 +176,12 @@ Inside VG `bedrock`:
 | `swap` | 4 GB | swap |
 | `thinpool` | rest minus margin | LVM thin pool, holds Bedrock storage tiers |
 
-Bedrock's `tier-critical`, `tier-bulk`, `tier-scratch`, and per-VM
-disks all live as thin LVs inside `bedrock/thinpool`, created at
-`bedrock init` time and on demand thereafter.
+Bedrock's `cluster` singleton (`bedrock-data-cluster` /
+`bedrock-meta-cluster`), the SeaweedFS volume (`bedrock-weed-volume`),
+and per-VM disks (`bedrock-data-<vm>` / `bedrock-meta-<vm>`) all live as
+thin LVs inside `bedrock/thinpool`, created at `bedrock init` time and on
+demand thereafter. (The legacy `tier-critical`/`tier-bulk`/`tier-scratch`
+multi-tier model was replaced by this per-resource layout.)
 
 Why VG name `bedrock` (not `almalinux`): Bedrock owns this box.
 The VG name should reflect that. Custom-install workflows on

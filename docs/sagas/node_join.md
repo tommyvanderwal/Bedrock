@@ -9,8 +9,9 @@
 Add a new node to an existing Bedrock cluster. Runs on the joining
 node end-to-end: discovers the master, asks for operator approval,
 provisions local storage, starts bedrock-d, joins rqlite as a voter,
-joins SeaweedFS as a volume server, and (at N=2) joins the
-cluster-tier DRBD as Secondary.
+joins SeaweedFS as a volume server, (at N≥2) joins the cluster-singleton
+DRBD (`cluster`) as Secondary, and finally flips its own rqlite node
+state from `joining` to `active`.
 
 ## Trigger
 
@@ -60,7 +61,7 @@ Same `FileSagaBackend` at `/var/lib/bedrock/init-progress.json` as
 | 8 | [`install_peer_pubkeys`](#install_peer_pubkeys) | Fetch peer SSH pubkeys from the master |
 | 9 | [`prescan_peer_hostkeys`](#prescan_peer_hostkeys) | Populate `/root/.ssh/known_hosts` |
 | 10 | [`provision_storage_n1`](#provision_storage_n1) | `tier_storage.setup_n1()` |
-| 11 | [`pre_extract_mgmt`](#pre_extract_mgmt) | Copy mgmt code into `/opt/bedrock/mgmt/` |
+| 11 | [`pre_extract_mgmt`](#pre_extract_mgmt) | Extract staged `mgmt.tar.gz` into `/opt/bedrock` |
 | 12 | [`start_bedrock_d`](#start_bedrock_d) | Enable + start the unified daemon |
 | 13 | [`wait_master_reachable`](#wait_master_reachable) | Poll until the master's loopback responds |
 | 14 | [`render_rqlited_env`](#render_rqlited_env) | rqlited config with `-join master_loopback:4001` |
@@ -70,14 +71,17 @@ Same `FileSagaBackend` at `/var/lib/bedrock/init-progress.json` as
 | 18 | [`seaweedfs_configs`](#seaweedfs_configs) | Render seaweed env + per-node configs |
 | 19 | [`seaweedfs_start_local`](#seaweedfs_start_local) | Start weed-master/volume/s3 on this node |
 | 20 | [`fuse_mount`](#fuse_mount) | Mount `/mnt/bedrock` from `.254:8888` |
-| 21 | [`cluster_tier_join_peer`](#cluster_tier_join_peer) | Wait for master's [`cluster_tier_promote_master`](cluster_tier_promote_master.md) to finish, then join DRBD as Secondary |
+| 21 | [`cluster_tier_join_peer`](#cluster_tier_join_peer) | Wait for master's [`cluster_tier_promote_master`](cluster_tier_promote_master.md) to finish, then join the `cluster` DRBD as Secondary |
+| 22 | [`activate_node`](#activate_node) | Flip this node's rqlite `nodes.state` from `joining` to `active` |
 
 ## Revert
 
-The inverse saga is [`node_leave`](node_leave.md), run on the **master**
-with `--target <node-to-remove>`. node_leave unregisters the node
-from rqlite + propagates the new cluster.json to remaining peers +
-stops services on the target node + verifies the membership drop.
+The inverse saga is [`node_leave`](node_leave.md), run as
+`bedrock node leave <node-to-remove>` on any surviving node (normally
+the master, never the target itself). node_leave unregisters the node
+from rqlite (peers pick up the change on the next revision bump),
+removes its rqlite Raft voter slot, stops services on the target node
+(best-effort), and verifies the membership drop.
 
 After `node_leave` runs cleanly, the now-removed node can run
 `bedrock node reset` to wipe its local state and start over with
@@ -146,10 +150,12 @@ write helper.
 
 ### `write_bootstrap_cluster_json`
 
-Minimal cluster.json that contains enough for netd to start before
-this node joins rqlite — it gets overwritten by the
-rqlite_subscriber projection as soon as `start_rqlited_joiner`
-completes.
+Minimal `/etc/bedrock/cluster.json` scaffold — just enough for
+`rqlite_setup.render_env_file()` to read before this node joins rqlite.
+Once `start_rqlited_joiner` completes, rqlite is the authoritative
+store and every consumer reads it via `cluster_state.load_cluster()`;
+there is no steady-state `cluster.json` projection (only `state.json`
+is re-projected per revision).
 
 ### `install_peer_pubkeys`
 
@@ -165,17 +171,21 @@ helpers) doesn't prompt on first connect.
 
 ### `provision_storage_n1`
 
-`tier_storage.setup_n1()`. Creates this node's local thinpool +
-three tier LVs + XFS + mounts. At N=1 every tier is local; the
-critical tier flips to DRBD when the master's
-[`cluster_tier_promote_master`](cluster_tier_promote_master.md) runs.
+`tier_storage.setup_n1()`. Creates this node's LVM thinpool, the
+SeaweedFS volume LV (`bedrock-weed-volume`, no DRBD), and the
+cluster-singleton directory at `/var/lib/bedrock/cluster`. The
+singleton starts as a plain dir on the root FS; it joins the master's
+`cluster` DRBD as a Secondary in the `cluster_tier_join_peer` step once
+the master has promoted (see
+[`cluster_tier_promote_master`](cluster_tier_promote_master.md)).
 
 ### `pre_extract_mgmt`
 
-Copies the mgmt code from `/usr/local/lib/bedrock/mgmt/` (or the
-ISO) into `/opt/bedrock/mgmt/` so the bedrock-d daemon can find it.
-Done before `start_bedrock_d` because bedrock-d imports from
-`/opt/bedrock/mgmt/`.
+Extracts the staged `/var/lib/bedrock-install/mgmt.tar.gz` into
+`/opt/bedrock` so the bedrock-d daemon can import `mgmt.app` +
+`mgmt.orchestrator` at startup. Must run before `start_bedrock_d` —
+without it bedrock-d crash-loops waiting for the code. Idempotent (tar
+overwrites). No-op if the tarball isn't staged.
 
 ### `start_bedrock_d`
 
@@ -199,15 +209,18 @@ joining the existing Raft cluster.
 
 ### `start_rqlited_joiner`
 
-`systemctl enable --now bedrock-rqlited`. Polls until rqlited
-reports it has a leader (could be itself or the master) before
-returning. The rqlite_subscriber kicks in once a leader is visible.
+`systemctl enable --now bedrock-rqlited` (its env carries
+`-join <master_loopback>:4001`). Polls `https://127.0.0.1:4001/status`
+(mTLS) until this node's own Raft state is `Follower` or `Leader` —
+i.e. it's a voter in the group — then returns. Fails loud on a 30 s
+timeout. The `rqlite_subscriber` task kicks in once a leader is visible.
 
 ### `install_dashboard`
 
-Copies the Svelte build artifacts from the ISO into
-`/opt/bedrock/mgmt/ui/build/` so the local mgmt-HTTPS-8443 serves
-the dashboard. Same UI as the master.
+Calls `dashboard_install.install_dashboard(repo, with_metrics=False)`:
+fetches `mgmt.tar.gz` from the install repo and extracts it into
+`/opt/bedrock/mgmt` (including the Svelte UI build) so this node serves
+the same dashboard as the master on its own HTTPS :8443. Idempotent.
 
 ### `seaweedfs_install`
 
@@ -233,15 +246,29 @@ fail the saga, because the filer may still be promoting.
 
 Inline (in this saga, not the standalone
 [`cluster_tier_join_peer`](cluster_tier_join_peer.md) saga) version
-of the peer-side cluster-tier DRBD join. Polls cluster.json for
-`tiers.critical.mode == "drbd"` (up to 120 s — waits for the
-orchestrator's `cluster_tier_watcher` on the master to fire and
-finish its promote), then calls
+of the peer-side cluster-singleton DRBD join. Polls **rqlite** (via
+`cluster_state.load_cluster()` — explicitly NOT the removed
+`cluster.json`) for `tiers.cluster.mode == "drbd"`, up to 120 s, while
+the orchestrator's `cluster_tier_watcher` on the master fires and
+finishes its promote. It then builds the peer list (master + recorded
+peers + self) and caps it via `tier_storage.cap_singleton_peers()` —
+the cluster-singleton DRBD is at most `min(3, N)`-way (lowest-octet
+nodes). If this node isn't in the capped set (a 4th+ node) it logs a
+skip and returns; otherwise it calls
 `tier_storage.transition_to_n2_peer()` to allocate the peer LV pair,
-write the .res file, and `drbdadm up` as Secondary. The initial
-sync then runs in the background.
+write `/etc/drbd.d/cluster.res`, and `drbdadm up` as Secondary. The
+initial sync then runs in the background.
 
-If the cluster is still N=1 by the time this step runs (no other
-nodes recorded), it no-ops and returns — the eventual second
-joiner will trigger the master's promote and the **first** joiner
-(this node) will join via the orchestrator's reconcile path.
+If the cluster is still N=1 by the time this step runs (fewer than 2
+nodes recorded), it no-ops and returns — the eventual second joiner
+triggers the master's promote, and this first joiner picks up the
+singleton via the orchestrator's reconcile path.
+
+### `activate_node`
+
+Final step: flips this node's rqlite `nodes.state` from `joining`
+(set by the master at approval, so the joiner stayed out of the
+master's election denominator during the join) to `active`. This
+write commits because `start_rqlited_joiner` already made the node a
+Raft voter. Calls `state.node_set_active(node_name)` — idempotent
+(re-running rewrites the same `active` value).

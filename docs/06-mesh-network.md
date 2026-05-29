@@ -1,7 +1,8 @@
 # Mesh networking — bedrock-net
 
-Per-node daemon that owns the layer between "L2 cable plugged in"
-and "DRBD / libvirt / NFS can talk to a peer's cluster identity."
+The mesh layer runs inside `bedrock-d`'s netd thread (`installer/lib/netd.py`).
+It owns the layer between "L2 cable plugged in" and "DRBD / libvirt / NFS can
+talk to a peer's cluster identity."
 
 The architecture is **three small protocols**, each doing exactly
 one job, never overlapping:
@@ -16,9 +17,9 @@ Three independent failure modes. If ICMP gets blocked, latency goes
 blank but discovery and routing keep working. If advertisement is
 delayed, cached routes hold until the next message. If discovery
 breaks, the affected peer falls out of the per-NIC neighbour table
-in 5 s and its `/32`s are withdrawn — exactly the behaviour we want.
+in 10 s and its `/32`s are withdrawn — exactly the behaviour we want.
 
-## Identity, reachability, and the cluster log
+## Identity, reachability, and cluster membership
 
 ### Identity (one per node)
 
@@ -34,9 +35,8 @@ node index:
   `mgmt /api/nodes/register`.
 - Stored as a `/32` on `lo`. **All cluster-internal protocols bind
   to or address this identity** — DRBD `path` blocks, libvirt
-  migrate-uri, NFS server bind, SSH-from-scripts, dashboard
-  inter-node, bedrock-rust peer dial. The kernel route to the `/32`
-  picks the best physical NIC.
+  migrate-uri, rqlite peer dial, SSH-from-scripts, dashboard
+  inter-node. The kernel route to the `/32` picks the best physical NIC.
 
 ### Reachability (one per NIC)
 
@@ -50,14 +50,15 @@ Blocklist: `lo`, `virbr*`, `docker*`, `br-*`, `veth*`, `tap*`,
 `tun*`, `wg*`, `kube*`, `cali*`, `cni*`, plus any interface that's
 enslaved to a bridge.
 
-### Cluster log (membership)
+### Cluster membership
 
-The bedrock-rust log carries the authoritative list of nodes (via
-`NODE_REGISTER` / `NODE_LOOPBACK`). The mesh layer **consumes** the
-log to know which nodes are legitimate cluster members, but **does
-not** depend on the log for routing decisions. Routes are recomputed
-locally on every node, every ~250 ms, from in-memory state fed by
-the three protocols above.
+rqlite (Raft-replicated SQLite) carries the authoritative list of
+nodes in its `nodes` table. The mesh layer **consumes** membership —
+read via `cluster_state.load_cluster()` (read-level `none`, so it
+works even without quorum) — to know which nodes are legitimate
+cluster members, but **does not** depend on it for routing decisions.
+Routes are recomputed locally on every node, every ~250 ms, from
+in-memory state fed by the three protocols above.
 
 ## Protocol 1 — Link discovery (multicast probe)
 
@@ -87,9 +88,11 @@ are jobs 2 and 3.
 In-memory state per `(peer_node, peer_nic, my_nic)`:
 - `first_seen`, `last_seen`, `peer_link_addr`, `peer_loopback`.
 
-Hysteresis: `LINK_UP` after 5 s continuous, `LINK_DOWN` after 30 s
-silent. Only the mgmt master appends to the cluster log; followers
-keep the in-memory state but don't write (single-writer invariant).
+Hysteresis: `LINK_UP` after 5 s continuous (`UP_HYSTERESIS_S`),
+`LINK_DOWN` after 10 s silent (`DOWN_HYSTERESIS_S`). Routing acts on
+the in-memory state on every node; only the
+mgmt master records observed paths to rqlite for the dashboard
+topology view (single-writer invariant).
 
 ## Protocol 2 — Latency measurement (ICMP echo)
 
@@ -308,9 +311,9 @@ idempotent against multiple defends.
 ## DRBD multi-path integration
 
 `tier_storage.regen_drbd_configs_from_snapshot()` runs on every
-folded log entry (subscribed via `mgmt/orchestrator.py`). For
-every tier currently in DRBD mode, it regenerates its resource
-file:
+cluster-state change (subscribed via `mgmt/orchestrator.py`). For
+every DRBD resource — the `cluster` singleton and each per-VM
+`vm-<name>-disk0` — it regenerates the resource file:
 
 - One `connection` per peer pair.
 - One `path` block per direct link observed by bedrock-net, with
@@ -333,7 +336,7 @@ complexity needed.
 ## Lifecycle (single node, simplified)
 
 ```
-   t=0   bedrock-net.service starts
+   t=0   bedrock-d starts the netd thread
          └─→ load_state(): cluster_uuid, my_loopback, cluster_key
          └─→ ensure_loopback_ip(): /32 on lo
          └─→ open recv sockets (discovery + advertisement)
@@ -371,17 +374,14 @@ ip -br -4 addr | grep -v "127\|UNKNOWN.*lo\b"
 #           lo with the cluster's /32
 
 # Latency per peer-link (in-memory smoothed):
-journalctl -u bedrock-net | grep "srtt"          # or future Prometheus
-
-# Path table:
-cat /etc/bedrock/cluster.json | jq '.paths | length'
+journalctl -u bedrock-d | grep "srtt"            # or future Prometheus
 
 # Per-peer kernel routes:
 ip -4 route show | grep "^100\." | head -20
 # expected: one /32 per peer per direct path + transit /32s + panic /24
 
 # DRBD resource (after promote to N>=2):
-cat /etc/drbd.d/tier-bulk.res
+cat /etc/drbd.d/cluster.res
 # expected: one connection block per peer pair, one path block per
 # direct link with distinct per-NIC addresses, loopback fallback last
 ```
@@ -394,9 +394,9 @@ cat /etc/drbd.d/tier-bulk.res
    cascade.
 2. **One advertisement per peer per cycle**, regardless of how many
    physical NICs connect them. Multiplying by NIC count is waste.
-3. **Cluster log is membership-of-record, not routing-of-record.**
-   Routing decisions are local, in-memory, sub-second. Log changes
-   propagate at the consensus pace (~seconds).
+3. **rqlite is membership-of-record, not routing-of-record.**
+   Routing decisions are local, in-memory, sub-second. Membership
+   changes propagate at the consensus (Raft) pace (~seconds).
 4. **Single-clock measurement** — every RTT is computed from one
    kernel's timestamps on both ends of the subtraction. No
    NTP/PTP dependency.

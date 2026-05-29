@@ -98,19 +98,20 @@ the full sequence — SSH calls, DRBD commands, log lines emitted, failure modes
 
 | Component | Port | Bind | Doc |
 |---|---|---|---|
-| mgmt dashboard (FastAPI + Svelte) | 8443 HTTPS | `.254` (singleton) | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
-| **rqlite (per-node)** | 4001 HTTP + Raft | node loopback | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
-| **rqlite-arbiter (3rd voter)** | 4011 HTTP + Raft | `.254` (singleton) | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
-| **SeaweedFS master** | 9333 | node loopback (Raft-3 nodes only) | [`storage-architecture.md`](storage-architecture.md) |
+| mgmt dashboard (FastAPI + Svelte) | 8443 HTTPS (operator-authed) | `0.0.0.0` | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
+| mgmt local CLI / intra-process API | 8001 HTTP (auth-exempt) | `127.0.0.1` | [`components/mgmt-dashboard.md`](components/mgmt-dashboard.md) |
+| **rqlite (per-node)** | 4001 HTTPS mTLS + 4002 Raft | node | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **rqlite-arbiter (extra voter)** | 4011 HTTPS mTLS + 4012 Raft | `.254` (singleton) | [`01-rqlite-state-store.md`](01-rqlite-state-store.md) |
+| **SeaweedFS master** | 9333 | node (Raft-3 nodes only) | [`storage-architecture.md`](storage-architecture.md) |
 | **SeaweedFS volume** | 8080 | `0.0.0.0` (every node) | [`storage-architecture.md`](storage-architecture.md) |
 | **SeaweedFS filer** | 8888 | `.254` (singleton; DRBD-backed) | [`storage-architecture.md`](storage-architecture.md) |
 | **SeaweedFS s3** | 8333 | `0.0.0.0` (every node) | [`storage-architecture.md`](storage-architecture.md) |
-| **bedrock-echo (witness)** | UDP 12321 | LAN appliance | [`cluster-quorum-spec.md`](cluster-quorum-spec.md) |
-| VictoriaMetrics | 8428 | node loopback | [`components/metrics.md`](components/metrics.md) |
-| VictoriaLogs | 9428 (syslog 5140) | node loopback | [`components/metrics.md`](components/metrics.md) |
-| node_exporter + vm_exporter | 9100 / 9177 | node loopback | [`components/exporters.md`](components/exporters.md) |
-| DRBD | kernel + per-link port | per-NIC IP | [`storage-architecture.md`](storage-architecture.md) + [`05-drbd-internals.md`](05-drbd-internals.md) |
-| bedrock-net (mesh) | UDP 7732 mcast + ICMP + UDP 7733 | per-NIC | [`06-mesh-network.md`](06-mesh-network.md) |
+| **bedrock-echo (witness)** | UDP 12321 (ChaCha20-Poly1305 AEAD) | LAN appliance | [`cluster-quorum-spec.md`](cluster-quorum-spec.md) |
+| VictoriaMetrics | 8428 | node | [`components/metrics.md`](components/metrics.md) |
+| VictoriaLogs | 9428 (syslog 5140) | node | [`components/metrics.md`](components/metrics.md) |
+| node_exporter + vm_exporter | 9100 / 9177 | node | [`components/exporters.md`](components/exporters.md) |
+| DRBD | kernel + per-link port (7000+minor) | per-NIC IP | [`storage-architecture.md`](storage-architecture.md) + [`05-drbd-internals.md`](05-drbd-internals.md) |
+| bedrock-net (mesh) | UDP 7732 mcast probe + 7733 advert + 7734 heartbeat + ICMP | per-NIC | [`06-mesh-network.md`](06-mesh-network.md) |
 | **bedrock-d (unified daemon)** | — | — | [`daemon-unification.md`](daemon-unification.md) |
 | Cockpit | 9090 | node | —  (upstream docs) |
 

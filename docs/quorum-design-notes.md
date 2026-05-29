@@ -20,15 +20,16 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
 - Witness quorum = majority of **all configured** witnesses
   (1-of-1, 2-of-3, 3-of-5, 2-of-2). Not "majority of valid ones".
 - A witness counts toward the quorum only if it currently has slot
-  entries for **every node** named in `cluster.json`. Older entries
+  entries for **every active node** in the rqlite `nodes` table
+  (read locally via `cluster_state.load_cluster()`). Older entries
   are OK; missing entries disqualify the witness. Heartbeats keep
   flowing regardless.
 - LMS write is "set" only after acknowledgment from a witness quorum.
 - LMS state is persisted in two places: on each contributing witness
   slot AND on the node that set it (local file).
-- A new local file (working name `/etc/bedrock/state.json`)
+- `/etc/bedrock/state.json` (the per-node local file)
   holds the realtime master-election view, distinct from rqlite's
-  `cluster_info.mgmt_master` and from `cluster.json`.
+  `cluster_info.mgmt_master`.
 - **One local-state file per node, in memory, written on change.**
   Folds into the existing `/etc/bedrock/state.json` (already
   per-node identity + role; election state goes here too — no new
@@ -41,24 +42,23 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   VMs, tiers, operators, the UUID-history table — all rqlite.
   Locally readable from every node via the per-node rqlited
   replica (the autonomous-isolated-node argument).
-- **LMS is +1 vote, not a separate concept.** Simplified vote
-  model:
-  - Voting pool = nodes in `cluster.json` minus those in
-    maintenance mode.
-  - Threshold = strict majority of voting pool.
-  - Each pool member is 1 vote when its mesh heartbeat shows
-    `current_master = candidate`.
-  - A node that has successfully written `tag.lms = 1` to the
-    witness quorum AND had the write acked gets +1 vote on top
-    of its own self-vote.
-  - The witness layer is therefore not a "voter" in its own
-    right — it is the *arbiter of LMS uniqueness*. Only one
-    node at a time can hold an acked `tag.lms = 1` across the
-    witness quorum, because the multi-phase advertisement +
-    eligibility-check rules prevent two simultaneous holders
-    from both reaching the cluster majority.
-  - Removes the awkward 10/1 weighting from the older spec; the
-    quorum outcomes for every cluster size are identical.
+- **Weighted vote model (as implemented in `election.py`).**
+  - `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1`.
+  - `total_votes = 100·N_active_nodes + N_configured_witnesses`;
+    `majority = total_votes // 2 + 1`. ALL configured witnesses
+    count in the denominator.
+  - `my_votes = 100·(self + ACKing peers) + (valid+confirmed
+    witnesses)`. A configured-but-invalid witness adds 0 to
+    `my_votes` while still raising the bar — biasing toward "do
+    not fail over" (safety > availability).
+  - The 100/1 spread (vs 1/1) keeps a single node from ever
+    crossing the bar on witness votes alone: a witness can break a
+    node-vs-node tie but can never substitute for a peer.
+  - The witness layer is also the *arbiter of LMS uniqueness*:
+    only one node at a time can hold an acked `tag.lms = 1`,
+    because each node owns its own slot.
+  - Voting pool excludes nodes in maintenance mode (0 votes,
+    dropped from both numerator and denominator).
 - Two-node baseline locked in first. Operator overrides (maintenance,
   forced promote, scheduled handoff) layered on after the baseline
   is correct.
@@ -114,10 +114,11 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   than to authorize.
 - **Single-node operation (N=1)**: `last_man_standing` is by
   definition always set; no patience wait; just be the master.
-- **30 s patience wait** applies only when `cluster.json.nodes`
-  contains more than one node. During the wait the promote-decision
-  function still runs, but the "not enough information to authorize"
-  outcome stays Pending rather than NoQuorum until 30 s elapse.
+- **30 s patience wait** applies only when the rqlite `nodes` table
+  (read locally via `cluster_state.load_cluster()`) contains more
+  than one node. During the wait the promote-decision function still
+  runs, but the "not enough information to authorize" outcome stays
+  Pending rather than NoQuorum until 30 s elapse.
 - A node in **maintenance mode** contributes 0 votes (does not count
   in either the numerator or the denominator of the quorum math).
 - **Maintenance mode is the mechanism that enables clean single-node
@@ -150,14 +151,14 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   by the operator pressing "Accept" on a pending join request in the
   dashboard. The saga executes via the existing rqlite saga backend
   (operations / operation_steps tables), runs through the
-  details — cluster.json update, key distribution, peer DRBD config,
+  details — rqlite `nodes` insert, key distribution, peer DRBD config,
   rqlited join, etc. The joiner side polls the master's HTTPS API
   for the result. Existing flow; nothing master-election-specific.
 - **`state.json` writer:**
   - Bedrock-net's election logic is the **sole writer**. Sagas
     (join, takeover, graceful shutdown) influence the file
     *indirectly* by changing the inputs the election reads —
-    mesh state via actuators, `cluster.json` via rqlite, witness
+    mesh state via actuators, cluster membership via rqlite, witness
     slot via heartbeat. They never write `state.json`
     themselves.
   - This keeps the file a single deterministic function of
@@ -216,8 +217,9 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   was waiting for. When Y's conclusion differs, Y broadcasts its
   own view and X sees no ack from Y, no quorum on Y's side.
 - **Patience window lifecycle (30 s):**
-  - Clock starts when local disk state has been read at boot —
-    `state.json`, `cluster.json`, witness list. The read is
+  - Clock starts when local state has been read at boot —
+    `state.json`, the rqlite `nodes` table (locally readable via
+    `cluster_state.load_cluster()`), witness list. The read is
     fast, so the clock effectively starts a few ms after daemon
     start.
   - **No resets** during a node's life. A graceful daemon stop
@@ -253,9 +255,9 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   not witnesses only.** Other cluster nodes are first-class
   participants in the master-election quorum and report their own
   observed view of who the master is.
-  - Quorum vote-weights stay as the existing formula: 10 votes per
-    reachable non-maintenance cluster node + 1 vote per witness in
-    the witness-quorum. Threshold = strict majority of the total.
+  - Quorum vote-weights use the existing formula: 100 votes per
+    reachable non-maintenance cluster node + 1 vote per valid
+    witness. Threshold = strict majority of the total.
   - A peer "acknowledges" a master claim by updating its OWN
     `state.json` with the new `current_master` value
     (carrying the transitioning bit while the claim is mid-saga)
@@ -265,11 +267,12 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
   - The claiming node waits until ENOUGH peers' heartbeats AND
     witness slot replies reflect itself as master (with
     transitioning bit) to clear the weighted-vote threshold.
-  - In 3-node: this node alone (10) is below threshold (16 of 31).
-    Needs at least one peer ack (10) to clear. Witness alone is
-    not sufficient.
-  - In 2-node: this node alone (10) is below threshold (11 of 21).
-    Needs either peer ack (10) or witness-quorum ack (1) to clear.
+  - In 3-node + 1 witness: this node alone (100) is below the
+    threshold (151 of 301). Needs at least one peer ack (100) to
+    clear. Witness alone is not sufficient.
+  - In 2-node + 1 witness: this node alone (100) is below the
+    threshold (101 of 201). Needs either a peer ack (100) or the
+    witness vote (1) to clear.
 - **Failover is multi-phase: advertise intent, gather acks,
   actuate, advertise end state.**
   - **Phase 1 — local commit.** Compute new state. Write own
@@ -305,11 +308,11 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
     not yet primary).
 - **Candidate eligibility — strict.** A node refuses to claim
   master entirely if *any* known cluster peer has a more
-  up-to-date DRBD `tier-critical` generation, regardless of
+  up-to-date DRBD `cluster` generation, regardless of
   whether that peer is currently reachable. Reason: if the peer's
   data is ahead, promoting this node would silently lose those
-  writes — including S3/SeaweedFS metadata on the tier-critical
-  volume. The peer might be temporarily unreachable, not
+  writes — including S3/SeaweedFS metadata on the `cluster`
+  singleton volume. The peer might be temporarily unreachable, not
   permanently dead.
 - **"rqlite came back online" is an event, not a saga.** A small,
   reusable event source that fires once when `_rqlite_ready`
@@ -411,8 +414,10 @@ canonical specs (`cluster-quorum-spec.md`, `cluster_arbiter.md`,
 8. (resolved 2026-05-25 with correction — LMS clear requires
    slot-owner AND witness both online; no self-correction. See
    "LMS clear semantics — verified against code" section.)
-9. cluster.json / state.json / state.json — authority order
-   and who writes which on each transition.
+9. rqlite (`cluster_info.mgmt_master`) vs `state.json` — authority
+   order and who writes which on each transition. (Resolved in the
+   spec: election is the realtime authority and sole `state.json`
+   writer; rqlite follows. See lesson `lesson_lms_writeback_race`.)
 10. Witness reconfiguration mid-flight: how the validity rule
     behaves when an operator adds or removes a witness.
 11. (resolved 2026-05-25 — two flavors: single-node via maintenance,
@@ -448,13 +453,18 @@ The hard rule:
   slot owner to the witness, requiring both online at the same
   moment.
 - If the slot owner dies with `lms = 1` outstanding, the slot stays
-  `lms = 1` until either the slot owner comes back and successfully
-  writes `lms = 0`, or the witness loses state (e.g. ESP32 reboot),
-  or operator manually clears.
-- The 15 s slot staleness rule is **not** a clear. It changes how
-  readers interpret a stale `lms = 1` — peer takeover via UUID
-  equality / history-chain match (stricter than treating the bit
-  as cleared).
+  `lms = 1` until the slot owner comes back and successfully writes
+  `lms = 0`, or the operator decommissions the owner (removes it from
+  the rqlite `nodes` table, so readers ignore its slot), re-keys the
+  cluster witness identity, or manually clears.
+- A witness that loses state and comes back EMPTY is **not** a clear:
+  per spec INV-7 a missing slot is treated as worst-case
+  (`lms = 1`-possible) until repopulated by a fresh heartbeat from the
+  current owner. Takeover stays refused in the meantime.
+- The 10 s slot staleness rule (`witness.SLOT_STALE_MS = 10_000`) is
+  **not** a clear either. It changes how readers interpret a stale
+  `lms = 1` — peer takeover via exact UUID equality / history-chain
+  match (stricter than treating the bit as cleared).
 
 Operational consequence: an LMS that cannot be cleared can leave
 the cluster in an inconsistent visible state (witness slot says
@@ -548,18 +558,19 @@ command for the edge case.
                                  ▼                          ▼
               role = FOLLOWER             ┌──────────────────────────────────┐
               (refuse to claim;           │  COUNT VOTES                     │
-              await operator              │   = 1 (self)                     │
-              seize)                      │   + Σ peers whose mesh heartbeat │
-                                          │     shows current_master = me    │
-                                          │   + 1 if self.tag.lms is         │
-                                          │     witness-quorum-acked         │
+              await operator              │   = 100 (self)                   │
+              seize)                      │   + 100·(peers whose mesh hb     │
+                                          │     shows current_master = me)   │
+                                          │   + 1 per valid+confirmed        │
+                                          │     witness                      │
                                           └──────────────┬───────────────────┘
                                                          │
                                           ┌──────────────▼───────────────┐
                                           │  votes ≥ strict majority of  │
-                                          │  voting pool?                │
-                                          │  (pool = cluster.json nodes  │
-                                          │   minus maintenance)         │
+                                          │  total_votes?                │
+                                          │  (= 100·active nodes + all   │
+                                          │   configured witnesses;      │
+                                          │   maintenance nodes excluded)│
                                           └──────────────┬───────────────┘
                                                          │
                                        no                │              yes
@@ -615,6 +626,7 @@ command for the edge case.
   each contributing witness must be **valid** (has slot entries
   for every cluster node).
 - **Valid witness** — a witness whose last reply contained a slot
-  for every node in `cluster.json`.
+  for every active node in the rqlite `nodes` table (read locally
+  via `cluster_state.load_cluster()`).
 - **Patience window** — fixed 30 s after bedrock-d start during
   which no witness-assisted decision fires.

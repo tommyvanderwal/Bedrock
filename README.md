@@ -8,10 +8,11 @@ dashboard.
 No corosync. No PVE framework. Just plain libvirt + DRBD + LVM with
 a thin orchestrator on top.
 
-> **Status** — pushing v1.0. Storage tiers, cluster log + protocol, dashboard,
-> VM lifecycle (cattle / pet / vipet), live migration, import/export, and
-> backups (Kopia, S3 / S3-compatible / filesystem) are working end-to-end on
-> the testbed. Hardening + power-yank validation are the remaining items.
+> **Status** — pushing v1.0. Cluster state (rqlite), the mesh/election/witness
+> protocol, dashboard, VM lifecycle (cattle / pet / vipet), live migration,
+> import/export, and backups (Kopia, S3 / S3-compatible / filesystem) are
+> working end-to-end on the testbed. Hardening + power-yank validation are the
+> remaining items.
 
 ## What's in here
 
@@ -35,9 +36,10 @@ a thin orchestrator on top.
 │   ├── bedrock                 ← the operator CLI
 │   └── mgmt.tar.gz             ← packaged dashboard (FastAPI + Svelte build)
 ├── mgmt/                       ← dashboard service (runs in bedrock-d)
-│   ├── app.py                  ← FastAPI backend (REST + WebSocket) on :8443
+│   ├── app.py                  ← FastAPI backend (REST + WebSocket); :8443 HTTPS
+│   │                              (LAN, operator-authed) + 127.0.0.1:8001 (local CLI)
 │   ├── orchestrator.py         ← calm reactor: rqlite subscriber, no-quorum
-│   │                              responder, boot orchestrator, target reconcile
+│   │                              responder, boot orchestrator, reconcile
 │   ├── backup.py               ← Kopia orchestration (LV snapshot + dd | kopia)
 │   ├── tasks.py                ← in-process task registry for long ops
 │   ├── ui/                     ← Svelte 5 frontend (build/ is shipped)
@@ -71,8 +73,8 @@ a thin orchestrator on top.
                   ┌──────────────────────┐   on every node
                   │   bedrock-d          │   (single Python process)
                   │  ┌────────────────┐  │
-                  │  │ mgmt FastAPI   │  │ ── :8443 HTTPS (bound to .254
-                  │  │ (mgmt/app.py)  │  │     on the arbiter-host)
+                  │  │ mgmt FastAPI   │  │ ── :8443 HTTPS (LAN, operator-authed)
+                  │  │ (mgmt/app.py)  │  │     + 127.0.0.1:8001 (local CLI)
                   │  └────────────────┘  │
                   │  ┌────────────────┐  │
                   │  │ orchestrator   │  │ ── calm loop: rqlite-driven
@@ -86,10 +88,10 @@ a thin orchestrator on top.
                         │
                         ▼
                   ┌─────────────────────┐
-                  │ rqlite (state) +    │ ── cluster state on tier-critical
-                  │ bedrock-echo        │     DRBD; witness on UDP/12321
-                  │ (witness, passive)  │     (passive AEAD K/V slot store)
-                  └─────┬───────────────┘
+                  │ rqlite (state) +    │ ── cluster state in rqlite (per-node
+                  │ bedrock-echo        │     + arbiter on the `cluster` DRBD
+                  │ (witness, passive)  │     singleton); witness on UDP/12321
+                  └─────┬───────────────┘     (passive AEAD K/V slot store)
                         ▼
                   ┌──────────────────┐
                   │ libvirtd, DRBD,  │ ── unchanged stock pieces
@@ -105,10 +107,10 @@ The [docs/architecture.md](docs/architecture.md) page has a fuller component
 ## Quick start (1-node lab)
 
 ```bash
-# On a fresh AlmaLinux 9 minimal, as root:
+# On a fresh AlmaLinux 10 minimal, as root:
 curl -sSL http://<repo-host>:8000/install.sh | bash
 bedrock init --name my-cluster
-# Open http://<this-host>:8080
+# Open https://<this-host>:8443   (http://<this-host> redirects there)
 ```
 
 For multi-node, run `bedrock join` on the second/third node pointing at the
