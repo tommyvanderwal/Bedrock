@@ -32,8 +32,6 @@ ALLOWED = {
     "installer/lib/view_builder.py",     # snapshot reader; not a writer
     "installer/lib/netd.py",             # election tick reads cluster.json + rqlite
     "installer/lib/cluster_arbiter.py",
-    "installer/lib/agent_install.py",    # legacy procedural body (BEDROCK_INIT_SAGA=0)
-    "installer/lib/mgmt_install.py",     # same
     "installer/lib/operator_auth.py",
     "installer/lib/join_handshake.py",
     "installer/lib/tier_storage.py",
