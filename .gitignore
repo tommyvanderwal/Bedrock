@@ -13,3 +13,7 @@ installer/iso-build/payload/
 # from pinned upstream URLs. GitHub has a 100 MB per-file limit;
 # `weed` (144 MB) and similar live outside git for this reason.
 installer/binaries/weed
+
+# Generated deployment tarballs (rebuilt by build-iso/sync; served from S3)
+installer/mgmt.tar.gz
+installer/bedrock_d.tar.gz
