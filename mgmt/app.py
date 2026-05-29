@@ -64,7 +64,11 @@ async def require_peer(request: Request) -> str:
 async def require_operator(request: Request) -> str:
     """FastAPI dep — accepts requests with a valid `Authorization: Bearer
     <token>` operator session token. Returns the username on success.
-    Raises 401 on any failure."""
+    Raises 401 on any failure. Loopback (the trusted local CLI on :8001)
+    is exempt — local root is already privileged; see _auth_middleware."""
+    _ch = request.client.host if request.client else ""
+    if _ch in ("127.0.0.1", "::1"):
+        return "local"
     authz = request.headers.get("authorization", "")
     if not authz.startswith("Bearer "):
         raise HTTPException(401, "missing Bearer token")
@@ -852,6 +856,16 @@ def _is_public(path: str) -> bool:
 async def _auth_middleware(request: Request, call_next):
     path = request.url.path
     if _is_public(path):
+        return await call_next(request)
+
+    # Loopback is the trusted local CLI on :8001 (bound 127.0.0.1 only).
+    # Local root is already fully privileged, so the `bedrock` CLI's POSTs
+    # carry no operator token. LAN requests (:8443) still require operator
+    # or peer auth below. A spoofed-loopback source from a real NIC is
+    # dropped by rp_filter/martian filtering, so this can't be reached
+    # remotely.
+    _ch = request.client.host if request.client else ""
+    if _ch in ("127.0.0.1", "::1"):
         return await call_next(request)
 
     authz = request.headers.get("authorization", "")
