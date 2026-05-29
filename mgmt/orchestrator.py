@@ -224,6 +224,20 @@ def _subscriber_pass(self_name: str) -> None:
     global _LAST_LOG_IDX
     since = _STATE.last_log_idx if _STATE is not None else _LAST_LOG_IDX
     with rqlite_client.RqliteClient() as rc:
+        # Apply the CURRENT revision once at (re)start, BEFORE entering
+        # the advance-only watch loop. Otherwise a node that is already
+        # caught up to the latest revision (a quiet joiner, or any node
+        # whose `since` already equals HEAD) idles until the next write
+        # and never converges per-fold reactors for state set earlier —
+        # notably obs_backends (written at `bedrock init`), so vmagent/
+        # vlagent + the second backend never deploy until something else
+        # happens to bump the revision. The initial apply makes every
+        # subscriber start self-heal the full current state.
+        try:
+            _apply_revision(rc, rc.revision(), self_name)
+            since = _LAST_LOG_IDX
+        except Exception as e:
+            log.warning("rqlite_subscriber: initial apply: %s", e)
         for rev in rc.watch(since_revision=since, interval_s=0.5):
             _apply_revision(rc, rev, self_name)
 
@@ -233,6 +247,15 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     """Refresh the in-memory snapshot from rqlite, project to disk,
     queue a reactor task."""
     global _LAST_LOG_IDX, _PREV_SNAPSHOT, _SNAPSHOT
+    # Re-resolve node identity each fold. On a joiner, bedrock-d (and
+    # this subscriber) can start BEFORE the join saga writes node_name
+    # into state.json, so rqlite_subscriber captured self_name=''. Re-
+    # reading here lets the subscriber recover the instant state.json is
+    # populated — without it, self_name stays '' for the process
+    # lifetime and backend-on-self convergence (this node becoming a
+    # vm/vl backend) + the state.json role projection never fire.
+    if not self_name:
+        self_name = _self_node_name()
     if _STATE is not None:
         with _STATE.snapshot_lock:
             prev = copy.deepcopy(_STATE.snapshot)
