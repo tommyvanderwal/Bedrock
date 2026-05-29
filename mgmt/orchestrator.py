@@ -206,12 +206,15 @@ async def rqlite_subscriber():
     reactor sees one consolidated revision-advance per tick even if
     many mutations landed within it.
     """
-    self_name = _self_node_name()
-    log.info("rqlite_subscriber: starting (node=%r)", self_name)
+    log.info("rqlite_subscriber: starting (node=%r)", _self_node_name())
     loop = asyncio.get_event_loop()
     while True:
         try:
-            await loop.run_in_executor(None, _subscriber_pass, self_name)
+            # Re-resolve identity on every (re)connect: a joiner's
+            # bedrock-d can start before the join saga writes node_name
+            # into state.json, and each retry below gets a FRESH client,
+            # so it should also get a fresh self_name.
+            await loop.run_in_executor(None, _subscriber_pass, _self_node_name())
         except Exception as e:
             log.warning("rqlite_subscriber: rqlite unreachable: %s", e)
         await asyncio.sleep(2)
@@ -233,11 +236,17 @@ def _subscriber_pass(self_name: str) -> None:
         # vlagent + the second backend never deploy until something else
         # happens to bump the revision. The initial apply makes every
         # subscriber start self-heal the full current state.
-        try:
-            _apply_revision(rc, rc.revision(), self_name)
-            since = _LAST_LOG_IDX
-        except Exception as e:
-            log.warning("rqlite_subscriber: initial apply: %s", e)
+        #
+        # Deliberately NOT wrapped in try/except: if rqlite isn't ready
+        # yet (this runs as early as setup step-1, before `bedrock init`),
+        # the raise propagates to rqlite_subscriber, which sleeps and
+        # retries with a BRAND-NEW client. That matters because a client
+        # created before rqlite is listening does not recover inside
+        # watch()'s internal retry — swallowing the error here left the
+        # subscriber spinning forever on a dead client (obs never
+        # converged on a fresh install; observed 2026-05-29).
+        _apply_revision(rc, rc.revision(), self_name)
+        since = _LAST_LOG_IDX
         for rev in rc.watch(since_revision=since, interval_s=0.5):
             _apply_revision(rc, rev, self_name)
 
