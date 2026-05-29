@@ -1,21 +1,16 @@
-"""ISO library routes (Stage 9 PR #4 of the rewrite).
+"""ISO library routes.
 
 Three endpoints — list, upload, delete — over the cluster-wide
 SeaweedFS FUSE mount at ``/mnt/bedrock/iso``. Writes go through
 the FUSE mount so the filer replicates per the /iso/ collection
 policy (see installer/lib/seaweedfs.py::init_collections).
 Listings on any node show the same files; a delete on any node
-deletes cluster-wide.
+deletes cluster-wide. Writing directly to the FUSE mount keeps a
+single path: virt-install reads ISOs from ``/mnt/bedrock/iso``, so
+an upload is immediately visible to libvirt on every node.
 
-Earlier versions wrote to ``/opt/bedrock/iso`` (master-local) and
-relied on a separate symlink or mirror step to surface them under
-``/mnt/bedrock/iso`` where virt-install reads from. That left
-uploads invisible to libvirt and produced "ERROR Validating
-install media" on cattle-VM create. Direct writes to the FUSE
-mount eliminate the second path.
-
-Same dependency-injection pattern as ``routes_console`` —
-``push_log`` is passed in to avoid a circular import.
+``push_log`` is injected (same pattern as ``routes_console``) to
+avoid a circular import.
 """
 from __future__ import annotations
 

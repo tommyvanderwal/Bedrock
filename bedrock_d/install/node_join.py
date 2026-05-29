@@ -50,10 +50,10 @@ class NodeJoin:
     """`bedrock join [<node-ip>]` — joiner-side flow.
 
     ctx inputs (set by the caller / cmd_join):
-      - witness: str — legacy field name; holds the IP/hostname the
-                       CLI dialled to fetch cluster info (any current
-                       cluster node, not necessarily the master, and
-                       not the cluster witness/Echo host)
+      - witness: str — the IP/hostname the CLI contacts to fetch
+                       cluster info (any current cluster node, not
+                       necessarily the master, and not the cluster
+                       witness/Echo host)
       - cluster_info: dict (the master's /cluster-info response,
                             including cluster_uuid + cluster_name +
                             mgmt_url + existing nodes list)

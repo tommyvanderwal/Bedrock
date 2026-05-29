@@ -67,8 +67,8 @@ def _poll_status(mgmt_url: str, request_id: str, *,
     Transient connect / timeout errors are swallowed and retried. Only
     404 (request_id not yet replicated) and explicit reject get
     surfaced; everything else gets one more attempt in `interval_s`.
-    Without this tolerance, a single slow round-trip during master's
-    bedrock-mgmt startup kills the joiner with a traceback.
+    Without this tolerance, a single slow round-trip during the
+    master's bedrock-d startup kills the joiner with a traceback.
     """
     from urllib.parse import quote
     deadline = time.monotonic() + timeout_s
@@ -120,10 +120,9 @@ def _install_peer_pubkeys(pubkeys: list):
 
 
 def install(witness: str, cluster_info: dict, repo: str):
-    """Joiner-side install. By default delegates to the node_join
-    saga (bedrock_d.install.node_join.run_node_join). The legacy
-    procedural body below is the ``BEDROCK_INIT_SAGA=0`` opt-out
-    for one release while the saga path bakes."""
+    """Joiner-side install. Delegates to the node_join saga
+    (bedrock_d.install.node_join.run_node_join). Setting
+    ``BEDROCK_INIT_SAGA=0`` runs the procedural body below instead."""
     import os as _os
     if _os.environ.get("BEDROCK_INIT_SAGA", "1") != "0":
         import sys as _sys
@@ -145,8 +144,8 @@ def install(witness: str, cluster_info: dict, repo: str):
 
     # mgmt_ip = the LAN/bridge address joiners reach the master on.
     # Per cluster_addr.py every intra-cluster bind/target uses the
-    # node's loopback /32 (set on `lo` by bedrock-net once the cluster
-    # identity is allocated by the master at join approval).
+    # node's loopback /32 (set on `lo` by bedrock-d's netd thread once
+    # the cluster identity is allocated by the master at join approval).
     mgmt_ip = ""
     for n in hw.get("nics", []):
         if n["state"] == "UP" and n["name"] == "br0" and n["ip"]:
@@ -159,12 +158,11 @@ def install(witness: str, cluster_info: dict, repo: str):
     existing = cluster_info.get("nodes", [])
     node_name = hw.get("hostname", f"node{len(existing)+1}")
     # Prefer the mgmt_url from cluster_info (returned by discovery.
-    # query_cluster) — that reflects what the master actually serves
-    # (HTTPS once cert-refresh has fetched a cert, HTTP fallback
-    # before). Fall back to the historical HTTPS-on-8443 hardcoding
-    # only if cluster_info didn't provide one. Cert verification
-    # stays off; peer trust comes from the operator-approved
-    # Ed25519 fingerprint check at the popup, not from TLS PKI.
+    # query_cluster) — that reflects what the master actually serves.
+    # Fall back to HTTPS-on-8443 only if cluster_info didn't provide
+    # one. Cert verification stays off; peer trust comes from the
+    # operator-approved Ed25519 fingerprint check at the popup, not
+    # from TLS PKI.
     mgmt_url = cluster_info.get("mgmt_url") or f"https://{witness}:8443"
 
     # Deploy exporters first — register makes mgmt rewrite scrape.yml to include us
@@ -180,11 +178,10 @@ def install(witness: str, cluster_info: dict, repo: str):
     # peer can verify HTTP requests we sign with `peer_auth.sign(...)`.
     bedrock_pub_hex = peer_auth.pubkey_hex()
 
-    # Approval-based join (piece #3): we ECDH a session key with the master,
+    # Approval-based join: we ECDH a session key with the master,
     # show the operator our Ed25519 fingerprint, and the master ships
-    # cluster.key sealed under the session key. No fallback to plain
-    # /api/nodes/register here — the old path stays for backward-compat
-    # with installers from before this code lived in the lib tree.
+    # cluster.key sealed under the session key. Join is approval-only;
+    # there is no fallback to plain /api/nodes/register.
     print(f"  Mgmt:           {mgmt_url}")
     print(f"  Bedrock pubkey: {bedrock_pub_hex}")
     eph_priv, eph_pub_b64 = join_handshake.gen_ephemeral()
@@ -207,8 +204,8 @@ def install(witness: str, cluster_info: dict, repo: str):
     os.chmod("/etc/bedrock/cluster.key", 0o600)
     print(f"  cluster.key received ({len(cluster_key)} bytes) and stored")
 
-    # Reshape approval response to look like the old register response
-    # so the rest of install() can run unchanged.
+    # Reshape the approval response into the dict shape the rest of
+    # install() consumes.
     result = {
         "nodes": approval.get("nodes", []),
         "node_map": approval.get("node_map", {}),
@@ -231,19 +228,19 @@ def install(witness: str, cluster_info: dict, repo: str):
         "witness_host": witness,
         "mgmt_url": mgmt_url,
         "mgmt_ip": mgmt_ip,
-        # Cluster identity for the mesh layer. mgmt allocated this in
-        # the register response; bedrock-net.service reads it from
+        # Cluster identity for the mesh layer. The master allocates
+        # this in the approval response; bedrock-d reads it from
         # state.json on next start to pin the /32 on `lo`. Empty if
-        # mgmt is on an older version that didn't allocate one.
+        # the master did not allocate one.
         "loopback_ip": result.get("loopback_ip", ""),
     })
     state.save(s)
 
     # Bootstrap cluster.json on the joiner — without it, rqlite_setup
     # can't render the env-file (it needs the nodes dict for peer
-    # loopbacks + sorted-name node-id). bedrock-mgmt's snapshot watcher
-    # will overwrite this with the canonical fold output once rqlited
-    # is joined and the SQLite DB has replicated.
+    # loopbacks; the node-id itself comes from the loopback's last
+    # octet). bedrock-d refreshes this from the replicated rqlite
+    # store once rqlited has joined and the SQLite DB has replicated.
     try:
         import json as _json
         from pathlib import Path as _Path
@@ -317,9 +314,10 @@ def install(witness: str, cluster_info: dict, repo: str):
     except Exception as e:
         print(f"  WARN: tier setup failed: {e}")
 
-    # Cluster HMAC key (used by lib/witness.py to sign Echo heartbeats).
-    # The master's key comes down in the register response so every
-    # node shares the same secret for witness auth.
+    # Cluster AEAD key (used by lib/witness.py to seal/open Echo slot
+    # packets with ChaCha20-Poly1305). The master's key comes down in
+    # the approval response so every node shares the same secret for
+    # witness auth.
     try:
         master_key_hex = result.get("cluster_key_hex")
         if master_key_hex:
@@ -379,10 +377,10 @@ def install(witness: str, cluster_info: dict, repo: str):
         print(f"  WARN: bedrock-net start failed: {e}")
 
     # Start the joiner's own rqlited and -join the leader's Raft so
-    # this node becomes a full rqlite voter. Required for bedrock-mgmt
-    # on this node to read/write the cluster store locally — without
-    # this, the only rqlite voter in the cluster is the master and
-    # the joiner's local mgmt API can't query state.
+    # this node becomes a full rqlite voter. Required for bedrock-d's
+    # mgmt API on this node to read/write the cluster store locally —
+    # without this, the only rqlite voter in the cluster is the master
+    # and the joiner's local mgmt API can't query state.
     print("  Starting rqlited (joining leader's Raft)...")
     try:
         from . import rqlite_setup as _rqs
@@ -465,10 +463,10 @@ def install(witness: str, cluster_info: dict, repo: str):
         print(f"  WARN: SeaweedFS setup failed: {e}")
 
     # Install + start the dashboard (FastAPI + Svelte UI). Reachable
-    # at http://<this-node>:8080. The follower's mgmt API serves the
-    # same cluster-wide picture from /etc/bedrock/cluster.json (kept
-    # in sync by the replicated log + view_builder); writes go through
-    # the same code paths and rely on cluster-wide SSH access.
+    # at https://<this-node>:8443. The follower's mgmt API serves the
+    # same cluster-wide picture by reading the Raft-replicated rqlite
+    # store; writes go through the same code paths and rely on
+    # cluster-wide SSH access.
     print("  Installing dashboard application...")
     try:
         dashboard_install.install_dashboard(repo, with_metrics=False)

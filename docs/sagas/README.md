@@ -41,19 +41,15 @@ and [`docs/storage-architecture.md`](../storage-architecture.md#everything-goes-
 
 ## Per-saga doc structure
 
-Each per-saga doc follows the same shape:
+Each per-saga doc has two top-level sections:
 
-1. **Purpose** — one paragraph, why this saga exists.
-2. **Trigger** — who submits it.
-3. **Inputs (ctx)** — fields the caller must set.
-4. **Outputs (ctx)** — fields filled by the saga's own steps.
-5. **Step overview** — table of step names, one-liners, and links
-   into the step-detail section.
-6. **Revert** — how to undo the effects (paired inverse saga, or
-   manual procedure if there isn't one).
-7. **Idempotency / resume** — what happens on re-run.
-8. **Step details** — section per step, with the idempotency check
-   it performs and what it changes.
+1. **Summary** — what the saga does, what triggers it, where it runs,
+   and its end state; a `### Steps` table (one row per step, in order)
+   and an `### Inputs / outputs (ctx)` table. Cluster-wide revert and
+   resume behaviour are stated here in one line each.
+2. **Detail** — one `### N. step_name` block per step: what it does, its
+   **Revert:** (compensation), and its **Idempotent:** guarantee (how a
+   re-run converges).
 
 ## Conventions
 

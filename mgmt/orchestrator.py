@@ -1,13 +1,12 @@
 """Bedrock management-plane orchestrator (rqlite edition).
 
-Per docs/post-alpha-rewrite-notes.md D-01..D-22, cluster state lives
-in rqlite. This orchestrator runs as a set of asyncio tasks inside
-the bedrock-mgmt FastAPI process — one Python process per node,
-hosting:
+Cluster state lives in rqlite. This orchestrator runs as a set of
+asyncio tasks inside the bedrock-mgmt FastAPI process — one Python
+process per node, hosting:
 
   ① rqlite_subscriber    poll bedrock_meta.revision; on advance,
-                          rebuild snapshot from rqlite, project to
-                          cluster.json + state.json, run the
+                          rebuild snapshot from rqlite, project this
+                          node's role/URL to state.json, run the
                           snapshot-diff reactor.
   ② boot_orchestrator    on startup: wait for clear cluster role
                           (quorum established by netd's election),
@@ -55,26 +54,24 @@ STATE_JSON = Path("/etc/bedrock/state.json")
 NO_QUORUM_MARKER = Path("/run/bedrock-no-quorum")
 
 # Cleanup itself is fast — virsh suspend on local VMs is seconds.
-# This is the cap on the cleanup procedure only; the operator can
-# troubleshoot a stuck cleanup in alpha/beta (no auto-reboot).
+# This is the cap on the cleanup procedure only; a stuck cleanup is
+# left for the operator to troubleshoot (no auto-reboot).
 NO_QUORUM_CLEANUP_TIMEOUT_S = 30.0
 
 # Live in-memory snapshot, updated by rqlite_subscriber and read by
 # other tasks (and by the FastAPI handlers that want fresh state).
 #
-# Unification status: when running under bedrock-d (the unified
-# daemon), these globals are bound to fields on the shared
-# state_shared.BedrockState object by orchestrator.attach_state().
-# Backwards-compat: standalone bedrock-mgmt still uses the module
+# Under bedrock-d (the unified daemon) these globals are bound to
+# fields on the shared state_shared.BedrockState object by
+# orchestrator.attach_state(); standalone bedrock-mgmt uses the module
 # globals directly. The accessor helpers below abstract over both.
 _SNAPSHOT: dict = view_builder.empty_snapshot()
-# bedrock_meta.revision of the last snapshot we observed.
-# Field name retained as _LAST_LOG_IDX for back-compat with existing
-# external readers; semantically it's now the rqlite revision.
+# bedrock_meta.revision of the last snapshot we observed. Named
+# _LAST_LOG_IDX because external readers reference that name; it holds
+# the rqlite revision.
 _LAST_LOG_IDX: int = 0
 # Previous snapshot — kept so the reactor can diff prev→cur to drive
-# transition handling (vm_destroyed, vm_migrated, etc.) the same way
-# the old log-replay reactor did on per-entry events.
+# transition handling (vm_destroyed, vm_migrated, etc.).
 _PREV_SNAPSHOT: dict = view_builder.empty_snapshot()
 _SERVICES_STARTED: bool = False
 
@@ -201,9 +198,9 @@ def get_snapshot() -> dict:
 async def rqlite_subscriber():
     """Watch the rqlite cluster-state store's revision counter; on
     every advance, rebuild the snapshot, project this node's role/URL
-    to state.json, run the reactor on the snapshot diff. (cluster.json
-    is no longer a runtime projection — consumers read rqlite directly
-    via cluster_state.load_cluster(); see _apply_revision.)
+    to state.json, run the reactor on the snapshot diff. Consumers read
+    cluster state straight from rqlite via cluster_state.load_cluster();
+    see _apply_revision.
 
     Poll-based (per rqlite's HTTP semantics) at ~500ms cadence; the
     reactor sees one consolidated revision-advance per tick even if
@@ -243,9 +240,9 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             _STATE.snapshot = new
             _STATE.prev_snapshot = prev
             _STATE.last_log_idx = int(new.get("log_index", revision))
-        # Keep module globals in lockstep so legacy callers (anything
-        # still doing `from orchestrator import _SNAPSHOT`) see the
-        # same data. Cheap, ~few μs per tick.
+        # Keep module globals in lockstep so callers doing
+        # `from orchestrator import _SNAPSHOT` see the same data.
+        # Cheap, ~few μs per tick.
         _SNAPSHOT = new
         _PREV_SNAPSHOT = prev
         _LAST_LOG_IDX = _STATE.last_log_idx
@@ -256,9 +253,9 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
         _SNAPSHOT.update(new)
         _LAST_LOG_IDX = int(new.get("log_index", revision))
 
-    # state.json projection of this node's role + mgmt_url. cluster.json
-    # is no longer written — consumers query rqlite directly via
-    # cluster_state.load_cluster() (level='none'). state.json holds the
+    # state.json projection of this node's role + mgmt_url. Consumers
+    # query cluster state from rqlite directly via
+    # cluster_state.load_cluster() (level='none'); state.json holds the
     # per-node fields that need to survive cold-boot without rqlite:
     # node identity + the derived role + master URL for that node.
     try:
@@ -302,9 +299,9 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             log.warning("rqlite_subscriber: drbd config regen at rev %d: %s",
                         revision, e)
 
-    # Arbiter mobility (D-04..D-08): converge based on whether this
-    # node currently holds the mgmt master role. promote/demote is
-    # idempotent so this is safe on every revision tick.
+    # Arbiter mobility: converge based on whether this node currently
+    # holds the mgmt master role. promote/demote is idempotent so this
+    # is safe on every revision tick.
     try:
         try:
             from installer.lib import cluster_arbiter as _ca  # type: ignore
@@ -376,7 +373,7 @@ async def _wait_for_role(timeout_s: float,
     quorum is back.
 
     Quorum-is-back signal: at least one peer is mesh-reachable AND
-    cluster.json says master is alive (someone, possibly us). We do
+    rqlite has a recorded mgmt_master (someone, possibly us). We do
     NOT gate on last_election_outcome — the election returns NO_QUORUM
     as long as the marker is present, which is circular (we're the
     ones holding the marker waiting for quorum to be back so we can
@@ -446,8 +443,8 @@ async def _start_local_services():
     # its DRBD primary/mount) is owned by cluster_arbiter.converge(),
     # driven from the rqlite subscriber + converge_retry. Per-VM DRBD
     # resources are ours to bring up: at boot nothing has run `drbdadm
-    # up` yet (the units are disabled — quorum-aware boot, finding I-02),
-    # so /dev/drbdN won't exist until we do it here, and libvirtd would
+    # up` yet (the units are disabled — quorum-aware boot), so
+    # /dev/drbdN won't exist until we do it here, and libvirtd would
     # fail to open the VM's backing device.
     ours = [n for n, vm in vms.items()
             if vm.get("host") == self_name and vm.get("state") == "running"]
@@ -456,10 +453,9 @@ async def _start_local_services():
 
     # Per-node SeaweedFS: weed-volume + weed-s3 run on EVERY node, and
     # weed-master on the Raft-3 set. Those units have `WantedBy=` empty
-    # by design (role-aware, not blanket boot-enabled), and were only
-    # ever started from the install/join paths — so nothing restarts
-    # them after a reboot/power-loss. Without this call a cold boot
-    # leaves S3/object storage down on this node (the .254 filer is
+    # by design (role-aware, not blanket boot-enabled), so nothing else
+    # restarts them after a reboot/power-loss. Without this call a cold
+    # boot leaves S3/object storage down on this node (the .254 filer is
     # separately owned by cluster_arbiter). promote_to_master_volume_host
     # is idempotent and role-aware (handles the master set + reset-failed).
     try:
@@ -519,13 +515,13 @@ async def _start_local_services():
 async def no_quorum_responder():
     """Watch /run/bedrock-no-quorum. On appearance, run cleanup
     (pause VMs) within NO_QUORUM_CLEANUP_TIMEOUT_S. Then poll for the
-    election to leave NoQuorum (cluster.json's mgmt_master becomes
-    reachable from rqlite) BEFORE clearing the marker — otherwise the
-    election re-flags NoQuorum on the next tick and we flap.
+    election to leave NoQuorum (rqlite has a recorded mgmt_master)
+    BEFORE clearing the marker — otherwise the election re-flags
+    NoQuorum on the next tick and we flap.
 
     If this task crashes mid-cleanup or rejoin never completes, the
-    marker stays present and the operator can troubleshoot in
-    alpha/beta (no auto-reboot)."""
+    marker stays present and the operator can troubleshoot (no
+    auto-reboot)."""
     global _SERVICES_STARTED
     while True:
         await asyncio.sleep(1)
@@ -549,8 +545,8 @@ async def no_quorum_responder():
         # Wait for the election to leave NoQuorum before unlinking the
         # marker — otherwise election would re-create it on the next
         # tick and we'd flap. _wait_for_role returns 'leader'/'follower'
-        # once cluster.json has a recorded mgmt_master from rqlite (i.e.
-        # the cluster has reformed quorum and a leader has been elected).
+        # once rqlite has a recorded mgmt_master (i.e. the cluster has
+        # reformed quorum and a leader has been elected).
         log.info("no_quorum: cleanup done; waiting for quorum to return "
                  "before clearing marker")
         role = await _wait_for_role(timeout_s=120.0, ignore_marker=True)
@@ -629,7 +625,7 @@ async def _reconcile_paused_vms():
 
     # VMs we resume here must be dropped from the vm_failover suspended
     # record so the 5-min kill timer doesn't destroy a VM that recovered
-    # inside the window (VM-01).
+    # inside the window.
     resumed: list[str] = []
 
     for vm_name in _paused_vm_names():
@@ -674,9 +670,8 @@ async def _reconcile_paused_vms():
 
 async def _reactor_diff(prev: dict, cur: dict, self_name: str):
     """Run side-effects derived from prev→cur snapshot transitions.
-    Replaces the old per-log-entry reactor — under rqlite there are
-    no entries to dispatch on, just before/after snapshots. The diff
-    surfaces the same transitions the old reactor reacted to:
+    Under rqlite there are no log entries to dispatch on, just
+    before/after snapshots; the diff surfaces the transitions:
 
       - VMs that disappeared from cur.vms → virsh destroy + undefine
       - VMs whose host changed → start/destroy locally as appropriate
@@ -777,21 +772,18 @@ _SCHEDULED_INFLIGHT: set[str] = set()
 
 async def backup_scheduler():
     """Master-only loop. Every 60 s, walks every VM's `backup_schedule`
-    in cluster.json and decides whether to fire a backup. Decision
-    uses bedrock-managed mtime — `cron.should_fire_now` compares the
-    cron expression against last-fired (most recent BACKUP_DONE for
-    the same VM + target_id) and a 60-min grace window for first-
-    time fires.
+    from cluster state (rqlite) and decides whether to fire a backup.
+    Decision uses bedrock-managed mtime — `cron.should_fire_now`
+    compares the cron expression against last-fired (most recent
+    BACKUP_DONE for the same VM + target_id) and a 60-min grace window
+    for first-time fires.
 
-    Why master-only: appending log entries (and, more importantly,
-    actually orchestrating the LV snapshot + dd | kopia stream) must
-    not double-fire. The leader is the single writer of the cluster
-    log, so scheduling against the leader's view is naturally
-    serialised.
-
-    A follower running this loop would either (a) duplicate the work
-    or (b) discover its IPC append fails (only the leader can append).
-    Cleaner to short-circuit on role.
+    Why master-only: writing the backup result to cluster state (and,
+    more importantly, actually orchestrating the LV snapshot + dd |
+    kopia stream) must not double-fire. The leader is the single writer
+    of cluster state, so scheduling against the leader's view is
+    naturally serialised. A follower running this loop would duplicate
+    the work, so short-circuit on role.
     """
     sys.path.insert(0, str(Path(__file__).parent))
     log.info("scheduler: starting (master-only loop)")
@@ -894,10 +886,10 @@ async def _scheduler_tick():
 def _last_scheduled_fire_time(vm: dict, sched: dict,
                               now) -> "dt.datetime | None":
     """Best-effort wall-clock of the most recent scheduled fire. We
-    reconstruct it from BACKUP_DONE entries that carry the schedule's
-    label_prefix — those are the auto-generated labels of the form
-    "<prefix>-YYYYMMDDTHHMMSS" written by run_backup when invoked from
-    the scheduler. Returns None if we've never fired one."""
+    reconstruct it from the VM's backup records (vm.backups) that carry
+    the schedule's label_prefix — those are the auto-generated labels of
+    the form "<prefix>-YYYYMMDDTHHMMSS" written by run_backup when
+    invoked from the scheduler. Returns None if we've never fired one."""
     import datetime as dt
     prefix = sched.get("label_prefix") or "auto"
     target_id = sched.get("target_id") or ""
@@ -1065,13 +1057,13 @@ _LEADER_ONLY_SAGA_KINDS = frozenset({
 
 
 async def saga_resume():
-    """BAD-6 / SA-02: resume in-flight runtime sagas once at bedrock-d
-    boot. A crash mid vm_create / cluster_tier_promote / cluster_rename
-    leaves an ``in_progress`` operations row that nothing else picks
-    back up — this delivers BEDROCK.md's "power-loss recoverable on
-    boot" guarantee for the rqlite-backed runtime sagas.
+    """Resume in-flight runtime sagas once at bedrock-d boot. A crash
+    mid vm_create / cluster_tier_promote / cluster_rename leaves an
+    ``in_progress`` operations row that nothing else picks back up —
+    this delivers the "power-loss recoverable on boot" guarantee for
+    the rqlite-backed runtime sagas.
 
-    Gating, per the locked plan:
+    Gating:
       - run only after rqlite is reachable (we can read inflight rows),
         and after this node has a settled role (quorum reformed);
       - leader-only saga kinds (cluster-tier / rename) are skipped
@@ -1163,8 +1155,8 @@ def start_all():
     asyncio.create_task(cluster_tier_watcher())
     asyncio.create_task(saga_resume())
     # Self-heal: leader-only calm loop that rebuilds redundancy after a
-    # permanent host loss (SG-05), one resource at a time, under the 80%
-    # disk gate.
+    # permanent host loss, one resource at a time, under the 80% disk
+    # gate.
     try:
         from bedrock_d.orchestrator import self_heal as _sh
         asyncio.create_task(_sh.self_heal_task())
@@ -1172,7 +1164,7 @@ def start_all():
         log.warning("orchestrator: self_heal start failed: %s", e)
     # VM failover state machine — suspend-on-no-quorum,
     # takeover-after-35s, kill-suspended-after-5min. Per-VM workload
-    # survival logic (Gap 2 from 2026-05-26 review).
+    # survival logic.
     try:
         from bedrock_d.orchestrator import vm_failover as _vmf
         _vmf.start_failover_tasks()

@@ -228,6 +228,6 @@ def lvextend_meta(host: str, resource: str, data_gb: int, *,
                   f"2>&1 || true", check=False)
 
 
-# Backwards-compat aliases — at runtime the saga steps call these.
+# Convenience aliases the saga steps call to fetch one LV name directly.
 data_lv_for = lambda r: lv_names_for(r).data_lv  # noqa: E731
 meta_lv_for = lambda r: lv_names_for(r).meta_lv  # noqa: E731

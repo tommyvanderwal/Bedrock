@@ -22,9 +22,10 @@ from pathlib import Path
 
 STATE_FILE = Path("/etc/bedrock/state.json")
 # Local bootstrap cluster snapshot (written at init/join, read by
-# rqlite_setup at boot). NOT the old runtime projection — it survives
-# the rename window that can lose state.json, so it is our self-heal
-# source for this node's identity. See recover_identity_from_cluster_json.
+# rqlite_setup at boot). A bootstrap file, not a runtime state
+# projection — it survives the rename window that can lose state.json,
+# so it is our self-heal source for this node's identity.
+# See recover_identity_from_cluster_json.
 CLUSTER_JSON_FILE = Path("/etc/bedrock/cluster.json")
 
 # The identity fields a node MUST have to bring up netd + rqlite. Every

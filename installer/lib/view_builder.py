@@ -1,23 +1,13 @@
-"""Materialised-view builder — rqlite edition.
+"""Materialised-view builder.
 
-Reads the cluster state from rqlite (the post-alpha rewrite's new
-state store, D-01..D-22) and projects it into the on-disk JSON
-files Bedrock has historically maintained:
+Reads the cluster state from rqlite (the Raft-replicated SQLite store)
+and assembles it into a single snapshot dict, the shape downstream
+consumers (mgmt/app.py, orchestrator reactor, dashboard, CLI verbs)
+expect.
 
-  /etc/bedrock/cluster.json  — cluster-wide canonical view
-  /etc/bedrock/state.json    — this node's role + mgmt_url
-
-The rqlite tables ARE the canonical store; these JSON files are
-caches that any consumer (the FastAPI app, `bedrock storage status`,
-the operator running `cat`) can read without a SQL round-trip.
-Callers invoke `rebuild()` whenever the cluster's
-bedrock_meta.revision advances; on a real cluster the orchestrator's
-`rqlite_subscriber` task does this in a watch loop.
-
-The output shape is IDENTICAL to the pre-rqlite log-replay version
-of this module — all downstream consumers (mgmt/app.py,
-orchestrator.py reactor, dashboard, CLI verbs) see the same dict
-structure they always did. Only the source of data changed.
+The rqlite tables ARE the canonical store. `build_snapshot()` folds
+all relevant tables into one dict so a consumer can read the whole
+cluster view in a single call instead of issuing many SQL queries.
 """
 from __future__ import annotations
 
@@ -52,9 +42,9 @@ def empty_snapshot() -> dict:
         "operators": {},
         "join_requests": {},
         "obs_backends": {"metrics": [], "logs": []},
-        # log_index name retained for backward-compat with consumers
-        # that read the field name; semantically it's now the
-        # bedrock_meta.revision (the rqlite monotonic counter).
+        # Named 'log_index' because consumers read that field name;
+        # semantically it holds bedrock_meta.revision (the rqlite
+        # monotonic counter).
         "log_index": 0,
     }
 
@@ -66,8 +56,7 @@ def empty_snapshot() -> dict:
 
 def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                    *, level: str = "weak") -> dict:
-    """Read the rqlite cluster-state tables and assemble a snapshot
-    dict matching the historical log-fold output shape.
+    """Read the rqlite cluster-state tables and assemble a snapshot dict.
 
     `level` follows rqlite's read-consistency knob — 'weak' (default)
     reads from this node's local Raft follower replica (sub-second
@@ -93,7 +82,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             out["cluster_name"] = ci["cluster_name"]
             out["mgmt_master"] = ci["mgmt_master"]
 
-        # bedrock_meta.revision → "log_index" for back-compat field
+        # bedrock_meta.revision → exposed under the "log_index" key
         meta = client.query_one(
             "SELECT revision FROM bedrock_meta WHERE id = 1",
             level=level,
@@ -161,9 +150,9 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "witness_pubkey": row["witness_pubkey"],
                 "encrypted_witness_key": row["encrypted_witness_key"],
             }
-            # D-17: backend column added so multi-backend (Echo /
-            # SMB / S3) is operator-visible. Default 'echo'
-            # for back-compat with consumers expecting just the key.
+            # Carry the backend kind (Echo / SMB / S3) so the witness
+            # transport is operator-visible. Only set when present;
+            # absent means the consumer assumes the default backend.
             if row.get("backend"):
                 entry["backend"] = row["backend"]
             out["witnesses"][row["witness_id"]] = entry
@@ -209,11 +198,10 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 entry["master_eph_pubkey"] = row.get("master_eph_pubkey", "")
                 entry["ciphertext"] = row.get("ciphertext", "")
                 entry["nonce"] = row.get("nonce", "")
-                # Cluster CA + joiner's signed TLS cert (mTLS rollout
-                # 2026-05-25). Projected into cluster.json so
-                # /api/join/status — which reads from cluster.json,
-                # not directly from rqlite — can surface them to the
-                # joiner.
+                # Cluster CA + joiner's signed TLS cert (mTLS).
+                # Projected into cluster.json so /api/join/status —
+                # which reads from cluster.json, not directly from
+                # rqlite — can surface them to the joiner.
                 entry["node_cert_pem"] = row.get("node_cert_pem", "")
                 entry["ca_cert_pem"]   = row.get("ca_cert_pem", "")
             elif row["state"] == "rejected":
@@ -261,7 +249,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             out["vms"][row["vm_name"]] = vm
 
         # vm_backups — attach to the owning VM in newest-first order,
-        # capped at 200 like the old fold did.
+        # capped at 200 per VM.
         for row in client.query(
             "SELECT vm_name, primary_kopia_id, disks, target_id, "
             "source_node, bytes_added, duration_s, label, "
@@ -368,8 +356,7 @@ def _cluster_view(v: dict) -> dict:
         "operators":      v.get("operators", {}),
         "join_requests":  v.get("join_requests", {}),
         "obs_backends":   v.get("obs_backends", {"metrics": [], "logs": []}),
-        # Field name kept as 'log_index' for back-compat with existing
-        # consumers; semantically this is the rqlite revision.
+        # Field is named 'log_index' but holds the rqlite revision.
         "log_index":      v["log_index"],
     }
 
@@ -394,17 +381,17 @@ def _state_view(v: dict, node_name: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# rebuild — DELETED. cluster.json projection layer was removed; every
-# consumer now queries rqlite directly via cluster_state.load_cluster()
-# (level='none', works without quorum). state.json projection is done
-# inline by mgmt/orchestrator.py:_apply_revision.
+# No cluster.json projection here: consumers query rqlite directly via
+# cluster_state.load_cluster() (level='none', works without quorum), and
+# state.json is projected inline by mgmt/orchestrator.py:_apply_revision.
 # ─────────────────────────────────────────────────────────────────────
 
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
-    """Same per-call unique-tmp pattern orchestrator.py uses — see
-    L48 / lesson_orchestrator_atomic_write for the race the simple
-    tmp+rename pattern was hitting before."""
+    """Write JSON atomically with a per-call unique tmp file, then
+    os.replace. The unique tmp name (not a fixed one) is required
+    because concurrent writers sharing a single tmp+rename race and
+    can produce concatenated JSON — see lesson_orchestrator_atomic_write."""
     import os
     import tempfile
     fd, tmp_path = tempfile.mkstemp(
@@ -422,24 +409,17 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# fold_into — back-compat shim for orchestrator's incremental updates
+# fold_into — rebuild the snapshot in place from rqlite
 # ─────────────────────────────────────────────────────────────────────
 
 
 def fold_into(out: dict, entries: list) -> dict:
-    """Back-compat: replaced by direct rqlite reads.
+    """Rebuild `out` in place from current rqlite state.
 
-    The pre-rqlite version of view_builder folded log entries
-    incrementally so the orchestrator could keep an in-memory
-    snapshot up to date entry-by-entry. Under rqlite, the snapshot
-    IS the database — there are no "entries" to fold. The
-    orchestrator's rqlite_subscriber should call build_snapshot()
-    directly when a revision-change is observed.
-
-    This function is kept as a compatibility shim that simply
-    rebuilds the snapshot from rqlite. Any callers passing log-
-    entry dicts will see them ignored. Tracked as deprecated;
-    delete in v1.0 once orchestrator is migrated.
+    The snapshot IS the database, so there is nothing to fold
+    incrementally: `entries` is ignored, build_snapshot() is called,
+    and `out` is replaced with the result. Callers that observe a
+    revision change can call build_snapshot() directly instead.
     """
     log.debug("view_builder.fold_into is deprecated under rqlite; "
               "rebuilding from current state instead")

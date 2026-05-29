@@ -1,8 +1,9 @@
 """Contract test: every registered saga has a markdown doc.
 
 The per-saga doc lives at ``docs/sagas/<kind>.md`` and follows the
-template described in ``docs/sagas/README.md`` (Purpose, Trigger,
-Inputs, Outputs, Step overview, Revert, Idempotency, Step details).
+template described in ``docs/sagas/README.md``: a ``## Summary`` section
+(what/trigger/where/end-state + a Steps table + Inputs/outputs) and a
+``## Detail`` section (one block per step, with its Revert + Idempotency).
 
 A drift between code and docs is the kind of bug nobody notices
 until they pick up an unfamiliar saga six months later. This test
@@ -78,18 +79,13 @@ class SagaDocsPresent(unittest.TestCase):
 
 
 class SagaDocSectionsPresent(unittest.TestCase):
-    """Each per-saga doc must contain the load-bearing sections so
-    readers can find Purpose / Inputs / Steps / Revert / Idempotency
-    in the same place every time."""
+    """Each per-saga doc must carry the two standard sections so readers
+    find the summary (what/trigger/where/steps/inputs) and the per-step
+    detail (revert + idempotency) in the same place every time."""
 
     REQUIRED_HEADINGS = (
-        "## Purpose",
-        "## Trigger",
-        "## Inputs",
-        "## Step overview",
-        "## Revert",
-        "## Idempotency",
-        "## Step details",
+        "## Summary",
+        "## Detail",
     )
 
     def test_each_doc_has_required_headings(self):

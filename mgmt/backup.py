@@ -49,7 +49,7 @@ CREDENTIALS_DIR = Path("/etc/bedrock/backup-credentials")  # per-target .env fil
 # every kopia invocation rather than letting it default to
 # ~/.config/kopia/repository.config: bedrock-mgmt runs as a systemd
 # unit without HOME set, so the default would be ambiguous. Per-target
-# files also let multiple targets coexist later (v1.x sync-to topology).
+# files also let multiple targets coexist.
 KOPIA_CONFIG_DIR = Path("/etc/bedrock/kopia")              # config files
 KOPIA_CACHE_ROOT = Path("/var/cache/bedrock-kopia")        # cache root
 
@@ -229,23 +229,23 @@ def _credentials_env(target_id: str) -> str:
 
 def _kopia_password_arg() -> str:
     """No-op: kopia 0.21 takes the password via KOPIA_PASSWORD env var
-    (set by _credentials_env). Empty string keeps existing call sites
-    that splice the result into command strings legible."""
+    (set by _credentials_env). Empty string keeps call sites that splice
+    the result into command strings legible."""
     return ""
 
 
 def _kopia_cache_arg(target_id: str) -> str:
-    """Legacy helper retained for any external callers; produces the
-    --cache-directory flag for `target_id`. New code should use
-    `_kopia_global_flags(...)` which bundles --config-file too."""
+    """Produce the --cache-directory flag for `target_id`, for callers
+    that need it standalone. `_kopia_global_flags(...)` bundles
+    --config-file too."""
     target = _target_record(target_id) or {}
     return f"--cache-directory={shlex.quote(_kopia_cache_dir(target_id, target.get('cache_directory') or ''))}"
 
 
 # ── state-write helpers (rqlite) ─────────────────────────────────────────
 #
-# Replaces the old bedrock-rust log-append path. Mutations go directly to
-# rqlite via bedrock_state.* helpers (which bump bedrock_meta.revision).
+# Mutations go directly to rqlite via bedrock_state.* helpers (which bump
+# bedrock_meta.revision).
 
 
 # ── public: backup target setup ──────────────────────────────────────────
@@ -274,21 +274,20 @@ def configure_target_locally(target_id: str, kind: str,
          256-bit floor (see ALLOWED_BLOCK_HASHES).
 
     Step 3 is the load-bearing one. It's how we detect the case
-    "operator created the repo themselves with a 128-bit hash" or
-    "an older bedrock version created the repo before this floor
-    existed" — we fail loudly rather than silently using a hash we
-    don't trust for content addressing.
+    "operator (or some other tool) created the repo with a sub-256-bit
+    hash" — we fail loudly rather than silently using a hash we don't
+    trust for content addressing.
 
     Idempotent: if already connected to the same repo, kopia exits
     cleanly and we still re-verify the hash. If connected to a
     different repo, kopia errors and the caller is expected to
     disconnect first.
 
-    NOTE: mgmt's reactor on every node also runs this on
-    BACKUP_TARGET_SET log entries — so configuring the target via the
-    `bedrock backup target set` CLI on the master propagates to every
-    peer automatically. This standalone function is for the master's
-    own setup and for ad-hoc reconnects."""
+    NOTE: mgmt's reactor on every node also runs this when a backup
+    target appears/changes in cluster state — so configuring the target
+    via the `bedrock backup target set` CLI on the master propagates to
+    every peer automatically. This standalone function is for the
+    master's own setup and for ad-hoc reconnects."""
     if not ENCRYPTION_KEY_FILE.exists():
         raise RuntimeError(
             f"missing {ENCRYPTION_KEY_FILE}; "
@@ -568,7 +567,7 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
          across snapshots don't re-upload, so dedup still works for
          each disk independently.
       7. Drop every LV snapshot. ALWAYS — even on kopia failure.
-      8. Append BACKUP_DONE with the multi-disk record.
+      8. Record the multi-disk result in rqlite via bs.backup_done().
     """
     cluster = _read_cluster()
     vm = (cluster.get("vms") or {}).get(vm_name)
@@ -774,7 +773,7 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
         "duration_s": duration,
         "label": snap_label,
         "fs_freeze_used": fs_freeze_used,
-        # Legacy fields — keep until callers migrate. Primary disk = first.
+        # Single-disk convenience fields: primary disk (the first one).
         "kopia_snapshot_id": disk_results[0]["kopia_snapshot_id"]
                               if disk_results else "",
         "bytes_added": total_bytes,
@@ -799,9 +798,9 @@ def _parse_kopia_create(json_out: str) -> tuple[str, int]:
 # ── public: list backups + restore ───────────────────────────────────────
 
 def list_backups_for_vm(vm_name: str) -> list[dict]:
-    """Backup history for one VM, drawn from the cluster log via cluster.json.
-    Returns newest first, list of {kopia_snapshot_id, target_id, ts_index,
-    bytes_added, duration_s, label, source_node}."""
+    """Backup history for one VM, drawn from the VM's record in cluster
+    state. Returns newest first, list of {kopia_snapshot_id, target_id,
+    ts_index, bytes_added, duration_s, label, source_node}."""
     vm = _vm_record(vm_name)
     if not vm:
         return []
@@ -820,10 +819,10 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
     if target is None:
         raise RuntimeError(f"backup target {target_id!r} not configured")
 
-    # Default the destination node to wherever the VM lives in
-    # cluster.json; that's where the LV is. (Restoring to a different
-    # node is a v1.x feature — would need to also (re)create the LV
-    # there and update libvirt, which is out of scope for this path.)
+    # Default the destination node to wherever the VM lives in cluster
+    # state; that's where the LV is. (Restoring to a different node is
+    # out of scope here — would need to also (re)create the LV there and
+    # update libvirt.)
     if dest_node_name is None:
         vm_rec = (cluster.get("vms") or {}).get(vm_name) or {}
         dest_node_name = vm_rec.get("host") or _self_node_name()
@@ -868,9 +867,9 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
         if matched_row:
             break
     # Single-LV operator override path: caller passed an explicit
-    # target_lv_path. Used by v1.x flows like restore-to-fresh-LV.
-    # In that case we don't need a matched row — we just restore the
-    # one snapshot the caller named, to the LV the caller chose.
+    # target_lv_path (e.g. restore-to-fresh-LV). In that case we don't
+    # need a matched row — we just restore the one snapshot the caller
+    # named, to the LV the caller chose.
     if target_lv_path is not None:
         plan = [{
             "target_dev": "custom",
@@ -984,7 +983,7 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
         "disks": restored,
         "dest_node": dest_node_name,
         "duration_s": duration,
-        # Legacy single-disk field — primary disk's target.
+        # Single-disk convenience field: primary disk's target.
         "target_lv_path": restored[0]["target_lv_path"] if restored else "",
     }
 

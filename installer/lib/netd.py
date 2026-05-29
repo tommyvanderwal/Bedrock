@@ -10,9 +10,10 @@ between L2-cable-up and "DRBD/libvirt/SeaweedFS can talk to a peer's
 loopback IP." The short version:
 
   * Every node has ONE cluster identity = a /32 loopback IP recorded
-    in cluster.json (via NODE_LOOPBACK log entry, set at init/join).
-    Per-NIC IPs ARE logged (as link_addr_a/b in LINK_UP/LINK_QUALITY)
-    so DRBD's multi-path config can list them in path blocks.
+    in rqlite's `nodes` table (set at init/join, mirrored in
+    state.json). Per-NIC IPs ARE logged (as link_addr_a/b in
+    LINK_UP/LINK_QUALITY) so DRBD's multi-path config can list them in
+    path blocks.
   * On every up non-blocklisted interface, this daemon emits a signed
     UDP multicast probe every 1 s. Recipients verify the cluster_key
     HMAC, learn "node X's loopback Y is reachable on this link via
@@ -132,10 +133,8 @@ ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
 # routes to that loopback. One signed+sealed message per peer per tick.
 HB_PORT = 7734                   # complements PROBE_PORT=7732, ADV_PORT=7733
 
-# BAD-1 single leader-loss detector. Replaces the old triad
-# (DOWN_HYSTERESIS_S-driven election liveness + NOQUORUM_HOLDDOWN_TICKS
-# + the disabled LONE_MASTER_WATCHDOG_S): the election now tracks
-# consecutive missed election-heartbeats from the believed master.
+# Single leader-loss detector: the election tracks consecutive missed
+# election-heartbeats from the believed master.
 #  * Survivor promotes at MASTER_LOSS_MISSES (~10 s).
 #  * An old master that has itself lost quorum self-demotes at
 #    SELF_DEMOTE_MISSES (~9 s) — 1 s before survivors promote so the
@@ -148,18 +147,17 @@ SELF_DEMOTE_MISSES = 9
 UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 # Down hysteresis: enough to absorb a few missed probes but short
 # enough that the election self-marks NoQuorum within the 90 s
-# isolation window the e2e harness uses (was 30 s — left
-# sim-1's .254 hanging until ~T+45 s after the assertion).
+# isolation window the e2e harness uses (a 30 s value left sim-1's
+# .254 hanging until ~T+45 s after the assertion).
 # This drives mesh LINK_DOWN / routing only; leader-loss detection is
-# now the MASTER_LOSS_MISSES heartbeat counter above.
+# the MASTER_LOSS_MISSES heartbeat counter above.
 DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 
 # Loopback identity range — derived per-cluster from cluster_uuid via
 # cluster_addr.cluster_loopback_prefix(). Lives in RFC 6598 Shared
 # Address Space (100.64.0.0/10) so it can't collide with operator
-# LANs. Computed at daemon startup; used here only for legacy log
-# strings — the actual values come from Daemon state at runtime.
+# LANs. The actual values come from Daemon state at runtime.
 
 # Per-NIC link-layer IPs come from IPv4 link-local (169.254.0.0/16,
 # RFC 3927). NetworkManager handles the actual assignment — ARP
@@ -683,8 +681,7 @@ class Daemon:
     # adv_send_sock — one UDP socket for all outgoing unicasts;
     #   the kernel picks the physical NIC via the /32 route to peer's
     #   loopback that emit_routes() installs. One advertisement per
-    #   peer per cycle, regardless of how many physical NICs connect us
-    #   (the architectural fix the previous per-link design botched).
+    #   peer per cycle, regardless of how many physical NICs connect us.
     # adv_recv_sock — one UDP socket bound to 0.0.0.0:ADV_PORT.
     # adv_seq — monotonic counter; receivers dedup by (advertiser, seq).
     # adv_table — last advertisement per advertiser; entries past
@@ -745,8 +742,8 @@ def open_send_socket(nic: str) -> socket.socket:
     # unsigned int regardless of platform LP-size — using "L" (which
     # is 8 bytes on x86_64 Linux) silently produces a 16-byte option
     # value, the kernel rejects it as too long, and IP_MULTICAST_IF
-    # falls back to "default outgoing interface". That's how we got
-    # probes being cross-attributed between mesh planes earlier.
+    # falls back to "default outgoing interface" — which cross-
+    # attributes probes between mesh planes.
     if_index = socket.if_nametoindex(nic)
     mreq = struct.pack("4s4sI",
                         socket.inet_aton("0.0.0.0"),
@@ -905,10 +902,10 @@ def load_state() -> tuple[bytes, str, str, str]:
     if not STATE_JSON.exists():
         raise RuntimeError(f"missing {STATE_JSON} — run `bedrock bootstrap` first")
     # state.json can be a 0-byte/corrupt truncation after a power-loss in
-    # save()'s rename window — a bare json.loads() here used to crash the
+    # save()'s rename window — a bare json.loads() here would crash the
     # whole netd thread (observed sim-4 2026-05-29). Load defensively and
-    # self-heal this node's identity from the surviving cluster.json before
-    # giving up, so a lost state.json no longer bricks consensus.
+    # self-heal this node's identity from the surviving cluster state before
+    # giving up, so a lost state.json doesn't brick consensus.
     try:
         from . import state as _state
     except ImportError:                      # running outside the package
@@ -940,8 +937,7 @@ def ensure_routing_sysctls() -> None:
       (src_IP, dst_IP) to the same nexthop. For Bedrock's pattern
       of "few clients, many flows" (e.g. DRBD's connection-per-
       path machinery hitting peer.loopback), L4 hashing actually
-      distributes traffic across cables. See post-alpha-rewrite-
-      notes.md D-15.
+      distributes traffic across cables.
 
     * `net.ipv4.conf.all.arp_ignore=1` — only reply to ARP for an
       IP if that IP is configured on the RECEIVING interface. The
@@ -1079,7 +1075,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         (the base layer drives the promote; the arbiter writes
         mgmt_master to rqlite as a RESULT, only after the arbiter rqlite
         is back — H5/INV-6) and ensures the LMS bit when last-standing
-        (H6). netd no longer writes mgmt_master itself.
+        (H6). The arbiter, not netd, writes mgmt_master.
       - on NoQuorum: after the self-demote streak, drops the no-quorum
         marker + demotes the singletons if we were hosting
       - on transition back to Leader/Follower from NoQuorum: nothing
@@ -1325,8 +1321,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
 
     # 6. Act on outcome.
     if result.outcome == _election.Outcome.NO_QUORUM:
-        # Single self-demote detector (replaces NOQUORUM_HOLDDOWN_TICKS +
-        # the disabled LONE_MASTER_WATCHDOG_S). Count consecutive
+        # Single self-demote detector. Count consecutive
         # NoQuorum ticks; an old master that has lost quorum self-demotes
         # at SELF_DEMOTE_MISSES (~9 s) — 1 s before a survivor promotes
         # at MASTER_LOSS_MISSES (~10 s), so .254 / arbiter rqlite is
@@ -1379,10 +1374,10 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     elif result.outcome == _election.Outcome.LEADER:
         # H5 / INV-6 two-tier ordering: netd (the base layer) DRIVES the
         # promote; mgmt_master is written by the arbiter as a RESULT, only
-        # after the arbiter rqlite is back. We no longer write
-        # set_mgmt_master here directly (the old backwards trigger — netd
-        # wrote it first, the orchestrator then promoted off the rqlite
-        # role). The promote needs NO rqlite (witness + local only), so
+        # after the arbiter rqlite is back. netd does not write
+        # set_mgmt_master here directly — driving the promote from the
+        # rqlite role would be backwards (it needs the role to already be
+        # set). The promote needs NO rqlite (witness + local only), so
         # there's no deadlock: promote_to_arbiter_host runs the takeover
         # protocol, brings up DRBD primary + .254 + arbiter rqlite +
         # filer, then writes mgmt_master once arbiter_status() confirms
@@ -1493,22 +1488,21 @@ def run_daemon(shared_state=None):
 
     Also honors `shared_state.stop_event` for clean shutdown when running
     inside the unified `bedrock-d` process. Without a shared_state arg the
-    function behaves exactly as before — used by the legacy `bedrock-net`
-    standalone systemd unit (kept during the transition)."""
-    # Under unification, bedrock-d starts BEFORE `bedrock init`/`bedrock join`
-    # has run — so cluster.key + state.json don't exist yet. The legacy
-    # standalone bedrock-net.service relied on systemd Restart=on-failure to
-    # retry after init wrote cluster.key. Inside bedrock-d we need to wait
-    # in-process instead — if we raise here the netd thread dies and stays
-    # dead, blocking the very init flow that would have unblocked us.
+    function crashes on missing state and relies on systemd
+    Restart=on-failure, as the standalone `bedrock-net` systemd unit does."""
+    # bedrock-d starts BEFORE `bedrock init`/`bedrock join` has run — so
+    # cluster.key + state.json don't exist yet. The standalone
+    # bedrock-net.service relies on systemd Restart=on-failure to retry
+    # after init wrote cluster.key; inside bedrock-d we wait in-process
+    # instead — raising here would kill the netd thread and leave it dead,
+    # blocking the very init flow that would have unblocked us.
     while True:
         try:
             cluster_key, cluster_uuid, my_node, my_loopback = load_state()
             break
         except RuntimeError as e:
             if shared_state is None:
-                # Legacy standalone path — preserve the old crash-and-let-
-                # systemd-restart behaviour.
+                # Standalone path — crash and let systemd restart us.
                 raise
             sys.stderr.write(
                 f"bedrock-net: waiting for cluster bootstrap: {e}\n"
@@ -1550,8 +1544,8 @@ def run_daemon(shared_state=None):
 
     # Publish the Daemon onto the shared state object so the unified
     # bedrock-d process can answer dashboard queries without re-reading
-    # /run/bedrock/*.json files. Standalone-mode (shared_state=None)
-    # keeps the original behaviour: state lives in this stack frame.
+    # /run/bedrock/*.json files. In standalone mode (shared_state=None)
+    # state lives only in this stack frame.
     if shared_state is not None:
         with shared_state.netd_lock:
             shared_state.netd = d
@@ -1584,8 +1578,8 @@ def run_daemon(shared_state=None):
     # rather than as a sibling daemon. On a Leader outcome netd DRIVES
     # cluster_arbiter.promote_to_arbiter_host(); the arbiter writes
     # `bs.set_mgmt_master(self)` to rqlite as a RESULT, only after the
-    # arbiter rqlite is back (H5/INV-6 two-tier ordering — netd no longer
-    # writes mgmt_master itself). Witness state is best-effort — no
+    # arbiter rqlite is back (H5/INV-6 two-tier ordering — the arbiter,
+    # not netd, writes mgmt_master). Witness state is best-effort — no
     # witness on the LAN just means 2-node clusters can't auto-failover
     # (split-brain prevention), which is the correct behaviour.
     try:
@@ -1617,7 +1611,7 @@ def run_daemon(shared_state=None):
         ws.sock = None
     # Publish ws onto shared_state so cluster_arbiter can fire a
     # witness claim at the moment of arbiter promote (rather than
-    # waiting for netd's next tick to notice cluster.json caught up).
+    # waiting for netd's next tick to notice cluster state caught up).
     if shared_state is not None:
         with shared_state.netd_lock:
             shared_state.netd_ws = ws
@@ -2457,11 +2451,11 @@ def _direct_neighbour_by_node(d: Daemon) -> dict:
 
 
 def _cluster_node_loopbacks(my_node: str) -> dict:
-    """Read cluster.json's nodes -> loopback_ip mapping (best-effort).
-    Used to know who to address advertisements to. Mesh routing
-    decisions themselves never depend on this — the cluster log is
-    membership-of-record, not routing-of-record, per the design
-    invariants. Returns {} on any error."""
+    """Read rqlite's nodes -> loopback_ip mapping (best-effort,
+    level='none'). Used to know who to address advertisements to. Mesh
+    routing decisions themselves never depend on this — cluster
+    membership is membership-of-record, not routing-of-record, per the
+    design invariants. Returns {} on any error."""
     try:
         try:
             from . import rqlite_client as _rc_mod
@@ -2525,7 +2519,7 @@ def adv_send_round(d: Daemon, now_ts: float) -> None:
     """Send one signed unicast advertisement to every known cluster
     peer per cycle. `Known peers` is the union of:
       * direct neighbours (we already have their peer_loopback)
-      * cluster.json nodes map (covers peers we know exist but
+      * rqlite's nodes map (covers peers we know exist but
         haven't observed a direct probe from yet — kernel routes
         transit /32 if installed, otherwise the send silently fails
         and the next cycle retries)
@@ -2893,10 +2887,10 @@ def _emit_nic_switch_log(nic: str, entry: dict, *, reason: str) -> None:
 def write_switch_state_file(d: Daemon) -> None:
     """Atomic write of the current per-NIC switch view to
     /run/bedrock/switch_neighbors.json. Per-node local file —
-    NOT replicated, NOT folded into cluster.json. The mgmt master
+    NOT replicated, NOT folded into rqlite. The mgmt master
     scrapes one of these per node to build an in-memory rollup
     for the dashboard (or a /run/bedrock/physical_topology.json
-    cache on the master, if convenient). cluster.json stays
+    cache on the master, if convenient). rqlite stays
     consensus-only.
 
     Shape:
@@ -2926,7 +2920,7 @@ def write_mesh_state_file(d: Daemon) -> None:
     """Atomic write of the current per-NIC view of directly-cabled
     cluster peers (protocol-1 observations) to
     /run/bedrock/mesh_neighbors.json. Per-node local file — same
-    lifecycle / non-replicated / not-folded-into-cluster.json story
+    lifecycle / non-replicated / not-folded-into-rqlite story
     as switch_neighbors.json. mgmt master scrapes this so the
     dashboard topology view shows node-to-node cables as well as
     node-to-switch.
@@ -3006,8 +3000,7 @@ def local_metric(bw_mbps: int, latency_us: int,
                                              above. Sub-ms is noise on
                                              a healthy LAN; bandwidth
                                              should dominate at local
-                                             scale. See post-alpha-
-                                             rewrite-notes.md D-14.
+                                             scale.
     flap penalty:   +50 if up_since < 60 s (additive, predictable —
                                              not a multiplier)
     loss penalty:   +500 × min(1, loss×20) → graded, not binary
@@ -3037,13 +3030,13 @@ def i_am_mgmt_master(d: Daemon) -> bool:
 def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> bool:
     """Persist a LINK_UP / LINK_DOWN / LINK_QUALITY observation by
     writing/updating the corresponding row in rqlite's `paths` table.
-    Only the mgmt master writes (D-20 single-writer discipline);
-    followers return True immediately so the hysteresis state machine
-    still records "logged" locally and doesn't keep retrying. The
-    cluster-wide path table is populated by the master observing its
-    own paths; followers' own paths reach cluster.json via the
-    master's reciprocal observation. Returns True on success or
-    follower-skip, False on rqlite error (caller retries next sweep).
+    Only the mgmt master writes (single-writer discipline); followers
+    return True immediately so the hysteresis state machine still records
+    "logged" locally and doesn't keep retrying. The cluster-wide path
+    table is populated by the master observing its own paths; followers'
+    own paths reach the `paths` table via the master's reciprocal
+    observation. Returns True on success or follower-skip, False on
+    rqlite error (caller retries next sweep).
     """
     if not i_am_mgmt_master(d):
         return True  # follower: don't write, but mark as logged
@@ -3094,9 +3087,8 @@ def emit_link_event(kind: str, d: Daemon, n: Neighbour, reason: str = "") -> boo
 
 def emit_routes(d: Daemon) -> None:
     """Compute the per-peer routes from the in-memory neighbour table
-    and (best-effort) fold the cluster.json paths section to fold in
-    transit hops. Update the kernel routing table only if the desired
-    set differs from what we last installed.
+    and the protocol-3 transit paths. Update the kernel routing table
+    only if the desired set differs from what we last installed.
 
     Strategy:
       * For every direct neighbour with logged_up=True, emit a host
@@ -3221,7 +3213,7 @@ def compute_routes(d: Daemon) -> list[str]:
         # local_metric (after sub-ms latency floor + bucketed bandwidth)
         # get emitted as a single multipath route. Kernel hashes flows
         # across nexthops via fib_multipath_hash_policy=1 (set in
-        # ensure_routing_sysctls). See post-alpha-rewrite-notes.md D-15.
+        # ensure_routing_sysctls).
         tier_groups: list[tuple[int, list]] = []
         for n in lst:
             if not n.peer_link_addr:
@@ -3262,9 +3254,9 @@ def compute_routes(d: Daemon) -> list[str]:
     #    /32 via that neighbour at METRIC_TRANSIT_BASE. Direct beats
     #    transit by definition (METRIC_DIRECT_BASE < METRIC_TRANSIT_BASE,
     #    and longest-prefix-match is identical at /32 so kernel sorts
-    #    by metric). The destination loopback IP comes from cluster.json
-    #    — membership-of-record, never used for routing decisions
-    #    themselves.
+    #    by metric). The destination loopback IP comes from rqlite's
+    #    nodes table — membership-of-record, never used for routing
+    #    decisions themselves.
     dest_loopbacks = _cluster_node_loopbacks(d.my_node)
     transit_items = sorted(d.best_transit_paths.items(),
                             key=lambda kv: (kv[1]["metric"], kv[0]))
@@ -3273,7 +3265,7 @@ def compute_routes(d: Daemon) -> list[str]:
             continue   # direct already covers it
         dest_lo = dest_loopbacks.get(dest, "")
         if not dest_lo:
-            continue   # cluster.json hasn't caught up yet; retry next tick
+            continue   # rqlite hasn't caught up yet; retry next tick
         nb = sel["neighbour"]
         if not nb.peer_link_addr:
             continue
@@ -3283,16 +3275,14 @@ def compute_routes(d: Daemon) -> list[str]:
 
     # Panic-via-master catch-all: route the whole cluster /24 via the
     # current mgmt-master's best-known path. The arbiter's "cluster IP"
-    # at the top of the /24 (D-05) reaches the master this way without
-    # any extra advertisement; future cluster-singleton service IPs
-    # ride the same path. See post-alpha-rewrite-notes.md D-13.
+    # at the top of the /24 reaches the master this way without any extra
+    # advertisement; cluster-singleton service IPs ride the same path.
     #
-    # Fallback: if cluster.json is missing or the master is unknown at
-    # this tick (bootstrap, before mgmt is up), fall back to the
-    # historical freshest-neighbour rule. Master itself doesn't install
-    # a /24-via-self route (loop) — it terminates the .254 traffic
-    # locally via the secondary /32 on its lo (set by orchestrator on
-    # role transition; see D-05).
+    # Fallback: if rqlite is unreachable or the master is unknown at this
+    # tick (bootstrap, before mgmt is up), fall back to the freshest-
+    # neighbour rule. Master itself doesn't install a /24-via-self route
+    # (loop) — it terminates the .254 traffic locally via the secondary
+    # /32 on its lo (set by orchestrator on role transition).
     if d.neighbours:
         from . import cluster_addr as _ca
         net = _ca.cluster_loopback_net(d.cluster_uuid)
@@ -3349,7 +3339,7 @@ def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
     cluster_info/nodes tables (level='none', works without quorum).
     Returns ('', '') if rqlite is unreachable, has no master set, or the
     master node has no loopback recorded. Used by
-    compute_routes() for the /24-via-master panic catch-all (D-13).
+    compute_routes() for the /24-via-master panic catch-all.
     Master may be `my_node` itself — caller decides to skip in that case.
     """
     try:
@@ -3380,7 +3370,7 @@ def current_cluster_routes(cluster_uuid: str) -> list[str]:
     destination match:
       * <cluster_prefix>.0/24 panic catch-all
       * /32 inside <cluster_prefix>.0/24 (per-peer loopback) — may
-        be single-path OR multipath (ECMP, D-15). Multipath routes
+        be single-path OR multipath (ECMP). Multipath routes
         appear in `ip route show` as a header line followed by
         indented `nexthop` continuation lines; we re-join them into
         the single-string form we emit so the diff round-trips

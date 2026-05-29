@@ -1,38 +1,39 @@
 """SeaweedFS lifecycle helpers — Bedrock's unified S3 stack.
 
-Filer metadata in leveldb3 on the critical-tier DRBD volume at N≥2
-(local LV at N=1); upgrade path to PostgreSQL via
-`weed shell` → fs.meta.save / fs.meta.load is bidirectional and
-documented in the SeaweedFS project wiki.
+Filer metadata lives in leveldb3 on the cluster-singleton DRBD
+volume so it moves with the mgmt-master role; switching to another
+store backend (postgres, mysql, tikv, etcd) is bidirectional via
+`weed shell` → fs.meta.save / fs.meta.load.
 
 Components SeaweedFS-side:
 
-  master    — cluster coordinator. Light. Runs on every node so
-              we have HA at N>=2. Knows the volume topology.
+  master    — cluster coordinator. Light. Runs on the Raft-3 member
+              set (N=1→1, N=2→1, N≥3→3 lowest-octet nodes).
+              Knows the volume topology.
   volume    — stores the actual file bytes (in "needle" files).
-              One volume server per node.
-  filer     — POSIX-style namespace on top of volumes. SQLite
-              metadata DB. Single instance on the master (D-07).
+              One volume server per node, on every node.
+  filer     — POSIX-style namespace on top of volumes. leveldb3
+              metadata store. Single instance bound to the .254 VIP.
               Moves with mgmt-master role via cluster-singleton DRBD.
   s3        — S3 API gateway, depends on filer. Single instance
-              co-resident with filer.
+              co-resident with filer; also runs on every node.
 
-For v1.0 we run `weed server -master -volume -filer -s3` in
-ALL-IN-ONE mode on the master node, with -volume.dir pointing at
-local LV storage. On a 2-node HA cluster, the second node runs
-the same all-in-one mode but is a master+volume peer; only the
-master-elected node activates the filer+s3 sub-roles (handled by
-cluster_arbiter.py-style mobility via cluster-singleton DRBD).
+Each component runs as its own bedrock-weed-* systemd unit, not a
+single all-in-one process. weed-volume + weed-s3 run on every node;
+weed-master runs on the Raft-3 set; weed-filer is a singleton on the
+.254 VIP, started/stopped with the arbiter-host role.
 
 This module provides:
 
   * ensure_install()          — drop /usr/local/bin/weed into place
   * write_master_config()     — render master.toml with cluster peers
-  * write_filer_config()      — render filer.toml with the SQLite
-                                metadata store pointing at
-                                /var/lib/bedrock/cluster/seaweedfs/filer.db
-  * write_systemd_units()     — bedrock-weed-master, -volume,
-                                -filer, -s3 unit files
+  * write_filer_config()      — render filer.toml with the leveldb3
+                                metadata store under
+                                /var/lib/bedrock/cluster/seaweedfs/
+  * write_env_file()          — render seaweedfs.env consumed by units
+  * write_s3_config()         — render the S3 gateway identities
+  * promote_to_master_volume_host() — enable volume+s3 (+master if in
+                                the Raft-3 set) on this node
   * promote_to_filer_host()   — start filer+s3 on this node (called
                                 from cluster_arbiter alongside the
                                 arbiter rqlite promote)
@@ -216,24 +217,22 @@ def write_master_config() -> None:
 
 def write_filer_config() -> None:
     """Render filer.toml — pins leveldb3 as the metadata store under
-    /var/lib/bedrock/cluster/seaweedfs/ (lives on the cluster-singleton
-    DRBD volume per D-07/D-10).
+    /var/lib/bedrock/cluster/seaweedfs/, which lives on the
+    cluster-singleton DRBD volume so it moves with the mgmt-master role.
 
-    Note: SeaweedFS v4.x dropped the SQLite filer store in favour of
-    leveldb3. Other store backends (postgres, mysql, tikv, etcd)
-    remain available; switching is bidirectional via `weed shell` →
-    `fs.meta.save` / `fs.meta.load`.
+    leveldb3 is the embedded store and is feature-complete for the
+    POSIX-namespace + S3 use case. Other store backends (postgres,
+    mysql, tikv, etcd) are also available; switching is bidirectional
+    via `weed shell` → `fs.meta.save` / `fs.meta.load`.
     """
     FILER_HOME.mkdir(parents=True, exist_ok=True)
     FILER_TOML.parent.mkdir(parents=True, exist_ok=True)
     body = textwrap.dedent(f"""\
         # Bedrock-managed SeaweedFS filer config — DO NOT edit by hand.
         #
-        # Per docs/post-alpha-rewrite-notes.md D-10: the metadata store
-        # lives on the cluster-singleton DRBD volume so it moves with the
-        # mgmt-master role. SeaweedFS 4.x removed sqlite; we use the
-        # embedded leveldb3 store which is feature-complete for our
-        # POSIX-namespace + S3 use case.
+        # The metadata store lives on the cluster-singleton DRBD volume
+        # so it moves with the mgmt-master role. The embedded leveldb3
+        # store is feature-complete for the POSIX-namespace + S3 use case.
 
         [leveldb3]
         enabled = true
@@ -244,11 +243,9 @@ def write_filer_config() -> None:
 
 
 def _master_set() -> list[str]:
-    """The Raft-3 weed-master member set (deterministic at v1.0:
-    the three lowest-octet loopbacks). The calm orchestrator will
-    eventually own this via the seaweed_master_membership rqlite
-    table; this fallback works pre-rqlite (during install) and
-    when the table is empty.
+    """The Raft-3 weed-master member set: the three lowest-octet
+    loopbacks. Computed locally from the cluster snapshot, so it works
+    without rqlite (during install) and when membership state is empty.
 
     N=1 → 1 master; N=2 → 1 master (single-node Raft);
     N≥3 → 3 masters."""
@@ -301,8 +298,7 @@ def write_env_file(*, volume_max: int = 50,
         "SEAWEED_LOOPBACK_IP":      my_lo,
         "SEAWEED_FILER_VIP":        filer_vip,
         "SEAWEED_MASTER_PEERS":     master_peers,
-        # Kept for backwards-compat with any unit referencing the
-        # old name — same value as MASTER_PEERS.
+        # Alias of SEAWEED_MASTER_PEERS for units that reference this name.
         "SEAWEED_FILER_MASTERS":    master_peers,
         "SEAWEED_VOLUME_DISK_TYPE": disk_type,
         "SEAWEED_VOLUME_MAX":       str(int(volume_max)),
@@ -321,7 +317,7 @@ def write_s3_config() -> None:
 
     SeaweedFS 4.25 refuses to start when the config has identities
     without credentials (logged as "no admin/credentials supplied
-    — set AWS_ACCESS_KEY_ID etc."). The 0.8-alpha shape:
+    — set AWS_ACCESS_KEY_ID etc."), so the config carries:
 
     - One ``admin`` identity carrying generated credentials so the
       gateway has a valid auth identity at startup.
@@ -331,10 +327,9 @@ def write_s3_config() -> None:
     Credentials are generated once per cluster (sourced from
     ``/etc/bedrock/cluster.key`` so every node deterministically
     derives the same admin creds — the same secret material
-    underwriting witness AEAD also underwrites S3 admin). Future
-    move (locked design): IAM identities live INSIDE the filer DB
-    via ``weed s3 -iam.filerBucketsPath=/buckets``; this file
-    bootstraps the gateway long enough for that DB to come up.
+    underwriting witness AEAD also underwrites S3 admin). This file
+    bootstraps the gateway; IAM identities live inside the filer DB
+    via ``weed s3 -iam.filerBucketsPath=/buckets``.
     """
     S3_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     access_key, secret_key = _derive_admin_credentials()
@@ -448,21 +443,19 @@ def reconcile_master_config() -> None:
 def promote_to_master_volume_host() -> None:
     """Called by install / orchestrator on every node.
 
-    Locked v1.0 topology (see docs/storage-architecture.md):
+    Topology (see docs/storage-architecture.md):
     - **weed-volume**: runs on EVERY node, bound 0.0.0.0:8080.
     - **weed-s3**:     runs on EVERY node, bound 0.0.0.0:8333.
     - **weed-master**: runs only on the Raft-3 member set
                        (N=1→1, N=2→1, N≥3→3 lowest-octet nodes).
     - **weed-filer**:  singleton on .254 (owned by cluster_arbiter).
 
-    Re-shuffles to the master set are calm-orchestrator-driven via
-    the `seaweed_master_membership` rqlite table; this function is
-    idempotent and uses the deterministic lowest-octet rule as a
-    fallback when the table isn't yet populated.
+    The master set is computed locally via the deterministic
+    lowest-octet rule (`_master_set`). This function is idempotent.
 
-    If this node was in the master set before but isn't now (e.g.
-    a new lower-octet node joined and bumped us out), the master
-    unit is stopped + disabled."""
+    If this node is no longer in the master set (e.g. a new
+    lower-octet node joined and bumped us out), the master unit is
+    stopped + disabled."""
     my_lo = _my_loopback()
     master_set = _master_set()
     i_run_master = my_lo in master_set
@@ -636,7 +629,7 @@ def init_collections() -> None:
     # "rpc error: code = Canceled" for 30s, then FUSE close returns
     # I/O error). At N=1 only 000 is satisfiable; N=2 adds 001; N=3+
     # adds 002. The cluster-default replication in MASTER_TOML
-    # follows the same rule (see _write_master_toml). init_collections
+    # follows the same rule (see write_master_config). init_collections
     # matches it per-prefix so e.g. /iso/ doesn't get pinned to 001
     # on an N=1 box and brick every ISO upload.
     n_nodes = _n_cluster_nodes()

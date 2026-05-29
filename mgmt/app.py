@@ -129,10 +129,9 @@ import os as _os
 
 def load_cluster():
     """Cluster-wide state. Reads from the local rqlite replica via
-    cluster_state.load_cluster() — same dict shape as the historical
-    cluster.json projection, but sourced from rqlite at level='none'
-    so it works without quorum (the per-node Raft follower replica
-    is always readable when this node's rqlited is up)."""
+    cluster_state.load_cluster() at level='none', so it works without
+    quorum (the per-node Raft follower replica is always readable when
+    this node's rqlited is up)."""
     try:
         return _cluster_state.load_cluster()
     except Exception as e:
@@ -141,9 +140,9 @@ def load_cluster():
 
 
 def save_cluster(cluster: dict):
-    """No-op since the cluster.json projection was removed. The only
-    side-effect kept is write_scrape_config(cluster), which produces
-    the Prometheus scrape config from the snapshot."""
+    """Its only side-effect is write_scrape_config(cluster), which
+    produces the VictoriaMetrics scrape config from the snapshot.
+    Cluster state itself lives in rqlite, not in a local projection."""
     write_scrape_config(cluster)
 
 
@@ -428,14 +427,14 @@ def parse_drbd_status(raw: str) -> dict:
 
 def get_witness_status() -> dict:
     """Witness panel data for the dashboard. Pulls the configured
-    witnesses from the replicated log (cluster.json `witnesses` map);
-    live reachability is observed by bedrock-rust's lease loop and is
-    not currently surfaced through the mgmt API."""
+    witnesses from replicated cluster state (the `witnesses` map);
+    live reachability is tracked by netd's election/witness loop and is
+    not surfaced through the mgmt API."""
     return {"witnesses": load_cluster().get("witnesses", {})}
 
 def get_vm_drbd_resource(host: str, vm_name: str) -> str:
-    """Parse virsh dumpxml to find the DRBD resource backing this VM's
-    first data disk. Back-compat shim over get_vm_disks — prefer that."""
+    """Find the DRBD resource backing this VM's first data disk.
+    Thin wrapper over get_vm_disks, returning just the first resource."""
     disks = get_vm_disks(host, vm_name)
     for d in disks:
         if d.get("drbd_resource"):
@@ -568,8 +567,8 @@ def build_cluster_state() -> dict:
 
     for vm_name, running_on, defined_on, disks, vnc_port in probes:
         backup_node = next((n for n in defined_on if n != running_on), None)
-        # Back-compat: drbd_resource = first disk's resource. New clients
-        # should read the disks[] array instead.
+        # drbd_resource is the first disk's resource; the full per-disk
+        # detail is in the disks[] array.
         first_resource = next((d["drbd_resource"] for d in disks
                               if d.get("drbd_resource")), "")
         drbd_state = drbd.get(first_resource, {}) if first_resource else {}
@@ -601,7 +600,7 @@ def build_cluster_state() -> dict:
             "name": vm_name, "state": "running" if running_on else "shut off",
             "running_on": running_on, "backup_node": backup_node, "defined_on": defined_on,
             "disks": disks_out,
-            # Back-compat fields — kept until all callers switched to disks[]:
+            # First-disk DRBD summary, alongside the full disks[] array:
             "drbd_resource": first_resource,
             "drbd_role": drbd_state.get("role", ""),
             "drbd_disk": drbd_state.get("disk", ""),
@@ -654,8 +653,8 @@ def build_physical_topology(nodes_data: dict) -> dict:
                                         src_mac, system_name,
                                         port_id, mgmt_ip, ...} } }
 
-    Output: derived view-only structure, NEVER folded into the
-    cluster log / cluster.json. Shape:
+    Output: derived view-only structure, never written to consensus
+    state. Shape:
 
         {
           'switches': {
@@ -692,9 +691,8 @@ def build_physical_topology(nodes_data: dict) -> dict:
                 if not isinstance(entry, dict):
                     continue
                 # Prefer device_key (MAC-canonicalised by l2disc).
-                # Older state files predating the upgrade may not
-                # have it; fall back to chassis_id so the merge still
-                # surfaces something instead of dropping the entry.
+                # Fall back to chassis_id when an entry lacks it so the
+                # merge still surfaces something instead of dropping it.
                 device_key = (entry.get("device_key")
                                or entry.get("chassis_id") or "")
                 if not device_key:
@@ -913,7 +911,7 @@ def peer_test(node: str = Depends(require_peer)):
     return {"verified_caller": node}
 
 
-# ── Operator login (piece #2) ───────────────────────────────────────
+# ── Operator login ──────────────────────────────────────────────────
 
 class LoginReq(BaseModel):
     username: str
@@ -975,7 +973,7 @@ class OperatorSet(BaseModel):
 @app.get("/api/operators")
 def list_operators(user: str = Depends(require_operator)):
     """Return the list of operator usernames. Hashes are NOT exposed —
-    they're write-only via the cluster log."""
+    they live write-only in the replicated `operators` cluster state."""
     ops = (load_cluster().get("operators") or {})
     return {"operators": sorted(ops.keys())}
 
@@ -983,8 +981,8 @@ def list_operators(user: str = Depends(require_operator)):
 @app.post("/api/operators/set")
 def set_operator(req: OperatorSet, user: str = Depends(require_operator)):
     """Upsert an operator credential. `bedrock operator passwd <user>`
-    uses this — same endpoint adds a new operator OR changes an
-    existing one's password (the log entry is upsert-shaped). Operator
+    uses this — the same endpoint adds a new operator OR changes an
+    existing one's password (the rqlite write is upsert-shaped). Operator
     must already be authenticated; we don't require the OLD password
     because the Bearer token already proves authority.
     """
@@ -1031,7 +1029,7 @@ def remove_operator(req: OperatorRemove, user: str = Depends(require_operator)):
     return {"username": req.username, "status": "removed"}
 
 
-# ── Join handshake (piece #3) ───────────────────────────────────────
+# ── Join handshake ──────────────────────────────────────────────────
 # A joiner doesn't yet have an operator token or a recognised peer
 # identity, so /api/join/request is UNAUTH. The privacy of the
 # handshake comes from:
@@ -1200,9 +1198,9 @@ def join_approve(req: JoinApprove, user: str = Depends(require_operator)):
         master_priv, pending["x25519_eph_pubkey"],
         req.request_id, cluster_key)
 
-    # Allocate the joiner's loopback /32 by scanning the log for taken
-    # indices (single source of truth — rqlite.nodes is authoritative,
-    # cluster.json may briefly lag).
+    # Allocate the joiner's loopback /32 by scanning rqlite.nodes for
+    # taken indices (the authoritative source; the local replica read
+    # below may briefly lag, hence the level='strong' query).
     used_loopbacks: set[str] = set()
     try:
         with _rqlite.RqliteClient() as _rc:
@@ -1610,7 +1608,7 @@ async def startup():
             return
         _STARTUP_DONE = True
     _main_loop = asyncio.get_running_loop()
-    # Seed with cluster.json so the sidebar shows host names instantly.
+    # Seed from cluster state so the sidebar shows host names instantly.
     cfg = load_cluster()
     _last_state = {
         "nodes": {n: {"name": n, "host": c.get("host", ""), "online": False,
@@ -1650,7 +1648,7 @@ async def startup():
         import orchestrator
     orchestrator.start_all()
 
-# ── REST API (same as before, for curl/scripting) ──────────────────────────
+# ── REST API (for curl/scripting) ──────────────────────────────────────────
 
 @app.get("/api/cluster")
 def api_cluster():
@@ -1661,10 +1659,9 @@ def api_cluster():
 @app.get("/api/topology")
 def api_topology():
     """Physical topology rollup — switches and routers each cluster
-    NIC sees, grouped by chassis_id. Computed every 3 s by the state
-    push loop from each node's /run/bedrock/switch_neighbors.json.
-    Not consensus state — never in cluster.json — purely a derived
-    view for the dashboard."""
+    NIC sees, grouped by device_key (MAC). Computed every 3 s by the
+    state push loop from each node's /run/bedrock/switch_neighbors.json.
+    Not consensus state — purely a derived view for the dashboard."""
     return _last_state.get("topology", {"switches": {}, "links": [],
                                           "node_count": 0, "switch_count": 0,
                                           "link_count": 0,
@@ -1746,13 +1743,11 @@ def _read_local_pubkey() -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
-# /api/nodes/register removed — replaced by the join-handshake flow
-# (`POST /api/join/request` → operator approval → `POST /api/join/approve`).
-# The new flow does the same SSH-pubkey fan-out, allocates the loopback
-# IP, and logs node_register+node_loopback, but cluster.key now ships
-# AEAD-sealed under an ECDH session key (see installer/lib/join_handshake.py)
-# instead of plain in the response body. See pieces #2 + #3 of the
-# inter-node-auth work for the design.
+# Node registration goes through the join-handshake flow
+# (`POST /api/join/request` → operator approval → `POST /api/join/approve`):
+# SSH-pubkey fan-out, loopback-IP allocation, and node_register+node_loopback
+# logging, with cluster.key shipped AEAD-sealed under an ECDH session key
+# (see installer/lib/join_handshake.py) rather than in plaintext.
 
 
 @app.get("/api/nodes")
@@ -1761,10 +1756,9 @@ def list_nodes():
 
 
 # ── ISO library ─────────────────────────────────────────────────────────────
-# Three endpoints (list / upload / delete) extracted to mgmt/routes_iso.py
-# as Stage 9 PR #4 of the codebase rewrite. ISO_DIR constant + VM
-# inventory helpers stay here because the VM creation paths in app.py
-# import them; future PRs will move those too.
+# The three endpoints (list / upload / delete) live in mgmt/routes_iso.py.
+# The ISO_DIR constant + VM inventory helpers stay here because the VM
+# creation paths in app.py import them.
 
 # Cluster-wide SeaweedFS FUSE mount — identical on every node, so
 # `--cdrom {ISO_DIR}/<name>.iso` works from anywhere. See routes_iso.py
@@ -1785,10 +1779,8 @@ def save_inventory(inv: dict):
     VM_INVENTORY_FILE.write_text(json.dumps(inv, indent=2))
 
 
-# routes_iso registration moved below to where push_log is defined —
-# the registration needs the push_log callable, so it must run after
-# `def push_log(...)`. Importing the module here is fine; the call
-# happens further down (see "── Route module registrations ──").
+# routes_iso registration needs the push_log callable, so it runs after
+# `def push_log(...)` further down (see "── routes_iso ──").
 
 
 # ── Import library (VMware/Hyper-V/qcow2 → Bedrock) ──────────────────────
@@ -2167,7 +2159,7 @@ async def _run_convert(job_id: str, inject_drivers: bool = False):
                     })
                 meta["status"] = "ready"
                 meta["disks"] = disk_metas
-                # Back-compat single-disk fields (disks[0])
+                # Single-disk convenience fields, mirroring disks[0]
                 meta["disk_path"] = disk_metas[0]["path"]
                 meta["virtual_size_bytes"] = disk_metas[0]["virtual_size_bytes"]
                 meta["virtual_size_gb"]    = disk_metas[0]["virtual_size_gb"]
@@ -2872,10 +2864,10 @@ def api_vm_migrate(vm_name: str, req: MigrateRequest = MigrateRequest()):
 
 
 # ── Backup endpoints ────────────────────────────────────────────────────────
-# Kopia orchestration. The mgmt master appends BACKUP_TARGET_SET to the
-# replicated log; every node's reactor reacts by running
-# `kopia repository connect` locally so any node can do backups/restores
-# of its locally-resident VMs. See snapshots-and-backup.md §9c-bis.
+# Kopia orchestration. The mgmt master writes the backup target to rqlite;
+# every node's reactor reacts by running `kopia repository connect` locally
+# so any node can do backups/restores of its locally-resident VMs.
+# See snapshots-and-backup.md §9c-bis.
 
 class BackupTargetSetRequest(BaseModel):
     target_id: str = "main"
@@ -2893,9 +2885,9 @@ class BackupTargetSetRequest(BaseModel):
     reason: str = ""
     # ── Credentials (NEVER logged) ─────────────────────────────────
     # Optional inline secrets. When present, mgmt writes the
-    # corresponding files on every cluster node before appending
-    # BACKUP_TARGET_SET to the log. When absent, the operator is
-    # expected to have dropped the files manually.
+    # corresponding files on every cluster node before recording the
+    # backup target in rqlite. When absent, the operator is expected
+    # to have dropped the files manually.
     s3_access_key: Optional[str] = None    # → KOPIA_S3_ACCESS_KEY in env file
     s3_secret_key: Optional[str] = None    # → KOPIA_S3_SECRET_KEY in env file
     encryption_password: Optional[str] = None  # → /etc/bedrock/backup.key
@@ -2932,7 +2924,7 @@ def _import_backup_module():
 
 # ── Backup secret propagation ──────────────────────────────────────────────
 #
-# Two secrets need to live on every node, mode 0600, never in the log:
+# Two secrets need to live on every node, mode 0600, never in cluster state:
 #   - /etc/bedrock/backup.key                    (kopia repo password)
 #   - /etc/bedrock/backup-credentials/<id>.env   (S3 access/secret keys)
 #
@@ -3084,13 +3076,12 @@ def api_backup_target_set(req: BackupTargetSetRequest):
          on its reactor's `kopia repository connect`.
       2. Run `kopia repository connect` (or create) locally on master.
          Verifies the repo's block hash is ≥256 bits.
-      3. Append BACKUP_TARGET_SET to the cluster log. Every node's
-         reactor reacts by running `kopia repository connect` against
-         the new target.
-      4. Return the log index so callers know the change is committed.
+      3. Write the backup target to rqlite. Every node's reactor reacts
+         by running `kopia repository connect` against the new target.
+      4. Return the revision so callers know the change is committed.
 
-    Credentials are NEVER in the log — only file paths and metadata
-    (endpoint, bucket, region) make it into BACKUP_TARGET_SET."""
+    Credentials are NEVER persisted to cluster state — only file paths
+    and metadata (endpoint, bucket, region) are stored."""
     backup = _import_backup_module()
 
     propagation_warnings: list[str] = []
@@ -3177,23 +3168,23 @@ def api_backup_target_set(req: BackupTargetSetRequest):
 
 @app.get("/api/backup/targets")
 def api_backup_targets_list():
-    """List configured backup targets, drawn from cluster.json (i.e. the
-    folded log). Always returns immediately — no kopia roundtrip."""
+    """List configured backup targets, drawn from cluster state.
+    Always returns immediately — no kopia roundtrip."""
     cluster = load_cluster()
     return {"targets": cluster.get("backup_targets", {})}
 
 
 @app.get("/api/backups")
 def api_backups_list_all():
-    """Cluster-wide backup history. Walks every VM in cluster.json
+    """Cluster-wide backup history. Walks every VM in cluster state
     and flattens its `backups` list, decorating each row with the
     owning vm name + whether the source VM still exists. Used by
     the dashboard's Backups page to render a single restore-able
     list across the whole cluster.
 
-    Sorted newest-first by ts_index (cluster log index = monotonic
-    timestamp). vm_present=False rows are kept so operators can
-    still restore a deleted VM's snapshots into a fresh LV."""
+    Sorted newest-first by ts_index (monotonic timestamp).
+    vm_present=False rows are kept so operators can still restore a
+    deleted VM's snapshots into a fresh LV."""
     cluster = load_cluster()
     vms = cluster.get("vms", {}) or {}
     out = []
@@ -3203,12 +3194,10 @@ def api_backups_list_all():
             row["vm"] = vm_name
             row["vm_present"] = True
             out.append(row)
-    # Snapshots whose source VM was deleted: walk backup history that
-    # might be referenced by RESTORE_DONE / etc. but not the live vm
-    # record. v1 simplification: cluster.json only retains entries on
-    # live VM records, so this branch is empty for now. Hook left
-    # in place for v1.x when we surface "orphan" snapshots from the
-    # repo via `kopia snapshot list`.
+    # Snapshots whose source VM was deleted: cluster state only retains
+    # backup entries on live VM records, so there are no orphan rows to
+    # surface here. (Listing orphans from the repo via
+    # `kopia snapshot list` is a possible future addition.)
     out.sort(key=lambda r: r.get("ts_index", 0), reverse=True)
     return {"backups": out}
 
@@ -3275,7 +3264,7 @@ async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()
 
 @app.get("/api/vms/{vm_name}/backups")
 def api_vm_backups_list(vm_name: str):
-    """Backup history for a VM, drawn from cluster.json. Newest first."""
+    """Backup history for a VM, drawn from cluster state. Newest first."""
     cluster = load_cluster()
     vm = (cluster.get("vms") or {}).get(vm_name)
     if vm is None:
@@ -3493,11 +3482,10 @@ def _vm_disk_vg(host: str) -> str:
     VM disks, all the dynamic ones). Reads /etc/bedrock/storage.json
     which `tier_storage.ensure_vg()` writes at bootstrap time. Falls
     back to detecting the only VG present, then to the literal name
-    `bedrock`. There is no loop-file fallback any more: bedrock-
-    bootstrap is expected to have run and to have set up the layout
-    correctly. If it hasn't, downstream lvcreate calls will fail
-    loudly — the right reaction is to fix the install, not to
-    silently put VM data on a sparse file on `/`."""
+    `bedrock`. No loop-file fallback: bedrock-bootstrap is expected to
+    have set up the layout. If it hasn't, downstream lvcreate calls fail
+    loudly — the right reaction is to fix the install, not to silently
+    put VM data on a sparse file on `/`."""
     try:
         out = ssh_cmd(host,
             "cat /etc/bedrock/storage.json 2>/dev/null", timeout=8)
@@ -3514,8 +3502,8 @@ def _vm_disk_vg(host: str) -> str:
         vgs = [v.strip() for v in vgs if v.strip()]
         if len(vgs) == 1:
             return vgs[0]
-        # Prefer the fresh-create name `bedrock-vg`, then legacy `bedrock`
-        # (mirrors tier_storage.detect_vg's multi-VG heuristic).
+        # Prefer `bedrock-vg`, then `bedrock` (mirrors
+        # tier_storage.detect_vg's multi-VG heuristic).
         if "bedrock-vg" in vgs:
             return "bedrock-vg"
         if "bedrock" in vgs:
@@ -3784,8 +3772,8 @@ def _vm_set_ha_level_up(vm_name: str, cur: str, tgt: str, src_name: str,
                 lv_name = src_lv.split("/")[-1]
                 vg_name = src_lv.split("/")[-2]
                 resource = f"vm-{vm_name}-disk{i}"
-                # Meta LV name must be unique per resource; keep the
-                # historical `<lv>-meta` suffix so existing resources parse.
+                # Meta LV name must be unique per resource; the `<lv>-meta`
+                # suffix is the convention _parse_drbd_res expects.
                 meta_lv_name = f"{lv_name}-meta"
                 meta_path = f"/dev/{vg_name}/{meta_lv_name}"
 
@@ -4213,7 +4201,7 @@ ISO_MOUNT_DIR = "/mnt/bedrock/iso"  # identical on every cluster node (SeaweedFS
 
 
 def _mgmt_node_name() -> str:
-    """Return the cluster.json node name of the mgmt host (where ISOs live)."""
+    """Return the node name of the mgmt host (where ISOs live)."""
     cfg = get_nodes()
     for name, node in cfg.items():
         if "mgmt" in node.get("role", ""):
@@ -4228,7 +4216,7 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     qcow2 into the LV (raw), then virt-installs with machine=q35, UEFI
     firmware, clock=UTC. Marks the import meta as consumed.
 
-    NOT routed through the bedrock_d vm_create saga (unlike POST /api/vms,
+    Not routed through the bedrock_d vm_create saga (unlike POST /api/vms,
     which uses _run_vm_saga). The saga's image-fill step only knows how to
     write the cached Alpine image or boot an ISO — it has no "import a
     pre-existing disk image" mode, and import additionally needs source-disk
@@ -4238,11 +4226,9 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     UUID to record (INV-5 only applies to replicated pet/vipet disks).
 
     Per-resource naming: this path uses vm-<name>-disk<N> LV names, matching
-    the rest of the legacy mgmt VM layer (attach-disk at _next_drbd_minor /
+    the rest of the mgmt VM layer (attach-disk at _next_drbd_minor /
     api_vm_attach_disk, _vm_get_settings, mgmt-side destroy) so disk ops on an
-    imported VM stay consistent. That layer's LV naming differs from the
-    saga's bedrock-data-<resource> scheme; unifying the two onto the saga is
-    tracked under BAD-2/BAD-3 (finish the rewrite), not here."""
+    imported VM stay consistent."""
     if not _VM_NAME_RE.match(req.name):
         raise HTTPException(400, "invalid VM name (3-32 chars, lowercase)")
     if req.priority not in _VALID_PRIORITIES:
@@ -4435,7 +4421,7 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
     inv = load_inventory()
     inv[req.name] = {
         "priority": req.priority, "vcpus": req.vcpus, "ram_mb": req.ram_mb,
-        "disk_gb": disks_plan[0]["size_gb"],   # back-compat primary disk
+        "disk_gb": disks_plan[0]["size_gb"],   # primary disk size
         "disks": [
             {"index": d["index"], "lv": d["lv_name"], "size_gb": d["size_gb"]}
             for d in disks_plan
@@ -4688,22 +4674,21 @@ def push_log(msg: str, node: str = "mgmt", app: str = "bedrock-mgmt",
             pass
     _vl_push_log(msg, node=node, app=app, level=level)
 
-# Metrics + logs read endpoints moved to mgmt/routes_obs.py
-# (Stage 9 PR #3 of the codebase rewrite).
+# Metrics + logs read endpoints live in mgmt/routes_obs.py.
 from routes_obs import register_routes as _register_obs_routes
 _register_obs_routes(app)
 
 # Generic saga submission API — POST /api/operations + the read-side.
-# Stage 8 of the rewrite: this is the surface the new CLI (and any
-# external automation) uses to submit vm_create / destroy / grow /
-# migrate / cluster_init / node_join / node_leave sagas.
+# This is the surface the CLI (and any external automation) uses to submit
+# vm_create / destroy / grow / migrate / cluster_init / node_join /
+# node_leave sagas.
 from routes_operations import register_routes as _register_operations_routes
 _register_operations_routes(app, require_operator=require_operator)
 
 
 # ── Supportability checks ─────────────────────────────────────────────────
-# Endpoint moved to mgmt/routes_support.py (Stage 9 PR #2). Pure
-# read-only diagnostic; see that file for the per-check details.
+# Endpoint lives in mgmt/routes_support.py. Pure read-only diagnostic;
+# see that file for the per-check details.
 from routes_support import register_routes as _register_support_routes
 _register_support_routes(
     app,
@@ -4714,8 +4699,7 @@ _register_support_routes(
 
 
 # ── Console redirect + VNC WebSocket → raw-TCP proxy ───────────────────────
-# Implementation moved to mgmt/routes_console.py (Stage 9 PR #1 of the
-# codebase rewrite plan — extract leaf routes from app.py).
+# Implementation lives in mgmt/routes_console.py.
 from routes_console import register_routes as _register_console_routes
 _register_console_routes(
     app,
@@ -4759,9 +4743,8 @@ if ui_build.exists():
 
 def serve_main():
     """Bind uvicorn to the operator/CLI ports and block until SIGTERM.
-    Extracted from the ``__main__`` block so the unified bedrock-d
-    entrypoint can call it after wiring shared state + starting the
-    netd thread.
+    The bedrock-d entrypoint calls this after wiring shared state +
+    starting the netd thread.
 
     Listeners:
       * 8443 HTTPS — operator dashboard + LAN-reachable mgmt API.
@@ -4778,10 +4761,8 @@ def serve_main():
         the next restart switches to the safe layout above.
 
     Port 8080 is reserved for ``weed-volume`` (see
-    docs/storage-architecture.md). Anything that previously dialled
-    ``http://localhost:8080`` for the local mgmt API has moved to
-    ``http://127.0.0.1:8001`` — that change is mechanical and stays
-    inside this codebase; no operator-facing URL changes.
+    docs/storage-architecture.md); the local mgmt API is on
+    ``http://127.0.0.1:8001``.
 
     The bootstrap listener must NOT reuse 8080: weed-volume binds
     ``0.0.0.0:8080`` (every node), and 0.0.0.0 already covers loopback,

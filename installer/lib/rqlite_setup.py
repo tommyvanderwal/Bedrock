@@ -21,12 +21,12 @@ Three responsibilities:
      by agent_install on each new node.
 
 The Bedrock identity model gives rqlite stable addresses by
-construction (see post-alpha-rewrite-notes.md D-02 + D-05). Each
-node's `100.X.Y.<idx>/32` lives on `lo` permanently — rqlite binds
-there and never has to deal with IP changes between restarts. The
-arbiter (D-04) is handled by a SEPARATE systemd unit
-(bedrock-rqlited-arbiter.service, not in this file yet); the
-per-node rqlite this module sets up is one of the three voters.
+construction. Each node's `100.X.Y.<idx>/32` lives on `lo`
+permanently — rqlite binds there and never has to deal with IP
+changes between restarts. The arbiter runs as a SEPARATE systemd
+unit (bedrock-rqlited-arbiter.service); its env is rendered here by
+render_arbiter_env_file(). The per-node rqlite this module sets up
+is one of the three voters.
 
 Run with: python3 rqlite_setup.py --render-env
        or: python3 rqlite_setup.py --init      (mgmt master only)
@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-# Paths mirror the conventions used by daemon_setup.py for bedrock-rust.
+# Standard /etc/bedrock config + /var/lib/bedrock data paths.
 CLUSTER_JSON     = Path("/etc/bedrock/cluster.json")
 STATE_JSON       = Path("/etc/bedrock/state.json")
 RQLITED_ENV      = Path("/etc/bedrock/rqlited.env")
@@ -54,9 +54,9 @@ HTTP_PORT = 4001
 # own config without colliding with the per-node rqlited's.
 ARBITER_ENV     = Path("/etc/bedrock/rqlited-arbiter.env")
 ARBITER_DATA_DIR = Path("/var/lib/bedrock/cluster/rqlite")
-# Arbiter node-id: 254 to match its /24 octet (per D-05) and to
-# stay distinct from any per-node id (which are 1..N from sorted
-# index). 0 is reserved by rqlite as "auto"; we avoid it.
+# Arbiter node-id: 254 to match its /24 octet and to stay distinct
+# from any per-node id (the loopback last octet). 0 is reserved by
+# rqlite as "auto"; we avoid it.
 ARBITER_NODE_ID  = 254
 
 
@@ -69,14 +69,12 @@ def _read_json(path: Path) -> dict:
 
 def _sorted_node_index(cluster: dict, node_name: str) -> Optional[int]:
     """Return this node's 1-based index in the sorted-by-name node
-    list. Used as the rqlite node-id — stable across restarts as
-    long as the node name doesn't change (which it never does in
-    Bedrock).
+    list, or None if the node isn't in cluster.json yet.
 
-    Returns None if the node isn't in cluster.json yet (pre-join
-    state — caller falls back to a sentinel like 0 which rqlite
-    refuses to accept, surfacing the bootstrap-ordering issue
-    early).
+    The rqlite node-id is derived from the loopback's last octet, not
+    this index: a sorted-name index shifts everyone when a new node
+    sorts before an existing one, but the loopback octet is permanent
+    and unique per node.
     """
     nodes = cluster.get("nodes") or {}
     if node_name not in nodes:
@@ -230,8 +228,8 @@ def render_arbiter_env_file(
     data_dir: Path = ARBITER_DATA_DIR,
 ) -> dict:
     """Materialise /etc/bedrock/rqlited-arbiter.env for the arbiter
-    rqlite daemon. The arbiter binds to `100.X.Y.254/32` (D-05) and
-    joins the existing per-node rqlite peers.
+    rqlite daemon. The arbiter binds to `100.X.Y.254/32` and joins
+    the existing per-node rqlite peers.
 
     Called from cluster_arbiter.promote_to_arbiter_host() right
     before systemctl start bedrock-rqlited-arbiter — at that point
@@ -256,10 +254,10 @@ def render_arbiter_env_file(
     # Peer list: this node's per-node rqlite FIRST (always reachable
     # — we're on the same host), then every other node's rqlite.
     # Order matters: rqlited tries -join entries left-to-right with
-    # a 30s TCP connect timeout per entry. v25 showed the arbiter
-    # spending 30 seconds dialing an unreachable peer before falling
-    # back to the local one, eating the entire 45s failover window.
-    # Local-first means worst-case join time is <1s.
+    # a 30s TCP connect timeout per entry. An unreachable peer first
+    # in the list burns 30 seconds before falling back to the local
+    # one, which would eat the entire 45s failover window. Local-first
+    # means worst-case join time is <1s.
     my_node = state.get("node_name", "")
     my_loopback = state.get("loopback_ip", "")
     peers: list[str] = []

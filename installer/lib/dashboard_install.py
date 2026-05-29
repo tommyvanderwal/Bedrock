@@ -4,11 +4,11 @@ local-ip.co wildcard cert) and http://127.0.0.1:8001 (per-node CLI).
 
 The master node also runs the metrics + logs stack (VictoriaMetrics +
 VictoriaLogs); followers only get the dashboard. The mgmt API on a
-follower works against the same /etc/bedrock/cluster.json that
-view_builder rebuilds from the replicated log, so reads return the
-cluster-wide picture; writes go through the same code path and rely
-on cluster-wide SSH access (every node has every other node's pubkey
-from the join handshake)."""
+follower reads cluster-wide state from the replicated rqlite store
+(via cluster_state.load_cluster(), read level 'none' so it works
+without quorum), so reads return the cluster-wide picture; writes go
+through the same code path and rely on cluster-wide SSH access (every
+node has every other node's pubkey from the join handshake)."""
 
 from __future__ import annotations
 
@@ -37,19 +37,16 @@ def install_dashboard(repo: str, with_metrics: bool = False) -> None:
     if _run(f"curl -fsSL '{mgmt_tar}' -o /tmp/mgmt.tar.gz") == 0:
         _run(f"tar xzf /tmp/mgmt.tar.gz -C {MGMT} --strip-components=1")
 
-    # The dashboard is served by the unified bedrock-d process — see
-    # docs/daemon-unification.md. We no longer write a separate
-    # bedrock-mgmt.service. install.sh has already shipped
-    # bedrock-d.service; this helper only needs to ensure the mgmt/
-    # source tarball is extracted into /opt/bedrock/mgmt/ (done above)
-    # so bedrock-d can import it. Enable + start the unified daemon.
+    # The dashboard is served by the bedrock-d process. install.sh
+    # ships bedrock-d.service; this helper only needs to ensure the
+    # mgmt/ source tarball is extracted into /opt/bedrock/mgmt/ (done
+    # above) so bedrock-d can import it. Enable + start the daemon.
     _run("systemctl daemon-reload")
     # Reset-failed first: a previous attempt may have left bedrock-d
     # in a rate-limited state from before cluster.key was written.
     _run("systemctl reset-failed bedrock-d.service 2>/dev/null", check=False)
     _run("systemctl enable --now bedrock-d")
-    # Tidy: if a stale bedrock-mgmt.service is still installed from a
-    # pre-unification ISO, disable it so it can't shadow bedrock-d on
-    # port 8080/8443.
+    # Tidy: if a stale bedrock-mgmt.service is present, disable it so
+    # it can't shadow bedrock-d on port 8080/8443.
     _run("systemctl disable --now bedrock-mgmt.service 2>/dev/null",
          check=False)

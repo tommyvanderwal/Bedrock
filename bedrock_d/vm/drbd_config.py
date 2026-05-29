@@ -1,20 +1,13 @@
 """DRBD .res config templates — external metadata, max-peers=7.
 
-Per docs/storage-architecture.md the locked v0.8-alpha design uses
-**external metadata** on a separate thin LV per resource (NOT
-internal — that was the pre-rewrite shape). The .res file points
-the data disk at ``/dev/bedrock/bedrock-data-<r>`` and the meta
-disk at ``/dev/bedrock/bedrock-meta-<r>``.
+Per docs/storage-architecture.md every DRBD resource uses **external
+metadata** on a separate thin LV per resource. The .res file points
+the data disk at ``/dev/bedrock/bedrock-data-<r>`` and the meta disk
+at ``/dev/bedrock/bedrock-meta-<r>``.
 
-This module emits the config text. Saga steps write it to disk
-on each peer + run ``drbdadm create-md --max-peers=7``.
-
-# Single source of DRBD .res text
-
-Every per-VM DRBD resource is rendered here (the legacy
-internal-metadata path in ``installer/lib/vm.py`` is gone — SG-07).
-External metadata on a separate thin LV per resource is the one
-locked shape.
+This module is the single source of DRBD .res text: every per-VM DRBD
+resource is rendered here. It emits the config text; saga steps write
+it to disk on each peer + run ``drbdadm create-md --max-peers=7``.
 """
 from __future__ import annotations
 

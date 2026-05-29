@@ -6,16 +6,16 @@ SeaweedFS filer's leveldb3, and S3 IAM database. One pair of LVs
 (``bedrock-data-cluster`` + ``bedrock-meta-cluster``) per node;
 DRBD glues them into a synchronous mirror with the master writable.
 
-The rqlite ``tiers`` row + the DRBD resource are both keyed ``cluster``
-(renamed from the legacy ``critical``; "critical" is now only the
-SeaweedFS 002 collection + the VM HA-importance label — SG-04).
+The rqlite ``tiers`` row + the DRBD resource are both keyed ``cluster``.
+("critical" is a separate concept: the SeaweedFS 002 collection + the
+VM HA-importance label.)
 
 This module owns the **transition** sagas — the saga executor runs
 them once per cluster-size jump:
 
 - ``cluster_tier_promote_master`` runs on the mgmt-master when the
-  cluster first reaches N=2. Converts the local critical LV into a
-  DRBD primary, preserving the filer leveldb3 contents byte-for-byte
+  cluster first reaches N=2. Converts the local cluster-singleton LV
+  into a DRBD primary, preserving the filer leveldb3 byte-for-byte
   via external metadata. Idempotent: safe to re-run after a crash;
   steps that already completed no-op.
 
@@ -107,7 +107,7 @@ def _cluster_tier_mode(cluster: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Master-side: promote the local critical LV to DRBD primary
+# Master-side: promote the local cluster-singleton LV to DRBD primary
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -117,10 +117,7 @@ class ClusterTierPromoteMaster:
     local cluster-singleton data into a DRBD primary that will be
     mirrored to peers as they join.
 
-    The saga is launched by the orchestrator's
-    ``cluster_tier_watcher`` task — see ``mgmt/orchestrator.py``.
-
-    Params (set by the orchestrator at submit time):
+    Params (set at submit time):
       - ``peer_node`` (str): node name of the first peer to mirror to
       - ``peer_loopback`` (str): peer's loopback IP for the DRBD link
 
@@ -269,7 +266,7 @@ class ClusterTierJoinPeer:
         cluster = _load_cluster()
         nodes = cluster.get("nodes") or {}
         # Rebuild the full peer list (master + every node currently
-        # in the critical-tier peer set, including self).
+        # in the cluster-tier peer set, including self).
         peers = []
         for name in (ctx.get("_peers") or []):
             n = nodes.get(name) or {}

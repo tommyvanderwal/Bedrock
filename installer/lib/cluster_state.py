@@ -1,8 +1,7 @@
 """Cluster-wide state — read directly from the local rqlited replica.
 
-`load_cluster()` returns the same dict shape consumers have been
-expecting from `/etc/bedrock/cluster.json`, but sourced from the
-per-node rqlite at consistency level `none`. That means:
+`load_cluster()` returns the cluster-wide state as a dict, sourced
+from the per-node rqlite at consistency level `none`. That means:
 
   * Reads work *without* cluster quorum. Every node has a full
     Raft-replicated copy of the cluster-state tables in its local
@@ -10,18 +9,16 @@ per-node rqlite at consistency level `none`. That means:
     consulting the leader. A node that's been partitioned away
     from the rest of the cluster can still answer "what are this
     cluster's witnesses / what vm_type is VM X" — the per-node
-    isolation-correctness argument that motivated keeping rqlite
-    over SQLite-on-DRBD.
-  * No projection layer. `cluster.json` and `view_builder.rebuild()`
-    used to write the dict to disk on every rqlite revision change;
-    that layer is gone. Stale-projection bug class (e.g. the
-    cluster CA cert columns not being projected) becomes
-    structurally impossible.
+    isolation-correctness argument for rqlite over SQLite-on-DRBD.
+  * No projection layer: the dict is assembled on demand from rqlite,
+    never written to disk. The stale-projection bug class (e.g. the
+    cluster CA cert columns not being projected) is structurally
+    impossible.
 
 `build_snapshot()` (in `view_builder.py`) is the actual SQL that
-assembles the dict. This module is a one-liner that wraps it; kept
-separate so the import name reflects intent ("cluster state") rather
-than implementation ("view builder").
+assembles the dict. This module is a one-liner that wraps it, separate
+so the import name reflects intent ("cluster state") rather than
+implementation ("view builder").
 
 Per-node state (this node's cluster_uuid, node_name, loopback_ip,
 bootstrap_done, etc.) stays in `/etc/bedrock/state.json` — that's

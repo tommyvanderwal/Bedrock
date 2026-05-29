@@ -1,7 +1,5 @@
 """Arbiter rqlite mobility — DRBD-promote + IP-add + service-start.
 
-Per docs/post-alpha-rewrite-notes.md D-04..D-08:
-
   * The arbiter is a SECOND rqlite daemon co-resident with the
     elected mgmt master, providing the 3rd Raft voter that
     rqlite (which doesn't natively understand Bedrock's
@@ -15,8 +13,8 @@ Per docs/post-alpha-rewrite-notes.md D-04..D-08:
     added to `lo` on the hosting node (NOT a real interface).
     From rqlite's perspective the address is constant across
     master moves — the IP simply changes which `lo` it lives on.
-    See D-05 and the post-alpha-rewrite-notes "Bedrock-specific
-    insight" for why this dissolves the rqlite catch-22.
+    A constant address on lo dissolves rqlite's catch-22: it never
+    has to be told that its peer moved.
 
 Public entry points:
 
@@ -47,8 +45,7 @@ log = logging.getLogger("bedrock.cluster_arbiter")
 
 # `cluster`: the shared DRBD volume hosting all cluster-singleton
 # services (rqlite-arbiter, SeaweedFS filer metadata, S3 IAM, future
-# singletons). Renamed from the legacy `tier-critical` (SG-04); must
-# align with tier_storage.CLUSTER_RESOURCE.
+# singletons). Must align with tier_storage.CLUSTER_RESOURCE.
 TIER_RESOURCE   = "cluster"
 MOUNT_POINT     = Path("/var/lib/bedrock/cluster")
 ARBITER_DATA    = MOUNT_POINT / "rqlite"
@@ -62,7 +59,7 @@ ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
 # Path MUST agree with tier_storage.CLUSTER_DRBD_MARKER.
 CLUSTER_DRBD_MARKER = Path("/etc/bedrock/cluster-drbd-ready")
 
-# Reserved arbiter octet at the top of the cluster /24, per D-05.
+# Reserved arbiter octet at the top of the cluster /24.
 # Derivation of the cluster_byte itself lives in cluster_addr; we just
 # combine here.
 ARBITER_OCTET   = 254
@@ -350,7 +347,8 @@ def promote_to_arbiter_host() -> dict:
     mgmt URL) is identical from day 1.
 
     Idempotent: safe to call on every role tick. Witness checks are
-    no-ops when we're already the master in cluster.json's view.
+    skipped when we are already hosting (DRBD primary + mounted +
+    .254 bound).
     """
     n = _cluster_size()
     drbd_present = _drbd_resource_exists()
@@ -385,10 +383,10 @@ def promote_to_arbiter_host() -> dict:
     # N>=2 with cluster DRBD. Run the takeover protocol.
     log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
 
-    # Idempotent fast-path: if I am already the hosting node per
-    # cluster.json, skip the witness protocol. This handles every
-    # tick after the initial promotion (converge_retry calls promote
-    # repeatedly).
+    # Idempotent fast-path: if I am already hosting (DRBD primary +
+    # mounted + .254 bound), skip the witness protocol. This handles
+    # every tick after the initial promotion (converge_retry calls
+    # promote repeatedly).
     am_already_host = (
         _drbd_role() == "Primary"
         and _is_mounted(MOUNT_POINT)
@@ -436,8 +434,8 @@ def _set_mgmt_master_after_promote(*, drbd_present: bool) -> None:
 
     The base layer (netd's election) DRIVES the promote; mgmt_master is
     written here as the RESULT, after arbiter_status() confirms this node
-    is hosting. This breaks the old backwards flow where netd wrote
-    mgmt_master first and the orchestrator promoted off the rqlite role.
+    is hosting. mgmt_master is never the promote trigger — the promote
+    drives the write, not the other way round.
 
     Hosting confirmation:
       * N>=2 (drbd_present): service_active AND ip_present AND DRBD
@@ -509,16 +507,17 @@ def _run_takeover_protocol() -> bool:
     NO rqlite calls on this path — the cluster's rqlite is the very
     service we're about to recover, so it cannot be a precondition.
 
-    Fast-path: if cluster.json says I'm already the mgmt_master (or
-    no master is recorded yet), there's nothing to take over from.
+    Fast-path: if rqlite cluster_info says I'm already the mgmt_master
+    (or no master is recorded yet), there's nothing to take over from.
     The protocol's job is to gate failover from another node; for the
     first promotion at storage-promote or the periodic self-renew
     after I've already been confirmed master, we skip witness checks
     entirely. netd publishes our slot every tick regardless.
     """
     if SHARED_STATE is None or SHARED_STATE.netd_ws is None:
-        # Pre-unification or netd not running. Fall back to "always
-        # allow" — the legacy boot path relies on this.
+        # netd not wired / not running: fall back to "always allow" so a
+        # standalone invocation (CLI, boot before netd attaches) can still
+        # promote.
         log.warning("arbiter: takeover protocol skipped (no shared state)")
         return True
     try:
@@ -662,11 +661,10 @@ def _run_takeover_protocol() -> bool:
              local_uuid_step3[:12])
 
     # Step 4: go solo — set our own slot tag=lms. The arbiter OWNS the
-    # LMS bit (Q-01/BAD-4): netd no longer recomputes own_tag from a
-    # steady-state heuristic, so this explicit set is authoritative and
-    # the step-5 readback can't be raced back to 0. netd's election tick
-    # (1 Hz) ships whatever tag we set here on its next heartbeat, and
-    # only refreshes own_marker — never the tag.
+    # LMS bit: netd does not recompute own_tag, so this explicit set is
+    # authoritative and the step-5 readback can't be raced back to 0.
+    # netd's election tick (1 Hz) ships whatever tag we set here on its
+    # next heartbeat, and only refreshes own_marker — never the tag.
     local_uuid = _read_local_drbd_uuid()
     marker_bytes = local_uuid.encode("ascii") if local_uuid else b""
     _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_LMS)
@@ -731,10 +729,10 @@ def ensure_lms_if_last_standing(ws) -> bool:
     valid+confirmed, claim last-man-standing by writing our own slot with
     tag.lms=1 and read it back to confirm.
 
-    The arbiter OWNS the LMS bit (Q-01/BAD-4): netd no longer recomputes
-    own_tag per tick, so this explicit set is authoritative. LMS is
-    cleared only on self-demote (demote_arbiter_host), never auto-cleared
-    (INV-7). Idempotent + cheap — set_own_slot just flips ws.own_tag;
+    The arbiter OWNS the LMS bit: netd does not recompute own_tag per
+    tick, so this explicit set is authoritative. LMS is cleared only on
+    self-demote (demote_arbiter_host), never auto-cleared (INV-7).
+    Idempotent + cheap — set_own_slot just flips ws.own_tag;
     when we already hold a reachable peer or aren't last-standing it's a
     no-op. Returns True iff we (re)asserted LMS this call.
 
@@ -993,12 +991,11 @@ def i_should_host_arbiter() -> bool:
     Authority (in order):
       1. netd's live election outcome via SHARED_STATE — this is the
          real-time decision based on peer_liveness + witness vote.
-         Used by the unified bedrock-d daemon.
             "leader"   → True  (host)
             "noquorum" → False (we lost quorum; demote in progress)
             "follower" → False (peer is master)
-      2. Fallback to state.json["role"] for standalone / pre-
-         unification installs. Returns False if missing.
+      2. Fallback to state.json["role"] for standalone invocations with
+         no shared state. Returns False if missing.
 
     Why netd wins: at N=2 (no rqlite arbiter yet), rqlite can't form
     quorum until the arbiter we're deciding about is started. Reading
@@ -1012,8 +1009,8 @@ def i_should_host_arbiter() -> bool:
             return True
         if outcome in ("noquorum", "follower"):
             return False
-        # outcome == "" / "init" → fall through to legacy path while
-        # the daemon is still warming up.
+        # outcome == "" / "init" → fall through to the state.json path
+        # while the daemon is still warming up.
     try:
         s = json.loads(STATE_JSON.read_text())
         return "mgmt" in (s.get("role") or "")
@@ -1045,9 +1042,9 @@ def converge() -> dict:
     Two flavours of "am I hosting":
       * ``am_host_complete`` — every singleton is up. Skip promote.
       * ``am_host_partial`` — any singleton state present. Demote
-        when cluster.json names someone else, even if only .254 is
-        bound (so a follower with leftover state from a prior role
-        is reliably cleaned up).
+        when the realtime layer says a peer is master, even if only
+        .254 is bound (so a follower with leftover state from a prior
+        role is reliably cleaned up).
     """
     should_host = i_should_host_arbiter()
     status = arbiter_status()
@@ -1079,7 +1076,8 @@ def converge() -> dict:
         am_host_partial  = filer_active or status["ip_present"]
     # Two-sided am_host: ``complete`` is the "everything's up" check
     # used to skip promote; ``partial`` is the "anything's up" check
-    # used to fire demote when our role disagrees with cluster.json.
+    # used to fire demote when our role disagrees with the realtime
+    # election outcome.
     am_host = am_host_complete
 
     # Note: master selection is owned by the realtime layer (netd's

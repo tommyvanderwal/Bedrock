@@ -21,8 +21,7 @@ Behaviour:
     apart on the same LAN.
   * No probing, no announcement, no goodbye. Pure responder.
 
-Implementation is ~180 lines of pure stdlib — no Avahi dependency,
-no DBus surface to keep in sync.
+Pure stdlib — no Avahi dependency, no DBus surface to keep in sync.
 """
 
 from __future__ import annotations
@@ -94,9 +93,9 @@ def _interface_ipv4_map() -> dict[int, str]:
 
 
 def own_lan_ip() -> str:
-    """Backwards-compat single-IP helper (used by callers outside
-    the responder, e.g. log lines). Returns the address most likely
-    to reach the wider network, preferring non-link-local."""
+    """Single-IP helper (used by callers outside the responder, e.g.
+    log lines). Returns the address most likely to reach the wider
+    network, preferring non-link-local."""
     ips = list(_interface_ipv4_map().values())
     if not ips:
         return "0.0.0.0"

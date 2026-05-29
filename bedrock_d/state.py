@@ -1,31 +1,19 @@
-"""bedrock_d.state — canonical state I/O for the rewritten codebase.
+"""bedrock_d.state — canonical state I/O.
 
-# Rule (from docs/codebase-rewrite-plan.md §3.3)
-
-**ONE module owns rqlite reads/writes.** New code imports from
-``bedrock_d.state`` (this file). The legacy ``installer/lib/bedrock_state``
-+ ``installer/lib/rqlite_client`` modules continue to back this
-re-export until Stage 7 (the directory move).
-
-# Why re-export instead of move-now
-
-Moving the implementations now would break in-flight imports across
-~6 legacy modules in installer/lib/ + mgmt/. The two-step approach:
-
-1. **Now** — create this thin re-export so new code points here
-   from day one and the eventual move is mechanical.
-2. **Stage 7** — physically relocate ``bedrock_state.py`` to
-   ``bedrock_d/state.py`` and delete the re-exports.
+**ONE module owns rqlite reads/writes.** Code imports state helpers from
+``bedrock_d.state`` (this file), which re-exports the implementations from
+``installer/lib/bedrock_state``, ``installer/lib/rqlite_client``, and
+``installer/lib/state``.
 
 # What's exposed
 
 - ``rqlite_client`` — the HTTP transport (RqliteClient, AsyncRqliteClient,
   apply_schema, bump_revision, RqliteError, RqliteRowError).
-- ``cluster_init``, ``node_register``, ``node_loopback``,
-  ``node_unregister``, ``node_maintenance``, ``operator_set``,
-  ``obs_backends_set``, ``set_cluster_name``, ``set_mgmt_master``,
-  ``tier_state``,
-  ``drbd_node_id_assigned``, ``drbd_node_id_freed``, etc. —
+- ``cluster_init``, ``node_register``, ``node_set_active``,
+  ``node_loopback``, ``node_unregister``, ``node_maintenance``,
+  ``operator_set``, ``obs_backends_set``, ``set_cluster_name``,
+  ``set_mgmt_master``, ``tier_state``, ``drbd_node_id_assigned``,
+  ``drbd_node_id_freed`` —
   high-level cluster-state mutators (typed columns, transaction-
   safe). All of these write the typed rows + bump the revision
   counter atomically so the subscriber sees consistent snapshots.
@@ -36,8 +24,7 @@ Moving the implementations now would break in-flight imports across
 # What's NOT exposed
 
 - View-building (``view_builder``) — that's the snapshot side,
-  not a state mutator. Stays in installer/lib/view_builder.py for
-  now; Stage 7 will move it to ``bedrock_d/snapshot.py``.
+  not a state mutator.
 - Direct SQL. If you find yourself wanting raw SQL, write a typed
   helper in installer/lib/bedrock_state.py and re-export it here.
   Inline SQL across the codebase is exactly what the
@@ -48,7 +35,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Path-shim while installer/lib/ still owns the implementation.
+# Path-shim so ``lib.*`` (installer/lib/) resolves as an import root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
 
 # ── rqlite transport ─────────────────────────────────────────────────
@@ -86,9 +73,8 @@ from lib.state import save as save_local_state  # noqa: F401, E402
 def schema_path() -> Path:
     """Return the on-disk path to bedrock_schema.sql.
 
-    Lives next to ``bedrock_state.py`` in the legacy layout. After
-    Stage 7 moves both into bedrock_d/, this helper returns the
-    relocated path without callers having to change."""
+    Resolved next to ``bedrock_state.py`` so it tracks that module's
+    location regardless of where the package is installed."""
     from lib import bedrock_state as _bs
     return Path(_bs.__file__).parent / "bedrock_schema.sql"
 

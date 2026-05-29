@@ -1,30 +1,18 @@
-"""Cluster-state write helpers — rqlite edition.
+"""Cluster-state write helpers against rqlite.
 
-Replaces installer/lib/log_entries.py. Where the old module produced
-MessagePack payload bytes that were appended to bedrock-rust's hash-
-chained log, this module performs the SQL upserts directly against
-rqlite — and bumps the revision counter so watchers see the change.
+Each function performs the SQL upserts/deletes for one kind of
+cluster-state mutation and bumps bedrock_meta.revision so subscribers
+wake. Functions open a short-lived rqlite client by default, or accept
+one for batch operations.
 
-API surface deliberately mirrors log_entries.py so the call-site
-migration is mechanical: every place that used to do
-
-    payload = le.node_register("sim-1", "192.168.2.18")
-    with rust_ipc.Daemon() as d:
-        d.append(payload)
-
-becomes
+Usage:
 
     bedrock_state.node_register("sim-1", "192.168.2.18")
 
-Each function takes the same arguments as the old encoder, opens a
-short-lived rqlite client by default (or accepts one for batch
-operations), runs the appropriate INSERT/UPDATE, and bumps
-bedrock_meta.revision so subscribers wake.
-
-Single-writer discipline: per D-20, only the elected mgmt-master
-should be calling the mutation helpers in this module. The role
-check lives in callers (mgmt/app.py, orchestrator.py) — this
-module doesn't gate, trusting the caller to have verified role.
+Single-writer discipline: only the elected mgmt-master calls the
+mutation helpers here. The role check lives in callers (mgmt/app.py,
+orchestrator.py) — this module doesn't gate, trusting the caller to
+have verified role.
 """
 from __future__ import annotations
 
@@ -91,9 +79,9 @@ def set_cluster_name(cluster_name: str,
                      client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Update the singleton ``cluster_info.cluster_name`` — the
     display tag every node projects into ``state.json`` and the mDNS
-    TXT record (the cluster.json runtime projection is gone; runtime
-    consumers read rqlite via ``cluster_state.load_cluster()``). The
-    ``cluster_uuid`` is immutable; only the name changes.
+    TXT record (runtime consumers read rqlite via
+    ``cluster_state.load_cluster()``). The ``cluster_uuid`` is
+    immutable; only the name changes.
 
     Bumps ``bedrock_meta.revision`` so every node's
     ``rqlite_subscriber`` re-projects within ~2 s and the mDNS
@@ -154,8 +142,8 @@ def node_register(node_name: str, host: str,
     re-registers (loopback is allocated separately by mgmt at join
     approval; this helper is for keeping host/role/pubkey current).
 
-    `state` is the lifecycle gate the election denominator reads
-    (cluster-quorum-spec / EXECUTION-PLAN C1): a node registered as
+    `state` is the lifecycle gate the election denominator reads:
+    a node registered as
     'joining' is excluded from the active-node count until it
     self-activates (node_set_active) at the end of its join saga, so a
     mid-join node never tips the master into NoQuorum. cluster_init
@@ -188,7 +176,7 @@ def node_set_active(node_name: str,
                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Flip a node's lifecycle state to 'active'. Called by the join
     saga's final step once rqlited has joined Raft + bedrock-d is up,
-    so the node now counts toward the election denominator (C1).
+    so the node now counts toward the election denominator.
     Idempotent — UPDATE to 'active' on an already-active node is a
     no-op write."""
     c, owns = _client(client)
@@ -209,7 +197,7 @@ def node_unregister(node_name: str, reason: str = "",
                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Drop a node from membership. Also drops its tier-peer
     membership and DRBD node-id entries to keep the snapshot
-    consistent (matches the old fold-side behaviour)."""
+    consistent."""
     c, owns = _client(client)
     try:
         c.execute([
@@ -306,7 +294,7 @@ def tier_state(tier: str, mode: str, master: str | None = None,
 
 def drbd_node_id_assigned(tier: str, node_name: str, node_id: int,
                           client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """Per L3: node-ids are permanent for a resource. Upsert here so
+    """DRBD node-ids are permanent for a resource. Upsert here so
     a re-register doesn't shift the assignment (the ON CONFLICT
     branch updates node_id to the same value — no-op semantically,
     refreshes updated_at)."""
@@ -355,9 +343,9 @@ def witness_register(witness_id: str, addr: str,
                      encrypted_witness_key_hex: str,
                      backend: str = "echo",
                      client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """Upsert a witness row. D-17 adds `backend` so the operator UI
-    (post-v1.0 plumbing) can show which kind. Default 'echo' for
-    today's UDP/12321 path."""
+    """Upsert a witness row. `backend` records which kind of witness
+    this is so the operator UI can show it. Default 'echo' for the
+    BedRock Echo UDP/12321 path."""
     c, owns = _client(client)
     try:
         c.execute(
@@ -551,14 +539,13 @@ def obs_backends_set(metrics: list[str], logs: list[str],
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Mesh path table — bedrock-net's LINK_UP/DOWN/QUALITY equivalent
+# Mesh path table — per-link up/down/quality from bedrock-net
 # ─────────────────────────────────────────────────────────────────────
 
 
 def _path_key(node_a: str, nic_a: str, node_b: str, nic_b: str) -> str:
-    """Canonical-order key — same algorithm as today's view_builder
-    _path_key so the same physical path is identified the same way
-    regardless of which side observed it first."""
+    """Canonical-order key, so the same physical path is identified
+    the same way regardless of which side observed it first."""
     a = (node_a, nic_a)
     b = (node_b, nic_b)
     if a > b:
@@ -628,8 +615,8 @@ def link_quality(node_a: str, nic_a: str, node_b: str, nic_b: str,
                  observed_at: float = 0.0,
                  client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Updated speed/RTT for an existing path. Only updates if the
-    path is already present (matches view_builder's old fold
-    behaviour: LINK_QUALITY doesn't resurrect a torn-down path)."""
+    path is already present: a quality update never resurrects a
+    torn-down path."""
     if (node_a, nic_a) > (node_b, nic_b):
         node_a, nic_a, link_addr_a, node_b, nic_b, link_addr_b = \
             node_b, nic_b, link_addr_b, node_a, nic_a, link_addr_a
@@ -910,9 +897,8 @@ def backup_done(vm: str, target_id: str, *,
                 kopia_snapshot_id: str | None = None,
                 bytes_added: int = 0,
                 client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """Same multi-disk schema as the old encoder. Persists one row
-    in vm_backups with the disks JSON column carrying the full
-    array."""
+    """Persists one row in vm_backups, with the disks JSON column
+    carrying the full multi-disk array."""
     if disks is None:
         if kopia_snapshot_id is None:
             raise ValueError("backup_done: pass disks=[…] or legacy "

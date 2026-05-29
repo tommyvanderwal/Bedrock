@@ -1,4 +1,8 @@
-"""Cattle/Pet/ViPet workload type abstraction. Stub — Phase E."""
+"""Cattle/Pet/ViPet workload type abstraction.
+
+Defines the supported workload types and their replication/placement
+requirements, and validates a requested type against the cluster's node count.
+"""
 
 
 WORKLOAD_TYPES = {

@@ -1,4 +1,4 @@
-"""Observability read-API routes (Stage 9 PR #3).
+"""Observability read-API routes.
 
 Thin wrappers over VictoriaMetrics + VictoriaLogs read endpoints —
 queries pre-canned for the dashboard. No state, no auth gates
@@ -11,10 +11,9 @@ plus three log-search endpoints (global / per-node / per-VM).
 # What's NOT here
 
 ``observability_promote`` (the operator's "swap a metrics/logs
-backend" action) stays in app.py for now — it pulls in
-bedrock_state + ssh + tier_storage and needs a heavier DI
-surface. A later PR extracts it once the rest of the rewrite
-gives state.py a clean entry point.
+backend" action) lives in app.py — it pulls in bedrock_state + ssh
++ tier_storage and needs a heavier DI surface than these read-only
+wrappers.
 """
 from __future__ import annotations
 

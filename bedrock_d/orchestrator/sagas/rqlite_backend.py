@@ -19,9 +19,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Import from legacy lib until module move (stage 7). The executor
-# itself stays decoupled — we only import here in the production
-# adapter.
+# The RqliteClient lives in installer/lib; this adapter is the only
+# place that imports it, so the executor itself stays decoupled.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "installer"))
 from lib import rqlite_client  # noqa: E402
 
@@ -111,9 +110,8 @@ class RqliteSagaBackend:
 
     def list_inflight_for(self, node: str) -> list[dict]:
         # NULL target_node = "any node" — included in every node's
-        # list so the first one to grab it wins (a future revision
-        # will add a claim mechanism; for now sagas should target a
-        # specific node).
+        # list so the first one to grab it wins. There is no claim
+        # mechanism, so sagas should target a specific node.
         rows = self._c.query(
             "SELECT id, kind, target_node, params, state, "
             "       requested_by, error, created_at, updated_at, "

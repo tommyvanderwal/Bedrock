@@ -1,8 +1,8 @@
 """Operator login + cluster-wide JWT-HS256 session tokens.
 
-Operators live in the replicated snapshot (via `OPERATOR_SET` /
-`OPERATOR_REMOVE` log entries), so adding/removing an operator on any
-node propagates to all peers within ~1s.
+Operators live in the replicated `operators` table in rqlite (written
+via `bedrock_state.operator_set` / `operator_remove`), so adding or
+removing an operator on any node propagates to all peers within ~1s.
 
 Login: POST /api/login {username, password} → {token, exp}.
 Token: standard JWT-HS256 (`header.payload.signature`, all base64url no

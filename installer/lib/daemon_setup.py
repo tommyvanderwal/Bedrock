@@ -1,14 +1,9 @@
 """Cluster-key bootstrap.
 
-Historically this module rendered /etc/bedrock/daemon.toml and ran
-the bedrock-rust daemon. The Rust daemon is gone (the Python
-bedrock-net daemon absorbed witness + election + routing); only the
-cluster_key bootstrap remains here, since witness HMAC signing needs
-a stable shared secret on every node.
-
-Keeping the module file (rather than moving the one surviving helper
-into lib/witness.py) so existing callers (mgmt_install, agent_install)
-keep working — they call `write_cluster_key(material)` at install time.
+Writes /etc/bedrock/cluster.key, the 32-byte shared secret used for
+witness HMAC signing, which needs a stable secret present on every
+node. mgmt_install and agent_install call `write_cluster_key(material)`
+at install time.
 """
 
 from __future__ import annotations

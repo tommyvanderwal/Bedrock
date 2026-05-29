@@ -14,8 +14,7 @@ operation must preserve, with crash-safety reasoning.
 For the journey of decisions and corrections that led here (wrong turns,
 misdiagnoses, lessons learned), see ../../docs/lessons-log.md.
 
-Storage model (per-resource; the legacy scratch/bulk/critical LV-tiers
-are gone — see docs/storage-architecture.md):
+Storage model (per-resource — see docs/storage-architecture.md):
 
   cluster singleton : N=1 → local thin LV; N≥2 → DRBD-replicated XFS,
                       mounted only on the mgmt-master. Hosts the
@@ -1979,9 +1978,9 @@ def node_reset_local() -> None:
             s = {}
         keep = {k: s[k] for k in ("hardware", "bootstrap_done") if k in s}
         # Go through lib.state.save for atomic + empty-write trap.
-        # The plain write_text this used to do raced with readers
-        # (rqlite_setup --render-env on every rqlited restart) and
-        # could produce a partial file.
+        # A plain write_text races with readers (rqlite_setup
+        # --render-env on every rqlited restart) and can produce a
+        # partial file.
         from . import state as _state_mod
         _state_mod.save(keep)
 
