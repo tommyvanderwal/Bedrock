@@ -86,6 +86,12 @@ def _systemd_want(unit: str, want_running: bool, restart_if_running: bool = Fals
     is_active = subprocess.run(f"systemctl is-active {unit}", shell=True,
                                capture_output=True, text=True).stdout.strip() == "active"
     if want_running and not is_active:
+        # Clear any failed / start-limit state first. A unit that
+        # crash-looped (e.g. vmagent before scrape.yml existed) trips
+        # systemd's StartLimit and then refuses `start` with "start
+        # request repeated too quickly" even once the cause is fixed —
+        # reset-failed lets it recover on the next start.
+        _run(f"systemctl reset-failed {unit}")
         _run(f"systemctl enable --now {unit}")
     elif want_running and is_active and restart_if_running:
         _run(f"systemctl restart {unit}")
@@ -103,6 +109,45 @@ def _backend_url(snapshot: dict, node_name: str, port: int) -> str:
 
 
 # ── Unit files (generated from the snapshot) ────────────────────────
+
+def _write_scrape_file(snapshot: dict, self_name: str) -> bool:
+    """Ensure scrape.yml exists so vmagent can start.
+
+    vmagent runs with `-promscrape.config=SCRAPE_FILE` and EXITS FATALLY
+    at startup if that file is missing. cluster_init only writes it on
+    the INIT node, so without this every joiner's vmagent crash-loops
+    ("cannot read /opt/bedrock/scrape.yml"). Every node that runs vmagent
+    must have it — written here as part of reconcile.
+
+    Each node scrapes its OWN local exporters (node-exporter :9100 +
+    libvirt/vm metrics :9177); vmagent dual-writes the samples to both
+    backends. If this node's identity isn't in the snapshot yet (still
+    settling at boot/join), write a valid EMPTY config so vmagent can
+    start as a pure forwarder; a later reconcile fills in the real
+    targets. Returns True if the content changed."""
+    n = (snapshot.get("nodes") or {}).get(self_name) or {}
+    addr = n.get("host") or n.get("loopback_ip") or ""
+    cluster = snapshot.get("cluster_name", "") or ""
+    if addr:
+        body = (
+            "scrape_configs:\n"
+            "  - job_name: node\n"
+            "    scrape_interval: 10s\n"
+            "    static_configs:\n"
+            f"      - targets: ['{addr}:9100']\n"
+            "        labels:\n"
+            f"          cluster: {cluster}\n"
+            "  - job_name: libvirt\n"
+            "    scrape_interval: 10s\n"
+            "    static_configs:\n"
+            f"      - targets: ['{addr}:9177']\n"
+            "        labels:\n"
+            f"          cluster: {cluster}\n"
+        )
+    else:
+        body = "scrape_configs: []\n"
+    return _write_if_changed(SCRAPE_FILE, body)
+
 
 def _vmagent_unit(metrics_backends: list[str], snapshot: dict) -> str:
     """vmagent dual-writes to each metrics backend's :8428. The persistent
@@ -282,6 +327,12 @@ def reconcile(snapshot: dict, self_name: str) -> None:
     # Agent unit files: write whenever they change, restart-if-running
     # to pick up the new backend URLs.
     if metrics_backends:
+        # vmagent EXITS FATALLY at startup if SCRAPE_FILE is missing, so
+        # write it on EVERY node before (re)starting vmagent — cluster_init
+        # only writes it on the init node, which left joiners' vmagent
+        # crash-looping. If only the scrape file changed vmagent auto-
+        # reloads -promscrape.config, so that alone needs no restart.
+        _write_scrape_file(snapshot, self_name)
         ch = _write_if_changed(
             f"/etc/systemd/system/{UNIT_VMAGENT}",
             _vmagent_unit(metrics_backends, snapshot))
