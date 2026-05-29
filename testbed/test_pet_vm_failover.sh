@@ -136,11 +136,22 @@ fi
 # We don't assume the peer is sim-2 — bedrock vm create picks the
 # first non-home node from rqlite's nodes table in whatever order
 # the rqlite snapshot happens to deliver.
-ORDER=$(rqlite_query 1 "SELECT failover_order FROM vms WHERE vm_name='$PET_NAME'")
+# vm create is fire-and-forget; failover_order is written by the saga's
+# final register_vm step, which can land a few seconds after the VM is
+# already "running". Poll until it's populated rather than racing it.
+PEER_NAME=""
+for _ in $(seq 1 20); do
+    ORDER=$(rqlite_query 1 "SELECT failover_order FROM vms WHERE vm_name='$PET_NAME'")
+    PEER_NAME=$(echo "$ORDER" | python3 -c 'import json,sys
+try: o=json.loads(sys.stdin.read())
+except Exception: o=[]
+print(o[1] if len(o) > 1 else "")')
+    [ -n "$PEER_NAME" ] && break
+    sleep 2
+done
 note "failover_order in rqlite: $ORDER"
-PEER_NAME=$(echo "$ORDER" | python3 -c 'import json,sys; o=json.loads(sys.stdin.read()); print(o[1] if len(o) > 1 else "")')
 if [ -z "$PEER_NAME" ]; then
-    mark_fail "failover_order has no peer entry: '$ORDER'"
+    mark_fail "failover_order has no peer entry after ~40s: '$ORDER'"
     exit 1
 fi
 PEER_IP=$(rqlite_query 1 "SELECT host FROM nodes WHERE node_name='$PEER_NAME'")

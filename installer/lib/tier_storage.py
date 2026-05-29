@@ -997,7 +997,7 @@ def render_drbd_res(resource: str, minor: int,
         # rs-discard-granularity + discard-zeroes-if-aligned let DRBD
         # pass TRIM/discard down through to the thin LV (SG-06), so a
         # `fstrim` on the mounted FS reclaims pool blocks on every peer.
-        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; '
+        f'  disk    {{ c-plan-ahead 0; c-min-rate 0; resync-rate 100M; '
         f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
@@ -1211,7 +1211,7 @@ def render_drbd_res_mesh(resource: str, minor: int,
         f'resource {resource} {{\n'
         f'  protocol C;\n'
         f'  options {{ on-no-quorum suspend-io; }}\n'
-        f'  disk    {{ c-plan-ahead 0; resync-rate 100M; '
+        f'  disk    {{ c-plan-ahead 0; c-min-rate 0; resync-rate 100M; '
         f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
