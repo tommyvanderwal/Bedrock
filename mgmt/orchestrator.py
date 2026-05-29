@@ -371,7 +371,12 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             lambda: asyncio.create_task(_reactor_diff(prev, _SNAPSHOT, self_name))
         )
     except Exception:
-        pass
+        # LOUD, not silent: dropping the reactor_diff means this
+        # revision's transitions (vm destroyed/migrated, tier-master
+        # change, backup target added) skip their side effects. Log it;
+        # the next revision's full snapshot apply is the recovery path.
+        log.exception("rqlite_subscriber: failed to queue reactor_diff "
+                      "(transitions skipped this tick)")
     _PREV_SNAPSHOT = prev
 
 
@@ -1213,6 +1218,49 @@ import threading as _t
 _START_LOCK = _t.Lock()
 
 
+def supervise(name: str, coro_fn, *, restart: bool = True):
+    """Wrap a fire-and-forget orchestrator task so its death is LOUD.
+
+    A bare asyncio.create_task() whose coroutine raises just vanishes
+    (asyncio's 'Task exception was never retrieved' is easily missed) —
+    the cluster keeps running with that whole subsystem silently dead and
+    no alarm. That is the silent-killer class behind the obs outage.
+
+      restart=True  (long-lived loops): on crash, log CRITICAL + full
+                    traceback, back off (cap 60s), re-run. The loop is
+                    meant to run forever, so keep it alive LOUDLY rather
+                    than kill the daemon on a transient.
+      restart=False (one-shots): clean return -> stop. On crash -> log
+                    CRITICAL + traceback and stop. We deliberately do NOT
+                    os._exit: these one-shots can raise on legitimate
+                    timeouts (e.g. _wait_for_role) and killing the whole
+                    daemon would be the WRONG escalation. The CRITICAL log
+                    is the loud, obvious signal; a task that CRITICAL-loops
+                    every backoff IS the alarm.
+
+    Returns the coroutine to hand to asyncio.create_task()."""
+    async def _run():
+        backoff = 1.0
+        while True:
+            try:
+                await coro_fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.critical("orchestrator task %r CRASHED", name,
+                             exc_info=True)
+                if not restart:
+                    return
+            else:
+                if not restart:
+                    return
+                log.critical("orchestrator task %r returned unexpectedly "
+                             "(a loop should run forever) — restarting", name)
+            await asyncio.sleep(min(backoff, 60.0))
+            backoff = min(backoff * 2.0, 60.0)
+    return _run()
+
+
 def start_all():
     """Spawn the orchestrator's tasks on the running event loop. Called
     from FastAPI's startup hook in mgmt/app.py. Under the unified
@@ -1230,20 +1278,24 @@ def start_all():
                      "FastAPI startup hook, dual-uvicorn) — skipping")
             return
         _TASKS_STARTED = True
-    asyncio.create_task(rqlite_subscriber())
-    asyncio.create_task(no_quorum_responder())
-    asyncio.create_task(boot_orchestrator())
-    asyncio.create_task(backup_scheduler())
-    asyncio.create_task(converge_retry())
-    asyncio.create_task(cluster_tier_watcher())
-    asyncio.create_task(saga_resume())
-    asyncio.create_task(operations_drain())
+    # All wrapped in supervise() so a crash is LOUD (CRITICAL + traceback)
+    # instead of a silently-vanished task. Loops restart-with-backoff;
+    # the two one-shots (boot_orchestrator, saga_resume) log-critical and
+    # stop on failure.
+    asyncio.create_task(supervise("rqlite_subscriber", rqlite_subscriber))
+    asyncio.create_task(supervise("no_quorum_responder", no_quorum_responder))
+    asyncio.create_task(supervise("boot_orchestrator", boot_orchestrator, restart=False))
+    asyncio.create_task(supervise("backup_scheduler", backup_scheduler))
+    asyncio.create_task(supervise("converge_retry", converge_retry))
+    asyncio.create_task(supervise("cluster_tier_watcher", cluster_tier_watcher))
+    asyncio.create_task(supervise("saga_resume", saga_resume, restart=False))
+    asyncio.create_task(supervise("operations_drain", operations_drain))
     # Self-heal: leader-only calm loop that rebuilds redundancy after a
     # permanent host loss, one resource at a time, under the 80% disk
     # gate.
     try:
         from bedrock_d.orchestrator import self_heal as _sh
-        asyncio.create_task(_sh.self_heal_task())
+        asyncio.create_task(supervise("self_heal", _sh.self_heal_task))
     except Exception as e:
         log.warning("orchestrator: self_heal start failed: %s", e)
     # VM failover state machine — suspend-on-no-quorum,
