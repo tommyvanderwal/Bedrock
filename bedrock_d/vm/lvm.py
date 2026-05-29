@@ -23,6 +23,7 @@ it independently unit-testable + keeps the saga step bodies short.
 from __future__ import annotations
 
 import math
+import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
@@ -136,9 +137,15 @@ def _run_on(host: str, cmd: str, *, check: bool = True,
     Returns (rc, stdout, stderr). Raises CalledProcessError if
     ``check`` and rc != 0."""
     if host and host not in ("localhost", _local_hostname()):
+        # shlex.quote the whole remote command — a naive '{cmd}' wrapper
+        # breaks when cmd itself contains single quotes (e.g. libvirt XML
+        # `type='kvm'`), which silently mangled the domain definition
+        # pushed to failover peers (RCA 2026-05-29). shlex.quote survives
+        # the local shell=True layer; the remote shell still interprets
+        # pipes/redirects/heredocs inside cmd.
         full = (
             f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes "
-            f"-o ConnectTimeout=5 root@{host} '{cmd}'"
+            f"-o ConnectTimeout=5 root@{host} {shlex.quote(cmd)}"
         )
     else:
         full = cmd

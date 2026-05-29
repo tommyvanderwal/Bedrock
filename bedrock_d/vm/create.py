@@ -320,9 +320,13 @@ class VmCreate:
             _lvm._run_on(
                 host,
                 f"cat > /tmp/{ctx['vm_name']}.xml << 'EOF'\n{xml}\nEOF")
-            _lvm._run_on(
+            rc, _, err = _lvm._run_on(
                 host, f"virsh define /tmp/{ctx['vm_name']}.xml",
                 check=False)
+            if rc != 0:
+                log.warning("vm_create: virsh define on peer %s FAILED "
+                            "rc=%d: %s — VM cannot fail over to this peer",
+                            host, rc, (err or "").strip()[:200])
 
     @step("record_disk_uuids")
     def step_record_uuids(self, ctx):
