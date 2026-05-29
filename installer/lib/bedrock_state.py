@@ -90,9 +90,10 @@ def cluster_init(cluster_uuid: str, cluster_name: str,
 def set_cluster_name(cluster_name: str,
                      client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Update the singleton ``cluster_info.cluster_name`` — the
-    display tag every node projects into ``cluster.json``,
-    ``state.json``, and the mDNS TXT record. The ``cluster_uuid`` is
-    immutable; only the name changes.
+    display tag every node projects into ``state.json`` and the mDNS
+    TXT record (the cluster.json runtime projection is gone; runtime
+    consumers read rqlite via ``cluster_state.load_cluster()``). The
+    ``cluster_uuid`` is immutable; only the name changes.
 
     Bumps ``bedrock_meta.revision`` so every node's
     ``rqlite_subscriber`` re-projects within ~2 s and the mDNS

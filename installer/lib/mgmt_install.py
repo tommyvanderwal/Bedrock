@@ -58,7 +58,7 @@ def install_full(cluster_name: str, repo: str):
     """Install FastAPI + VM + VL + SQLite + witness.
 
     Execution: by default, the saga path
-    (``bedrock_d.install.cluster_init.run_cluster_init``) — 21
+    (``bedrock_d.install.cluster_init.run_cluster_init``) — a sequence of
     ordered idempotent steps, progress persisted to
     ``/var/lib/bedrock/init-progress.json``, resumable from crash.
 
