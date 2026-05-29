@@ -1021,10 +1021,34 @@ def _minor_for(resource: str) -> int:
                    f"not {resource!r}")
 
 
+SINGLETON_MAX_REPLICAS = 3  # cluster-singleton DRBD caps at 3-way (storage-architecture.md)
+
+
+def _peer_octet(p: dict) -> int:
+    try:
+        return int((p.get("loopback_ip") or "").rsplit(".", 1)[-1])
+    except (ValueError, IndexError):
+        return 9999
+
+
+def cap_singleton_peers(peers: list[dict]) -> list[dict]:
+    """The cluster-singleton DRBD resource is capped at SINGLETON_MAX_REPLICAS
+    peers — the lowest-octet nodes (deterministic, mirrors
+    seaweedfs._master_set). Beyond that, extra nodes host per-VM DRBD +
+    the local weed-volume but NOT the singleton. Without this the singleton
+    went N-way (observed 4-way at N=4 → a peer Unconnected + initial sync
+    stalled → arbiter couldn't fail over)."""
+    return sorted(peers, key=_peer_octet)[:SINGLETON_MAX_REPLICAS]
+
+
 def write_drbd_resource(resource: str, peers: list[dict]) -> None:
     """Write /etc/drbd.d/<resource>.res based on peer list.
     Honors persistent node-id assignments (see get_drbd_node_id).
     """
+    if resource == CLUSTER_RESOURCE:
+        # Defensive: the singleton .res must never list more than the
+        # 3-way replica set, even if a caller passes a wider peer list.
+        peers = cap_singleton_peers(peers)
     minor = _minor_for(resource)
     Path("/etc/drbd.d").mkdir(parents=True, exist_ok=True)
     p = Path(f"/etc/drbd.d/{resource}.res")

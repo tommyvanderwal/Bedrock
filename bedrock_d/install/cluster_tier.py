@@ -279,6 +279,15 @@ class ClusterTierJoinPeer:
         self_lo = _self_loopback()
         if not any(p["name"] == self_name for p in peers):
             peers.append({"name": self_name, "loopback_ip": self_lo})
+        # Cluster-singleton DRBD is 3-way max (lowest-octet nodes). A 4th+
+        # node hosts per-VM DRBD + weed-volume but NOT the singleton.
+        capped = _ts.cap_singleton_peers(peers)
+        if not any(p["name"] == self_name for p in capped):
+            log.info("cluster_tier_join_peer: %s not in the %d-way "
+                     "cluster-singleton replica set; skipping singleton join",
+                     self_name, _ts.SINGLETON_MAX_REPLICAS)
+            return
+        peers = capped
         master = ctx.get("_master") or ""
         master_lo = (nodes.get(master) or {}).get("loopback_ip", "")
         _ts.transition_to_n2_peer(

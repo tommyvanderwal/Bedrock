@@ -515,6 +515,14 @@ class NodeJoin:
         my_lo = ctx.get("loopback_ip") or ""
         if my_name and not any(p["name"] == my_name for p in peers):
             peers.append({"name": my_name, "loopback_ip": my_lo})
+        # Cluster-singleton DRBD is 3-way max (lowest-octet nodes).
+        capped = _ts.cap_singleton_peers(peers)
+        if my_name and not any(p["name"] == my_name for p in capped):
+            log.info("cluster_tier_join_peer: %s not in the %d-way "
+                     "cluster-singleton replica set; skipping singleton join",
+                     my_name, _ts.SINGLETON_MAX_REPLICAS)
+            return
+        peers = capped
         _ts.transition_to_n2_peer(
             self_loopback_ip=my_lo,
             master={"name": master_name, "loopback_ip": master_lo},
