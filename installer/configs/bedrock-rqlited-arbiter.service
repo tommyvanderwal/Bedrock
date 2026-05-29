@@ -54,6 +54,10 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
 
 Restart=on-failure
 RestartSec=3s
+# Memory is bounded IN-PROCESS by the Go runtime (GOMEMLIMIT = soft cap;
+# the GC paces to hold the heap near it, no kernel throttle). Deliberately
+# NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
+Environment=GOMEMLIMIT=256MiB
 
 # Arbiter is a 3rd voter; doesn't carry much state. Cap RAM lower
 # than the per-node unit since arbiter shouldn't have a large

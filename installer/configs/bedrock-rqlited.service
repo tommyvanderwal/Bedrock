@@ -59,6 +59,10 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
 
 Restart=on-failure
 RestartSec=2s
+# Memory is bounded IN-PROCESS by the Go runtime (GOMEMLIMIT = soft cap;
+# the GC paces to hold the heap near it, no kernel throttle). Deliberately
+# NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
+Environment=GOMEMLIMIT=512MiB
 # Loop guard — if rqlited refuses to come up repeatedly, let
 # systemd's limit catch it rather than hammering forever.
 

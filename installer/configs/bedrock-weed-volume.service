@@ -24,14 +24,18 @@ ExecStart=/usr/local/bin/weed volume \
     -port=8080 \
     -port.grpc=18080 \
     -dir=/var/lib/bedrock/seaweedfs/volumes \
+    -index=leveldb \
     -disk=${SEAWEED_VOLUME_DISK_TYPE} \
     -max=${SEAWEED_VOLUME_MAX} \
     -mserver=${SEAWEED_MASTER_PEERS}
 
 Restart=on-failure
 RestartSec=3s
-# Volume server holds the actual bytes — let it use real memory.
-# Cap higher than master; bedrock at scale wants the page cache.
+# Memory is bounded IN-PROCESS by the Go runtime (GOMEMLIMIT = soft cap;
+# the GC paces to hold the heap near it, no kernel throttle). Deliberately
+# NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
+Environment=GOMEMLIMIT=1GiB
+Environment=GOGC=50
 
 ProtectSystem=strict
 ProtectHome=true

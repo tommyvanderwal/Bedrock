@@ -26,6 +26,11 @@ ExecStart=/usr/local/bin/weed s3 \
 
 Restart=on-failure
 RestartSec=3s
+# Memory is bounded IN-PROCESS by the Go runtime (GOMEMLIMIT = soft cap;
+# the GC paces to hold the heap near it, no kernel throttle). Deliberately
+# NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
+Environment=GOMEMLIMIT=512MiB
+Environment=GOGC=50
 
 ProtectSystem=strict
 ProtectHome=true
