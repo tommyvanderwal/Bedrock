@@ -81,6 +81,9 @@ _SERVICES_STARTED: bool = False
 # via call_soon_threadsafe. (Bug pre-2026-05-30: get_event_loop() in the
 # worker thread raised, was swallowed, and reactor_diff never ran.)
 _MAIN_LOOP = None
+# The central cluster-state loop (ClusterStateSource), held so its supervised
+# task is not garbage-collected.
+_CLUSTER_SRC = None
 
 # When non-None, all snapshot/last_log_idx/services_started reads + writes
 # go through this object instead of the module globals above. Set by
@@ -200,68 +203,42 @@ def get_snapshot() -> dict:
     return _SNAPSHOT
 
 
-# ── ① rqlite_subscriber ──────────────────────────────────────────────────
+# ── ① central cluster-state loop (ClusterStateSource) ────────────────────
+#
+# The single per-node detector of cluster-state changes lives in
+# bedrock_d/orchestrator/cluster_loop.py. It polls the revision (master-first
+# read with a really-handled local fallback) — and exposes check_now() so
+# rqlite CDC on the leader can wake it near-instantly (poll is the floor, CDC
+# the speed-up). On each detected advance it calls _cluster_change below, which
+# is the ONE fan-out: build the snapshot at the detected read level and run the
+# reactors. This replaces the old rqlite_subscriber / _subscriber_pass.
 
-async def rqlite_subscriber():
-    """Watch the rqlite cluster-state store's revision counter; on
-    every advance, rebuild the snapshot, project this node's role/URL
-    to state.json, run the reactor on the snapshot diff. Consumers read
-    cluster state straight from rqlite via cluster_state.load_cluster();
-    see _apply_revision.
-
-    Poll-based (per rqlite's HTTP semantics) at ~500ms cadence; the
-    reactor sees one consolidated revision-advance per tick even if
-    many mutations landed within it.
-    """
-    log.info("rqlite_subscriber: starting (node=%r)", _self_node_name())
-    loop = asyncio.get_event_loop()
-    while True:
-        try:
-            # Re-resolve identity on every (re)connect: a joiner's
-            # bedrock-d can start before the join saga writes node_name
-            # into state.json, and each retry below gets a FRESH client,
-            # so it should also get a fresh self_name.
-            await loop.run_in_executor(None, _subscriber_pass, _self_node_name())
-        except Exception as e:
-            log.warning("rqlite_subscriber: rqlite unreachable: %s", e)
-        await asyncio.sleep(2)
+async def _cluster_change(revision: int, level: str) -> None:
+    """Dispatcher invoked by ClusterStateSource on a detected revision
+    advance. Runs the (blocking) reactor set in a worker thread so the
+    event loop stays responsive, preserving the prior all-in-a-thread
+    behavior. Re-resolves self_name each call (recovers the joiner race
+    where bedrock-d started before state.json had node_name). NOT
+    blanket-caught — a crash escalates to supervise(), never swallowed."""
+    await asyncio.to_thread(_apply_at_level, revision, level)
 
 
-def _subscriber_pass(self_name: str) -> None:
-    """One subscriber lifecycle: poll bedrock_meta.revision and on
-    each advance, refresh state. Called from a thread executor (the
-    rqlite client is sync)."""
-    global _LAST_LOG_IDX
-    since = _STATE.last_log_idx if _STATE is not None else _LAST_LOG_IDX
+def _apply_at_level(revision: int, level: str) -> None:
+    """Build the snapshot at `level` (with a FRESH client) and run the
+    reactors. A fresh client per change means a client created before
+    rqlite was listening can never wedge the loop."""
     with rqlite_client.RqliteClient() as rc:
-        # Apply the CURRENT revision once at (re)start, BEFORE entering
-        # the advance-only watch loop. Otherwise a node that is already
-        # caught up to the latest revision (a quiet joiner, or any node
-        # whose `since` already equals HEAD) idles until the next write
-        # and never converges per-fold reactors for state set earlier —
-        # notably obs_backends (written at `bedrock init`), so vmagent/
-        # vlagent + the second backend never deploy until something else
-        # happens to bump the revision. The initial apply makes every
-        # subscriber start self-heal the full current state.
-        #
-        # Deliberately NOT wrapped in try/except: if rqlite isn't ready
-        # yet (this runs as early as setup step-1, before `bedrock init`),
-        # the raise propagates to rqlite_subscriber, which sleeps and
-        # retries with a BRAND-NEW client. That matters because a client
-        # created before rqlite is listening does not recover inside
-        # watch()'s internal retry — swallowing the error here left the
-        # subscriber spinning forever on a dead client (obs never
-        # converged on a fresh install; observed 2026-05-29).
-        _apply_revision(rc, rc.revision(), self_name)
-        since = _LAST_LOG_IDX
-        for rev in rc.watch(since_revision=since, interval_s=0.5):
-            _apply_revision(rc, rev, self_name)
+        _apply_revision(rc, revision, _self_node_name(), level=level)
 
 
 def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
-                    self_name: str) -> None:
+                    self_name: str, level: str = "weak") -> None:
     """Refresh the in-memory snapshot from rqlite, project to disk,
-    queue a reactor task."""
+    queue a reactor task. `level` is the rqlite read consistency the
+    central ClusterStateSource detected at ('strong' = via the leader,
+    'weak' = local replica fallback) — the snapshot BUILD uses the same
+    level so we never detect a strong revision then build a stale-local
+    snapshot."""
     global _LAST_LOG_IDX, _PREV_SNAPSHOT, _SNAPSHOT
     # Re-resolve node identity each fold. On a joiner, bedrock-d (and
     # this subscriber) can start BEFORE the join saga writes node_name
@@ -275,7 +252,7 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     if _STATE is not None:
         with _STATE.snapshot_lock:
             prev = copy.deepcopy(_STATE.snapshot)
-            new = view_builder.build_snapshot(client=rc)
+            new = view_builder.build_snapshot(client=rc, level=level)
             _STATE.snapshot = new
             _STATE.prev_snapshot = prev
             _STATE.last_log_idx = int(new.get("log_index", revision))
@@ -1281,7 +1258,7 @@ def start_all():
     `arbiter: promoting` / `boot: role=leader` log lines, two competing
     rqlite_subscribers, and two no_quorum_responders that clobber
     each other's wait_for_role timing)."""
-    global _TASKS_STARTED, _MAIN_LOOP
+    global _TASKS_STARTED, _MAIN_LOOP, _CLUSTER_SRC
     with _START_LOCK:
         if _TASKS_STARTED:
             log.info("orchestrator: start_all already invoked (second "
@@ -1297,7 +1274,12 @@ def start_all():
     # instead of a silently-vanished task. Loops restart-with-backoff;
     # the two one-shots (boot_orchestrator, saga_resume) log-critical and
     # stop on failure.
-    asyncio.create_task(supervise("rqlite_subscriber", rqlite_subscriber))
+    # The ONE central cluster-state loop (replaces rqlite_subscriber):
+    # detects revision advances (master-first read, local fallback, CDC-
+    # wakeable) and fans out to _cluster_change → the reactors.
+    from bedrock_d.orchestrator.cluster_loop import ClusterStateSource
+    _CLUSTER_SRC = ClusterStateSource(_cluster_change)
+    asyncio.create_task(supervise("cluster_loop", _CLUSTER_SRC.run))
     asyncio.create_task(supervise("no_quorum_responder", no_quorum_responder))
     asyncio.create_task(supervise("boot_orchestrator", boot_orchestrator, restart=False))
     asyncio.create_task(supervise("backup_scheduler", backup_scheduler))
