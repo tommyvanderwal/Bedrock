@@ -231,6 +231,62 @@ def _apply_at_level(revision: int, level: str) -> None:
         _apply_revision(rc, revision, _self_node_name(), level=level)
 
 
+def signal_check_now() -> bool:
+    """Wake the central cluster-state loop IMMEDIATELY — the CDC fast path:
+    'cluster state changed, converge now' instead of waiting for the poll
+    floor. Thread-safe: schedules check_now on the main loop, so it is safe
+    to call from a request handler thread. Returns True if the loop was
+    signalled, False if it isn't up yet (caller can fall back to the poll)."""
+    if _MAIN_LOOP is not None and _CLUSTER_SRC is not None:
+        _MAIN_LOOP.call_soon_threadsafe(_CLUSTER_SRC.check_now)
+        return True
+    return False
+
+
+def fanout_check_now_blocking() -> None:
+    """Leader-side CDC fan-out: tell every OTHER node to converge NOW.
+
+    Called (in a worker thread — it does blocking HTTP) when the local
+    rqlited, which is the Raft leader, delivers a CDC event. Each peer is
+    nudged via a signed POST to its /api/internal/check-now over the mesh
+    loopback address.
+
+    Best-effort BY DESIGN, and this is the FULL handling of a failed POST:
+    a peer we can't reach simply converges via its own poll floor (the
+    correctness backstop that always runs), so the cluster stays correct —
+    CDC is only the speed-up. A per-peer failure is therefore logged loud
+    and skipped, never escalated. We do NOT swallow a failure to even
+    enumerate peers: that is logged at ERROR (the fan-out did nothing this
+    commit; every peer falls back to its poll floor)."""
+    self_name = _self_node_name()
+    from lib import cluster_state as _cs
+    from lib import peer_auth as _pa
+    try:
+        nodes = (_cs.load_cluster(level="none").get("nodes") or {})
+    except Exception:
+        log.error("cdc fanout: could not enumerate peers — every node will "
+                  "converge via its poll floor this commit", exc_info=True)
+        return
+    ok = total = 0
+    for name, n in nodes.items():
+        if name == self_name:
+            continue
+        lip = (n.get("loopback_ip") or "").strip()
+        if not lip:
+            log.warning("cdc fanout: node %s has no loopback_ip — skipping "
+                        "(it converges via its poll floor)", name)
+            continue
+        total += 1
+        try:
+            _pa.request("POST", f"https://{lip}:8443/api/internal/check-now",
+                        {}, self_name, timeout=3.0)
+            ok += 1
+        except Exception as e:
+            log.warning("cdc fanout to %s (%s) failed: %s — that node "
+                        "converges via its poll floor", name, lip, e)
+    log.info("cdc fanout: nudged %d/%d peers to converge now", ok, total)
+
+
 def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
                     self_name: str, level: str = "weak") -> None:
     """Refresh the in-memory snapshot from rqlite, project to disk,

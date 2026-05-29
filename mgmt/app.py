@@ -911,6 +911,35 @@ def peer_test(node: str = Depends(require_peer)):
     return {"verified_caller": node}
 
 
+# CDC fast-path receiver. The leader, on an applied rqlite commit, fans this
+# out to every node so the central loop converges near-instantly instead of
+# waiting for its poll floor. Idempotent + cheap: it only nudges the loop to
+# re-read; the loop still does the authoritative master-first read itself.
+@app.post("/api/internal/check-now")
+def internal_check_now(node: str = Depends(require_peer)):
+    from mgmt import orchestrator as _orch
+    return {"woke": _orch.signal_check_now()}
+
+
+# CDC source. The local rqlited — only when it is the Raft leader — POSTs an
+# applied-commit event here (loopback only; rqlited dials 127.0.0.1). We don't
+# need the payload: any committed change means "converge now". We wake our own
+# loop, then fan the nudge out to every other node so the whole cluster
+# converges near-instantly instead of each waiting out its poll floor. The
+# fan-out runs in a thread (blocking signed HTTP) and is best-effort — the poll
+# floor backstops any peer it misses.
+@app.post("/api/internal/cdc")
+async def internal_cdc(request: Request):
+    ch = request.client.host if request.client else ""
+    if ch not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "cdc endpoint is loopback-only")
+    await request.body()                      # drain so rqlited gets its 200
+    from mgmt import orchestrator as _orch
+    _orch.signal_check_now()                  # our own loop
+    asyncio.create_task(asyncio.to_thread(_orch.fanout_check_now_blocking))
+    return {"ok": True}
+
+
 # ── Operator login ──────────────────────────────────────────────────
 
 class LoginReq(BaseModel):

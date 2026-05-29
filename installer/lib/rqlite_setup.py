@@ -184,6 +184,17 @@ def render_env_file(
         "BEDROCK_RQLITED_NODE_ID": str(node_idx),
         "BEDROCK_RQLITED_BIND_IP": my_loopback,
         "BEDROCK_RQLITED_DATA_DIR": str(data_dir),
+        # CDC fast-path (the central event loop's event trigger): the Raft
+        # LEADER POSTs each applied commit to this node's own bedrock-d on
+        # loopback :8001, which wakes the central loop and fans the nudge
+        # out to peers. Set uniformly on every node — rqlite CDC transmits
+        # only from whichever node is currently leader, so it follows
+        # failover automatically with no per-node difference. Loopback HTTP
+        # means no TLS. rqlite batches (max_batch_delay 200ms / size 10) and
+        # retries indefinitely, so a momentarily-down bedrock-d loses no
+        # events; the loop's poll floor is the correctness backstop.
+        "BEDROCK_RQLITED_CDC_FLAG":
+            "-cdc-config http://127.0.0.1:8001/api/internal/cdc",
     }
     if is_solo_master:
         # N=1 fresh init — bootstrap a single-node Raft cluster.

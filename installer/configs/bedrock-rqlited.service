@@ -55,6 +55,7 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -node-verify-client \
     $BEDROCK_RQLITED_JOIN_FLAG \
     $BEDROCK_RQLITED_BOOTSTRAP_FLAG \
+    $BEDROCK_RQLITED_CDC_FLAG \
     "$BEDROCK_RQLITED_DATA_DIR"'
 
 Restart=on-failure
