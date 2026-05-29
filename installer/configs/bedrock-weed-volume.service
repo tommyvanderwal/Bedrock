@@ -32,8 +32,6 @@ Restart=on-failure
 RestartSec=3s
 # Volume server holds the actual bytes — let it use real memory.
 # Cap higher than master; bedrock at scale wants the page cache.
-MemoryHigh=2G
-MemoryMax=4G
 
 ProtectSystem=strict
 ProtectHome=true

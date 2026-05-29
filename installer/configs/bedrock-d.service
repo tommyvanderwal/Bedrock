@@ -32,8 +32,6 @@ StandardError=journal
 # Resources: dashboard rendering can briefly spike on `bedrock storage
 # status` and similar; orchestrator tasks are tiny. 1 GB ceiling
 # catches a runaway leak before it kills the node.
-MemoryHigh=512M
-MemoryMax=1G
 
 # Capabilities: bedrock-d needs CAP_NET_ADMIN (for `ip addr add` from
 # cluster_arbiter), CAP_NET_BIND_SERVICE (port 80 redirector), and

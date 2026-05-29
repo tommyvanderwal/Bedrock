@@ -58,8 +58,6 @@ RestartSec=3s
 # Arbiter is a 3rd voter; doesn't carry much state. Cap RAM lower
 # than the per-node unit since arbiter shouldn't have a large
 # working set.
-MemoryHigh=128M
-MemoryMax=192M
 
 ProtectSystem=strict
 ProtectHome=true

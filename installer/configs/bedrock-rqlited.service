@@ -65,8 +65,6 @@ RestartSec=2s
 # Resource bounds — rqlite at Bedrock's scale idles at ~25 MB RSS.
 # Cap at 256 MB so a runaway bug can't eat the host's RAM budget
 # for VMs.
-MemoryHigh=192M
-MemoryMax=256M
 # CPU is uncontended on dev boxes; leave unbounded for now.
 
 # Filesystem isolation: rqlited only needs its data dir + the

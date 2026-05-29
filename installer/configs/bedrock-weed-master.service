@@ -29,11 +29,6 @@ ExecStart=/usr/local/bin/weed master \
 
 Restart=on-failure
 RestartSec=3s
-# Master holds the volume/topology metadata + Raft. Lighter than s3/filer
-# but 128M throttled it under load (mem_cgroup_handle_over_high; RCA
-# 2026-05-29). MemoryMax caps, not reserves.
-MemoryHigh=512M
-MemoryMax=1G
 
 ProtectSystem=strict
 ProtectHome=true
