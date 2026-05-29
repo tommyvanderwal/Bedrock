@@ -8,7 +8,11 @@ ip_of(){ python3 -c "import sys;sys.path.insert(0,'.');from spawn import get_mgm
 RQ='curl -fsS --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt https://127.0.0.1:4001/db/query?level=strong'
 
 echo "=== $(date) RESET + REINSTALL (fresh ISO) ==="
-python3 spawn.py reset 2>&1 | tail -6
+python3 spawn.py reset 2>&1 | tail -3
+echo "--- spawn 4 sims (anaconda install from ISO) ---"
+python3 spawn.py up 4 2>&1 | tail -8
+echo "--- wait for anaconda to finish, then boot installed disk + firstboot ---"
+python3 spawn.py wait 4 2>&1 | tail -10
 
 echo "=== $(date) POLL bootstrap-done ==="
 for i in $(seq 1 45); do
