@@ -25,6 +25,7 @@ ExecStart=/usr/local/bin/weed volume \
     -port.grpc=18080 \
     -dir=/var/lib/bedrock/seaweedfs/volumes \
     -index=leveldb \
+    -index.leveldbTimeout=24 \
     -disk=${SEAWEED_VOLUME_DISK_TYPE} \
     -max=${SEAWEED_VOLUME_MAX} \
     -mserver=${SEAWEED_MASTER_PEERS}
