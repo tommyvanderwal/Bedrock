@@ -1125,6 +1125,57 @@ async def saga_resume():
              "resumed on this node)", resumed, len(inflight))
 
 
+_OPS_DRAIN_INTERVAL_S = 3.0
+# Saga kinds dispatched to a specific node via `operations.target_node`
+# and run by THAT node's operations_drain — NOT synchronously by the
+# submitter. rqlite is the channel: the mgmt master submits with
+# target_node=<the VM's home node>, and the home node runs the saga
+# locally (no SSH). Every other saga kind runs synchronously on its
+# submitter (vm_create, cluster_tier_promote, …) and is left alone here.
+_NODE_DISPATCHED_KINDS = {"vm_backup", "vm_restore"}
+
+
+async def operations_drain():
+    """Per-node loop: execute rqlite `operations` rows targeted at this
+    node for the node-dispatched saga kinds (vm_backup / vm_restore).
+
+    This is what lets a backup or restore run on the VM's home node
+    without the master SSHing in: the master writes the operation row,
+    this loop on the home node picks it up (target_node match) and runs
+    the saga locally, recording the result back to rqlite."""
+    log.info("operations_drain: started (kinds=%s, every %.0fs)",
+             sorted(_NODE_DISPATCHED_KINDS), _OPS_DRAIN_INTERVAL_S)
+    while True:
+        await asyncio.sleep(_OPS_DRAIN_INTERVAL_S)
+        if NO_QUORUM_MARKER.exists():
+            continue   # need rqlite to read the queue and record results
+        try:
+            self_name = _self_node_name()
+            if not self_name:
+                continue
+            from bedrock_d.orchestrator.sagas import SagaExecutor
+            from bedrock_d.orchestrator.sagas.rqlite_backend import (
+                RqliteSagaBackend,
+            )
+            from bedrock_d import state as _st
+            from bedrock_d.vm import backup as _bk  # noqa: F401  registers sagas
+            backend = RqliteSagaBackend(_st.RqliteClient())
+            ex = SagaExecutor(backend=backend, this_node=self_name)
+            todo = [op for op in backend.list_inflight_for(self_name)
+                    if op.get("kind") in _NODE_DISPATCHED_KINDS]
+        except Exception as e:
+            log.debug("operations_drain: list failed: %s", e)
+            continue
+        for op in todo:
+            try:
+                res = await asyncio.to_thread(ex.execute_one, op["id"])
+                log.info("operations_drain: op=%s kind=%s -> %s",
+                         op.get("id"), op.get("kind"), res.state.value)
+            except Exception as e:
+                log.warning("operations_drain: op=%s raised %r",
+                            op.get("id"), e)
+
+
 _TASKS_STARTED: bool = False
 import threading as _t
 _START_LOCK = _t.Lock()
@@ -1154,6 +1205,7 @@ def start_all():
     asyncio.create_task(converge_retry())
     asyncio.create_task(cluster_tier_watcher())
     asyncio.create_task(saga_resume())
+    asyncio.create_task(operations_drain())
     # Self-heal: leader-only calm loop that rebuilds redundancy after a
     # permanent host loss, one resource at a time, under the 80% disk
     # gate.

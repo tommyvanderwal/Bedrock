@@ -148,9 +148,114 @@ def _parse_disks_from_xml(xml: str) -> tuple[list[str], list[str]]:
     return lvs, devs
 
 
+def _drbd_backing_map(ssh_host: str) -> dict[str, str]:
+    """Map each DRBD device (`/dev/drbdN` — what a pet/vipet guest opens)
+    to its backing LVM LV on `ssh_host`. `lvcreate --snapshot` must run
+    against the backing LV, not the DRBD device. Cattle disks are plain
+    LVs and don't appear here, so they pass through unchanged."""
+    script = (
+        "for res in $(drbdadm sh-resources 2>/dev/null); do "
+        "dev=$(drbdadm sh-dev \"$res\" 2>/dev/null); "
+        "ll=$(drbdadm sh-ll-dev \"$res\" 2>/dev/null); "
+        "[ -n \"$dev\" ] && [ -n \"$ll\" ] && printf '%s\\t%s\\n' \"$dev\" \"$ll\"; "
+        "done"
+    )
+    out = _ssh(ssh_host, script, check=False)
+    m: dict[str, str] = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            m[parts[0].strip()] = parts[1].strip()
+    return m
+
+
+def _vm_vcpus(xml: str) -> int:
+    """Pull the vCPU count out of a libvirt domain XML (0 if absent)."""
+    import re
+    m = re.search(r"<vcpu[^>]*>(\d+)</vcpu>", xml)
+    return int(m.group(1)) if m else 0
+
+
+def _backup_vm_metadata(target_id: str, vm_name: str, ssh_host: str, *,
+                        cluster_uuid: str, src_prefix: str, vm: dict,
+                        disk_results: list[dict], label: str) -> str:
+    """Snapshot a small portable metadata JSON into the same kopia repo,
+    on the source line `<prefix>:<vm>:metadata`. It carries the VM's
+    shape — type, vCPUs, RAM, disk sizes, each disk's kopia snapshot id,
+    and the full libvirt domain XML — so ANY cluster pointing at this
+    bucket + password can reconstruct the VM definition and restore its
+    disks (see restore_vm_from_backup). Returns the metadata snapshot id."""
+    import base64
+    g = _kopia_global_flags(target_id)
+    cred_env = _credentials_env(target_id)
+    xml = _ssh(ssh_host, f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
+    meta = {
+        "schema": "bedrock-vm-metadata/1",
+        "vm_name": vm_name,
+        "vm_type": vm.get("vm_type", "cattle"),
+        "vcpus": _vm_vcpus(xml),
+        "ram_mb": vm.get("ram_mb"),
+        "disk_gb": vm.get("disk_gb"),
+        "priority": vm.get("priority", "normal"),
+        "source_cluster_uuid": cluster_uuid,
+        "label": label,
+        "disks": [
+            {"target_dev": d["target_dev"],
+             "kopia_snapshot_id": d["kopia_snapshot_id"],
+             "override_source": f"{src_prefix}:{vm_name}:{d['target_dev']}"}
+            for d in disk_results
+        ],
+        "libvirt_xml": xml,
+    }
+    b64 = base64.b64encode(json.dumps(meta, indent=2).encode()).decode()
+    override = f"{src_prefix}:{vm_name}:metadata"
+    script = (
+        f"set -o pipefail; {cred_env} && "
+        f"echo {shlex.quote(b64)} | base64 -d | "
+        f"kopia {g} snapshot create /bedrock/vms/{shlex.quote(vm_name)}/metadata "
+        f"  --stdin-file=metadata.json "
+        f"  --override-source={shlex.quote(override)} "
+        f"  --description={shlex.quote('metadata ' + label)} --json"
+    )
+    out = _ssh(ssh_host, script, timeout=300)
+    kid, _ = _parse_kopia_create(out)
+    log.info("backup[%s]: portable metadata snapshot %s", vm_name, kid)
+    return kid
+
+
+def _local_node_addrs() -> set[str]:
+    """Names/addresses that mean 'this node'. Used by `_ssh` to run a
+    command locally instead of over SSH when the target is ourselves."""
+    import socket
+    addrs = {"127.0.0.1", "localhost"}
+    try:
+        addrs.add(socket.gethostname())
+    except Exception:
+        pass
+    try:
+        me = (_read_cluster().get("nodes") or {}).get(socket.gethostname()) or {}
+        for k in ("host", "loopback_ip"):
+            if me.get(k):
+                addrs.add(me[k])
+    except Exception:
+        pass
+    return addrs
+
+
 def _ssh(host: str, cmd: str, check: bool = True, timeout: int = 600) -> str:
-    """Run `cmd` on `host` via SSH. Returns stdout. Raises on failure
-    if `check`."""
+    """Run `cmd` on `host`. If `host` is THIS node, run it LOCALLY via a
+    subprocess (no SSH) — a backup/restore runs as a saga on the VM's
+    home node, so that node snapshots its own disks and streams to kopia
+    locally. Only a genuinely remote host falls back to SSH. Returns
+    stdout; raises on failure if `check`."""
+    if host in _local_node_addrs():
+        r = subprocess.run(["bash", "-lc", cmd],
+                           capture_output=True, text=True, timeout=timeout)
+        if check and r.returncode != 0:
+            raise RuntimeError(
+                f"local cmd failed (rc={r.returncode}): {cmd}\n"
+                f"  stderr: {r.stderr.strip()}")
+        return r.stdout.strip()
     full = [
         "ssh", "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
@@ -600,6 +705,13 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
     target_devs = _vm_disk_target_devs(vm_name, ssh_host)
     # _vm_disk_target_devs returns same length list as disk_lvs in same order.
 
+    # Pet/vipet disks show up in the domain XML as /dev/drbdN (the DRBD
+    # device the guest opens). lvcreate --snapshot must run against the
+    # LVM LV underneath DRBD, so resolve each DRBD device to its backing
+    # LV. Cattle disks are plain LVs and pass through unchanged.
+    backing = _drbd_backing_map(ssh_host)
+    disk_lvs = [backing.get(lv, lv) for lv in disk_lvs]
+
     started = time.monotonic()
     snap_label = label or time.strftime("%Y%m%dT%H%M%S")
     cluster_uuid = cluster.get("cluster_uuid", "unknown-cluster")
@@ -755,11 +867,25 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
             pass
         raise
 
+    # Portable VM metadata — store the VM's shape (type, vcpus, ram,
+    # disks + their kopia ids, libvirt XML) in the same repo so any
+    # cluster with this bucket + password can reconstruct and restore it.
+    metadata_kopia_id = ""
+    try:
+        metadata_kopia_id = _backup_vm_metadata(
+            target_id, vm_name, ssh_host,
+            cluster_uuid=cluster_uuid, src_prefix=src_prefix,
+            vm=vm, disk_results=disk_results, label=snap_label)
+    except Exception as e:
+        log.warning("backup[%s]: metadata snapshot failed (disks are backed "
+                    "up; portable restore needs this): %s", vm_name, e)
+
     duration = time.monotonic() - started
     total_bytes = sum(d["bytes_added"] for d in disk_results)
     log.info("backup[%s] done: %d disk(s), %d bytes added total, %.1fs, "
-             "fs_freeze_used=%s",
-             vm_name, len(disk_results), total_bytes, duration, fs_freeze_used)
+             "fs_freeze_used=%s, metadata=%s",
+             vm_name, len(disk_results), total_bytes, duration, fs_freeze_used,
+             metadata_kopia_id or "—")
     bs.backup_done(
         vm=vm_name, target_id=target_id,
         disks=disk_results,
@@ -773,6 +899,7 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
         "duration_s": duration,
         "label": snap_label,
         "fs_freeze_used": fs_freeze_used,
+        "metadata_kopia_id": metadata_kopia_id,
         # Single-disk convenience fields: primary disk (the first one).
         "kopia_snapshot_id": disk_results[0]["kopia_snapshot_id"]
                               if disk_results else "",
@@ -986,6 +1113,67 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
         # Single-disk convenience field: primary disk's target.
         "target_lv_path": restored[0]["target_lv_path"] if restored else "",
     }
+
+
+def run_restore_to_ha(target_id: str, vm_name: str, *,
+                      kopia_snapshot_id: str = "") -> dict:
+    """Restore a VM from a kopia backup and bring it back up — HA on DRBD
+    for pet/vipet. Runs on the VM's home node (so all commands are local).
+
+    For a VM that still exists in this cluster: power it off, restore
+    every disk of the chosen backup (the newest if `kopia_snapshot_id`
+    is empty), then start it. The disks are restored by writing through
+    the DRBD-primary device, so DRBD replicates the restored bytes to the
+    peers and the VM comes back fully HA — no manual re-sync.
+
+    A VM that no longer exists must first be re-provisioned from its
+    portable metadata (see `read_vm_metadata` + the recreate flow); this
+    function restores into an existing VM shell."""
+    cluster = _read_cluster()
+    vm = (cluster.get("vms") or {}).get(vm_name)
+    if vm is None:
+        raise RuntimeError(
+            f"VM {vm_name!r} is not present in this cluster. Re-provision it "
+            f"from its portable backup metadata first (recreate-from-metadata), "
+            f"then restore.")
+    home = vm.get("host") or _self_node_name()
+    ssh_host = (cluster.get("nodes") or {}).get(home, {}).get("host") or home
+
+    if not kopia_snapshot_id:
+        backups = list(vm.get("backups") or [])   # newest first
+        if not backups:
+            raise RuntimeError(f"no backups recorded for {vm_name}")
+        b0 = backups[0]
+        kopia_snapshot_id = (b0.get("primary_kopia_id")
+                             or ((b0.get("disks") or [{}])[0]
+                                 .get("kopia_snapshot_id", "")))
+        if not kopia_snapshot_id:
+            raise RuntimeError(f"newest backup of {vm_name} has no kopia id")
+
+    # Power the VM off before restoring — run_restore refuses on a running
+    # VM (qemu holds the device O_RDWR; the dd write would race it).
+    st = _ssh(ssh_host,
+              f"virsh domstate {shlex.quote(vm_name)} 2>/dev/null || true",
+              check=False).strip().lower()
+    if st == "running":
+        log.info("restore_to_ha[%s]: powering off before restore", vm_name)
+        _ssh(ssh_host, f"virsh destroy {shlex.quote(vm_name)} >/dev/null 2>&1 || true",
+             check=False)
+        for _ in range(30):
+            s = _ssh(ssh_host,
+                     f"virsh domstate {shlex.quote(vm_name)} 2>/dev/null || true",
+                     check=False).strip().lower()
+            if s != "running":
+                break
+            time.sleep(1)
+
+    res = run_restore(target_id, kopia_snapshot_id, vm_name, dest_node_name=home)
+
+    log.info("restore_to_ha[%s]: starting VM after restore (HA via DRBD)", vm_name)
+    _ssh(ssh_host, f"virsh start {shlex.quote(vm_name)}", check=False)
+    res["started"] = True
+    res["home_node"] = home
+    return res
 
 
 def delete_backup(target_id: str, kopia_snapshot_id: str, vm_name: str,

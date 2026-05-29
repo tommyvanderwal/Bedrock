@@ -3230,36 +3230,33 @@ async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()
     if target is None:
         raise HTTPException(400, f"backup target {req.target_id!r} not configured")
 
-    backup = _import_backup_module()
-    task = task_registry().create(
-        "vm.backup",
-        f"Backup VM {vm_name} → {req.target_id}",
-        vm_name=vm_name,
-    )
+    home = vm.get("host") or ""
+    if not home:
+        raise HTTPException(400, f"VM {vm_name!r} has no home node recorded")
 
-    async def _run():
-        try:
-            task.step_start("snapshot+kopia")
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: backup.run_backup(req.target_id, vm_name, label=req.label),
-            )
-            task.step_done("snapshot+kopia")
-            disks = result.get("disks") or []
-            task.log(f"{len(disks)} disk(s) backed up "
-                     f"(fs_freeze_used={result.get('fs_freeze_used', False)})")
-            for d in disks:
-                task.log(f"  {d['target_dev']}: kopia={d['kopia_snapshot_id']} "
-                         f"({d['bytes_added']} bytes added)")
-            task.log(f"duration: {result['duration_s']:.1f}s")
-            task.succeed()
-        except Exception as e:
-            task.step_fail("snapshot+kopia", str(e))
-            task.fail(str(e))
-
-    asyncio.create_task(_run())
-    return {"status": "accepted", "task_id": task.id}
+    # Submit a vm_backup saga targeted at the VM's HOME node. That node's
+    # operations_drain (mgmt/orchestrator.py) runs it locally — kopia on
+    # the node that owns the disks — recording the result to rqlite. No
+    # SSH from here; rqlite's `operations` table is the channel.
+    import socket as _socket
+    from bedrock_d.orchestrator.sagas import SagaExecutor
+    from bedrock_d.orchestrator.sagas.rqlite_backend import RqliteSagaBackend
+    from bedrock_d import state as _bst
+    from bedrock_d.vm import backup as _vmbk  # noqa: F401  registers vm_backup
+    try:
+        backend = RqliteSagaBackend(_bst.RqliteClient())
+        ex = SagaExecutor(backend=backend, this_node=_socket.gethostname())
+        op_id = ex.submit(
+            kind="vm_backup", target_node=home,
+            params={"target_id": req.target_id, "vm_name": vm_name,
+                    "label": req.label or ""},
+            requested_by="api_vm_backup",
+        )
+    except Exception as e:
+        raise HTTPException(500, f"could not queue backup: {e}")
+    push_log(f"VM {vm_name}: backup queued → {req.target_id} "
+             f"(op {op_id}, runs on {home})", level="info")
+    return {"status": "accepted", "operation_id": op_id, "home_node": home}
 
 
 @app.get("/api/vms/{vm_name}/backups")
@@ -3280,44 +3277,39 @@ def api_vm_backups_list(vm_name: str):
 
 @app.post("/api/vms/{vm_name}/restore")
 async def api_vm_restore(vm_name: str, req: RestoreRequest):
-    """Restore a backup into a fresh LV. Mints a task; result lands in
-    the log via RESTORE_DONE / RESTORE_FAILED."""
+    """Restore a VM from a kopia backup and bring it back up HA. Submits
+    a vm_restore saga targeted at the VM's home node; that node powers the
+    VM off, restores each disk through its DRBD primary (so the bytes
+    replicate to peers), and starts it again. Returns 202 + operation_id."""
     cluster = load_cluster()
     if (cluster.get("backup_targets") or {}).get(req.target_id) is None:
         raise HTTPException(400, f"backup target {req.target_id!r} not configured")
+    vm = (cluster.get("vms") or {}).get(vm_name)
+    if vm is None:
+        raise HTTPException(404, f"VM {vm_name!r} not present in this cluster")
+    home = vm.get("host") or ""
+    if not home:
+        raise HTTPException(400, f"VM {vm_name!r} has no home node recorded")
 
-    backup = _import_backup_module()
-    task = task_registry().create(
-        "vm.restore",
-        f"Restore VM {vm_name} from {req.kopia_snapshot_id}",
-        vm_name=vm_name,
-    )
-
-    async def _run():
-        try:
-            task.step_start("kopia snapshot restore")
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: backup.run_restore(
-                    req.target_id, req.kopia_snapshot_id, vm_name,
-                    target_lv_path=req.target_lv_path,
-                    dest_node_name=req.dest_node,
-                ),
-            )
-            task.step_done("kopia snapshot restore")
-            for d in (result.get("disks") or []):
-                task.log(f"  {d['target_dev']} ← kopia={d['kopia_snapshot_id']} "
-                         f"→ {d['target_lv_path']}")
-            task.log(f"on node: {result['dest_node']}")
-            task.log(f"duration: {result['duration_s']:.1f}s")
-            task.succeed()
-        except Exception as e:
-            task.step_fail("kopia snapshot restore", str(e))
-            task.fail(str(e))
-
-    asyncio.create_task(_run())
-    return {"status": "accepted", "task_id": task.id}
+    import socket as _socket
+    from bedrock_d.orchestrator.sagas import SagaExecutor
+    from bedrock_d.orchestrator.sagas.rqlite_backend import RqliteSagaBackend
+    from bedrock_d import state as _bst
+    from bedrock_d.vm import backup as _vmbk  # noqa: F401  registers vm_restore
+    try:
+        backend = RqliteSagaBackend(_bst.RqliteClient())
+        ex = SagaExecutor(backend=backend, this_node=_socket.gethostname())
+        op_id = ex.submit(
+            kind="vm_restore", target_node=home,
+            params={"target_id": req.target_id, "vm_name": vm_name,
+                    "kopia_snapshot_id": req.kopia_snapshot_id or ""},
+            requested_by="api_vm_restore",
+        )
+    except Exception as e:
+        raise HTTPException(500, f"could not queue restore: {e}")
+    push_log(f"VM {vm_name}: restore queued from {req.target_id} "
+             f"(op {op_id}, runs on {home})", level="info")
+    return {"status": "accepted", "operation_id": op_id, "home_node": home}
 
 
 class BackupScheduleSetRequest(BaseModel):

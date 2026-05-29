@@ -667,6 +667,48 @@ def init_collections() -> None:
         log.warning("init_collections: %s", e)
 
 
+def ensure_bucket(name: str) -> bool:
+    """Idempotently create an S3 bucket on the local SeaweedFS cluster
+    (under the filer's `/buckets/` path) via `weed shell s3.bucket.create`.
+    A kopia-s3 backup repo lives inside a bucket, and the bucket must exist
+    before kopia connects — this is the plumbing that creates it on the
+    cluster's own SeaweedFS. Re-running for an existing bucket is a no-op.
+    Returns True if the bucket exists on the cluster afterwards."""
+    import re
+    if not re.match(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$", name):
+        raise ValueError(
+            f"invalid S3 bucket name {name!r}: use 3-63 chars, lowercase "
+            f"letters/digits/'.'/'-', start and end alphanumeric")
+    if not WEED_BIN.exists():
+        log.warning("ensure_bucket: weed binary missing at %s", WEED_BIN)
+        return False
+    master_set = _master_set()
+    if not master_set:
+        log.warning("ensure_bucket: no SeaweedFS master available yet")
+        return False
+    master_url = f"{master_set[0]}:{MASTER_PORT}"
+    # s3.bucket.create is idempotent (an existing bucket is reported, not an
+    # error); s3.bucket.list confirms the bucket is present afterwards.
+    script = f"s3.bucket.create -name {name}\ns3.bucket.list\n"
+    try:
+        r = subprocess.run(
+            [str(WEED_BIN), "shell", "-master", master_url],
+            input=script, capture_output=True, text=True, timeout=30,
+        )
+        present = name in (r.stdout or "")
+        if present:
+            log.info("ensure_bucket: bucket %r present (master=%s)",
+                     name, master_url)
+        else:
+            log.warning("ensure_bucket: bucket %r not confirmed (rc=%d): %s",
+                        name, r.returncode,
+                        (r.stdout or r.stderr or "")[:200])
+        return present
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("ensure_bucket: %s", e)
+        return False
+
+
 def seed_iso_library(source_dir: Path = Path("/opt/bedrock/iso")) -> None:
     """Copy any ISOs staged in `source_dir` (e.g. virtio-win.iso baked
     into the install ISO) into the filer's `/iso/` subtree, visible

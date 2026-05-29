@@ -36,6 +36,8 @@ and [`docs/storage-architecture.md`](../storage-architecture.md#everything-goes-
 | [`vm_create`](vm_create.md) | `bedrock_d/vm/create.py` | `POST /api/vms` | [`vm_destroy`](vm_destroy.md) |
 | [`vm_destroy`](vm_destroy.md) | `bedrock_d/vm/destroy.py` | `DELETE /api/vms/{name}` | n/a — terminal |
 | [`vm_grow`](vm_grow.md) | `bedrock_d/vm/grow.py` | `POST /api/operations` (kind `vm_grow`) | manual (online shrink not supported) |
+| [`vm_backup`](vm_backup.md) | `bedrock_d/vm/backup.py` | `POST /api/vms/{name}/backup` → op `target_node=home` | n/a — kopia snapshots are immutable; delete a snapshot to undo |
+| [`vm_restore`](vm_restore.md) | `bedrock_d/vm/backup.py` | `POST /api/vms/{name}/restore` → op `target_node=home` | n/a — restore an earlier backup to roll back further |
 | [`vm_migrate`](vm_migrate.md) | `bedrock_d/vm/migrate.py` | `POST /api/vms/{name}/migrate` | run again pointing back at the source node |
 | [`replica_repair`](replica_repair.md) | `bedrock_d/orchestrator/replica_repair.py` | `self_heal` calm loop (mgmt-master only) | manual (`tier_storage.drbd_remove_peer`) |
 
