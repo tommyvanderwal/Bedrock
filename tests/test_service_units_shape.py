@@ -123,3 +123,37 @@ def test_no_cross_bedrock_requires():
         "executor / orchestrator owns actual lifecycle:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_no_cgroup_memory_limits():
+    """No unit may set MemoryHigh=/MemoryMax=/MemoryLimit=.
+
+    These are cgroup *throttles*, not ceilings: when a service's heap
+    crosses MemoryHigh the kernel parks its threads in
+    mem_cgroup_handle_over_high on every allocation and the service
+    crawls — it does not recover on its own. bedrock-weed-s3 at
+    MemoryHigh=128M collapsed from ~1 GB/s to ~25 KB/s during the first
+    backup and never came back (RCA 2026-05-29 / lessons-log L45); the
+    same trap sat on bedrock-d, rqlited and the arbiter.
+
+    Bound memory IN-PROCESS instead, where the runtime can act
+    intelligently: GOMEMLIMIT on the Go services (weed-*, rqlited,
+    arbiter) and `weed volume -index=leveldb` to keep the needle index
+    on disk. If you think you need a hard cgroup ceiling here, you don't
+    — you need GOMEMLIMIT.
+    """
+    offenders: list[str] = []
+    # Check EVERY unit file, incl. the systemd/ subdir (node-exporter,
+    # vm-exporter, s3backer) — not just bedrock-*.
+    for p in sorted(CONFIGS.glob("**/*.service")):
+        text = p.read_text()
+        for key in ("MemoryHigh", "MemoryMax", "MemoryLimit"):
+            v = _get_directive(text, key)
+            if v:
+                offenders.append(f"{p.relative_to(REPO)}: {key}={v}")
+    assert not offenders, (
+        "cgroup memory limits throttle pathologically (RCA 2026-05-29, "
+        "lessons-log L45) — REMOVE them. Use GOMEMLIMIT (Go services) / "
+        "`weed volume -index=leveldb` instead:\n  "
+        + "\n  ".join(offenders)
+    )

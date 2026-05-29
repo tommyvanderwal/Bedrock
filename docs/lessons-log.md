@@ -1843,3 +1843,55 @@ testbed validation time chasing it as a Bedrock bug. It is purely
 a testbed-cloud-init issue and only affects VMs spawned via
 `BEDROCK_TESTBED_USE_CLOUD_IMG=1`. Production installs (ISO path)
 don't go through cloud-init and aren't affected.
+
+---
+
+## L45 — systemd `MemoryHigh`/`MemoryMax` silently throttled the whole stack
+**2026-05-29** · commits fb10ab9 → 944d880 → d072991
+
+**What we thought:** capping each weed / rqlited / bedrock-d unit with
+systemd `MemoryHigh`/`MemoryMax` was a tidy way to keep Bedrock's memory
+footprint small and leave RAM for guest VMs.
+
+**What we found:** `MemoryHigh` is a *throttle*, not a ceiling. When a
+service's heap crosses it the kernel parks the process's threads in
+`mem_cgroup_handle_over_high` on **every allocation** — the service stays
+"active" but crawls, and does not recover on its own. `bedrock-weed-s3`
+(`MemoryHigh=128M`) collapsed from ~1 GB/s to **~25 KB/s** during the
+first VM backup (the S3 read path holds 8 MiB chunk buffers in a
+hardcoded 256-slot `readerCache`, which blew straight past 128 MB;
+`memory.events` showed **223 726** `high` throttle events) and never came
+back without a restart. The decisive proof: a *fresh* `weed s3` instance
+read the identical object in **20 ms** while the throttled production one
+timed out — so every layer underneath was healthy (disk 3.9 GB/s, inter-
+node net 200 MB/s, filer 20 ms, volume needles ~30 ms) and the cgroup was
+the sole cause. Raising the live limit 128M→1G restored 867 MB/s
+instantly, no restart. The same trap sat on `bedrock-d` (512M),
+`bedrock-rqlited` (192M) and the arbiter (128M) — a strong candidate for
+the long-standing *"the testbed goes slow/weird after running a while"*
+class of phantom flakiness, as long-lived daemons accumulate heap and
+cross their high-water mark.
+
+**What we changed:** removed `MemoryHigh`/`MemoryMax` from **every**
+Bedrock unit — they are never to be set again. Memory is now bounded
+**in-process**, where the runtime can act intelligently:
+- `GOMEMLIMIT` on every Go service (weed-s3/filer/master/volume, rqlited,
+  arbiter) — a Go-runtime *soft* target: the GC paces toward it and the
+  process keeps serving, instead of the kernel freezing it. weed 4.25 is
+  built with go1.26 and has no in-code `SetMemoryLimit`, so it honors the
+  env var directly.
+- `weed volume -index=leveldb` — the volume's dominant RAM driver is the
+  needle index, which `-index=memory` loads entirely into RAM (~11 B ×
+  every object). leveldb keeps it on disk (~a few MB/volume) for one extra
+  lookup per Get. A little more disk, far less RAM — exactly the trade we
+  want.
+- `bedrock-d` is Python (no `GOMEMLIMIT`); it runs unbounded, as systemd
+  defaults intend. The host OOM-killer is the only real backstop, by design.
+
+Guarded against regression by
+`tests/test_service_units_shape.py::test_no_cgroup_memory_limits`.
+
+**Reference:** full RCA in this session. The s3 chunk-buffer pool
+(`s3ReaderCacheDownloaderLimit=256`, ~2 GiB worst case) and the prefetch
+count (`DefaultPrefetchCount=4`) are both hardcoded in weed 4.25 with no
+flag — so `GOMEMLIMIT` is the *only* lever for the s3 read path.
