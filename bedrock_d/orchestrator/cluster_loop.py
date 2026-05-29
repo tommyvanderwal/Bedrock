@@ -80,14 +80,26 @@ class ClusterStateSource:
         *,
         poll_interval_s: float = 0.5,
         leader_retry_s: float = 5.0,
+        dispatch_timeout_s: float = 45.0,
     ) -> None:
         self._on_change = on_change
         self._poll_interval_s = poll_interval_s
         self._leader_retry_s = leader_retry_s
+        # Upper bound on how long the loop will WAIT for a reactor dispatch
+        # before declaring it hung and carrying on. Generous: a normal tick's
+        # reactors (obs/drbd/arbiter/iso) do a handful of subprocess calls and
+        # finish in well under a second; 45s only trips on a genuinely wedged
+        # drbdadm/virsh/systemctl. The dispatch keeps running (shielded) — we
+        # just stop blocking the loop on it.
+        self._dispatch_timeout_s = dispatch_timeout_s
         self._wake = asyncio.Event()
         self._mode = _READ_MASTER
         self._last_rev = -1
         self._local_ticks = 0
+        # Single-flight: the in-flight reactor-dispatch task, if any. Detection
+        # keeps running while it does; a new trigger never piles a second
+        # dispatch on top of a slow/hung one.
+        self._dispatch_task: Optional[asyncio.Task] = None
 
     # ── public ────────────────────────────────────────────────────────
     def check_now(self) -> None:
@@ -116,11 +128,38 @@ class ClusterStateSource:
             return  # rqlite unreachable at leader AND local (logged loud)
         if not force and rev == self._last_rev:
             return
+        # Single-flight: if a prior dispatch is still running (a slow or hung
+        # reactor), do NOT pile a second one on top. Skip this trigger without
+        # advancing _last_rev, so the loop keeps polling/detecting and we
+        # reconverge the instant the dispatch frees. (The dispatch reads the
+        # CURRENT rqlite state when it runs, so skipping intermediate revisions
+        # loses nothing — it converges to the latest.)
+        if self._dispatch_task is not None and not self._dispatch_task.done():
+            log.warning("cluster_loop: prior reactor dispatch still running — "
+                        "skipping rev %d trigger (reconverges when it frees); "
+                        "detection/CDC keep running meanwhile", rev)
+            return
+        # on_change builds the snapshot at `level` and runs the reactors. We
+        # BOUND how long the loop blocks on it: a genuinely hung reactor (a
+        # wedged drbdadm/virsh) must never freeze detection, CDC fan-out, or
+        # leader re-probe. shield() keeps the dispatch running after a timeout
+        # (it is not cancelled) — we just stop waiting on it; the single-flight
+        # guard above then defers new triggers until it completes. A real
+        # reactor *exception* is NOT swallowed here: shield re-raises it and it
+        # escalates to supervise() (fail loud). _last_rev advances only after a
+        # completed dispatch, so a timeout retries next tick.
+        self._dispatch_task = asyncio.ensure_future(self._on_change(rev, level))
+        try:
+            await asyncio.wait_for(asyncio.shield(self._dispatch_task),
+                                   timeout=self._dispatch_timeout_s)
+        except asyncio.TimeoutError:
+            log.error("cluster_loop: reactor dispatch for rev %d exceeded %.0fs "
+                      "— a reactor is HUNG. Loop stays alive (detection/CDC/"
+                      "leader re-probe continue); last_rev held at %d, dispatch "
+                      "still running, retries once it frees.",
+                      rev, self._dispatch_timeout_s, self._last_rev)
+            return
         self._last_rev = rev
-        # Single fan-out. on_change builds the snapshot at `level` and runs
-        # the reactors. NOT wrapped in a blanket catch here — a crash
-        # escalates to supervise(), it is never silently swallowed.
-        await self._on_change(rev, level)
 
     def _read_revision(self):
         """(revision, level) at the current read level, with a master->local
