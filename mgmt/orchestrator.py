@@ -74,6 +74,13 @@ _LAST_LOG_IDX: int = 0
 # transition handling (vm_destroyed, vm_migrated, etc.).
 _PREV_SNAPSHOT: dict = view_builder.empty_snapshot()
 _SERVICES_STARTED: bool = False
+# The main asyncio event loop, captured in start_all() (which runs IN the
+# loop thread). _apply_revision runs in a thread executor, where
+# asyncio.get_event_loop() raises "no current event loop in thread" — so
+# cross-thread task spawns (the reactor_diff) MUST use this captured ref
+# via call_soon_threadsafe. (Bug pre-2026-05-30: get_event_loop() in the
+# worker thread raised, was swallowed, and reactor_diff never ran.)
+_MAIN_LOOP = None
 
 # When non-None, all snapshot/last_log_idx/services_started reads + writes
 # go through this object instead of the module globals above. Set by
@@ -365,18 +372,21 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     # Snapshot-diff reactor — on each revision advance, derive
     # transitions from prev→cur and run side effects (vm destroyed,
     # vm host changed, tier master changed, backup target added).
-    try:
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(
+    # Spawn the prev->cur transition reactor on the MAIN loop. We are in a
+    # worker thread (run_in_executor), where asyncio.get_event_loop()
+    # raises "no current event loop in thread" — so use the captured
+    # _MAIN_LOOP ref and call_soon_threadsafe to cross threads. (The old
+    # get_event_loop() call raised every tick and was swallowed, so this
+    # reactor never ran; dropping a diff means a revision's transitions —
+    # vm destroyed/migrated, backup target appeared — skip their side
+    # effects, so a missing loop is logged LOUD, not silently passed.)
+    if _MAIN_LOOP is not None:
+        _MAIN_LOOP.call_soon_threadsafe(
             lambda: asyncio.create_task(_reactor_diff(prev, _SNAPSHOT, self_name))
         )
-    except Exception:
-        # LOUD, not silent: dropping the reactor_diff means this
-        # revision's transitions (vm destroyed/migrated, tier-master
-        # change, backup target added) skip their side effects. Log it;
-        # the next revision's full snapshot apply is the recovery path.
-        log.exception("rqlite_subscriber: failed to queue reactor_diff "
-                      "(transitions skipped this tick)")
+    else:
+        log.error("rqlite_subscriber: main loop not captured — reactor_diff "
+                  "transitions skipped (start_all not run yet?)")
     _PREV_SNAPSHOT = prev
 
 
@@ -1271,13 +1281,18 @@ def start_all():
     `arbiter: promoting` / `boot: role=leader` log lines, two competing
     rqlite_subscribers, and two no_quorum_responders that clobber
     each other's wait_for_role timing)."""
-    global _TASKS_STARTED
+    global _TASKS_STARTED, _MAIN_LOOP
     with _START_LOCK:
         if _TASKS_STARTED:
             log.info("orchestrator: start_all already invoked (second "
                      "FastAPI startup hook, dual-uvicorn) — skipping")
             return
         _TASKS_STARTED = True
+    # Capture the running loop so worker-thread code (_apply_revision runs
+    # in the rqlite_subscriber executor) can schedule tasks on it via
+    # call_soon_threadsafe — asyncio.get_event_loop() raises in a worker
+    # thread, which is what silently killed the reactor_diff.
+    _MAIN_LOOP = asyncio.get_running_loop()
     # All wrapped in supervise() so a crash is LOUD (CRITICAL + traceback)
     # instead of a silently-vanished task. Loops restart-with-backoff;
     # the two one-shots (boot_orchestrator, saga_resume) log-critical and
