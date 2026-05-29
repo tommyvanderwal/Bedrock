@@ -25,6 +25,15 @@ READ STRATEGY — master-first, local fallback (REALLY handled, never silent):
     the dispatcher so the snapshot BUILD uses the same consistency as the
     detection (no detect-strong / build-stale-local skew).
 
+  * SCOPE: this strong->local fallback is for CONVERGENCE reads ONLY (this loop
+    + the idempotent reactors, which self-correct next tick). It must NEVER
+    back a definitive/safety-critical decision — e.g. whether this node may
+    take over a per-VM DRBD disk and PROMOTE it. Those reads must be
+    strict-leader (level='strong', NO fallback) at their own call site and FAIL
+    LOUD / defer if the leader is unreachable; deciding a takeover from a stale
+    local replica risks split-brain. (The arbiter/cluster-singleton disk is
+    gated separately by the witness + weighted-vote election, not here.)
+
 CHANGE DETECTION — poll floor now, CDC fast-path ready (NOT deferred):
   * poll bedrock_meta.revision. Worst-case react latency = the poll interval;
     an acceptable transition-time floor, not the steady-state default.
