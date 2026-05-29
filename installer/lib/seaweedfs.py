@@ -100,10 +100,11 @@ def ensure_install() -> None:
         d.mkdir(parents=True, exist_ok=True, mode=0o755)
 
 
-def _read_cluster() -> dict:
+def _read_cluster(strong: bool = False) -> dict:
     try:
         from . import cluster_state
-        return cluster_state.load_cluster()
+        return cluster_state.load_cluster(
+            level="strong" if strong else "none")
     except Exception:
         return {}
 
@@ -118,8 +119,14 @@ def _read_state() -> dict:
 def _peer_loopbacks() -> list[str]:
     """All other nodes' loopback IPs — used to construct the master
     peer list. Stable sorted order so every node renders an identical
-    master.toml."""
-    cluster = _read_cluster()
+    master.toml.
+
+    Reads the Raft-committed node set (strong), not the local replica:
+    the master-peer list MUST be the same on every node, and a render
+    from a partial local view (e.g. mid-reboot before quorum reforms)
+    would emit a self-only peer list, so that node's master never peers
+    and its volume server never registers with the leader."""
+    cluster = _read_cluster(strong=True)
     state = _read_state()
     me = state.get("node_name", "")
     out: list[str] = []
@@ -460,6 +467,21 @@ def promote_to_master_volume_host() -> None:
     master_set = _master_set()
     i_run_master = my_lo in master_set
 
+    # Re-render config from the current (strong) cluster view before
+    # (re)starting the units. A render done during an earlier partial
+    # boot view (mid-reboot, before quorum reformed) can emit a
+    # self-only master peer list — that node's master then never peers
+    # and its volume server never registers with the leader. Regenerate
+    # seaweedfs.env + master.toml here so every boot converges on the
+    # full Raft-3 peer set. daemon-reload picks up any unit env change.
+    try:
+        write_env_file()
+        write_master_config()
+        subprocess.run(["systemctl", "daemon-reload"],
+                       check=False, timeout=10, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("seaweedfs: pre-start config re-render failed: %s", e)
+
     # Reset-failed first: any of these may have crash-looped earlier
     # (env file not yet written → "Failed to load environment files"
     # → restart → ... → StartLimitBurst). Clear before we try to
@@ -482,8 +504,13 @@ def promote_to_master_volume_host() -> None:
     # by us, not at boot. `enable` on such a unit prints "no
     # installation config" but still creates the runtime symlink we
     # want via `--now`.
+    # `restart` (not `enable --now`): these units have empty WantedBy
+    # so `enable` makes no symlink, and `--now` won't restart an already-
+    # running server — so a freshly re-rendered config (above) wouldn't
+    # take effect. `restart` starts a stopped unit and re-applies config
+    # on a running one.
     subprocess.run(
-        ["systemctl", "enable", "--now",
+        ["systemctl", "restart",
          "bedrock-weed-volume.service",
          "bedrock-weed-s3.service"],
         check=False, timeout=30,
@@ -494,7 +521,7 @@ def promote_to_master_volume_host() -> None:
     # reason for the stderr silencing as above.
     if i_run_master:
         subprocess.run(
-            ["systemctl", "enable", "--now",
+            ["systemctl", "restart",
              "bedrock-weed-master.service"],
             check=False, timeout=30,
             stderr=subprocess.DEVNULL,
