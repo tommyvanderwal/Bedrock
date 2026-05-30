@@ -1775,8 +1775,12 @@ def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
                 ensure_loopback_ip(d.my_loopback)
                 print(f"bedrock-net: loopback now {d.my_loopback}",
                       file=sys.stderr, flush=True)
-        except Exception:
-            pass
+        except Exception as e:
+            # Re-runs every tick, so a transient failure self-heals — but log
+            # it (don't swallow silently) so a PERSISTENT failure is visible,
+            # matching the sibling refresh path.
+            print(f"bedrock-net: loopback refresh failed (retry next tick): {e}",
+                  file=sys.stderr, flush=True)
 
     # Maintain interface set: drive NetworkManager to assign IPv4
     # link-local on fresh NICs (or pick up whatever address the OS

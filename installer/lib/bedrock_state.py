@@ -718,6 +718,41 @@ def vm_set_failover_order(name: str, order: list[str],
         raise
 
 
+def vm_set_libvirt_xml(name: str, xml: str,
+                       client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Store the VM's libvirt domain XML in cluster state so any node — even
+    one that joined AFTER the VM was created — can re-`virsh define` it before
+    taking it over on failover. Written by the create saga; the failover path
+    reads it via vm_get_libvirt_xml. Not projected into the snapshot."""
+    c, owns = _client(client)
+    try:
+        c.execute("UPDATE vms SET libvirt_xml = ?, updated_at = ? "
+                  "WHERE vm_name = ?",
+                  params=[xml or "", _now(), name])
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def vm_get_libvirt_xml(name: str,
+                       client: Optional[rqlite_client.RqliteClient] = None,
+                       level: str = "strong") -> str:
+    """Read the VM's stored libvirt domain XML (for failover re-define).
+    Returns '' if unknown. Defaults to a STRONG read — a takeover define is a
+    decision that must use authoritative state, not a possibly-stale local
+    replica."""
+    c, owns = _client(client)
+    try:
+        row = c.query_one("SELECT libvirt_xml FROM vms WHERE vm_name = ?",
+                          params=[name], level=level)
+        return (row or {}).get("libvirt_xml") or ""
+    finally:
+        if owns:
+            c.close()
+
+
 def vm_set_priority(name: str, priority: str,
                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Record this VM's HA-importance ('low'|'normal'|'high'). The

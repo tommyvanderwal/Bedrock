@@ -314,6 +314,17 @@ class VmCreate:
             return
         xml = ctx["libvirt_xml"]
         home = ctx["home"]
+        # Persist the domain XML in cluster state FIRST, so a node that joins
+        # LATER (and so isn't in this peer loop) can still re-`virsh define` +
+        # take over this VM on failover. The peer-define below is the fast
+        # path; this is the durable, joiner-proof backstop.
+        try:
+            from lib import bedrock_state as _bs  # type: ignore
+            _bs.vm_set_libvirt_xml(ctx["vm_name"], xml)
+        except Exception as e:
+            log.warning("vm_create: could not store libvirt_xml for %s in "
+                        "cluster state (failover to a later-joining node may "
+                        "then need a manual define): %s", ctx["vm_name"], e)
         for name, host in zip(ctx["peers"], _peer_hosts(ctx["peers"])):
             if name == home:
                 continue

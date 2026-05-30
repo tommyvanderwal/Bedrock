@@ -556,9 +556,13 @@ def get_mgmt_ip(i: int) -> str | None:
                 if ip and not ip.startswith(("169.254.", "127.")):
                     return ip
 
-    # Last-resort fallback: convention .201+i. Often wrong post-test
-    # (DHCP renumbers); only correct on the very first install.
-    return mgmt_ip(i)
+    # No live ARP/agent address for this node. Return None — NOT the .201+i
+    # convention: DHCP renumbers post-install so that guess is plausible-but-
+    # wrong, and it defeated the `or ''` / `if not ip` guard every caller
+    # already implements (→ ssh hangs against a stale address; lessons-log
+    # L48). None makes callers correctly wait/skip. mgmt_ip(i) is still used
+    # for the kickstart {MGMT_IP} reservation hint — a different, correct use.
+    return None
 
     # Try virsh domifaddr (works for NAT)
     out, _ = virsh("domifaddr", hostname)

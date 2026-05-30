@@ -182,6 +182,13 @@ CREATE TABLE IF NOT EXISTS vms (
     -- 'high' replicas are rebuilt before 'normal' before 'low'.
     -- Set at create time; 'normal' for VMs created before this column.
     priority          TEXT NOT NULL DEFAULT 'normal',
+    -- The VM's libvirt domain XML, captured at create time. Stored in
+    -- cluster state so ANY node (including one that JOINED AFTER the VM
+    -- was created, and so never received the create-time
+    -- virsh-define-on-peers) can re-`virsh define` the domain before
+    -- taking it over on failover. Read on-demand at failover only — NOT
+    -- projected into the snapshot, to keep cluster.json lean.
+    libvirt_xml       TEXT NOT NULL DEFAULT '',
     updated_at        INTEGER NOT NULL
 );
 

@@ -505,14 +505,56 @@ def _takeover_one(vm_name: str, disks: list[str], me: str) -> bool:
         )
         return False
 
-    # e. virsh define + start
+    # e. virsh define (from stored XML if undefined here) + start
     rc_d = _virsh("dominfo", vm_name)
     if rc_d[0] != 0:
-        log.warning(
-            "vm_failover: VM %r is not defined here yet — XML must "
-            "be on shared storage or reconstructed. (TODO: implement "
-            "automatic re-define from cluster state)", vm_name,
-        )
+        # This node never received the create-time virsh-define (e.g. it
+        # JOINED AFTER the VM was created). Re-define from the domain XML
+        # stored in cluster state at create time. STRONG read — this gates a
+        # takeover, so it must use authoritative state (quorum already
+        # confirmed by is_safe_to_start_vm above, so the leader is reachable).
+        log.warning("vm_failover: VM %r not defined on this node — "
+                    "re-defining from stored cluster XML", vm_name)
+        xml = ""
+        try:
+            from lib import bedrock_state as _bs  # type: ignore
+            xml = _bs.vm_get_libvirt_xml(vm_name, level="strong")
+        except Exception as e:
+            log.error("vm_failover: could not read stored libvirt_xml for %r: "
+                      "%s — REFUSING takeover (cannot define the domain here)",
+                      vm_name, e)
+            return False
+        if not xml.strip():
+            log.error("vm_failover: no stored libvirt_xml for %r (created "
+                      "before XML-in-cluster-state, or the create saga did "
+                      "not persist it) — REFUSING takeover; define the domain "
+                      "on this node manually to enable failover here.", vm_name)
+            return False
+        import tempfile
+        import os as _os
+        path = ""
+        try:
+            fd, path = tempfile.mkstemp(prefix=f"bedrock-{vm_name}-",
+                                        suffix=".xml")
+            with _os.fdopen(fd, "w") as f:
+                f.write(xml)
+            rc_def = _virsh("define", path)
+        except Exception as e:
+            log.error("vm_failover: virsh define of %r from stored XML raised: "
+                      "%s — REFUSING takeover", vm_name, e)
+            return False
+        finally:
+            if path:
+                try:
+                    _os.unlink(path)
+                except OSError:
+                    pass
+        if rc_def[0] != 0:
+            log.error("vm_failover: virsh define %r FAILED: %s — REFUSING "
+                      "takeover", vm_name, rc_def[2].strip())
+            return False
+        log.warning("vm_failover: re-defined %r from stored cluster XML — "
+                    "proceeding with takeover", vm_name)
     rc_s = _virsh("start", vm_name)
     if rc_s[0] != 0:
         log.error(
