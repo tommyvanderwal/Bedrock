@@ -1218,6 +1218,10 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     ws.member_ids = member_ids or None
     _witnesses = cluster.get("witnesses") or {}
     n_configured_witnesses = len(_witnesses)
+    # Bind voting witnesses to the configured set: only a reply whose echo_id
+    # matches a configured witness_id is admitted/counted (drops a rogue Echo
+    # and a just-removed witness's stale entry from the tally).
+    ws.configured_witness_ids = set(_witnesses.keys())
     # Refresh the directed-probe list for next tick's witness IO: every
     # backend=='echo' witness's (host, port). Lets an Echo added BY IP that is
     # off the broadcast domain still get probed + vote.

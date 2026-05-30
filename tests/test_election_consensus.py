@@ -349,6 +349,30 @@ def test_count_valid_confirmed_tallies_multiple_witnesses():
     assert witness.count_valid_confirmed(ws, n_configured=3) == 2
 
 
+def test_count_valid_confirmed_binds_to_configured_witness_ids():
+    # Split-brain guard: a valid+confirmed endpoint whose echo_id is NOT a
+    # configured witness_id (a rogue Echo holding the cluster key, or a
+    # just-REMOVED witness's not-yet-aged entry) must NOT supply a vote.
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.own_marker = b"mygen"
+    good = lambda: {1: _slot(1), 2: _slot(2, marker=b"mygen")}
+    # echo_id not in the configured set → 0
+    ws.configured_witness_ids = {"w-known"}
+    ws.discovered = {"w-rogue": _ep("w-rogue", good())}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 0
+    # echo_id IS a configured witness_id → counts
+    ws.discovered = {"w-known": _ep("w-known", good())}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+    # mixed: only the configured one counts
+    ws.discovered = {"w-known": _ep("w-known", good()),
+                     "w-rogue": _ep("w-rogue", good())}
+    assert witness.count_valid_confirmed(ws, n_configured=2) == 1
+    # None (early boot, membership unknown) → no filter (back-compat)
+    ws.configured_witness_ids = None
+    ws.discovered = {"w-rogue": _ep("w-rogue", good())}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+
+
 def test_count_valid_confirmed_caps_at_configured():
     # M10: more valid Echoes answering than configured → capped at the
     # configured count (a rogue extra Echo can't inflate the vote).

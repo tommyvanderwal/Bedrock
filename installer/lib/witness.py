@@ -139,6 +139,17 @@ class WitnessState:
     # endpoint and a broadcast-found one dedupe to a single discovered entry.
     configured_echo_addrs: list = field(default_factory=list)
 
+    # The set of CONFIGURED witness identities (the rqlite witnesses table's
+    # witness_id keys), refreshed each netd tick. An Echo's ack carries its
+    # echo_id; only a reply whose echo_id matches a configured witness_id is
+    # admitted/counted, so a rogue Echo (holding the cluster key but reporting
+    # an unconfigured id) and a just-REMOVED witness's stale entry can no longer
+    # supply the deciding witness vote. The operator provisions each Echo with
+    # echo_id == its witness_id (the testbed does: --echo-id matches the
+    # `bedrock witness add <id>`). None = "membership not yet known" → no
+    # filtering (early boot), matching member_ids' convention.
+    configured_witness_ids: Optional[set] = None
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Crypto helpers
@@ -332,6 +343,14 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
         if not raw_echo_id:
             continue
         echo_id = str(raw_echo_id)
+        # Bind to a CONFIGURED witness: only admit replies whose echo_id is a
+        # configured witness_id. A rogue Echo (has the cluster key, reports an
+        # unconfigured id) and a just-removed witness's stale replies are
+        # dropped at ingress, so they can never enter discovered or vote.
+        # (None = membership not yet known → no filter, early boot.)
+        if (ws.configured_witness_ids is not None
+                and echo_id not in ws.configured_witness_ids):
+            continue
         now_ms = int(time.time() * 1000)
         ep = ws.discovered.get(echo_id)
         if ep is None:
@@ -448,6 +467,13 @@ def count_valid_confirmed(ws: WitnessState, n_configured: int,
     now_mono = time.monotonic()
     count = 0
     for ep in ws.discovered.values():
+        # Only count endpoints bound to a configured witness (echo_id matches a
+        # configured witness_id). Defends against an entry admitted while
+        # configured that should stop counting the instant the witness is
+        # removed — not 12s later when it ages out.
+        if (ws.configured_witness_ids is not None
+                and ep.echo_id not in ws.configured_witness_ids):
+            continue
         if (now_mono - ep.last_reply_monotonic) > WITNESS_FRESHNESS_S:
             continue
         if (_slots_valid(ws, ep.slots)

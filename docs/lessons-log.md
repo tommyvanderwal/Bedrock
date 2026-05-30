@@ -2131,10 +2131,17 @@ introduced, one PRE-EXISTING and widened:
    Fix: require echo_id; ignore replies without it (fail-safe: under-count,
    never over-count). The directed probe widened a latent pre-existing hole.
 
-**Deferred pre-existing follow-ups (NOT introduced here, larger protocol work):**
-witness replies are authenticated only by the shared cluster_key — the stored
-per-witness `witness_pubkey` is NEVER used, so a rogue key-holder or a stale
-not-yet-pruned entry (ws.discovered isn't pruned on witness removal, only ages
-out after 12s) can supply the deciding vote. Proper fix = bind a voting
-endpoint to a configured witness (verify pubkey / match echo_id to a configured
-id) + prune ws.discovered when a witness leaves the configured set.
+**Pre-existing identity gap — NOW PARTLY FIXED (next commit):** witness replies
+are authenticated only by the shared cluster_key, with NO binding to a
+configured witness, so a rogue key-holder OR a just-removed witness's stale
+entry (ws.discovered ages out after 12s) could supply the deciding vote. **Fix
+shipped:** netd plumbs `ws.configured_witness_ids` (the rqlite witness_id set)
+each tick; `drain_replies` admits and `count_valid_confirmed` counts ONLY
+endpoints whose `echo_id` matches a configured witness_id — so a rogue with an
+unconfigured id and a removed witness's stale entry drop out IMMEDIATELY (not
+12s later). Convention: echo_id == witness_id (the testbed provisions the Echo
+`--echo-id <witness_id>`). **Still future (defense-in-depth):** cryptographic
+per-witness identity — sign the ack with the Echo's key, verify with the stored
+`witness_pubkey` (pubkey + encrypted_witness_key columns exist but are unused) —
+to also stop a rogue that KNOWS a configured witness_id. The echo_id binding
+closes the main gap; pubkey signing hardens the holds-key-AND-knows-an-id case.
