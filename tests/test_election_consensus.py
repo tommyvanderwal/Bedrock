@@ -397,6 +397,74 @@ def test_count_valid_confirmed_skips_stale_witness():
     assert witness.count_valid_confirmed(ws, n_configured=1) == 0
 
 
+# ── fileshare-backend fold into the tally (witness_file worker → verdict) ──
+
+def _fv(witness_id, valid_confirmed=True, fresh=True):
+    return witness.FileWitnessVerdict(
+        witness_id=witness_id, valid_confirmed=valid_confirmed,
+        evaluated_monotonic=(time.monotonic() if fresh
+                             else time.monotonic() - witness.WITNESS_FRESHNESS_S - 1),
+    )
+
+
+def test_count_valid_confirmed_folds_fresh_fileshare_witness():
+    # A fileshare witness whose cached verdict is fresh + valid_confirmed adds +1.
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.file_witnesses = {"fs1": _fv("fs1")}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+
+
+def test_count_valid_confirmed_fileshare_stale_verdict_not_counted():
+    # A hung/dead IO worker → verdict ages past the freshness window → 0
+    # (biases toward "do not fail over").
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.file_witnesses = {"fs1": _fv("fs1", fresh=False)}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 0
+
+
+def test_count_valid_confirmed_fileshare_invalid_verdict_not_counted():
+    # Worker evaluated it as NOT valid+confirmed (missing member slot / our
+    # readback failed) → 0 even though fresh.
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.file_witnesses = {"fs1": _fv("fs1", valid_confirmed=False)}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 0
+
+
+def test_count_valid_confirmed_fileshare_binds_to_configured_ids():
+    # Same split-brain binding as Echo: a fileshare verdict whose witness_id is
+    # not configured must not vote; falsy configured set = no filter.
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.file_witnesses = {"fs-rogue": _fv("fs-rogue")}
+    ws.configured_witness_ids = {"fs-known"}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 0
+    ws.file_witnesses = {"fs-known": _fv("fs-known")}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+    ws.configured_witness_ids = None          # early boot → no filter
+    ws.file_witnesses = {"fs-rogue": _fv("fs-rogue")}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+
+
+def test_count_valid_confirmed_mixes_echo_and_fileshare():
+    # One Echo + one fileshare, both valid+confirmed → tally 2.
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.own_marker = b"mygen"
+    good = {1: _slot(1), 2: _slot(2, marker=b"mygen")}
+    ws.discovered = {"e1": _ep("e1", good)}
+    ws.file_witnesses = {"fs1": _fv("fs1")}
+    assert witness.count_valid_confirmed(ws, n_configured=2) == 2
+
+
+def test_count_valid_confirmed_same_id_both_backends_counts_once():
+    # Defensive: if one witness_id surfaced under BOTH backends, the set means
+    # it contributes exactly one vote (never double-counts the denominator).
+    ws = _ws(member_ids={1, 2}, my_id=2)
+    ws.own_marker = b"mygen"
+    good = {1: _slot(1), 2: _slot(2, marker=b"mygen")}
+    ws.discovered = {"w1": _ep("w1", good)}
+    ws.file_witnesses = {"w1": _fv("w1")}
+    assert witness.count_valid_confirmed(ws, n_configured=2) == 1
+
+
 def test_drain_replies_drops_non_member_slots():
     # Build a real ack envelope so drain_replies runs end-to-end, then
     # confirm a decommissioned node's slot (id 9) is filtered out.

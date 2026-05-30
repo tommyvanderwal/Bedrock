@@ -101,6 +101,24 @@ class EchoEndpoint:
 
 
 @dataclass
+class FileWitnessVerdict:
+    """Cached valid+confirmed verdict for ONE fileshare witness, produced by
+    the off-hot-path slot-IO worker (SMB/S3 latency must never stall the 1Hz
+    election tick, so the tick NEVER does fileshare IO — it only reads this).
+
+    A verdict counts toward the vote only while FRESH: ``evaluated_monotonic``
+    within ``WITNESS_FRESHNESS_S``. A hung or dead IO worker therefore ages its
+    witnesses out of the tally automatically (biases toward 'do not fail over',
+    the split-brain-safe direction) without any explicit liveness plumbing.
+    ``valid_confirmed`` already folds the Echo predicates (a slot for every
+    member + our own fresh readback), evaluated by the worker via
+    ``witness_file.is_valid_confirmed``."""
+    witness_id: str
+    valid_confirmed: bool = False
+    evaluated_monotonic: float = 0.0   # monotonic when the worker last evaluated
+
+
+@dataclass
 class WitnessState:
     cluster_uuid: str        # used as msgpack `cu` value; stored as 16-byte str
     cluster_key: bytes       # 32 bytes — AEAD key
@@ -156,6 +174,13 @@ class WitnessState:
     # operator-visible (the witness is reachable but provisioned with a
     # mismatched id → it never votes).
     seen_unconfigured_echo_ids: set = field(default_factory=set)
+
+    # Per-fileshare-witness cached verdict (witness_id -> FileWitnessVerdict),
+    # WRITTEN by the off-hot-path slot-IO worker and READ by
+    # count_valid_confirmed on the election tick. Empty for Echo-only clusters,
+    # so the fold below is a no-op there (zero behaviour change until a
+    # fileshare witness is configured and its worker starts populating this).
+    file_witnesses: dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -490,7 +515,13 @@ def count_valid_confirmed(ws: WitnessState, n_configured: int,
     if n_configured <= 0 or not ws.member_ids:
         return 0
     now_mono = time.monotonic()
-    count = 0
+    # Collect DISTINCT confirmed witness_ids across both backends, then count.
+    # A set (rather than a counter) means a witness that somehow surfaced under
+    # both backends — or an Echo that appeared twice in `discovered` — counts
+    # exactly once; it can never inflate the numerator above the real number of
+    # distinct certifying witnesses.
+    confirmed: set = set()
+    # ── Echo backend: each discovered endpoint validated against ITS own cache.
     for ep in ws.discovered.values():
         # Only count endpoints bound to a configured witness (echo_id matches a
         # configured witness_id). Defends against an entry admitted while
@@ -504,8 +535,20 @@ def count_valid_confirmed(ws: WitnessState, n_configured: int,
             continue
         if (_slots_valid(ws, ep.slots)
                 and _slots_confirmed(ws, ep.slots, now_local_ms)):
-            count += 1
-    return min(count, n_configured)
+            confirmed.add(ep.echo_id)
+    # ── Fileshare backend: verdict cached by the off-hot-path slot-IO worker
+    # (the tick never touches SMB/S3 itself). A verdict counts only while FRESH
+    # — the worker evaluated it within the freshness window — so a hung/dead
+    # worker ages its witness out of the tally (safe direction). Same
+    # configured-id binding and falsy=no-filter rule as the Echo path.
+    for wid, v in ws.file_witnesses.items():
+        if ws.configured_witness_ids and wid not in ws.configured_witness_ids:
+            continue
+        if (now_mono - v.evaluated_monotonic) > WITNESS_FRESHNESS_S:
+            continue
+        if v.valid_confirmed:
+            confirmed.add(wid)
+    return min(len(confirmed), n_configured)
 
 
 def needs_reprobe(ws: WitnessState) -> bool:
