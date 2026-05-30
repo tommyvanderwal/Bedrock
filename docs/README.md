@@ -67,6 +67,7 @@ emitted, and the failure modes.
 | Restore a VM from a backup | dashboard `Restore` button on snapshot | [`actions/vm-restore.md`](actions/vm-restore.md) |
 | List & delete backups | dashboard `/backups` (cluster-wide) or VM card | [`actions/backup-list-delete.md`](actions/backup-list-delete.md) |
 | Schedule periodic backups | dashboard VM page → Schedule cron field | [`actions/backup-schedule.md`](actions/backup-schedule.md) |
+| Add / remove a witness (Echo or fileshare) | dashboard `/witness` or `bedrock witness add` | [`actions/witness-manage.md`](actions/witness-manage.md) |
 
 ## Failure scenarios (what happens when things break)
 

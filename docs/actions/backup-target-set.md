@@ -34,12 +34,18 @@ VMs.
   "s3_secret_key": "...",
   "encryption_password": "...",
   "force_password_overwrite": false,
+  "is_mirror": false,
+  "sync_to": ["mirror-b2"],
+  "delete_orphans": false,
   "reason": "operator note"
 }
 ```
 
 - `s3_*` fields apply only to `kind=kopia-s3`; `filesystem_path` only to
   `kind=kopia-fs`.
+- `is_mirror` / `sync_to` / `delete_orphans` configure multi-target
+  replication — see [Multi-target replication](#multi-target-replication-mirrors)
+  below.
 - `override_source_prefix` defaults to `<cluster_uuid>:vms`;
   `cache_directory` defaults to `/var/cache/bedrock-kopia/<target_id>`.
 - The three credential fields (`s3_access_key`, `s3_secret_key`,
@@ -158,6 +164,49 @@ VMs.
 | `400 …kopia connect failed: …InvalidAccessKeyId…` | Wrong S3 access key | Verify creds in the storage admin UI; resubmit. |
 | `200` with `warnings: ["S3 credentials not deployed to: <node>(…)"]` | Master can't SFTP to a peer (usually missing root key in the peer's authorized_keys) | Fix the SSH mesh, then resubmit. The rqlite row already landed, so the peer's reactor / boot reconcile retries. |
 | Peers stay unconnected after `200 ok` | A peer's reactor runs only once `_SERVICES_STARTED=True`; if it was still catching up at submit time, the diff was applied but the connect was skipped | `systemctl restart bedrock-d` on that peer to trigger `_start_local_services` reconcile. |
+
+## Multi-target replication (mirrors)
+
+Back up once to a **primary** target, then fan the same snapshots out to one or
+more **mirror** targets (a second region, an on-prem copy) via
+`kopia repository sync-to`. The backup runs once on the VM's home node and the
+mirror copy follows it — you don't pay the VM-read twice.
+
+A **mirror** is a target created with `is_mirror: true`. It is special:
+
+- It is **never independently initialized** — you do *not* run a normal
+  `configure` against it. The **first** `sync-to` from its primary copies the
+  primary's repo *format block* into the (empty) destination. A mirror you
+  `kopia repository create`d yourself would have an incompatible format and
+  every sync would fail "incompatible data" forever. So: create the mirror
+  destination's *storage* (an empty bucket / dir), then add it with
+  `is_mirror: true` and **no** encryption password — the format comes from the
+  primary.
+- It must belong to **exactly one** primary. The API refuses a `sync_to` that
+  points at a mirror already owned by another primary — two primaries would push
+  incompatible formats and, with `delete_orphans`, `--delete`-prune each other's
+  blobs (data loss).
+
+On a normal target you then set `sync_to: ["<mirror_id>", …]`. After each backup
+of a VM on that target, the home node runs `kopia repository sync-to` to each
+listed mirror. `delete_orphans: true` adds `--delete` so the mirror prunes
+blobs no longer in the primary (a true mirror); leave it `false` to let the
+mirror accumulate (append-only safety copy).
+
+Mirror credentials follow the same rule as any target: a `kopia-s3` mirror needs
+its own `/etc/bedrock/backup-credentials/<mirror_id>.env` (the sync uses the
+destination's keys, not the primary's). Configuring a `kopia-s3` mirror whose
+`.env` is missing is refused — otherwise the sync would silently fall back to
+the primary's identity.
+
+**Fail-loud, non-masking:** if the primary backup succeeds but a mirror sync
+fails, the operation reports the failure (the VM **is** safely backed up to the
+primary and restorable; only the secondary copy lagged — retry is safe). A
+mirror is a copy, never the only copy.
+
+Dashboard: on `/backups`, an `is_mirror` checkbox marks a target as a mirror
+destination, and a primary target's form has a `sync_to` multi-select of the
+configured mirrors.
 
 ## Operator perspective
 
