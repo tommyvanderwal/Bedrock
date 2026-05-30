@@ -234,6 +234,38 @@ def test_run_io_cycle_isolates_a_bad_witness_from_a_good_one(tmp_path):
     assert ws.file_witnesses["good"].valid_confirmed is True
 
 
+# ── probe_writable (the add-time UX guard) ───────────────────────────────
+
+def test_probe_writable_ok_for_writable_dir(tmp_path):
+    assert witness_file.probe_writable(str(tmp_path)) == ""
+    # and it left no probe turd behind
+    assert os.listdir(str(tmp_path)) == []
+
+
+def test_probe_writable_reason_for_missing_dir(tmp_path):
+    reason = witness_file.probe_writable(str(tmp_path / "not-mounted"))
+    assert reason and "directory" in reason
+
+
+def test_probe_writable_reason_for_a_file_not_dir(tmp_path):
+    f = tmp_path / "afile"
+    f.write_text("x")
+    reason = witness_file.probe_writable(str(f))
+    assert reason and "directory" in reason
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses dir perms")
+def test_probe_writable_reason_for_readonly_dir(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(ro, 0o555)
+    try:
+        reason = witness_file.probe_writable(str(ro))
+        assert reason and "write failed" in reason
+    finally:
+        os.chmod(ro, 0o755)   # let pytest clean up
+
+
 # ── netd._witness_file_worker (the background-thread body) ────────────────
 
 def test_witness_file_worker_runs_real_cycle_then_stops(tmp_path):

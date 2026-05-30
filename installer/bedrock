@@ -591,6 +591,39 @@ def cmd_witness(args):
         return
 
     if args.action == "add":
+        backend = getattr(args, "backend", "echo")
+        if backend == "fileshare":
+            # PATH-BASED fileshare witness: addr = a dir the operator mounted the
+            # share at on EVERY node. Probe writability HERE (fail fast); full
+            # per-node assurance comes from the slot protocol at vote time.
+            from lib import witness_file
+            path = (args.path or "").strip()
+            if not path:
+                print("error: --path <dir> is required for a fileshare witness",
+                      file=sys.stderr)
+                return 2
+            if not os.path.isabs(path):
+                print(f"error: --path must be absolute, got {path!r}",
+                      file=sys.stderr)
+                return 2
+            err = witness_file.probe_writable(path)
+            if err:
+                print(f"error: fileshare path {path!r} not usable on this node: "
+                      f"{err}.\n       Mount the share + ensure it is writable on "
+                      f"EVERY node first.", file=sys.stderr)
+                return 2
+            rev = bs.witness_register(
+                witness_id=args.id, addr=path,
+                witness_pubkey_hex="", encrypted_witness_key_hex="",
+                backend="fileshare")
+            print(f"  rev={rev} witness_register({args.id}, fileshare {path})")
+            _propagate_daemon_config(args.id)
+            return
+        # echo backend
+        if not args.host_port or not args.pubkey:
+            print("error: echo witness needs <host[:port]> <pubkey> "
+                  "(or use --backend fileshare --path <dir>)", file=sys.stderr)
+            return 2
         host_port = args.host_port
         if ":" in host_port:
             host, port_s = host_port.rsplit(":", 1)
@@ -605,6 +638,7 @@ def cmd_witness(args):
             # encrypted keys (design §10) are deferred. Empty string
             # so the schema slot exists.
             encrypted_witness_key_hex="",
+            backend="echo",
         )
         print(f"  rev={rev} witness_register({args.id})")
         _propagate_daemon_config(args.id)
@@ -1043,8 +1077,15 @@ def main():
     p_w_sub.add_parser("list", help="List configured witnesses")
     p_w_add = p_w_sub.add_parser("add", help="Add a witness (commit-then-restart)")
     p_w_add.add_argument("id", help="friendly id (e.g. 'office-mikrotik')")
-    p_w_add.add_argument("host_port", metavar="host[:port]", help="UDP endpoint (default port 12321)")
-    p_w_add.add_argument("pubkey", help="X25519 pubkey hex (64 chars / 32 bytes)")
+    p_w_add.add_argument("host_port", metavar="host[:port]", nargs="?",
+                         help="echo: UDP endpoint (default port 12321)")
+    p_w_add.add_argument("pubkey", nargs="?",
+                         help="echo: X25519 pubkey hex (64 chars / 32 bytes)")
+    p_w_add.add_argument("--backend", choices=("echo", "fileshare"),
+                         default="echo", help="witness backend (default: echo)")
+    p_w_add.add_argument("--path", default="", metavar="DIR",
+                         help="fileshare: absolute path of the share mounted on "
+                              "EVERY node (Bedrock writes slot files there)")
     p_w_rm = p_w_sub.add_parser("rm", help="Remove a witness (commit-then-restart)")
     p_w_rm.add_argument("id", help="witness id from `bedrock witness list`")
     p_w.set_defaults(func=cmd_witness)

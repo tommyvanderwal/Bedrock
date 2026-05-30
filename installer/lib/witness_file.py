@@ -114,6 +114,30 @@ def is_valid_confirmed(ws: "witness.WitnessState", base_dir: str,
             and witness._slots_confirmed(ws, slots, now_local_ms))
 
 
+def probe_writable(base_dir: str) -> str:
+    """Add-time UX guard for a fileshare witness: return "" if ``base_dir`` is
+    a writable directory on THIS node, else a short human reason.
+
+    Creates + removes a temp file to prove REAL write access — a read-only
+    export passes ``os.access(W_OK)`` on some kernels but fails the actual
+    write, so we do the write. This proves only the LOCAL node can write; the
+    share must be writable on EVERY node, but that stronger condition is
+    enforced at vote time by the slot protocol itself: a node that can't write
+    leaves its slot absent, so the witness simply stays at 0 votes (never a
+    silent miscount). So this is a fail-fast convenience, not the safety
+    boundary."""
+    import tempfile
+    if not os.path.isdir(base_dir):
+        return "not a directory (is the share mounted on this node?)"
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".bedrock-wprobe-", dir=base_dir)
+        os.close(fd)
+        os.unlink(tmp)
+    except OSError as e:
+        return f"write failed ({type(e).__name__}: {e})"
+    return ""
+
+
 def run_io_cycle(ws: "witness.WitnessState", *,
                  now_ms: Optional[int] = None,
                  now_mono: Optional[float] = None,

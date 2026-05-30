@@ -3335,9 +3335,9 @@ def api_backup_target_remove(target_id: str, reason: str = ""):
 
 class WitnessAddRequest(BaseModel):
     witness_id: str
-    addr: str = ""             # "host" or "host:port" (echo default 12321)
+    addr: str = ""             # echo: "host[:port]"; fileshare: mounted dir path
     witness_pubkey: str = ""   # X25519 pubkey hex (64 chars) — required for echo
-    backend: str = "echo"      # "echo" | "smb" | "s3"
+    backend: str = "echo"      # "echo" | "fileshare" (smb/s3 = future managed)
     reason: str = ""
 
 
@@ -3346,28 +3346,72 @@ def api_witnesses_list():
     return {"witnesses": load_cluster().get("witnesses", {})}
 
 
+def _api_witness_add_fileshare(wid: str, req: WitnessAddRequest):
+    """Register a PATH-BASED fileshare witness. addr = an absolute directory the
+    operator has mounted the shared store (NFS/SMB/object) at on EVERY node;
+    netd's off-hot-path worker writes slot-<NN>.bin there and folds the verdict
+    into the vote. We probe writability on THIS node (the master) as a fail-fast
+    UX guard — full per-node assurance is enforced at vote time by the slot
+    protocol (a node that can't write leaves its slot absent → 0 votes, never a
+    miscount)."""
+    import os as _os
+    try:
+        from lib import witness_file as _wf  # type: ignore
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import witness_file as _wf  # type: ignore
+    path = (req.addr or "").strip()
+    if not path:
+        raise HTTPException(400, "addr (the mounted share directory) is required "
+                                 "for a fileshare witness")
+    if not _os.path.isabs(path):
+        raise HTTPException(400, f"fileshare witness path must be absolute, "
+                                 f"got {path!r}")
+    err = _wf.probe_writable(path)
+    if err:
+        raise HTTPException(
+            400, f"fileshare witness path {path!r} is not usable on this node: "
+            f"{err}. Mount the share and ensure it is writable on EVERY node "
+            f"before adding it.")
+    try:
+        rev = _bs.witness_register(witness_id=wid, addr=path,
+                                   witness_pubkey_hex="",
+                                   encrypted_witness_key_hex="",
+                                   backend="fileshare")
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"witness {wid!r} added (fileshare {path})",
+             app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "witness_id": wid,
+            "addr": path, "backend": "fileshare"}
+
+
 @app.post("/api/witnesses")
 def api_witness_add(req: WitnessAddRequest):
     wid = (req.witness_id or "").strip()
     if not wid:
         raise HTTPException(400, "witness_id is required")
     backend = (req.backend or "echo").strip().lower()
-    if backend not in ("echo", "smb", "s3"):
+    if backend not in ("echo", "fileshare", "smb", "s3"):
         raise HTTPException(400, f"unknown witness backend {backend!r} "
-                                 f"(expected echo | smb | s3)")
-    if backend != "echo":
-        # smb/s3 fileshare witness backends are NOT implemented yet (no
-        # transport exists — netd only speaks the Echo UDP protocol). A
-        # configured-but-non-functional witness is strictly WORSE than no
-        # witness: it raises the quorum bar by one vote (it's counted in
-        # len(witnesses)) while it can never become valid+confirmed (0 votes),
-        # which can brick failover on a 2-node cluster. Refuse until the
-        # backend ships, rather than let an operator wedge their quorum.
+                                 f"(expected echo | fileshare)")
+    if backend in ("smb", "s3"):
+        # NATIVE (Bedrock-managed-creds) SMB/S3 is a future build — backup uses
+        # kopia's own S3 client and there is no mount/cred infra to reuse, so an
+        # S3 blob client in the quorum path would be net-new. Today a fileshare
+        # witness is PATH-BASED: the operator mounts the SMB/S3/NFS share on
+        # every node and adds it with backend='fileshare' + that path; Bedrock
+        # writes slot files there. Refuse smb/s3 rather than register a witness
+        # with no transport (it would raise the quorum bar without ever voting →
+        # can BLOCK failover on a 2-node cluster).
         raise HTTPException(
-            400, f"witness backend {backend!r} is not implemented yet — only "
-            f"'echo' witnesses are active. A non-functional witness would "
-            f"raise the quorum bar without ever voting, which can BLOCK "
-            f"failover. (The fileshare/S3 witness backend is a future build.)")
+            400, f"witness backend {backend!r} is not a managed backend yet. "
+            f"Mount the {backend.upper()} share on every node and add it as a "
+            f"fileshare witness (backend='fileshare', addr=<mounted dir>) — "
+            f"Bedrock writes slot files there. Managed-{backend} is a future build.")
+    if backend == "fileshare":
+        return _api_witness_add_fileshare(wid, req)
     addr = (req.addr or "").strip()
     if not addr:
         raise HTTPException(400, "addr is required (ipv4 or ipv4:port)")
