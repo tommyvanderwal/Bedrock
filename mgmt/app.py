@@ -3484,20 +3484,20 @@ def api_witness_remove(witness_id: str, reason: str = ""):
 
 @app.get("/api/witnesses/discover")
 def api_witnesses_discover():
-    """Best-effort mDNS discovery of Bedrock services on the LAN — surfaced so
-    the dashboard can offer reachable hosts for one-click witness add. The
-    operator still supplies the Echo's pubkey. (Echo-specific service
-    advertisement is a follow-up; today this finds Bedrock nodes/clusters.)"""
+    """Best-effort mDNS discovery of BedRock Echo witnesses (bedrock-echo.local)
+    on the LAN, so the dashboard can offer one-click add. Each result carries
+    echo_id (used AS the witness_id — netd binds the vote to echo_id==witness_id)
+    and the Echo's pubkey, so nothing needs hand-typing. Echoes advertise this
+    service (real firmware + the testbed stub); an Echo on a routed segment that
+    doesn't answer multicast can still be added by IP."""
     try:
         from lib import discovery as _disc
-        cands = _disc.discover_clusters(timeout=2.0)
+        echoes = _disc.discover_echo_witnesses(timeout=2.0)
     except Exception as e:
         raise HTTPException(500, f"discovery failed: {e}")
     return {"candidates": [
-        {"ip": getattr(c, "ip", ""),
-         "name": getattr(c, "cluster_name", "") or getattr(c, "name", ""),
-         "node": getattr(c, "node_name", "")}
-        for c in (cands or [])]}
+        {"ip": e.ip, "echo_id": e.echo_id, "pubkey": e.pubkey}
+        for e in (echoes or [])]}
 
 
 @app.post("/api/vms/{vm_name}/backup")

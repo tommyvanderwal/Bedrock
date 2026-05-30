@@ -89,7 +89,7 @@
 		error = '';
 		try {
 			candidates = (await discoverWitnesses()).candidates || [];
-			if (candidates.length === 0) notice = 'No Bedrock hosts found on the LAN via mDNS.';
+			if (candidates.length === 0) notice = 'No BedRock Echo witnesses found on the LAN via mDNS.';
 		} catch (e: any) {
 			error = e.message;
 		} finally {
@@ -98,9 +98,13 @@
 	}
 
 	function useCandidate(c: WitnessCandidate) {
-		f_addr = c.ip;
 		f_backend = 'echo';
-		notice = `Filled address ${c.ip} — paste the Echo's pubkey and Add.`;
+		f_addr = c.ip;
+		if (c.echo_id) f_id = c.echo_id;     // echo_id is the witness_id
+		if (c.pubkey) f_pubkey = c.pubkey;   // advertised pubkey → one-click add
+		notice = c.pubkey
+			? `Filled ${c.echo_id || 'Echo'} @ ${c.ip} with its pubkey — review and Add.`
+			: `Filled ${c.echo_id || 'Echo'} @ ${c.ip} — paste the pubkey and Add.`;
 	}
 </script>
 
@@ -143,21 +147,25 @@
 </div>
 
 <div class="card">
-	<h3>Discover on network (mDNS)</h3>
+	<h3>Discover Echo witnesses (mDNS)</h3>
 	<button class="btn-ghost" onclick={discover} disabled={discovering}>{discovering ? 'Scanning…' : 'Scan LAN'}</button>
 	{#if candidates.length > 0}
 		<table class="mini">
-			<thead><tr><th>IP</th><th>Name</th><th>Node</th><th></th></tr></thead>
+			<thead><tr><th>Echo id</th><th>IP</th><th>Pubkey</th><th></th></tr></thead>
 			<tbody>
 				{#each candidates as c}
 					<tr>
-						<td><code>{c.ip}</code></td><td>{c.name || '—'}</td><td>{c.node || '—'}</td>
+						<td>{c.echo_id || '—'}</td><td><code>{c.ip}</code></td>
+						<td>{c.pubkey ? c.pubkey.slice(0, 12) + '…' : '— (type it)'}</td>
 						<td><button class="btn-ghost sm" onclick={() => useCandidate(c)}>Use</button></td>
 					</tr>
 				{/each}
 			</tbody>
 		</table>
 	{/if}
+	<p class="hint">Echoes advertising <code>bedrock-echo.local</code> appear here with
+		their id and (if advertised) public key for a one-click add. An Echo on a
+		routed segment that doesn't answer multicast can still be added by IP above.</p>
 </div>
 
 {#if loading}

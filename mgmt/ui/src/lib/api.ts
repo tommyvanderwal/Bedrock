@@ -474,7 +474,7 @@ export async function removeWitness(witness_id: string) {
 	return r.json();
 }
 
-export interface WitnessCandidate { ip: string; name: string; node: string; }
+export interface WitnessCandidate { ip: string; echo_id: string; pubkey: string; }
 
 export async function discoverWitnesses(): Promise<{ candidates: WitnessCandidate[] }> {
 	return apiGet('/api/witnesses/discover');
