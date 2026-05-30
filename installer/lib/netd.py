@@ -1068,6 +1068,35 @@ def _failover_ack_target(d, node_loopbacks: dict, peer_liveness: dict) -> str:
     return ""
 
 
+def _parse_echo_addr(addr):
+    """Parse a witness `host:port` / `[ipv6]:port` / bare host into
+    (host, port) for a directed Echo probe. Default port 12321. Returns None
+    if unparseable (skipped, never raises)."""
+    addr = (addr or "").strip()
+    if not addr:
+        return None
+    port = 12321
+    try:
+        if addr.startswith("["):
+            host, sep, rest = addr[1:].partition("]")
+            if not sep:
+                return None
+            if rest.startswith(":"):
+                port = int(rest[1:])
+        elif addr.count(":") >= 2:
+            host = addr                       # bare IPv6 literal, default port
+        elif ":" in addr:
+            host, _, ps = addr.partition(":")
+            port = int(ps)
+        else:
+            host = addr
+    except ValueError:
+        return None
+    if not host or not (1 <= port <= 65535):
+        return None
+    return (host, port)
+
+
 def _election_tick(d, ws, _witness, _election, prev_outcome):
     """One election tick. Side-effects:
       - heartbeats / re-discovers the witness
@@ -1086,6 +1115,13 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     try:
         if _witness.needs_reprobe(ws):
             _witness.broadcast_probe(ws, ["255.255.255.255"])
+            # Also directly probe CONFIGURED Echo witnesses (added BY IP /
+            # routed off the local broadcast domain). The address list is set
+            # from cluster state on the previous tick (cluster isn't loaded
+            # until step 3 below). Both probes elicit replies keyed by echo_id,
+            # so a configured + a broadcast-found Echo dedupe in discovered.
+            if ws.configured_echo_addrs:
+                _witness.unicast_probe(ws, ws.configured_echo_addrs)
         else:
             _witness.heartbeat_all(ws)
         _witness.drain_replies(ws)
@@ -1167,7 +1203,18 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         except (IndexError, ValueError):
             pass
     ws.member_ids = member_ids or None
-    n_configured_witnesses = len(cluster.get("witnesses") or {})
+    _witnesses = cluster.get("witnesses") or {}
+    n_configured_witnesses = len(_witnesses)
+    # Refresh the directed-probe list for next tick's witness IO: every
+    # backend=='echo' witness's (host, port). Lets an Echo added BY IP that is
+    # off the broadcast domain still get probed + vote.
+    ws.configured_echo_addrs = [
+        ep for ep in (
+            _parse_echo_addr(w.get("addr", ""))
+            for w in _witnesses.values()
+            if (w.get("backend") or "echo") == "echo"
+        ) if ep is not None
+    ]
     # M10 multi-witness: count CONFIGURED witnesses that are INDIVIDUALLY
     # valid+confirmed (capped at n_configured), not a hard-coded 0/1.
     # Single-witness testbed still yields 0/1; multiple valid witnesses

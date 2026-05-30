@@ -130,6 +130,15 @@ class WitnessState:
     # None = "membership not yet known" — no filtering, no validity.
     member_ids: Optional[set[int]] = None
 
+    # Configured Echo endpoints (host, port) from the rqlite `witnesses`
+    # table (backend=='echo'). netd refreshes this each tick and the probe
+    # step unicasts to each — so an Echo added BY IP that is OFF the broadcast
+    # domain (routed/off-subnet) is still probed + can vote. broadcast_probe
+    # only reaches the local L2; this directed probe covers the rest. The
+    # reply is keyed by the Echo's echo_id in drain_replies, so a configured
+    # endpoint and a broadcast-found one dedupe to a single discovered entry.
+    configured_echo_addrs: list = field(default_factory=list)
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Crypto helpers
@@ -261,6 +270,24 @@ def broadcast_probe(ws: WitnessState, broadcast_addrs: Iterable[str]) -> None:
         except OSError:
             pass
     ws.last_probe_at = time.monotonic()
+
+
+def unicast_probe(ws: WitnessState, endpoints: Iterable) -> None:
+    """Send a probe to each explicit (host, port) — for CONFIGURED Echo
+    witnesses which may be OFF the broadcast domain (added by IP / routed).
+    Mirrors broadcast_probe but targets exact addresses + ports (broadcast_probe
+    hardcodes WITNESS_PORT and only reaches the local L2). Replies are keyed by
+    the Echo's echo_id in drain_replies, so a configured endpoint dedupes with
+    any broadcast-found one. Best-effort; never raises."""
+    if ws.sock is None:
+        return
+    pkt = _encode_envelope(ws, t="probe", include_own_slot=False)
+    for ep in endpoints:
+        try:
+            host, port = ep
+            ws.sock.sendto(pkt, (host, int(port)))
+        except (OSError, ValueError, TypeError):
+            pass
 
 
 def heartbeat_all(ws: WitnessState) -> None:
