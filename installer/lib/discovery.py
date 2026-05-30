@@ -41,6 +41,7 @@ MGMT_PORT_HTTP   = 8444
 MDNS_GROUP       = "224.0.0.251"
 MDNS_PORT        = 5353
 MDNS_NAME        = b"bedrock.local"
+ECHO_MDNS_NAME   = b"bedrock-echo.local"   # BedRock Echo witness mDNS service
 
 
 # Self-signed-friendly context for HTTPS scans. The cert is issued for
@@ -96,16 +97,28 @@ def _can_reach(host: str, port: int, timeout: float = 1.0) -> bool:
 # ─── mDNS query (multicast, collect all responses for ~2 s) ────────
 
 
-def _build_mdns_query(qtype: int = 255) -> bytes:
-    """Build a multicast DNS query for ``bedrock.local`` of the given
-    type (default 255 = ANY). The QU bit is left unset; standard
+def _encode_qname(name: bytes) -> bytes:
+    """Encode a dotted DNS name (e.g. ``b'bedrock-echo.local'``) as
+    length-prefixed labels + zero terminator."""
+    out = bytearray()
+    for label in name.split(b"."):
+        if not label:
+            continue
+        out.append(len(label))
+        out += label
+    out.append(0)
+    return bytes(out)
+
+
+def _build_mdns_query(qtype: int = 255, qname: bytes = MDNS_NAME) -> bytes:
+    """Build a multicast DNS query for ``qname`` (default ``bedrock.local``)
+    of the given type (default 255 = ANY). The QU bit is left unset; standard
     multicast responses are fine."""
     # Header: ID=0 (mDNS), flags=0 (standard query, no flags),
     # 1 question, 0 answers, 0 ns, 0 ar.
     header = struct.pack("!HHHHHH", 0, 0, 1, 0, 0, 0)
-    qname = b"\x07bedrock\x05local\x00"
     qrest = struct.pack("!HH", qtype, 1)  # type, class IN
-    return header + qname + qrest
+    return header + _encode_qname(qname) + qrest
 
 
 def _parse_txt_rdata(rdata: bytes) -> dict:
@@ -158,11 +171,11 @@ def _read_name(buf: bytes, pos: int) -> tuple[Optional[bytes], int]:
         pos += 1 + ln
 
 
-def _parse_mdns_response(buf: bytes) -> dict:
-    """Extract A + TXT records from an mDNS response for our name.
-    Returns ``{ips: list[str], txt: dict}``. Responders may include
-    multiple A records (one per local IPv4) so we collect them all.
-    Returns empty dict if the response doesn't match our name."""
+def _parse_mdns_response(buf: bytes, expect_name: bytes = MDNS_NAME) -> dict:
+    """Extract A + TXT records from an mDNS response for ``expect_name``
+    (default ``bedrock.local``). Returns ``{ips: list[str], txt: dict}``.
+    Responders may include multiple A records (one per local IPv4) so we
+    collect them all. Returns empty dict if the response doesn't match."""
     if len(buf) < 12:
         return {}
     # Read header
@@ -186,7 +199,7 @@ def _parse_mdns_response(buf: bytes) -> dict:
         pos += 10
         rdata = buf[pos:pos + rdlength]
         pos += rdlength
-        if name != MDNS_NAME:
+        if name != expect_name:
             continue
         if rtype == 1 and rdlength == 4:          # A
             ip = socket.inet_ntoa(rdata)
@@ -251,6 +264,64 @@ def discover_clusters(timeout: float = 2.0) -> list[ClusterCandidate]:
                 c.ip,
             ),
         )
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+@dataclass
+class EchoCandidate:
+    """One BedRock Echo witness found via mDNS. ``ip`` is the Echo's address;
+    ``echo_id`` is its identity (use it AS the witness_id — netd binds the vote
+    to ``echo_id == witness_id``); ``pubkey`` is its X25519 public key hex if
+    advertised, so the dashboard can prefill it for a one-click witness add
+    instead of the operator hand-copying the key."""
+    ip: str
+    echo_id: str = ""
+    pubkey: str = ""
+
+    def label(self) -> str:
+        return f"{self.echo_id or '?'} @ {self.ip}"
+
+
+def discover_echo_witnesses(timeout: float = 2.0) -> list[EchoCandidate]:
+    """Multicast-query ``bedrock-echo.local`` and collect every Echo that
+    answers within ``timeout``. Each Echo advertises an A record (its IP) and a
+    TXT record (``echo_id=…;pubkey=…``). This is the witness analogue of
+    ``discover_clusters``: it lets the dashboard 'Scan LAN' find actual Echoes
+    (not cluster nodes) and prefill id + pubkey for a one-click add. The real
+    ESP32 firmware advertises this service; the testbed stub does too.
+
+    Dedup is per-IP (one Echo box = one candidate even if it answers on several
+    addresses we'd only ever probe one). Result sorted by echo_id then ip."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    s.bind(("", 0))
+    try:
+        query = _build_mdns_query(qtype=255, qname=ECHO_MDNS_NAME)
+        s.sendto(query, (MDNS_GROUP, MDNS_PORT))
+        s.settimeout(0.3)
+        deadline = time.monotonic() + timeout
+        seen: dict[str, EchoCandidate] = {}
+        while time.monotonic() < deadline:
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            parsed = _parse_mdns_response(data, expect_name=ECHO_MDNS_NAME)
+            ips = parsed.get("ips") or [addr[0]]
+            txt = parsed.get("txt") or {}
+            for ip in ips:
+                if ip not in seen:
+                    seen[ip] = EchoCandidate(
+                        ip=ip,
+                        echo_id=txt.get("echo_id", ""),
+                        pubkey=txt.get("pubkey", ""),
+                    )
+        return sorted(seen.values(), key=lambda c: (c.echo_id, c.ip))
     finally:
         try:
             s.close()
