@@ -3161,6 +3161,20 @@ def api_backup_target_set(req: BackupTargetSetRequest):
                 f"the mirror destination with is_mirror=true — a mirror is never "
                 f"independently initialized; the first sync-to copies the "
                 f"primary's repo format into it.")
+        # A mirror must belong to exactly ONE primary. Two primaries syncing to
+        # the same mirror push incompatible repo formats (every sync after the
+        # first fails "incompatible data") and, with delete_orphans, their
+        # --delete passes would prune each other's blobs (data loss). Reject a
+        # secondary already owned by a different primary.
+        other = next((pid for pid, pt in strong_targets.items()
+                      if pid != req.target_id
+                      and sid in (pt.get("sync_to") or [])), None)
+        if other is not None:
+            raise HTTPException(
+                400, f"mirror {sid!r} is already a replication target of "
+                f"{other!r}. A mirror can belong to only one primary "
+                f"(two primaries would push incompatible formats and "
+                f"--delete-prune each other). Use a separate mirror target.")
     # Existing mirror set for this primary (strong, so a clear isn't skipped
     # against a stale replica).
     current_mirrors = (strong_targets.get(req.target_id) or {}).get("sync_to") or []

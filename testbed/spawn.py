@@ -564,54 +564,6 @@ def get_mgmt_ip(i: int) -> str | None:
     # for the kickstart {MGMT_IP} reservation hint — a different, correct use.
     return None
 
-    # Try virsh domifaddr (works for NAT)
-    out, _ = virsh("domifaddr", hostname)
-    for line in out.split("\n"):
-        parts = line.split()
-        if len(parts) >= 4 and parts[2] == "ipv4":
-            ip = parts[3].split("/")[0]
-            # Skip DRBD net IPs (we want mgmt)
-            if not ip.startswith(DRBD_PREFIX):
-                return ip
-
-    # For bridged networks: get MAC from XML, then look up in host ARP
-    out, _ = virsh("domiflist", hostname)
-    mgmt_mac = None
-    for line in out.split("\n"):
-        parts = line.split()
-        if len(parts) >= 5 and parts[2] == MGMT_NET:
-            mgmt_mac = parts[4].lower()
-            break
-    if not mgmt_mac:
-        return None
-
-    # Check existing ARP table first
-    arp_out, _ = run("ip neigh", capture=True)
-    for line in arp_out.split("\n"):
-        if mgmt_mac in line.lower():
-            return line.split()[0]
-
-    # Trigger ARP by pinging the subnet (quick scan)
-    run(f"ping -c 1 -W 1 -b 192.168.2.255 2>/dev/null || true", check=False)
-    run(f"arp-scan -l -I br0 2>/dev/null || nmap -sn 192.168.2.0/24 -oG - 2>/dev/null > /tmp/nmap-out || true",
-        check=False)
-    # Retry ARP
-    arp_out, _ = run("ip neigh", capture=True)
-    for line in arp_out.split("\n"):
-        if mgmt_mac in line.lower():
-            return line.split()[0]
-
-    # Fallback: parse nmap output
-    if Path("/tmp/nmap-out").exists():
-        nmap_content = Path("/tmp/nmap-out").read_text()
-        # Pair IPs with MACs from nmap greppable output
-        import re as _re
-        m = _re.search(rf"Host:\s*(\d+\.\d+\.\d+\.\d+).*{_re.escape(mgmt_mac)}",
-                       nmap_content, _re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return None
-
 
 # ── Main ───────────────────────────────────────────────────────────────────
 

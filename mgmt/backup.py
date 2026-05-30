@@ -1015,8 +1015,16 @@ def run_sync_to_secondaries(primary_target_id: str,
     targets = cluster.get("backup_targets") or {}
     primary = targets.get(primary_target_id)
     if primary is None:
-        # The backup step just wrote to this repo, so it must exist. A missing
-        # primary here is a real, loud error — not a silent skip.
+        # Distinguish a TRANSIENT read failure from a genuinely-missing target.
+        # _read_cluster swallows rqlite errors and returns {} — so an empty
+        # target map almost certainly means the read failed (the backup step
+        # just wrote to this repo, so it exists). Either way raise loud (the op
+        # is retryable), but with the right cause so the operator isn't misled.
+        if not targets:
+            raise RuntimeError(
+                f"sync-to: could not read cluster state (rqlite transient/"
+                f"no-leader?) — cannot resolve primary {primary_target_id!r}; "
+                f"retry the operation")
         raise RuntimeError(
             f"sync-to: primary target {primary_target_id!r} not in cluster "
             f"state — cannot mirror")
