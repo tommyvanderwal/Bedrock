@@ -572,6 +572,13 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
     # (failover re-define refuses loudly until the VM is next written).
     _add_column_if_missing(client, "vms", "libvirt_xml",
                            "TEXT NOT NULL DEFAULT ''")
+    # endpoint_id: links backup_targets + witnesses to a consolidated
+    # storage_endpoints row (the S3/SMB/NFS unification). Existing rows
+    # default '' = use their own inline storage fields (back-compat).
+    _add_column_if_missing(client, "backup_targets", "endpoint_id",
+                           "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(client, "witnesses", "endpoint_id",
+                           "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

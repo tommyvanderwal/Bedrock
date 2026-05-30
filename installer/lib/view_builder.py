@@ -34,6 +34,7 @@ def empty_snapshot() -> dict:
         "nodes": {},
         "tiers": {},
         "witnesses": {},
+        "storage_endpoints": {},
         "params": {},
         "mgmt_master": None,
         "vms": {},
@@ -142,7 +143,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         # witnesses
         for row in client.query(
             "SELECT witness_id, addr, witness_pubkey, "
-            "encrypted_witness_key, backend FROM witnesses",
+            "encrypted_witness_key, backend, endpoint_id FROM witnesses",
             level=level,
         ):
             entry = {
@@ -150,12 +151,51 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "witness_pubkey": row["witness_pubkey"],
                 "encrypted_witness_key": row["encrypted_witness_key"],
             }
-            # Carry the backend kind (Echo / SMB / S3) so the witness
+            # Carry the backend kind (echo / fileshare / s3) so the witness
             # transport is operator-visible. Only set when present;
             # absent means the consumer assumes the default backend.
             if row.get("backend"):
                 entry["backend"] = row["backend"]
+            # For fileshare/s3 witnesses, the storage comes from a shared
+            # storage_endpoints row.
+            if row.get("endpoint_id"):
+                entry["endpoint_id"] = row["endpoint_id"]
             out["witnesses"][row["witness_id"]] = entry
+
+        # storage_endpoints — the consolidated S3/SMB/NFS definition shared by
+        # backup_targets + witnesses. SECRETS (s3_secret_key_enc,
+        # fs_password_enc) are NOT projected into the snapshot: a consumer that
+        # must mount/connect reads + unseals them on-demand directly from
+        # rqlite. The snapshot carries only the location + a has-secret flag.
+        try:
+            for row in client.query(
+                "SELECT endpoint_id, type, label, s3_endpoint, s3_bucket, "
+                "s3_region, s3_prefix, s3_disable_tls, "
+                "s3_disable_tls_verification, s3_access_key, fs_server, "
+                "fs_share, fs_options, fs_username, s3_secret_key_enc, "
+                "fs_password_enc FROM storage_endpoints",
+                level=level,
+            ):
+                out["storage_endpoints"][row["endpoint_id"]] = {
+                    "type": row["type"],
+                    "label": row.get("label", ""),
+                    "s3_endpoint": row.get("s3_endpoint", ""),
+                    "s3_bucket": row.get("s3_bucket", ""),
+                    "s3_region": row.get("s3_region", ""),
+                    "s3_prefix": row.get("s3_prefix", ""),
+                    "s3_disable_tls": bool(row.get("s3_disable_tls")),
+                    "s3_disable_tls_verification": bool(row.get("s3_disable_tls_verification")),
+                    "s3_access_key": row.get("s3_access_key", ""),
+                    "fs_server": row.get("fs_server", ""),
+                    "fs_share": row.get("fs_share", ""),
+                    "fs_options": row.get("fs_options", ""),
+                    "fs_username": row.get("fs_username", ""),
+                    "has_s3_secret": bool(row.get("s3_secret_key_enc")),
+                    "has_fs_password": bool(row.get("fs_password_enc")),
+                }
+        except Exception as e:
+            log.warning("view_builder: storage_endpoints projection skipped "
+                        "(table missing on a pre-unification cluster?): %s", e)
 
         # params (open-ended k/v, value is JSON-encoded)
         for row in client.query(
@@ -385,6 +425,7 @@ def _cluster_view(v: dict) -> dict:
         "nodes":          v["nodes"],
         "tiers":          v["tiers"],
         "witnesses":      v["witnesses"],
+        "storage_endpoints": v.get("storage_endpoints", {}),
         "params":         v["params"],
         "vms":            v.get("vms", {}),
         "backup_targets": v.get("backup_targets", {}),

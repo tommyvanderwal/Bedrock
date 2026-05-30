@@ -102,8 +102,49 @@ CREATE TABLE IF NOT EXISTS witnesses (
     addr                    TEXT NOT NULL,
     witness_pubkey          TEXT NOT NULL,    -- hex
     encrypted_witness_key   TEXT NOT NULL,    -- hex (AEAD-wrapped per-witness key)
-    backend                 TEXT NOT NULL DEFAULT 'echo',  -- 'echo' | 'smb' | 's3' (D-17)
+    backend                 TEXT NOT NULL DEFAULT 'echo',  -- 'echo' | 'fileshare' | 's3'
+    -- For backend in ('fileshare','s3') the storage lives in a shared
+    -- storage_endpoints row (smb/nfs mount, or native S3); addr stays the
+    -- echo host:port for backend='echo'. One bucket/share can serve BOTH a
+    -- backup target and this witness (see storage_endpoints.s3_prefix).
+    endpoint_id             TEXT NOT NULL DEFAULT '',
     updated_at              INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- storage_endpoints — ONE consolidated definition of an S3 / SMB / NFS
+-- store, referenced BY ID by both backup_targets and witnesses, so a single
+-- bucket or share can serve backup AND a fileshare/S3 witness (the unification).
+-- CREDENTIALS live HERE in rqlite: rqlite enforces mTLS client-cert auth on
+-- every connection (bedrock-rqlited.service -http-verify-client/-node-verify-
+-- client), and root-on-a-node already holds the cluster cert, so a separate
+-- per-node creds file buys nothing. The SECRET fields are AEAD-wrapped with the
+-- cluster key (ChaCha20-Poly1305, hex) so an rqlite snapshot/backup never
+-- carries plaintext. For smb/nfs, Bedrock mounts the share on EVERY node at
+-- two mountpoints — /mnt/bedrock/kopia/<id> (cached, performance) and
+-- /mnt/bedrock/witness/<id> (strong: noac / cache=none). S3 needs no mount.
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS storage_endpoints (
+    endpoint_id                     TEXT PRIMARY KEY,
+    type                            TEXT NOT NULL,             -- 's3' | 'smb' | 'nfs'
+    label                           TEXT NOT NULL DEFAULT '',
+    -- S3 (native: kopia s3 backend + witness_s3 PUT/LIST/GET)
+    s3_endpoint                     TEXT NOT NULL DEFAULT '',
+    s3_bucket                       TEXT NOT NULL DEFAULT '',
+    s3_region                       TEXT NOT NULL DEFAULT '',
+    s3_prefix                       TEXT NOT NULL DEFAULT '',  -- sub-path: repo under <prefix>/repo, witness under <prefix>/witness
+    s3_disable_tls                  INTEGER NOT NULL DEFAULT 0,
+    s3_disable_tls_verification     INTEGER NOT NULL DEFAULT 0,
+    s3_access_key                   TEXT NOT NULL DEFAULT '',
+    s3_secret_key_enc               TEXT NOT NULL DEFAULT '',  -- AEAD(cluster_key) hex
+    -- SMB / NFS (filesystem family: OS mount + kopia filesystem backend +
+    -- witness fileshare slot files)
+    fs_server                       TEXT NOT NULL DEFAULT '',  -- host or ip
+    fs_share                        TEXT NOT NULL DEFAULT '',  -- //server/share (smb) or server:/export (nfs)
+    fs_options                      TEXT NOT NULL DEFAULT '',  -- extra operator mount options
+    fs_username                     TEXT NOT NULL DEFAULT '',  -- smb
+    fs_password_enc                 TEXT NOT NULL DEFAULT '',  -- AEAD(cluster_key) hex
+    updated_at                      INTEGER NOT NULL
 );
 
 -- ─────────────────────────────────────────────────────────────────
@@ -237,6 +278,10 @@ CREATE TABLE IF NOT EXISTS backup_targets (
     -- format + blobs, making it a true mirror. Primaries (is_mirror=0)
     -- are created + connected normally; VMs back up to them.
     is_mirror                       INTEGER NOT NULL DEFAULT 0,
+    -- When set, the S3/fs storage comes from this storage_endpoints row
+    -- (the consolidated definition); the inline s3_*/filesystem_path columns
+    -- above remain for back-compat with pre-unification targets.
+    endpoint_id                     TEXT NOT NULL DEFAULT '',
     updated_at                      INTEGER NOT NULL
 );
 

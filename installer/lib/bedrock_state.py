@@ -866,6 +866,95 @@ def vm_state_change(name: str, host: str, state: str,
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _seal_secret(plaintext: str) -> str:
+    """AEAD-wrap a secret with the cluster key, return hex. '' → ''. So a
+    plaintext password/secret-key never lands in an rqlite snapshot/backup;
+    only a node holding the cluster key (and the mTLS cert to even reach
+    rqlite) can recover it."""
+    if not plaintext:
+        return ""
+    from . import witness as _w
+    return _w._aead_seal(_w.load_cluster_key(), plaintext.encode()).hex()
+
+
+def unseal_secret(blob_hex: str) -> str:
+    """Inverse of _seal_secret. Returns '' on empty input or on auth failure
+    (a caller that needs the secret must check for '' and fail loud)."""
+    if not blob_hex:
+        return ""
+    from . import witness as _w
+    pt = _w._aead_open(_w.load_cluster_key(), bytes.fromhex(blob_hex))
+    return pt.decode() if pt is not None else ""
+
+
+def storage_endpoint_set(endpoint_id: str, endpoint_type: str, *,
+                         label: str = "",
+                         s3_endpoint: str = "", s3_bucket: str = "",
+                         s3_region: str = "", s3_prefix: str = "",
+                         s3_disable_tls: bool = False,
+                         s3_disable_tls_verification: bool = False,
+                         s3_access_key: str = "", s3_secret_key: str = "",
+                         fs_server: str = "", fs_share: str = "",
+                         fs_options: str = "", fs_username: str = "",
+                         fs_password: str = "", reason: str = "",
+                         client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Upsert a consolidated storage endpoint (endpoint_type in
+    's3'|'smb'|'nfs'). Secrets (s3_secret_key, fs_password) are AEAD-wrapped
+    with the cluster key before storage. This setter writes exactly what it is
+    given — the caller (mgmt API) is responsible for reading-existing-and-
+    reusing a secret the operator did not re-type, so a label edit can't wipe a
+    password."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "INSERT INTO storage_endpoints(endpoint_id, type, label, "
+            "s3_endpoint, s3_bucket, s3_region, s3_prefix, "
+            "s3_disable_tls, s3_disable_tls_verification, "
+            "s3_access_key, s3_secret_key_enc, "
+            "fs_server, fs_share, fs_options, fs_username, fs_password_enc, "
+            "updated_at) VALUES(?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?) "
+            "ON CONFLICT(endpoint_id) DO UPDATE SET "
+            "type=excluded.type, label=excluded.label, "
+            "s3_endpoint=excluded.s3_endpoint, s3_bucket=excluded.s3_bucket, "
+            "s3_region=excluded.s3_region, s3_prefix=excluded.s3_prefix, "
+            "s3_disable_tls=excluded.s3_disable_tls, "
+            "s3_disable_tls_verification=excluded.s3_disable_tls_verification, "
+            "s3_access_key=excluded.s3_access_key, "
+            "s3_secret_key_enc=excluded.s3_secret_key_enc, "
+            "fs_server=excluded.fs_server, fs_share=excluded.fs_share, "
+            "fs_options=excluded.fs_options, fs_username=excluded.fs_username, "
+            "fs_password_enc=excluded.fs_password_enc, "
+            "updated_at=excluded.updated_at",
+            params=[endpoint_id, endpoint_type, label,
+                    s3_endpoint, s3_bucket, s3_region, s3_prefix,
+                    1 if s3_disable_tls else 0,
+                    1 if s3_disable_tls_verification else 0,
+                    s3_access_key, _seal_secret(s3_secret_key),
+                    fs_server, fs_share, fs_options, fs_username,
+                    _seal_secret(fs_password), _now()],
+        )
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def storage_endpoint_removed(endpoint_id: str,
+                             client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Delete a storage endpoint. (Caller guards against deleting one still
+    referenced by a backup_target or witness.)"""
+    c, owns = _client(client)
+    try:
+        c.execute("DELETE FROM storage_endpoints WHERE endpoint_id = ?",
+                  params=[endpoint_id])
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
 def backup_target_set(target_id: str, kind: str, *,
                       s3_endpoint: str = "", s3_bucket: str = "",
                       s3_region: str = "",
