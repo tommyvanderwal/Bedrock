@@ -533,10 +533,12 @@ def _takeover_one(vm_name: str, disks: list[str], me: str) -> bool:
         import tempfile
         import os as _os
         path = ""
+        fd = -1
         try:
             fd, path = tempfile.mkstemp(prefix=f"bedrock-{vm_name}-",
                                         suffix=".xml")
             with _os.fdopen(fd, "w") as f:
+                fd = -1   # fdopen now owns the fd; don't double-close it
                 f.write(xml)
             rc_def = _virsh("define", path)
         except Exception as e:
@@ -544,6 +546,11 @@ def _takeover_one(vm_name: str, disks: list[str], me: str) -> bool:
                       "%s — REFUSING takeover", vm_name, e)
             return False
         finally:
+            if fd >= 0:        # mkstemp succeeded but fdopen raised → close it
+                try:
+                    _os.close(fd)
+                except OSError:
+                    pass
             if path:
                 try:
                     _os.unlink(path)

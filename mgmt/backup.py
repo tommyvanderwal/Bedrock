@@ -1035,6 +1035,25 @@ def run_sync_to_secondaries(primary_target_id: str,
             log.error("sync-to[%s]: secondary %r not in cluster state — "
                       "skipping (the other mirrors continue)", vm_name, sec_id)
             continue
+        # Fail LOUD on a missing secondary S3 credential file (mirror the
+        # create path's hard requirement at configure_target_locally). Without
+        # this, an absent <sec>.env makes the sync-to flags expand empty and
+        # kopia silently falls back to the PRIMARY's AWS_* env — writing the
+        # mirror with the wrong identity (or a masked 403). A clear error
+        # beats an opaque downstream auth failure or wrong-identity write.
+        if sec.get("kind", "kopia-s3") == "kopia-s3" and \
+                not (CREDENTIALS_DIR / f"{sec_id}.env").exists():
+            results.append({
+                "target_id": sec_id, "ok": False, "duration_s": 0.0,
+                "error": f"missing S3 credentials file "
+                         f"{CREDENTIALS_DIR}/{sec_id}.env on this node — set "
+                         f"the mirror target's s3 keys (they propagate to "
+                         f"every node) before enabling replication"})
+            log.error("sync-to[%s]: secondary %r is kopia-s3 but its creds "
+                      "file %s/%s.env is missing on this node — REFUSING to "
+                      "sync (would silently use the primary's identity)",
+                      vm_name, sec_id, CREDENTIALS_DIR, sec_id)
+            continue
         try:
             cmd = _kopia_syncto_cmd(primary_target_id, sec_id, sec,
                                     delete_orphans=delete_orphans,

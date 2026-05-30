@@ -3131,6 +3131,40 @@ def api_backup_target_set(req: BackupTargetSetRequest):
 
     propagation_warnings: list[str] = []
 
+    # ── (0) Validate the mirror set UP FRONT, before any writes ──────
+    # A bad sync_to must 400 with NO partial commit (no kopia repo created, no
+    # target row written). STRONG read so a sibling target created moments ago
+    # is visible (a level='none' local replica can lag and falsely reject a
+    # valid secondary). Each secondary must EXIST and be is_mirror=true — a
+    # non-mirror (independently-created) repo has an incompatible format block
+    # and every sync-to into it would fail "incompatible data" forever.
+    sync_to = list(req.sync_to or [])
+    if req.target_id in sync_to:
+        raise HTTPException(
+            400, f"a backup target cannot mirror to itself ({req.target_id!r})")
+    try:
+        strong_targets = _cluster_state.load_cluster(
+            level="strong").get("backup_targets", {}) or {}
+    except Exception as e:
+        raise HTTPException(
+            503, f"could not validate sync_to — rqlite strong read failed "
+            f"(no leader?): {e}")
+    for sid in sync_to:
+        t = strong_targets.get(sid)
+        if t is None:
+            raise HTTPException(
+                400, f"sync_to references unknown backup target {sid!r} — "
+                f"create it as a mirror (is_mirror=true) first")
+        if not t.get("is_mirror"):
+            raise HTTPException(
+                400, f"sync_to secondary {sid!r} is not a mirror target. Create "
+                f"the mirror destination with is_mirror=true — a mirror is never "
+                f"independently initialized; the first sync-to copies the "
+                f"primary's repo format into it.")
+    # Existing mirror set for this primary (strong, so a clear isn't skipped
+    # against a stale replica).
+    current_mirrors = (strong_targets.get(req.target_id) or {}).get("sync_to") or []
+
     # ── (1a) Encryption password ──────────────────────────────────
     if req.encryption_password is not None:
         already_have_local_key = Path(BACKUP_KEY_FILE).exists()
@@ -3207,32 +3241,19 @@ def api_backup_target_set(req: BackupTargetSetRequest):
     except Exception as e:
         raise HTTPException(500, f"rqlite write failed: {e}")
 
-    # ── (3b) Multi-target mirror set ───────────────────────────────
-    # Persist which SECONDARY targets this primary mirrors to via
-    # `kopia repository sync-to` after each backup. Only write when there is
-    # something to set or clear, so single-target sets don't churn the table.
-    if req.target_id in (req.sync_to or []):
-        raise HTTPException(
-            400, f"a backup target cannot mirror to itself ({req.target_id!r})")
-    known_targets = load_cluster().get("backup_targets", {})
-    current_mirrors = (known_targets.get(req.target_id) or {}).get("sync_to") or []
-    if req.sync_to or current_mirrors:
-        missing = [s for s in req.sync_to if s not in known_targets]
-        if missing:
-            raise HTTPException(
-                400, f"sync_to references unknown backup target(s) {missing} — "
-                f"create them as backup targets first (they share this "
-                f"cluster's backup password automatically).")
+    # ── (3b) Persist the mirror set (already validated in step 0). Write only
+    # when setting OR clearing, so single-target sets don't churn the table.
+    if sync_to or current_mirrors:
         try:
             rev = _bs.backup_target_sync_set(
-                req.target_id, list(req.sync_to or []),
+                req.target_id, sync_to,
                 delete_orphans=req.delete_orphans, reason=req.reason,
             )
         except Exception as e:
             raise HTTPException(500, f"rqlite write (mirror set) failed: {e}")
 
     push_log(f"backup target {req.target_id!r} set ({req.kind})"
-             + (f" → mirrors {req.sync_to}" if req.sync_to else ""),
+             + (f" → mirrors {sync_to}" if sync_to else ""),
              app="bedrock-mgmt", level="info")
     return {
         "status": "ok",
@@ -3320,17 +3341,53 @@ def api_witness_add(req: WitnessAddRequest):
     if backend not in ("echo", "smb", "s3"):
         raise HTTPException(400, f"unknown witness backend {backend!r} "
                                  f"(expected echo | smb | s3)")
+    if backend != "echo":
+        # smb/s3 fileshare witness backends are NOT implemented yet (no
+        # transport exists — netd only speaks the Echo UDP protocol). A
+        # configured-but-non-functional witness is strictly WORSE than no
+        # witness: it raises the quorum bar by one vote (it's counted in
+        # len(witnesses)) while it can never become valid+confirmed (0 votes),
+        # which can brick failover on a 2-node cluster. Refuse until the
+        # backend ships, rather than let an operator wedge their quorum.
+        raise HTTPException(
+            400, f"witness backend {backend!r} is not implemented yet — only "
+            f"'echo' witnesses are active. A non-functional witness would "
+            f"raise the quorum bar without ever voting, which can BLOCK "
+            f"failover. (The fileshare/S3 witness backend is a future build.)")
     addr = (req.addr or "").strip()
     if not addr:
         raise HTTPException(400, "addr is required (host or host:port)")
-    if ":" in addr:
-        host, _, port_s = addr.rpartition(":")
+    # Parse host[:port]. Support bracketed IPv6 ([::1]:port / [::1]); a bare
+    # IPv6 literal (2+ colons, no brackets) is taken as the host with the
+    # default port (rpartition would otherwise mangle it). Port must be valid.
+    port = 12321
+    if addr.startswith("["):
+        host, sep, rest = addr[1:].partition("]")
+        if not sep:
+            raise HTTPException(400, f"malformed bracketed address {addr!r}")
+        if rest.startswith(":"):
+            port_s = rest[1:]
+        elif rest == "":
+            port_s = ""
+        else:
+            raise HTTPException(400, f"malformed address after ] in {addr!r}")
+    elif addr.count(":") >= 2:
+        host, port_s = addr, ""          # bare IPv6 literal, default port
+    elif ":" in addr:
+        host, _, port_s = addr.partition(":")
+    else:
+        host, port_s = addr, ""
+    if not host:
+        raise HTTPException(400, f"address {addr!r} has no host")
+    if port_s:
         try:
             port = int(port_s)
         except ValueError:
-            raise HTTPException(400, f"invalid port in addr {addr!r}")
-    else:
-        host, port = addr, 12321
+            raise HTTPException(400, f"invalid port {port_s!r} in addr {addr!r}")
+        if not (1 <= port <= 65535):
+            raise HTTPException(400, f"port {port} out of range (1-65535)")
+    # Re-bracket IPv6 hosts so the stored addr round-trips unambiguously.
+    stored_addr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     pubkey = (req.witness_pubkey or "").strip().lower()
     if backend == "echo":
         # An Echo's X25519 public key is 32 bytes = 64 hex chars. Validate
@@ -3341,20 +3398,25 @@ def api_witness_add(req: WitnessAddRequest):
                 400, "witness_pubkey must be 64 hex chars (the Echo's X25519 "
                 "public key) for an echo witness")
     try:
-        rev = _bs.witness_register(witness_id=wid, addr=f"{host}:{port}",
+        rev = _bs.witness_register(witness_id=wid, addr=stored_addr,
                                    witness_pubkey_hex=pubkey,
                                    encrypted_witness_key_hex="",
                                    backend=backend)
     except Exception as e:
         raise HTTPException(500, f"rqlite write failed: {e}")
-    push_log(f"witness {wid!r} added ({backend} {host}:{port})",
+    push_log(f"witness {wid!r} added ({backend} {stored_addr})",
              app="bedrock-mgmt", level="info")
     return {"status": "ok", "revision": rev, "witness_id": wid,
-            "addr": f"{host}:{port}", "backend": backend}
+            "addr": stored_addr, "backend": backend}
 
 
 @app.delete("/api/witnesses/{witness_id}")
 def api_witness_remove(witness_id: str, reason: str = ""):
+    # 404 for a non-existent witness — witness_unregister's DELETE matches 0
+    # rows but still "succeeds" and bumps the revision, so without this a
+    # typo'd delete reports success and churns every node's reactor for nothing.
+    if witness_id not in (load_cluster().get("witnesses") or {}):
+        raise HTTPException(404, f"witness {witness_id!r} not found")
     try:
         rev = _bs.witness_unregister(witness_id)
     except Exception as e:

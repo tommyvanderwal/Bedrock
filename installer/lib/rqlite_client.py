@@ -563,6 +563,15 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
     # running cluster doesn't suddenly drop everyone from the denominator.
     _add_column_if_missing(client, "nodes", "state",
                            "TEXT NOT NULL DEFAULT 'active'")
+    # backup_targets.is_mirror: a sync-to mirror destination (never
+    # independently created). Existing targets default 0 (primary).
+    _add_column_if_missing(client, "backup_targets", "is_mirror",
+                           "INTEGER NOT NULL DEFAULT 0")
+    # vms.libvirt_xml: the domain XML, stored so a later-joining node can
+    # re-define + take over the VM on failover. Existing rows default ''
+    # (failover re-define refuses loudly until the VM is next written).
+    _add_column_if_missing(client, "vms", "libvirt_xml",
+                           "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

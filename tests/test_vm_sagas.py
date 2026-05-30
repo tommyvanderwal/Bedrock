@@ -200,6 +200,10 @@ VM_CREATE_STEPS = [
     "virsh_define_on_peers",
     "record_disk_uuids",
     "register_vm",
+    # Persist the domain XML in cluster state for failover re-define on a
+    # later-joining node. MUST run after register_vm (whose INSERT OR REPLACE
+    # would otherwise clobber libvirt_xml back to '').
+    "store_libvirt_xml",
 ]
 
 

@@ -2058,3 +2058,44 @@ same kbtest snapshots as the primary; a fresh saga backup completed with
 once an independent repo) makes every sync-to fail `incompatible data` — the
 destination must be cleared. `is_mirror` prevents this for fresh targets; a
 converted target needs its storage wiped first.
+
+## L50 — adversarial review caught 4 classes of bug in the multi-target/HA/witness code
+**2026-05-30** · a self-review workflow over the phase-2/open-items/phase-3 diff
+
+A 4-dimension find→verify workflow surfaced 22 confirmed/plausible findings;
+the load-bearing classes, all now fixed:
+
+1. **Every new column on an EXISTING table needs an `_add_column_if_missing`
+   entry** (installer/lib/rqlite_client.py apply_schema). `CREATE TABLE IF NOT
+   EXISTS` never alters an existing table. I added `backup_targets.is_mirror`
+   and `vms.libvirt_xml` to the DDL but forgot the migrations — so on any
+   upgraded cluster the columns were absent and `backup_target_set` INSERT,
+   `vm_set_libvirt_xml`, the view_builder SELECT, and the failover re-define
+   all hard-failed (it's why the testbed needed manual ALTERs). This is a
+   STANDING RULE: schema column add ⇒ matching `_add_column_if_missing`.
+
+2. **kopia sync-to destination creds must be a hard requirement, never an env
+   fallback.** A missing secondary `<id>.env` made `--access-key=` expand
+   empty, and kopia silently fell back to the PRIMARY's `AWS_*` env — writing
+   the mirror with the wrong identity. Fixed: `run_sync_to_secondaries` now
+   fail-loud-refuses a kopia-s3 secondary whose creds file is missing (mirrors
+   the create-path guard).
+
+3. **A non-functional witness is WORSE than no witness.** The election counts
+   EVERY configured witness in the denominator (`len(witnesses)`) but only an
+   Echo can ever be valid+confirmed. An smb/s3 witness (backend unbuilt) raises
+   the quorum bar by +1 while contributing 0 votes → can brick failover on a
+   2-node cluster. Fixed: the API refuses non-echo backends until they ship.
+
+4. **Saga-step ordering + INSERT OR REPLACE.** Storing libvirt_xml in a step
+   BEFORE register_vm's `INSERT OR REPLACE INTO vms` (which omits the column)
+   silently clobbered it back to '' — the feature was a no-op. Fixed: a
+   `store_libvirt_xml` step declared AFTER register_vm (executor runs steps in
+   source order, re-running after any register retry).
+
+Also fixed: scheduled backups ran `sync-to` on the master not the home node
+(wrong for a kopia-fs primary) — now submit the vm_backup saga; sync_to
+validation moved BEFORE the writes (no partial commit) + strong-read +
+is_mirror-required; witness addr IPv6/port-range validation; witness-remove
+404; a vm_failover temp-fd leak. (Deferred low: delete_orphans fan-in guard,
+_read_cluster transient-error message, spawn.py dead-code tail.)

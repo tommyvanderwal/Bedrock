@@ -1015,42 +1015,57 @@ async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
     import datetime as dt
     label = f"{sched.get('label_prefix') or 'auto'}-{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
     try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        import backup as bedrock_backup  # type: ignore
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: bedrock_backup.run_backup(target_id, vm_name, label=label),
-        )
-        # Multi-target replication: mirror to the primary's configured
-        # secondary targets (resolved from cluster state, same as the API
-        # path). The primary backup already succeeded above — a mirror
-        # failure is logged LOUD but does NOT mark the primary backup failed.
-        secondaries: list = []
-        try:
-            from lib import cluster_state as _cs
-            tgt = (_cs.load_cluster().get("backup_targets") or {}).get(target_id) or {}
-            secondaries = list(tgt.get("sync_to") or [])
-        except Exception as e:
-            log.warning("scheduler: could not resolve mirror targets for %s: %s",
-                        vm_name, e)
-        if secondaries:
-            res = await loop.run_in_executor(
-                None,
-                lambda: bedrock_backup.run_sync_to_secondaries(
-                    target_id, secondaries, vm_name=vm_name),
-            )
-            if res.get("failed"):
-                log.warning("scheduler: backup of %s mirrored to %d/%d secondary "
-                            "target(s) — FAILED: %s (primary backup is safe)",
-                            vm_name, len(res.get("ok", [])), len(secondaries),
-                            res["failed"])
-            else:
-                log.info("scheduler: backup of %s mirrored to %d secondary "
-                         "target(s)", vm_name, len(secondaries))
-        log.info("scheduler: backup of %s done (label=%s)", vm_name, label)
+        # Submit the SAME vm_backup saga the API uses (target_node=home), so the
+        # backup AND the kopia sync-to mirror both run ON THE VM'S HOME NODE
+        # where the primary repo lives. The scheduler runs on the master, which
+        # is frequently NOT the VM's home; running the sync-to here would mirror
+        # the master's (empty/divergent) local repo for a kopia-fs primary.
+        from lib import cluster_state as _cs
+        cluster = _cs.load_cluster()
+        vm = (cluster.get("vms") or {}).get(vm_name) or {}
+        home = vm.get("host") or ""
+        if not home:
+            log.warning("scheduler: VM %s has no home node recorded — skipping "
+                        "scheduled backup", vm_name)
+            return
+        tgt = (cluster.get("backup_targets") or {}).get(target_id) or {}
+        secondaries = list(tgt.get("sync_to") or [])
+
+        import socket as _socket
+        from bedrock_d.orchestrator.sagas import SagaExecutor
+        from bedrock_d.orchestrator.sagas.rqlite_backend import RqliteSagaBackend
+        from bedrock_d import state as _bst
+        from bedrock_d.vm import backup as _vmbk  # noqa: F401  registers vm_backup
+        backend = RqliteSagaBackend(_bst.RqliteClient())
+        ex = SagaExecutor(backend=backend, this_node=_socket.gethostname())
+        op_id = ex.submit(
+            kind="vm_backup", target_node=home,
+            params={"target_id": target_id, "vm_name": vm_name, "label": label,
+                    "secondary_target_ids": secondaries},
+            requested_by="backup_scheduler")
+        log.info("scheduler: submitted vm_backup saga for %s (op %d, runs on %s,"
+                 " %d mirror target(s))", vm_name, op_id, home, len(secondaries))
+        # Hold _SCHEDULED_INFLIGHT until the home node's operations_drain runs
+        # it (bounded poll), so the "skip if a prior run is in flight" guard in
+        # _scheduler_tick stays accurate and we log the real outcome.
+        for _ in range(900):       # ~15 min ceiling
+            await asyncio.sleep(1)
+            try:
+                op = await asyncio.to_thread(backend.get_operation, op_id)
+            except Exception:
+                continue
+            st = (op or {}).get("state", "")
+            if st in ("completed", "failed"):
+                if st == "failed":
+                    log.warning("scheduler: backup of %s (op %d) FAILED: %s",
+                                vm_name, op_id, (op or {}).get("error", ""))
+                else:
+                    log.info("scheduler: backup of %s (op %d) done (label=%s)",
+                             vm_name, op_id, label)
+                break
     except Exception as e:
-        log.warning("scheduler: backup of %s failed: %s", vm_name, e)
+        log.warning("scheduler: backup of %s failed to submit/run: %s",
+                    vm_name, e)
     finally:
         _SCHEDULED_INFLIGHT.discard(vm_name)
 

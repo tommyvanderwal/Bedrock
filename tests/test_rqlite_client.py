@@ -296,7 +296,9 @@ class TestApplySchema(unittest.TestCase):
         # (self-heal) and nodes.state (C1 election-denominator lifecycle).
         # With a mock client the PRAGMA check reports each column absent,
         # so every ALTER is issued — so call_count = 2 + (#migrations).
-        self.assertEqual(client.execute.call_count, 4)
+        # Today: vms.priority, nodes.state, backup_targets.is_mirror,
+        # vms.libvirt_xml — 4 migrations, so call_count = 2 + 4 = 6.
+        self.assertEqual(client.execute.call_count, 6)
         first_call_args = client.execute.call_args_list[0]
         statements = first_call_args.args[0]
         self.assertEqual(len(statements), 2)
@@ -304,10 +306,14 @@ class TestApplySchema(unittest.TestCase):
         self.assertIn("CREATE TABLE b", statements[1])
         # The trailing executes are the additive column migrations.
         alter_sqls = [client.execute.call_args_list[i].args[0]
-                      for i in (2, 3)]
+                      for i in range(2, client.execute.call_count)]
         self.assertTrue(any("ALTER TABLE vms ADD COLUMN priority" in s
                             for s in alter_sqls))
         self.assertTrue(any("ALTER TABLE nodes ADD COLUMN state" in s
+                            for s in alter_sqls))
+        self.assertTrue(any("ALTER TABLE backup_targets ADD COLUMN is_mirror" in s
+                            for s in alter_sqls))
+        self.assertTrue(any("ALTER TABLE vms ADD COLUMN libvirt_xml" in s
                             for s in alter_sqls))
 
 

@@ -115,8 +115,8 @@
 		<label>Backend
 			<select bind:value={f_backend}>
 				<option value="echo">BedRock Echo (UDP)</option>
-				<option value="smb">Fileshare (SMB)</option>
-				<option value="s3">Fileshare (S3)</option>
+				<option value="smb" disabled>Fileshare SMB (coming soon)</option>
+				<option value="s3" disabled>Fileshare S3 (coming soon)</option>
 			</select>
 		</label>
 		<label>Address<input placeholder={f_backend === 'echo' ? 'host or host:12321' : 'host:port'} bind:value={f_addr} /></label>
@@ -129,9 +129,9 @@
 	<button class="btn-add" onclick={add} disabled={adding}>{adding ? 'Adding…' : 'Add witness'}</button>
 	<p class="hint">A witness raises the quorum bar by one vote and only counts toward
 		failover once it is reachable + valid — a configured-but-unreachable witness
-		is split-brain-safe (it makes failover harder, never easier).
-		{#if f_backend !== 'echo'}<br/><strong>Note:</strong> fileshare (SMB/S3) witness backends are not yet active — the row is stored for when they ship.{/if}
-	</p>
+		is split-brain-safe (it makes failover harder, never easier). Only BedRock
+		Echo witnesses are active today; fileshare (SMB/S3) witnesses are a planned
+		backend.</p>
 </div>
 
 <div class="card">
