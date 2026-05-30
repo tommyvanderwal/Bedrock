@@ -2011,3 +2011,50 @@ there) and stale ARP (old VM gone).
 latent footgun for every caller — returning a wrong-but-plausible IP instead of
 `None`. Consider returning `None` when ARP+agent both miss, so callers wait
 instead of acting on a bogus address.
+
+## L49 — kopia multi-target mirrors: the destination must be EMPTY, never independently created
+**2026-05-30** · multi-target backup (phase 2)
+
+**What we thought:** to mirror a backup to a second repo, create the secondary
+as an ordinary kopia repo with the SAME cluster password (so the formats match),
+then `kopia repository sync-to <secondary> --must-exist`.
+
+**What we found:** that fails every time with **`destination repository contains
+incompatible data`**. Two independently-`kopia repository create`d repos are NOT
+mirror-compatible even with the same password + block hash + encryption — each
+create writes a format block with a **unique random repository id/salt**, and
+`sync-to` refuses a destination whose format differs from the source. Worse,
+`--must-exist` is exactly backwards for the first sync: it refuses an *empty*
+destination, but an empty destination is precisely what you need.
+
+**The correct kopia model:** a mirror destination must start **EMPTY**. The
+first `kopia repository sync-to <dest>` **without** `--must-exist` copies the
+SOURCE's format block (id, encryption, hash) plus all blobs into it, making it a
+true byte-compatible mirror you can later `connect` to and restore from.
+Subsequent syncs are incremental.
+
+**What we built (phase 2):**
+- A `backup_targets.is_mirror` flag. A mirror target is registered (storage
+  config + creds, shares the one cluster `/etc/bedrock/backup.key`) but is NEVER
+  `configure_target_locally`d — `api_backup_target_set` and BOTH orchestrator
+  reactors skip the independent connect/create for `is_mirror` targets, so the
+  storage stays empty.
+- `_kopia_syncto_cmd` drops `--must-exist`; the first sync creates the mirror.
+- Source read once on the VM's home node; destination S3 creds passed as
+  `--access-key`/`--secret-access-key` flags (they override `AWS_*` env, so they
+  don't clobber the source-read env); each secondary synced INDEPENDENTLY (never
+  `&&`-chained) so one failed mirror doesn't abort the rest.
+- Fail-loud-but-non-masking: a mirror failure marks the op FAILED with a message
+  that explicitly says the PRIMARY backup SUCCEEDED and is restorable — never
+  conflate a mirror failure with backup loss. Retry is safe (sync-to idempotent,
+  the `backup` step is skipped).
+
+**Validated:** `local`(S3) → `mirror-fs`(kopia-fs, is_mirror) on the testbed:
+first sync copied 46 blobs/239.6 MB and created the mirror; the mirror lists the
+same kbtest snapshots as the primary; a fresh saga backup completed with
+`mirrored to 1/1 secondary target(s)` in 0.4s (incremental).
+
+**Gotcha:** a mirror whose storage already holds incompatible data (e.g. it was
+once an independent repo) makes every sync-to fail `incompatible data` — the
+destination must be cleared. `is_mirror` prevents this for fresh targets; a
+converted target needs its storage wiped first.

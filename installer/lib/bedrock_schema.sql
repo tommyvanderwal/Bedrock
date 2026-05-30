@@ -223,6 +223,13 @@ CREATE TABLE IF NOT EXISTS backup_targets (
     filesystem_path                 TEXT NOT NULL DEFAULT '',
     override_source_prefix          TEXT NOT NULL DEFAULT '',
     cache_directory                 TEXT NOT NULL DEFAULT '',
+    -- A "mirror" target is a sync-to DESTINATION only: it is never
+    -- independently `kopia repository create`d (that would give it an
+    -- incompatible format block). It starts EMPTY and the first
+    -- `kopia repository sync-to` from its primary copies the source's
+    -- format + blobs, making it a true mirror. Primaries (is_mirror=0)
+    -- are created + connected normally; VMs back up to them.
+    is_mirror                       INTEGER NOT NULL DEFAULT 0,
     updated_at                      INTEGER NOT NULL
 );
 
@@ -243,6 +250,28 @@ CREATE TABLE IF NOT EXISTS vm_backups (
 
 CREATE INDEX IF NOT EXISTS idx_vm_backups_vm       ON vm_backups(vm_name, ts_index DESC);
 CREATE INDEX IF NOT EXISTS idx_vm_backups_kopia    ON vm_backups(primary_kopia_id);
+
+-- ─────────────────────────────────────────────────────────────────
+-- Backup multi-target replication. After a VM backup writes to its
+-- PRIMARY kopia repo, the primary is mirrored to a set of SECONDARY
+-- repos via `kopia repository sync-to` (blob-level, source read once,
+-- dedup preserved). Each row = "primary_id mirrors to secondary_id".
+-- Secondaries are themselves ordinary backup_targets rows (own
+-- endpoint/bucket/creds) but share the ONE cluster backup password so
+-- kopia mirrors are compatible. Composite-PK ordered set, same shape
+-- as obs_backends. A target becomes a "primary" purely by having rows
+-- here; VMs/schedules keep referencing a single (primary) target_id.
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS backup_target_sync (
+    primary_id      TEXT NOT NULL,       -- source repo  (backup_targets.target_id)
+    secondary_id    TEXT NOT NULL,       -- mirror repo  (backup_targets.target_id)
+    position        INTEGER NOT NULL DEFAULT 0,  -- operator-facing order
+    delete_orphans  INTEGER NOT NULL DEFAULT 0,  -- kopia sync-to --delete (prune)
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (primary_id, secondary_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bts_primary   ON backup_target_sync(primary_id, position);
+CREATE INDEX IF NOT EXISTS idx_bts_secondary ON backup_target_sync(secondary_id);
 
 -- ─────────────────────────────────────────────────────────────────
 -- Mesh path table — bedrock-net's LINK_UP/DOWN/QUALITY equivalent

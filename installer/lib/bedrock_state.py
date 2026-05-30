@@ -838,7 +838,8 @@ def backup_target_set(target_id: str, kind: str, *,
                       s3_disable_tls_verification: bool = False,
                       filesystem_path: str = "",
                       override_source_prefix: str = "",
-                      cache_directory: str = "", reason: str = "",
+                      cache_directory: str = "", is_mirror: bool = False,
+                      reason: str = "",
                       client: Optional[rqlite_client.RqliteClient] = None) -> int:
     c, owns = _client(client)
     try:
@@ -847,8 +848,8 @@ def backup_target_set(target_id: str, kind: str, *,
             "s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
-            "updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "is_mirror, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(target_id) DO UPDATE SET "
             "kind = excluded.kind, "
             "s3_endpoint = excluded.s3_endpoint, "
@@ -859,12 +860,13 @@ def backup_target_set(target_id: str, kind: str, *,
             "filesystem_path = excluded.filesystem_path, "
             "override_source_prefix = excluded.override_source_prefix, "
             "cache_directory = excluded.cache_directory, "
+            "is_mirror = excluded.is_mirror, "
             "updated_at = excluded.updated_at",
             params=[target_id, kind, s3_endpoint, s3_bucket, s3_region,
                     1 if s3_disable_tls else 0,
                     1 if s3_disable_tls_verification else 0,
                     filesystem_path, override_source_prefix,
-                    cache_directory, _now()],
+                    cache_directory, 1 if is_mirror else 0, _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:
@@ -877,10 +879,69 @@ def backup_target_removed(target_id: str, reason: str = "",
                           client: Optional[rqlite_client.RqliteClient] = None) -> int:
     c, owns = _client(client)
     try:
-        c.execute("DELETE FROM backup_targets WHERE target_id = ?",
-                  params=[target_id])
+        # Drop the target AND any mirror edges that reference it (as a
+        # primary OR as a secondary) in one txn — otherwise the
+        # backup_target_sync table would keep dangling rows pointing at a
+        # repo that no longer exists.
+        c.execute([
+            ["DELETE FROM backup_targets WHERE target_id = ?", target_id],
+            ["DELETE FROM backup_target_sync "
+             "WHERE primary_id = ? OR secondary_id = ?", target_id, target_id],
+        ])
         log.info("bedrock_state: backup_target_removed %s reason=%r",
                  target_id, reason)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def backup_target_sync_set(primary_id: str, secondary_ids: list,
+                           *, delete_orphans: bool = False, reason: str = "",
+                           client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Replace the mirror set for one PRIMARY backup target. `secondary_ids`
+    is the ordered list of backup_targets.target_id that <primary_id> mirrors
+    to via `kopia repository sync-to` after each backup. An empty list clears
+    all mirrors for the primary. Idempotent (DELETE-then-INSERT the set in one
+    txn), same shape as obs_backends_set."""
+    c, owns = _client(client)
+    try:
+        statements: list[list[Any]] = [
+            ["DELETE FROM backup_target_sync WHERE primary_id = ?", primary_id],
+        ]
+        for i, sec in enumerate(secondary_ids or []):
+            statements.append([
+                "INSERT INTO backup_target_sync(primary_id, secondary_id, "
+                "position, delete_orphans, updated_at) VALUES(?, ?, ?, ?, ?)",
+                primary_id, sec, i, 1 if delete_orphans else 0, _now(),
+            ])
+        c.execute(statements)
+        log.info("bedrock_state: backup_target_sync_set %s -> %r reason=%r",
+                 primary_id, list(secondary_ids or []), reason)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def backup_target_sync_removed(primary_id: str, secondary_id: Optional[str] = None,
+                               *, reason: str = "",
+                               client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Remove mirror edges. With secondary_id=None, remove ALL mirrors for the
+    primary; otherwise remove just that one primary->secondary edge."""
+    c, owns = _client(client)
+    try:
+        if secondary_id is None:
+            c.execute("DELETE FROM backup_target_sync WHERE primary_id = ?",
+                      params=[primary_id])
+        else:
+            c.execute("DELETE FROM backup_target_sync "
+                      "WHERE primary_id = ? AND secondary_id = ?",
+                      params=[primary_id, secondary_id])
+        log.info("bedrock_state: backup_target_sync_removed %s/%s reason=%r",
+                 primary_id, secondary_id, reason)
         return _bump_and_close(c, owns)
     except Exception:
         if owns:

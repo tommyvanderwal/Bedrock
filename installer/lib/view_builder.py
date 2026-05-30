@@ -281,7 +281,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         for row in client.query(
             "SELECT target_id, kind, s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
-            "filesystem_path, override_source_prefix, cache_directory "
+            "filesystem_path, override_source_prefix, cache_directory, "
+            "is_mirror "
             "FROM backup_targets",
             level=level,
         ):
@@ -296,7 +297,42 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "filesystem_path":        row.get("filesystem_path", ""),
                 "override_source_prefix": row.get("override_source_prefix", ""),
                 "cache_directory":        row.get("cache_directory", ""),
+                # is_mirror: a sync-to destination, never independently created
+                "is_mirror":      bool(row.get("is_mirror")),
+                # multi-target mirrors (filled below from backup_target_sync)
+                "sync_to":        [],
+                "delete_orphans": False,
             }
+
+        # backup multi-target mirrors — attach the ordered secondary list onto
+        # each primary target's dict (no new top-level key; the dashboard/API
+        # see it inline on the target). Defensive: backup_target_sync is a
+        # newer table; on a cluster whose schema predates it the SELECT would
+        # raise "no such table" and brick the whole snapshot build (load_cluster
+        # is load-bearing, incl. failover paths). So tolerate its absence — log
+        # LOUD (so the operator re-applies the schema) but keep building; the
+        # only effect is targets report no mirrors until the table exists.
+        try:
+            sync_rows = list(client.query(
+                "SELECT primary_id, secondary_id, position, delete_orphans "
+                "FROM backup_target_sync ORDER BY primary_id, position",
+                level=level,
+            ))
+        except Exception as e:
+            if "no such table" in str(e).lower():
+                log.warning("view_builder: backup_target_sync table missing — "
+                            "re-apply bedrock_schema.sql; backup mirrors are "
+                            "inert until then (%s)", e)
+                sync_rows = []
+            else:
+                raise
+        for row in sync_rows:
+            tgt = out["backup_targets"].get(row["primary_id"])
+            if tgt is None:
+                continue   # primary repo was deleted; edge is orphaned, skip
+            tgt["sync_to"].append(row["secondary_id"])
+            if bool(row.get("delete_orphans")):
+                tgt["delete_orphans"] = True
 
         # paths (mesh topology)
         for row in client.query(

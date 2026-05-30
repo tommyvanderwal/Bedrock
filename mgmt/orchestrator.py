@@ -581,6 +581,10 @@ async def _start_local_services():
     # each target idempotently. `kopia repository connect` is a no-op
     # if we're already connected.
     for target_id, t in (cluster.get("backup_targets") or {}).items():
+        if t.get("is_mirror"):
+            # Mirror targets are sync-to destinations only — never connected
+            # independently (the first sync-to from the primary creates them).
+            continue
         log.info("services: reconciling backup target %s", target_id)
         try:
             sys.path.insert(0, str(Path(__file__).parent))
@@ -825,6 +829,11 @@ async def _react_backup_target_set(target_id: str, target: dict):
     before issuing the target-set."""
     if not target_id:
         return
+    if target.get("is_mirror"):
+        # A mirror target is a sync-to destination only — never independently
+        # connected/created (that gives it an incompatible format block). The
+        # first `kopia repository sync-to` from its primary creates it.
+        return
     try:
         sys.path.insert(0, "/usr/local/lib/bedrock")
         sys.path.insert(0, str(Path(__file__).parent))
@@ -1013,6 +1022,32 @@ async def _run_scheduled_backup(vm_name: str, target_id: str, sched: dict):
             None,
             lambda: bedrock_backup.run_backup(target_id, vm_name, label=label),
         )
+        # Multi-target replication: mirror to the primary's configured
+        # secondary targets (resolved from cluster state, same as the API
+        # path). The primary backup already succeeded above — a mirror
+        # failure is logged LOUD but does NOT mark the primary backup failed.
+        secondaries: list = []
+        try:
+            from lib import cluster_state as _cs
+            tgt = (_cs.load_cluster().get("backup_targets") or {}).get(target_id) or {}
+            secondaries = list(tgt.get("sync_to") or [])
+        except Exception as e:
+            log.warning("scheduler: could not resolve mirror targets for %s: %s",
+                        vm_name, e)
+        if secondaries:
+            res = await loop.run_in_executor(
+                None,
+                lambda: bedrock_backup.run_sync_to_secondaries(
+                    target_id, secondaries, vm_name=vm_name),
+            )
+            if res.get("failed"):
+                log.warning("scheduler: backup of %s mirrored to %d/%d secondary "
+                            "target(s) — FAILED: %s (primary backup is safe)",
+                            vm_name, len(res.get("ok", [])), len(secondaries),
+                            res["failed"])
+            else:
+                log.info("scheduler: backup of %s mirrored to %d secondary "
+                         "target(s)", vm_name, len(secondaries))
         log.info("scheduler: backup of %s done (label=%s)", vm_name, label)
     except Exception as e:
         log.warning("scheduler: backup of %s failed: %s", vm_name, e)

@@ -2912,6 +2912,19 @@ class BackupTargetSetRequest(BaseModel):
     override_source_prefix: str = ""  # default: "<cluster_uuid>:vms"
     cache_directory: str = ""         # default: /var/cache/bedrock-kopia
     reason: str = ""
+    # ── Multi-target replication ───────────────────────────────────
+    # Ordered list of OTHER backup_targets ids this target mirrors to via
+    # `kopia repository sync-to` after each backup. Secondaries are normal
+    # targets (own endpoint/bucket/creds) sharing the one cluster password.
+    # Empty = single-target (the default; no behaviour change).
+    sync_to: list[str] = []
+    delete_orphans: bool = False      # kopia sync-to --delete (prune mirrors)
+    # A mirror target is a sync-to DESTINATION only — registered for its
+    # storage config + creds but NEVER independently created (an independent
+    # `kopia repository create` gives it an incompatible format block). It
+    # starts empty; the first sync-to from its primary copies the source
+    # format. Set this when adding a replication destination.
+    is_mirror: bool = False
     # ── Credentials (NEVER logged) ─────────────────────────────────
     # Optional inline secrets. When present, mgmt writes the
     # corresponding files on every cluster node before recording the
@@ -3158,19 +3171,24 @@ def api_backup_target_set(req: BackupTargetSetRequest):
             )
 
     # ── (2) Connect this node + verify hash floor ──────────────────
-    try:
-        backup.configure_target_locally(
-            target_id=req.target_id, kind=req.kind,
-            s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
-            s3_region=req.s3_region,
-            s3_disable_tls=req.s3_disable_tls,
-            s3_disable_tls_verification=req.s3_disable_tls_verification,
-            filesystem_path=req.filesystem_path,
-            override_source_prefix=req.override_source_prefix,
-            cache_directory=req.cache_directory,
-        )
-    except Exception as e:
-        raise HTTPException(400, f"backup target setup failed locally: {e}")
+    # SKIP for a mirror target: it must stay empty so the first
+    # `kopia repository sync-to` can copy the source's format block into it.
+    # Independently creating it here would give it an incompatible format
+    # and every sync-to would fail "destination contains incompatible data".
+    if not req.is_mirror:
+        try:
+            backup.configure_target_locally(
+                target_id=req.target_id, kind=req.kind,
+                s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
+                s3_region=req.s3_region,
+                s3_disable_tls=req.s3_disable_tls,
+                s3_disable_tls_verification=req.s3_disable_tls_verification,
+                filesystem_path=req.filesystem_path,
+                override_source_prefix=req.override_source_prefix,
+                cache_directory=req.cache_directory,
+            )
+        except Exception as e:
+            raise HTTPException(400, f"backup target setup failed locally: {e}")
 
     # ── (3) Persist to rqlite so peers get it via their reactors ──
     try:
@@ -3183,17 +3201,44 @@ def api_backup_target_set(req: BackupTargetSetRequest):
             filesystem_path=req.filesystem_path,
             override_source_prefix=req.override_source_prefix,
             cache_directory=req.cache_directory,
+            is_mirror=req.is_mirror,
             reason=req.reason,
         )
     except Exception as e:
         raise HTTPException(500, f"rqlite write failed: {e}")
 
-    push_log(f"backup target {req.target_id!r} set ({req.kind})",
+    # ── (3b) Multi-target mirror set ───────────────────────────────
+    # Persist which SECONDARY targets this primary mirrors to via
+    # `kopia repository sync-to` after each backup. Only write when there is
+    # something to set or clear, so single-target sets don't churn the table.
+    if req.target_id in (req.sync_to or []):
+        raise HTTPException(
+            400, f"a backup target cannot mirror to itself ({req.target_id!r})")
+    known_targets = load_cluster().get("backup_targets", {})
+    current_mirrors = (known_targets.get(req.target_id) or {}).get("sync_to") or []
+    if req.sync_to or current_mirrors:
+        missing = [s for s in req.sync_to if s not in known_targets]
+        if missing:
+            raise HTTPException(
+                400, f"sync_to references unknown backup target(s) {missing} — "
+                f"create them as backup targets first (they share this "
+                f"cluster's backup password automatically).")
+        try:
+            rev = _bs.backup_target_sync_set(
+                req.target_id, list(req.sync_to or []),
+                delete_orphans=req.delete_orphans, reason=req.reason,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"rqlite write (mirror set) failed: {e}")
+
+    push_log(f"backup target {req.target_id!r} set ({req.kind})"
+             + (f" → mirrors {req.sync_to}" if req.sync_to else ""),
              app="bedrock-mgmt", level="info")
     return {
         "status": "ok",
         "revision": rev,
         "target_id": req.target_id,
+        "sync_to": list(req.sync_to or []),
         "warnings": propagation_warnings,
     }
 
@@ -3266,6 +3311,12 @@ async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()
     if not home:
         raise HTTPException(400, f"VM {vm_name!r} has no home node recorded")
 
+    # Multi-target: resolve the primary's mirror set NOW (from cluster state)
+    # and carry it in the saga params so the home node's sync_to_secondaries
+    # step mirrors the backup. Putting it in params (vs re-reading on the home
+    # node) makes it durable across resume + master failover.
+    secondary_target_ids = list(target.get("sync_to") or [])
+
     # Submit a vm_backup saga targeted at the VM's HOME node. That node's
     # operations_drain (mgmt/orchestrator.py) runs it locally — kopia on
     # the node that owns the disks — recording the result to rqlite. No
@@ -3281,7 +3332,8 @@ async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()
         op_id = ex.submit(
             kind="vm_backup", target_node=home,
             params={"target_id": req.target_id, "vm_name": vm_name,
-                    "label": req.label or ""},
+                    "label": req.label or "",
+                    "secondary_target_ids": secondary_target_ids},
             requested_by="api_vm_backup",
         )
     except Exception as e:

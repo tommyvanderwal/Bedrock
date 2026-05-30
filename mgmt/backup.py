@@ -53,6 +53,12 @@ CREDENTIALS_DIR = Path("/etc/bedrock/backup-credentials")  # per-target .env fil
 KOPIA_CONFIG_DIR = Path("/etc/bedrock/kopia")              # config files
 KOPIA_CACHE_ROOT = Path("/var/cache/bedrock-kopia")        # cache root
 
+# Multi-target replication: how long one `kopia repository sync-to` to a
+# secondary may run. Generous (an initial full mirror copies every blob);
+# incrementals are fast. Matches the backup stream timeout ceiling.
+SYNC_TO_TIMEOUT_S = 14400      # 4h
+SYNC_TO_PARALLEL = 8           # kopia sync-to --parallel
+
 # Content-addressing hash floor. Bedrock refuses to use any kopia repo
 # whose block hash is below 256 bits — that's the "data integrity is
 # non-negotiable" stance. A collision in the content hash means kopia
@@ -934,6 +940,128 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
                               if disk_results else "",
         "bytes_added": total_bytes,
     }
+
+
+# ── multi-target replication (kopia repository sync-to) ───────────────────
+
+
+def _kopia_syncto_cmd(primary_id: str, secondary_id: str, secondary: dict,
+                      *, delete_orphans: bool = False,
+                      parallel: int = SYNC_TO_PARALLEL) -> str:
+    """Build the `kopia repository sync-to` command that mirrors the PRIMARY
+    repo (connected via its own --config-file) to the SECONDARY backend.
+
+    Credential model (verified against kopia 0.21): the SOURCE read uses the
+    primary's connection + env (its <id>.env AWS_* + the shared KOPIA_PASSWORD);
+    the DESTINATION (secondary) creds are passed as --access-key/
+    --secret-access-key FLAGS, which override the AWS_* env — so they do NOT
+    clobber the source's env. The repo password is shared cluster-wide
+    (/etc/bedrock/backup.key), which is exactly what sync-to (a blob-level
+    mirror) requires."""
+    g = _kopia_global_flags(primary_id)        # --config-file=<primary>.config
+    env = _credentials_env(primary_id)         # primary AWS_* (source) + KOPIA_PASSWORD
+    kind = secondary.get("kind", "kopia-s3")
+    delete_flag = "--delete" if delete_orphans else "--no-delete"
+    # NOTE: no --must-exist. A mirror destination starts EMPTY; the first
+    # sync-to copies the SOURCE's format block (unique repo id, encryption,
+    # block hash) into it, making it a true byte-compatible mirror. With
+    # --must-exist kopia would refuse the empty destination ("destination does
+    # not have repository"); independently creating it instead would give it a
+    # DIFFERENT format and every sync-to would fail "incompatible data". So the
+    # mirror is created by sync-to and never by `kopia repository create`.
+    tail = f"--parallel={int(parallel)} {delete_flag}"
+    if kind == "kopia-s3":
+        sec_env = shlex.quote(str(CREDENTIALS_DIR / f"{secondary_id}.env"))
+        # Extract the SECONDARY's S3 creds in subshells so reading them never
+        # disturbs the primary's source-read env (the flags override AWS_*).
+        ak = (f'"$( set -a; . {sec_env} 2>/dev/null; '
+              f'printf %s "${{KOPIA_S3_ACCESS_KEY:-}}" )"')
+        sk = (f'"$( set -a; . {sec_env} 2>/dev/null; '
+              f'printf %s "${{KOPIA_S3_SECRET_KEY:-}}" )"')
+        return (
+            f"{env} && "
+            f"kopia {g} repository sync-to s3 "
+            f"  --bucket={shlex.quote(secondary.get('s3_bucket', ''))} "
+            f"  --endpoint={shlex.quote(secondary.get('s3_endpoint', ''))} "
+            f"  --region={shlex.quote(secondary.get('s3_region', ''))} "
+            f"  --access-key={ak} --secret-access-key={sk} "
+            f"  {_kopia_tls_flags(bool(secondary.get('s3_disable_tls')), bool(secondary.get('s3_disable_tls_verification')))}"
+            f"  {tail}"
+        )
+    return (
+        f"{env} && "
+        f"kopia {g} repository sync-to filesystem "
+        f"  --path={shlex.quote(secondary.get('filesystem_path', ''))} "
+        f"  {tail}"
+    )
+
+
+def run_sync_to_secondaries(primary_target_id: str,
+                            secondary_target_ids: list,
+                            *, vm_name: str = "",
+                            parallel: int = SYNC_TO_PARALLEL) -> dict:
+    """Mirror the PRIMARY kopia repo to each SECONDARY via `kopia repository
+    sync-to`, on THIS (the VM's home) node. The primary blobs are read once
+    and pushed to each secondary; every secondary shares the one cluster backup
+    password, so the mirrors are kopia-compatible.
+
+    Each secondary is synced INDEPENDENTLY (never &&-chained) so one
+    unreachable/failed mirror does NOT abort the rest. Returns
+    {ok:[ids], failed:[{target,reason}], results:[{target_id, ok, duration_s,
+    error}]}. Does NOT itself decide success/failure — the caller surfaces
+    partial failure. The primary backup already succeeded + is recorded; a
+    mirror failure must never mask that."""
+    cluster = _read_cluster()
+    targets = cluster.get("backup_targets") or {}
+    primary = targets.get(primary_target_id)
+    if primary is None:
+        # The backup step just wrote to this repo, so it must exist. A missing
+        # primary here is a real, loud error — not a silent skip.
+        raise RuntimeError(
+            f"sync-to: primary target {primary_target_id!r} not in cluster "
+            f"state — cannot mirror")
+    # Resume-safe: ensure the primary repo is connected on this node (a
+    # re-entry at the sync step after a crash starts a fresh process).
+    _ensure_local_connection(primary_target_id, primary)
+    delete_orphans = bool(primary.get("delete_orphans"))
+
+    results: list = []
+    for sec_id in (secondary_target_ids or []):
+        t0 = time.monotonic()
+        sec = targets.get(sec_id)
+        if sec is None:
+            results.append({"target_id": sec_id, "ok": False, "duration_s": 0.0,
+                            "error": "secondary target not in cluster state"})
+            log.error("sync-to[%s]: secondary %r not in cluster state — "
+                      "skipping (the other mirrors continue)", vm_name, sec_id)
+            continue
+        try:
+            cmd = _kopia_syncto_cmd(primary_target_id, sec_id, sec,
+                                    delete_orphans=delete_orphans,
+                                    parallel=parallel)
+            r = subprocess.run(["bash", "-lc", cmd], capture_output=True,
+                               text=True, timeout=SYNC_TO_TIMEOUT_S)
+            dur = time.monotonic() - t0
+            if r.returncode != 0:
+                msg = (r.stderr or r.stdout or "").strip()[-600:]
+                results.append({"target_id": sec_id, "ok": False,
+                                "duration_s": dur, "error": msg})
+                log.error("sync-to[%s] -> %s FAILED (rc=%d, %.1fs): %s",
+                          vm_name, sec_id, r.returncode, dur, msg)
+            else:
+                results.append({"target_id": sec_id, "ok": True,
+                                "duration_s": dur, "error": ""})
+                log.info("sync-to[%s] -> %s ok (%.1fs)", vm_name, sec_id, dur)
+        except Exception as e:
+            dur = time.monotonic() - t0
+            results.append({"target_id": sec_id, "ok": False,
+                            "duration_s": dur, "error": str(e)})
+            log.error("sync-to[%s] -> %s raised: %s", vm_name, sec_id, e)
+
+    ok = [r["target_id"] for r in results if r["ok"]]
+    failed = [{"target": r["target_id"], "reason": r["error"]}
+              for r in results if not r["ok"]]
+    return {"ok": ok, "failed": failed, "results": results}
 
 
 def _parse_kopia_create(json_out: str) -> tuple[str, int]:
