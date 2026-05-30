@@ -143,6 +143,9 @@
 			<a class="tree-top" class:active={isActive('/backups')} href="/backups">
 				<span class="tree-icon">⎘</span> Backups
 			</a>
+			<a class="tree-top" class:active={isActive('/witness')} href="/witness">
+				<span class="tree-icon">◈</span> Witness
+			</a>
 			<a class="tree-top" class:active={isActive('/topology')} href="/topology">
 				<span class="tree-icon">⇆</span> Topology
 				{#if $topology.switch_count > 0}

@@ -437,3 +437,37 @@ export interface SupportChecksResponse {
 export async function getSupportChecks(): Promise<SupportChecksResponse> {
 	return apiGet('/api/support/checks');
 }
+
+// ── Witness ─────────────────────────────────────────────────────────────────
+
+export interface Witness {
+	addr: string;
+	witness_pubkey: string;
+	encrypted_witness_key?: string;
+	backend?: 'echo' | 'smb' | 's3';
+}
+
+export async function listWitnesses(): Promise<{ witnesses: Record<string, Witness> }> {
+	return apiGet('/api/witnesses');
+}
+
+export async function addWitness(body: {
+	witness_id: string;
+	addr: string;
+	witness_pubkey?: string;
+	backend?: 'echo' | 'smb' | 's3';
+}) {
+	return apiPost('/api/witnesses', body);
+}
+
+export async function removeWitness(witness_id: string) {
+	const r = await fetch(`/api/witnesses/${encodeURIComponent(witness_id)}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
+export interface WitnessCandidate { ip: string; name: string; node: string; }
+
+export async function discoverWitnesses(): Promise<{ candidates: WitnessCandidate[] }> {
+	return apiGet('/api/witnesses/discover');
+}
