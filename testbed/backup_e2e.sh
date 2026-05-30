@@ -7,6 +7,28 @@ SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=y
 ip_of(){ python3 -c "import sys;sys.path.insert(0,'.');from spawn import get_mgmt_ip;print(get_mgmt_ip($1) or '')"; }
 RQ='curl -fsS --cert /etc/bedrock/node.crt --key /etc/bedrock/node.key.pem --cacert /etc/bedrock/ca.crt https://127.0.0.1:4001/db/query?level=strong'
 
+# ── ISO build — the e2e installs from THIS ISO, so it OWNS building it with
+#    the testbed SSH key. Building without --testbed ships an empty
+#    /root/.ssh/authorized_keys → key auth fails → the bootstrap poll can never
+#    SSH in and sticks at 0/4 (the 2026-05-30 footgun). Default: rebuild here so
+#    the run always tests current code with a reachable install. Iterating on
+#    THIS script (not the install)? Set BEDROCK_E2E_SKIP_ISO=1.
+if [ "${BEDROCK_E2E_SKIP_ISO:-0}" != "1" ]; then
+  echo "=== $(date) BUILD ISO (--testbed; BEDROCK_E2E_SKIP_ISO=1 to skip) ==="
+  ( cd ../installer/iso-build && bash build-iso.sh --testbed ) > /tmp/e2e-iso-build.log 2>&1
+  rc=$?; tail -3 /tmp/e2e-iso-build.log
+  [ $rc -eq 0 ] || { echo "!! ISO build FAILED (rc=$rc) — see /tmp/e2e-iso-build.log; aborting"; exit 1; }
+fi
+# Guard (runs even when the build is skipped): refuse to install from a
+# production-mode ISO whose kickstart preloads no authorized_keys — the nodes
+# would be unreachable and the whole run would silently stall.
+KS=../installer/iso-build/build/iso-extract-offline/ks.cfg
+if [ ! -f "$KS" ] || grep -q "production build . no authorized_keys" "$KS" 2>/dev/null; then
+  echo "!! ISO lacks the testbed SSH key (empty authorized_keys) — nodes unreachable."
+  echo "   Fix: cd installer/iso-build && bash build-iso.sh --testbed   (or unset BEDROCK_E2E_SKIP_ISO)"
+  exit 1
+fi
+
 echo "=== $(date) RESET + INSTALL ==="
 python3 spawn.py reset 2>&1 | tail -2
 python3 spawn.py up 4 2>&1 | tail -3

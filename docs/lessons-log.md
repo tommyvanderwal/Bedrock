@@ -1944,3 +1944,33 @@ across a quorum-gated rolling restart, rev kept advancing); the leader must
 log `cdc fanout` while followers do not; a fresh install must render the
 flag via ExecStartPre on first boot (CDC POSTs simply retry until
 bedrock-d's :8001 is up — they must never block rqlited startup).
+
+## L47 — the testbed e2e must build its OWN ISO with `--testbed`, or the fresh install is unreachable
+**2026-05-30**
+
+**What happened:** rebuilt the installer ISO with `bash build-iso.sh` (no
+flags) to bake the CDC changes, then launched the fresh-install e2e. It stuck
+at `0/4 bootstrap-done` for 20+ minutes. The VMs installed, rebooted from disk,
+got IPs, and ran sshd — but every SSH was `Permission denied (publickey)`, so
+the e2e's bootstrap poll (which SSHes in to test the marker) could never reach
+any node.
+
+**Root cause:** `build-iso.sh` defaults `TESTBED=0`; only `--testbed` flips it
+to 1. In production mode the kickstart `%post` writes **no**
+`/root/.ssh/authorized_keys` (`# (production build — no authorized_keys
+preloaded)`). So the fresh install had an empty authorized_keys; the baked key
+and `~/.ssh/id_ed25519` actually MATCH (both `tommy@HP-G1a`) — the key was just
+never installed. Not a CDC/2b regression; a build-mode mistake. The failure
+mode is nasty because it looks like a slow install (sshd is up, the node is
+"there"), not an auth misconfig.
+
+**What we changed:** the e2e now OWNS its ISO build. `backup_e2e.sh` rebuilds
+with `build-iso.sh --testbed` by default (so a run always tests current code
+against a reachable install; `BEDROCK_E2E_SKIP_ISO=1` to skip when iterating on
+the script itself), and — even when skipped — a guard refuses to install from a
+production-mode ISO (greps the staged `ks.cfg` for the no-authorized_keys
+marker) with the exact fix command. Fail loud, no silent 20-minute stall.
+
+**Reference:** the two SSH-key paths — build-iso's baked testbed key
+(`build-iso.sh:91`, `--testbed` only) vs spawn.py's `~/.ssh/id_ed25519` — must
+agree; they do, but only when the ISO is a testbed build.
