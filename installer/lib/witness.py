@@ -190,6 +190,21 @@ class WitnessState:
     # witnesses (the worker is a no-op / not started).
     configured_file_witnesses: list = field(default_factory=list)
 
+    # Per-S3-witness cached verdict (witness_id -> FileWitnessVerdict), written by
+    # witness_s3.run_io_cycle on the SAME off-hot-path worker and READ by
+    # count_valid_confirmed. A SEPARATE dict from file_witnesses so the two
+    # backends' atomic whole-dict swaps never clobber each other; the tally folds
+    # both into one set (a witness surfacing under both still counts once). Empty
+    # for clusters with no S3 witness (the fold below is then a no-op).
+    s3_witnesses: dict = field(default_factory=dict)
+
+    # Configured S3 witnesses as (witness_id, witness_s3.S3Config) pairs, refreshed
+    # each netd tick from the rqlite `witnesses` table (backend=='s3'). The
+    # off-hot-path IO worker (witness_s3.run_io_cycle) reads this to know WHICH
+    # buckets/prefixes to write/read slots on (no mount — direct SigV4 over HTTP).
+    # Empty = no S3 witnesses (the worker is a no-op / not started).
+    configured_s3_witnesses: list = field(default_factory=list)
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Crypto helpers
@@ -550,6 +565,17 @@ def count_valid_confirmed(ws: WitnessState, n_configured: int,
     # worker ages its witness out of the tally (safe direction). Same
     # configured-id binding and falsy=no-filter rule as the Echo path.
     for wid, v in ws.file_witnesses.items():
+        if ws.configured_witness_ids and wid not in ws.configured_witness_ids:
+            continue
+        if (now_mono - v.evaluated_monotonic) > WITNESS_FRESHNESS_S:
+            continue
+        if v.valid_confirmed:
+            confirmed.add(wid)
+    # ── S3 backend: identical fold over the S3 worker's verdict cache. Same
+    # freshness + configured-id binding + falsy=no-filter rule. `confirmed` is a
+    # SET keyed by witness_id, so a witness that somehow surfaced under more than
+    # one backend counts exactly once (never inflates the numerator).
+    for wid, v in ws.s3_witnesses.items():
         if ws.configured_witness_ids and wid not in ws.configured_witness_ids:
             continue
         if (now_mono - v.evaluated_monotonic) > WITNESS_FRESHNESS_S:
