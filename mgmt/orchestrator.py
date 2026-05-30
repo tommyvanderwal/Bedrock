@@ -85,6 +85,13 @@ _MAIN_LOOP = None
 # task is not garbage-collected.
 _CLUSTER_SRC = None
 
+# Wake event for operations_drain. The central loop sets it on every detected
+# change so a freshly-queued node-dispatched saga (vm_backup / vm_restore) runs
+# near-instantly instead of waiting out the drain's poll floor. Created in
+# start_all (bound to the running loop); the drain keeps its own poll floor as
+# the correctness backstop, so a missed wake just means "3s later", never lost.
+_OPS_WAKE = None
+
 # When non-None, all snapshot/last_log_idx/services_started reads + writes
 # go through this object instead of the module globals above. Set by
 # `attach_state(state)` from the unified bedrock-d entrypoint.
@@ -221,6 +228,13 @@ async def _cluster_change(revision: int, level: str) -> None:
     where bedrock-d started before state.json had node_name). NOT
     blanket-caught — a crash escalates to supervise(), never swallowed."""
     await asyncio.to_thread(_apply_at_level, revision, level)
+    # The state just changed — nudge the node-dispatched saga drain so a
+    # vm_backup/vm_restore op the leader just queued for this node runs now
+    # rather than waiting out its 3s poll floor. We are on the main loop here,
+    # so set the event directly (no cross-thread hop needed). The drain's poll
+    # floor still backstops a missed wake.
+    if _OPS_WAKE is not None:
+        _OPS_WAKE.set()
 
 
 def _apply_at_level(revision: int, level: str) -> None:
@@ -1223,10 +1237,22 @@ async def operations_drain():
     without the master SSHing in: the master writes the operation row,
     this loop on the home node picks it up (target_node match) and runs
     the saga locally, recording the result back to rqlite."""
-    log.info("operations_drain: started (kinds=%s, every %.0fs)",
+    log.info("operations_drain: started (kinds=%s, floor %.0fs + event wake)",
              sorted(_NODE_DISPATCHED_KINDS), _OPS_DRAIN_INTERVAL_S)
+    global _OPS_WAKE
+    if _OPS_WAKE is None:
+        _OPS_WAKE = asyncio.Event()
     while True:
-        await asyncio.sleep(_OPS_DRAIN_INTERVAL_S)
+        # Wait for the central loop to signal a state change (a saga op may have
+        # just been queued for us) OR the poll floor — whichever comes first.
+        # The floor is the correctness backstop; the wake is the fast path so a
+        # backup/restore starts ~now instead of up to _OPS_DRAIN_INTERVAL_S late.
+        try:
+            await asyncio.wait_for(_OPS_WAKE.wait(),
+                                   timeout=_OPS_DRAIN_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass  # poll floor fired
+        _OPS_WAKE.clear()
         if NO_QUORUM_MARKER.exists():
             continue   # need rqlite to read the queue and record results
         try:
@@ -1314,13 +1340,16 @@ def start_all():
     `arbiter: promoting` / `boot: role=leader` log lines, two competing
     rqlite_subscribers, and two no_quorum_responders that clobber
     each other's wait_for_role timing)."""
-    global _TASKS_STARTED, _MAIN_LOOP, _CLUSTER_SRC
+    global _TASKS_STARTED, _MAIN_LOOP, _CLUSTER_SRC, _OPS_WAKE
     with _START_LOCK:
         if _TASKS_STARTED:
             log.info("orchestrator: start_all already invoked (second "
                      "FastAPI startup hook, dual-uvicorn) — skipping")
             return
         _TASKS_STARTED = True
+    # operations_drain's wake event — created here on the running loop so the
+    # central loop can nudge it from the very first revision (no lazy race).
+    _OPS_WAKE = asyncio.Event()
     # Capture the running loop so worker-thread code (_apply_revision runs
     # in the rqlite_subscriber executor) can schedule tasks on it via
     # call_soon_threadsafe — asyncio.get_event_loop() raises in a worker
