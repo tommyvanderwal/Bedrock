@@ -3290,6 +3290,97 @@ def api_backup_target_remove(target_id: str, reason: str = ""):
     return {"status": "ok", "revision": rev, "target_id": target_id}
 
 
+# ── Witness management ──────────────────────────────────────────────
+# Add / list / remove cluster witnesses for the weighted-vote quorum
+# (each valid witness = 1 vote; nodes = 100). Writes the rqlite
+# `witnesses` table — Raft replicates it, and EVERY node's netd 1 Hz
+# election tick reloads the list automatically, so no explicit daemon
+# propagation is needed from mgmt (unlike the CLI path). The operator
+# dashboard drives these.
+
+class WitnessAddRequest(BaseModel):
+    witness_id: str
+    addr: str = ""             # "host" or "host:port" (echo default 12321)
+    witness_pubkey: str = ""   # X25519 pubkey hex (64 chars) — required for echo
+    backend: str = "echo"      # "echo" | "smb" | "s3"
+    reason: str = ""
+
+
+@app.get("/api/witnesses")
+def api_witnesses_list():
+    return {"witnesses": load_cluster().get("witnesses", {})}
+
+
+@app.post("/api/witnesses")
+def api_witness_add(req: WitnessAddRequest):
+    wid = (req.witness_id or "").strip()
+    if not wid:
+        raise HTTPException(400, "witness_id is required")
+    backend = (req.backend or "echo").strip().lower()
+    if backend not in ("echo", "smb", "s3"):
+        raise HTTPException(400, f"unknown witness backend {backend!r} "
+                                 f"(expected echo | smb | s3)")
+    addr = (req.addr or "").strip()
+    if not addr:
+        raise HTTPException(400, "addr is required (host or host:port)")
+    if ":" in addr:
+        host, _, port_s = addr.rpartition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            raise HTTPException(400, f"invalid port in addr {addr!r}")
+    else:
+        host, port = addr, 12321
+    pubkey = (req.witness_pubkey or "").strip().lower()
+    if backend == "echo":
+        # An Echo's X25519 public key is 32 bytes = 64 hex chars. Validate
+        # FAIL-LOUD: a bad paste would silently write a witness netd can never
+        # authenticate against (it would just never count toward quorum).
+        if len(pubkey) != 64 or any(c not in "0123456789abcdef" for c in pubkey):
+            raise HTTPException(
+                400, "witness_pubkey must be 64 hex chars (the Echo's X25519 "
+                "public key) for an echo witness")
+    try:
+        rev = _bs.witness_register(witness_id=wid, addr=f"{host}:{port}",
+                                   witness_pubkey_hex=pubkey,
+                                   encrypted_witness_key_hex="",
+                                   backend=backend)
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"witness {wid!r} added ({backend} {host}:{port})",
+             app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "witness_id": wid,
+            "addr": f"{host}:{port}", "backend": backend}
+
+
+@app.delete("/api/witnesses/{witness_id}")
+def api_witness_remove(witness_id: str, reason: str = ""):
+    try:
+        rev = _bs.witness_unregister(witness_id)
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"witness {witness_id!r} removed", app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "witness_id": witness_id}
+
+
+@app.get("/api/witnesses/discover")
+def api_witnesses_discover():
+    """Best-effort mDNS discovery of Bedrock services on the LAN — surfaced so
+    the dashboard can offer reachable hosts for one-click witness add. The
+    operator still supplies the Echo's pubkey. (Echo-specific service
+    advertisement is a follow-up; today this finds Bedrock nodes/clusters.)"""
+    try:
+        from lib import discovery as _disc
+        cands = _disc.discover_clusters(timeout=2.0)
+    except Exception as e:
+        raise HTTPException(500, f"discovery failed: {e}")
+    return {"candidates": [
+        {"ip": getattr(c, "ip", ""),
+         "name": getattr(c, "cluster_name", "") or getattr(c, "name", ""),
+         "node": getattr(c, "node_name", "")}
+        for c in (cands or [])]}
+
+
 @app.post("/api/vms/{vm_name}/backup")
 async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()):
     """Take a backup of `vm_name` to `target_id`. Returns 202 + task_id;
