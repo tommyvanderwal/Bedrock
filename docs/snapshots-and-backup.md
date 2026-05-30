@@ -217,6 +217,35 @@ chunk-existence check per chunk against the repo (over the network instead of
 local disk) — minutes of metadata round-trips for a large VM, then warm again.
 Dedup is repo-level, so a cold cache never re-uploads unchanged content.
 
+### 4a. Multi-target replication (mirrors)
+
+A primary target can **mirror** to one or more secondary targets. After a VM
+backup lands in the primary repo, the VM's home node runs
+`kopia repository sync-to <secondary>` for each mirror — a blob-level copy, so
+the source is read once and dedup is preserved (it does NOT re-snapshot per
+target). Each mirror is synced **independently** (never `&&`-chained) so one
+unreachable mirror can't abort the others.
+
+- A mirror destination is a normal `backup_targets` row but flagged
+  **`is_mirror`**: it is NEVER independently `kopia repository create`d (that
+  gives it an incompatible format block — see lessons-log **L49**). It starts
+  EMPTY; the first `sync-to` (no `--must-exist`) copies the PRIMARY's repo
+  format + blobs into it, making it a true byte-compatible mirror you can later
+  connect to and restore from. All targets share the one cluster backup
+  password (`/etc/bedrock/backup.key`), which is exactly what `sync-to` requires.
+- The relationship lives in the **`backup_target_sync`** table (composite PK
+  `primary_id, secondary_id`, ordered, `delete_orphans` flag). A mirror belongs
+  to exactly ONE primary (the API rejects fan-in — two primaries pushing
+  incompatible formats and `--delete`-pruning each other's blobs).
+- **Fail-loud but non-masking:** a mirror failure marks the backup operation
+  FAILED with a message that the PRIMARY backup SUCCEEDED and is restorable;
+  retry is safe (`sync-to` is idempotent and the primary step is skipped).
+- Set it via the dashboard (Backups → target form: "mirror destination"
+  checkbox + "Replicate to mirrors" multi-select) or `POST /api/backup/targets`
+  (`is_mirror` / `sync_to` / `delete_orphans`). Mirror S3 creds must be present
+  on every node (the sync refuses a kopia-s3 mirror whose `<id>.env` is missing,
+  rather than silently using the primary's identity).
+
 ---
 
 ## 5. Scheduling

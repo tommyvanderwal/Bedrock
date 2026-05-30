@@ -8,7 +8,7 @@ The witness lets a 2-node cluster make a safe arbiter failover when the peer lin
 - Keyspace: 1–250 = node slots (`witness.NODE_ID_MIN/MAX`; `_decode_slot` rejects anything outside this), 254 reserved for the arbiter VIP octet, 255 broadcast, 251–253 reserved, 0 unused. The arbiter's DRBD-UUID marker is NOT written under a slot[254]; it rides in the hosting node's OWN slot (1–250), which is what the takeover protocol reads.
 - **Each node OWNS its slot.** The witness files the slot blob under the envelope's `n` (the AEAD-verified writer id) — it can't read the encrypted slot body, so it never compares the two. Reader-side, `drain_replies` drops a slot whose decrypted inner `n` ≠ the map key. Within a cluster, the cluster_key is the auth boundary; cross-node spoofing is out of the threat model.
 - The witness has NO concept of master, election, claim, "bless", or "accept". It stores last-write per slot and returns all slots on every reply.
-- The implemented backend is **bedrock-echo** (UDP 12321). `WitnessState.discovered` already holds multiple Echo endpoints and `count_valid_confirmed` tallies each one independently, so multiple Echo witnesses each add a vote; a true majority-of-witnesses quorum read, and a fileshare (one file per slot, atomic write+rename) backend, are designed-for but not yet built.
+- The implemented backend is **bedrock-echo** (UDP 12321). `WitnessState.discovered` holds multiple Echo endpoints and `count_valid_confirmed` tallies each one independently — but ONLY those whose `echo_id` matches a configured `witness_id` (the identity binding below), so multiple Echo witnesses each add a vote while a rogue/removed endpoint cannot. Witnesses can be added by IP (directed unicast probe) or on the local L2 (broadcast). A true majority-of-witnesses quorum read, and a fileshare (one file per slot, atomic write+rename) backend, are designed-for but not yet built.
 
 ## Slot payload (the data the witness stores per slot)
 The payload is **AEAD-encrypted with `/etc/bedrock/cluster.key`** (32 bytes). The witness only ever stores+returns the ciphertext; it does NOT decrypt and CANNOT decrypt. Other cluster nodes verify and decrypt locally.
@@ -62,7 +62,7 @@ b"BREC" | nonce | ChaCha20-Poly1305(cluster_key, nonce, plaintext) | tag
 plaintext = msgpack({
   v:         1,
   t:         "ack",
-  echo_id:   "<witness instance id>",
+  echo_id:   "<witness instance id — MUST equal the configured witness_id>",
   cu:        cluster_uuid,
   slots:     {                          # ALL slots the witness has for this cluster_uuid
     node_id: <encrypted-slot-payload-bytes>,
@@ -72,6 +72,10 @@ plaintext = msgpack({
 ```
 
 The reader decrypts the envelope (proves cluster membership), then decrypts each slot (proves it was signed by a current cluster member). A reply that fails AEAD verification at either layer is silently dropped.
+
+**Witness-identity binding (split-brain guard).** Cluster-key auth alone proves "some holder of the cluster secret answered" — NOT "a configured witness answered". So `drain_replies` admits and `count_valid_confirmed` counts a reply ONLY if its `echo_id` matches a configured `witness_id` (`netd` plumbs `WitnessState.configured_witness_ids` from the rqlite `witnesses` table each tick, like `member_ids`). This stops two ways an over-count → split-brain could happen: a **rogue** Echo holding the cluster key but reporting an unconfigured id, and a **just-removed** witness's still-fresh entry (which would otherwise vote until the 12 s freshness window expires). The convention is therefore **`echo_id == witness_id`** — provision each Echo with its configured id (the testbed runs the stub `--echo-id <witness_id>`). A mismatched id is dropped (fail-safe: under-count, never over-count) and `netd` logs it (rate-limited) so the misconfiguration is visible. `configured_witness_ids` falsy (None at early boot, or an empty set from a momentarily-lagging `level='none'` replica) = no filter, so a stale zero-read can't evict a live witness. A non-Python Echo packing `echo_id` as msgpack bytes/int is normalized to a string before the compare. *Future defense-in-depth:* cryptographic per-witness identity — sign the ack with the Echo's key, verify the stored `witness_pubkey` (column exists, unused today) — to also stop a rogue that KNOWS a configured id.
+
+**Discovery (Echo-by-IP).** `netd` finds Echo witnesses by (a) a slot-less `broadcast_probe` to `255.255.255.255` (zero-config, local L2 only) AND (b) a directed `unicast_probe` to every configured Echo's `host:port` — so an Echo added BY IP that is routed/off the broadcast domain still gets probed and can vote. Replies key by `echo_id` in `discovered`, so the two paths dedupe to one endpoint. The directed-probe target must be an **IPv4 unicast literal** (the mgmt API + `_parse_echo_addr` enforce it): a hostname would block the single-threaded 1 Hz election tick on synchronous DNS, a multicast/broadcast addr would flood, and IPv6 is unreachable on the `AF_INET` witness socket.
 
 ## Slot lifecycle
 - Each node writes its own slot every **1 s** with current `(ts_writer, tag, marker)`.
@@ -181,7 +185,8 @@ At N≥2, even an eligible cold-booter holds off its FIRST promote for `COLD_BOO
 | backend | status | mechanism | persistence | notes |
 |---|---|---|---|---|
 | `bedrock-echo` (UDP/12321) | implemented | ESP32 firmware or `testbed/bedrock_echo_stub.py`. AEAD packets, slot map in memory + flushed to flash on every accepted write. | Required in production. Testbed stub may be RAM-only. | LAN flap → all slots stale → cluster halts safely. |
-| multiple Echo endpoints | implemented | Each discovered Echo holds its own slot cache (`EchoEndpoint.slots`), validated independently; `count_valid_confirmed` gives +1 per valid+confirmed witness (capped at `n_configured`). | Each Echo's own. | This is the per-witness tally; a *majority* read across witnesses is not yet built. |
+| multiple Echo endpoints | implemented | Each discovered Echo holds its own slot cache (`EchoEndpoint.slots`), validated independently; `count_valid_confirmed` gives +1 per valid+confirmed witness whose `echo_id` matches a configured `witness_id` (capped at `n_configured`). | Each Echo's own. | Per-witness tally, bound to the configured set; a *majority* read across witnesses is not yet built. |
+| Echo-by-IP (directed probe) | implemented | `netd` unicast-probes every configured Echo's IPv4 `host:port` alongside the L2 broadcast, so a routed/off-subnet Echo still votes. | n/a | IPv4 unicast only (no hostname/DNS on the election tick, no multicast/broadcast, no IPv6 on the AF_INET socket). |
 | fileshare (SMB / NFS / S3) | not yet built | One file per slot, `slot-<NN>.bin`, atomic `tmp + rename`. Same payload + envelope, no UDP framing. | The fileshare itself. | Writes must land in < 1 s. |
 | multi-witness quorum read | not yet built | A read returns a slot only if a majority of configured witnesses agree. | Each backend's own. | Wire protocol already permits multiple endpoints. |
 
