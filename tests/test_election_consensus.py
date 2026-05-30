@@ -371,6 +371,11 @@ def test_count_valid_confirmed_binds_to_configured_witness_ids():
     ws.configured_witness_ids = None
     ws.discovered = {"w-rogue": _ep("w-rogue", good())}
     assert witness.count_valid_confirmed(ws, n_configured=1) == 1
+    # EMPTY set (lagging local replica momentarily read 0 witnesses) → no
+    # filter, so a live legit Echo is NOT evicted (availability guard).
+    ws.configured_witness_ids = set()
+    ws.discovered = {"w-known": _ep("w-known", good())}
+    assert witness.count_valid_confirmed(ws, n_configured=1) == 1
 
 
 def test_count_valid_confirmed_caps_at_configured():

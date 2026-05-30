@@ -150,6 +150,13 @@ class WitnessState:
     # filtering (early boot), matching member_ids' convention.
     configured_witness_ids: Optional[set] = None
 
+    # echo_ids that ANSWERED but matched NO configured witness_id (a likely
+    # echo_id != witness_id typo, or a rogue). drain_replies records them;
+    # netd logs newly-seen ones so the otherwise-silent fail-safe drop is
+    # operator-visible (the witness is reachable but provisioned with a
+    # mismatched id → it never votes).
+    seen_unconfigured_echo_ids: set = field(default_factory=set)
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Crypto helpers
@@ -342,14 +349,32 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
         raw_echo_id = body.get("echo_id")
         if not raw_echo_id:
             continue
-        echo_id = str(raw_echo_id)
+        # Normalize to a str so it can match a configured witness_id (rqlite
+        # TEXT, always Python str). A conformant non-Python Echo (the ESP32
+        # target) may pack echo_id as msgpack BIN (bytes) or an int; bare
+        # str(b"id") would mangle it to "b'id'" and NEVER match → the legit
+        # witness would be silently dropped. Decode bytes as utf-8 (the ascii
+        # id case); fall back to hex for non-utf8.
+        if isinstance(raw_echo_id, (bytes, bytearray)):
+            try:
+                echo_id = raw_echo_id.decode("utf-8")
+            except UnicodeDecodeError:
+                echo_id = raw_echo_id.hex()
+        else:
+            echo_id = str(raw_echo_id)
         # Bind to a CONFIGURED witness: only admit replies whose echo_id is a
         # configured witness_id. A rogue Echo (has the cluster key, reports an
         # unconfigured id) and a just-removed witness's stale replies are
         # dropped at ingress, so they can never enter discovered or vote.
-        # (None = membership not yet known → no filter, early boot.)
-        if (ws.configured_witness_ids is not None
+        # Falsy (None OR empty set) = no filter: None is early-boot "unknown";
+        # an empty set is a lagging local replica that momentarily read zero
+        # witnesses — neither must evict a live, legit Echo (over-count is
+        # still bounded by n_configured, which is 0 in those cases anyway).
+        if (ws.configured_witness_ids
                 and echo_id not in ws.configured_witness_ids):
+            # Record the mismatch so netd can surface it (fail-loud): an Echo
+            # is answering but its echo_id matches no configured witness_id.
+            ws.seen_unconfigured_echo_ids.add(echo_id)
             continue
         now_ms = int(time.time() * 1000)
         ep = ws.discovered.get(echo_id)
@@ -470,8 +495,9 @@ def count_valid_confirmed(ws: WitnessState, n_configured: int,
         # Only count endpoints bound to a configured witness (echo_id matches a
         # configured witness_id). Defends against an entry admitted while
         # configured that should stop counting the instant the witness is
-        # removed — not 12s later when it ages out.
-        if (ws.configured_witness_ids is not None
+        # removed — not 12s later when it ages out. Falsy (None/empty) = no
+        # filter (early boot / lagging-replica zero-read; see drain_replies).
+        if (ws.configured_witness_ids
                 and ep.echo_id not in ws.configured_witness_ids):
             continue
         if (now_mono - ep.last_reply_monotonic) > WITNESS_FRESHNESS_S:

@@ -154,6 +154,10 @@ UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
 
+# Rate-limit (monotonic) for the "Echo answering with an unconfigured echo_id"
+# warning — a likely echo_id != witness_id misconfiguration.
+_LAST_UNCONFIGURED_WARN = 0.0
+
 # Loopback identity range — derived per-cluster from cluster_uuid via
 # cluster_addr.cluster_loopback_prefix(). Lives in RFC 6598 Shared
 # Address Space (100.64.0.0/10) so it can't collide with operator
@@ -1220,8 +1224,13 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     n_configured_witnesses = len(_witnesses)
     # Bind voting witnesses to the configured set: only a reply whose echo_id
     # matches a configured witness_id is admitted/counted (drops a rogue Echo
-    # and a just-removed witness's stale entry from the tally).
-    ws.configured_witness_ids = set(_witnesses.keys())
+    # and a just-removed witness's stale entry from the tally). EMPTY → None
+    # (no filter): a lagging local replica (level='none', node replaying its
+    # Raft log) can momentarily read ZERO witness rows without error; an empty
+    # SET would then drop every live, legit Echo. None means "membership not
+    # known here, don't filter" — and when there genuinely are 0 witnesses,
+    # count_valid_confirmed returns 0 anyway (n_configured<=0), so no over-count.
+    ws.configured_witness_ids = set(_witnesses.keys()) or None
     # Refresh the directed-probe list for next tick's witness IO: every
     # backend=='echo' witness's (host, port). Lets an Echo added BY IP that is
     # off the broadcast domain still get probed + vote.
@@ -1238,6 +1247,21 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # each contribute +1 to the tally.
     n_valid_witnesses = _witness.count_valid_confirmed(
         ws, n_configured_witnesses)
+
+    # Surface a silent misconfiguration (fail-loud): an Echo is answering but
+    # its echo_id matches no configured witness_id (a likely echo_id !=
+    # witness_id typo, or a rogue) — so it never votes. Rate-limited to ~60s.
+    if ws.seen_unconfigured_echo_ids:
+        global _LAST_UNCONFIGURED_WARN
+        now_w = time.monotonic()
+        if now_w - _LAST_UNCONFIGURED_WARN >= 60.0:
+            _LAST_UNCONFIGURED_WARN = now_w
+            sys.stderr.write(
+                "bedrock-net: WARNING — Echo(es) answering with echo_id(s) "
+                f"{sorted(ws.seen_unconfigured_echo_ids)} that match NO "
+                f"configured witness_id {sorted(ws.configured_witness_ids or [])}"
+                " — they will NOT vote. Provision each Echo with "
+                "--echo-id == its `bedrock witness add <id>` id.\n")
 
     # 3b. Local arbiter-DRBD UUID — the eligibility proof we advertise
     # AND the input we fold into our own 7-day history (so a voter on
