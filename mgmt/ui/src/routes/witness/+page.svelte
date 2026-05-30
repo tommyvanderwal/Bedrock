@@ -13,7 +13,7 @@
 	// add form
 	let f_id = $state('');
 	let f_addr = $state('');
-	let f_backend = $state<'echo' | 'smb' | 's3'>('echo');
+	let f_backend = $state<'echo' | 'fileshare'>('echo');
 	let f_pubkey = $state('');
 	let adding = $state(false);
 
@@ -40,11 +40,17 @@
 	async function add() {
 		error = ''; notice = '';
 		if (!f_id.trim()) { error = 'Witness id is required'; return; }
-		if (!f_addr.trim()) { error = 'Address is required (host or host:port)'; return; }
 		if (f_backend === 'echo') {
+			if (!f_addr.trim()) { error = 'Address is required (host or host:port)'; return; }
 			const pk = f_pubkey.trim().toLowerCase();
 			if (!/^[0-9a-f]{64}$/.test(pk)) {
 				error = "An Echo witness needs its 64-hex X25519 public key";
+				return;
+			}
+		} else {
+			// fileshare: addr is an absolute directory the share is mounted at
+			if (!f_addr.trim().startsWith('/')) {
+				error = 'A fileshare witness needs the absolute path of the mounted share (e.g. /mnt/witness)';
 				return;
 			}
 		}
@@ -115,11 +121,12 @@
 		<label>Backend
 			<select bind:value={f_backend}>
 				<option value="echo">BedRock Echo (UDP)</option>
-				<option value="smb" disabled>Fileshare SMB (coming soon)</option>
-				<option value="s3" disabled>Fileshare S3 (coming soon)</option>
+				<option value="fileshare">Fileshare (mounted dir)</option>
 			</select>
 		</label>
-		<label>Address<input placeholder={f_backend === 'echo' ? 'host or host:12321' : 'host:port'} bind:value={f_addr} /></label>
+		<label>{f_backend === 'echo' ? 'Address' : 'Share path'}<input
+			placeholder={f_backend === 'echo' ? 'host or host:12321' : '/mnt/witness (absolute path)'}
+			bind:value={f_addr} spellcheck="false" /></label>
 		{#if f_backend === 'echo'}
 			<label class="wide">Echo public key (X25519, 64 hex)
 				<input placeholder="64 hex chars" bind:value={f_pubkey} spellcheck="false" />
@@ -129,9 +136,10 @@
 	<button class="btn-add" onclick={add} disabled={adding}>{adding ? 'Adding…' : 'Add witness'}</button>
 	<p class="hint">A witness raises the quorum bar by one vote and only counts toward
 		failover once it is reachable + valid — a configured-but-unreachable witness
-		is split-brain-safe (it makes failover harder, never easier). Only BedRock
-		Echo witnesses are active today; fileshare (SMB/S3) witnesses are a planned
-		backend.</p>
+		is split-brain-safe (it makes failover harder, never easier). A
+		<strong>fileshare</strong> witness is a directory you have mounted the same
+		NFS/SMB/object share at on <em>every</em> node; Bedrock writes its slot files
+		there. The path must exist and be writable on each node before it can vote.</p>
 </div>
 
 <div class="card">

@@ -452,7 +452,7 @@ export interface Witness {
 	addr: string;
 	witness_pubkey: string;
 	encrypted_witness_key?: string;
-	backend?: 'echo' | 'smb' | 's3';
+	backend?: 'echo' | 'fileshare';
 }
 
 export async function listWitnesses(): Promise<{ witnesses: Record<string, Witness> }> {
@@ -463,7 +463,7 @@ export async function addWitness(body: {
 	witness_id: string;
 	addr: string;
 	witness_pubkey?: string;
-	backend?: 'echo' | 'smb' | 's3';
+	backend?: 'echo' | 'fileshare';
 }) {
 	return apiPost('/api/witnesses', body);
 }
