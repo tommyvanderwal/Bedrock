@@ -35,6 +35,30 @@ python3 spawn.py up 4 2>&1 | tail -3
 python3 spawn.py wait 4 2>&1 | tail -6
 echo "=== $(date) POLL bootstrap-done ==="
 for i in $(seq 1 45); do n=0; for s in 1 2 3 4; do ip=$(ip_of $s); [ -z "$ip" ] && continue; ssh $SSHO root@"$ip" 'test -f /var/lib/bedrock-install/.bootstrap-done' 2>/dev/null && n=$((n+1)); done; echo "[$(date +%H:%M:%S)] $n/4"; [ "$n" -eq 4 ] && break; sleep 20; done
+
+# IP-settle gate (L48). After bootstrap, mgmt IPs can still churn as firstboot
+# reconfigures the mesh NICs, and the host ARP cache (br0) may hold STALE
+# entries from a prior install. get_mgmt_ip reads `virsh domifaddr --source arp`
+# — a stale entry → setup_4node_cluster joins the wrong/old IP and the fresh
+# nodes never cluster (observed 2026-05-30: solo leader, nodes=0). Flush stale
+# ARP and require each node's IP to be STABLE (two equal reads) + SSH-reachable
+# as a fresh bedrock node before clustering.
+echo "=== $(date) IP-settle gate (stable + reachable, post-ARP-flush) ==="
+sudo ip neigh flush dev br0 2>/dev/null || true
+for i in $(seq 1 18); do
+  ok=0
+  for s in 1 2 3 4; do
+    a=$(ip_of $s); sleep 1; b=$(ip_of $s)
+    [ -n "$a" ] && [ "$a" = "$b" ] && \
+      ssh $SSHO root@"$a" 'test -f /var/lib/bedrock-install/.bootstrap-done && command -v bedrock >/dev/null' 2>/dev/null && \
+      ok=$((ok+1))
+  done
+  echo "[$i] stable+reachable: $ok/4"
+  [ "$ok" -eq 4 ] && { echo "✓ mgmt IPs settled — safe to cluster"; break; }
+  sudo ip neigh flush dev br0 2>/dev/null || true
+  sleep 10
+done
+
 for s in 1 2 3 4; do ip=$(ip_of $s); ssh $SSHO root@"$ip" 'mkdir -p /var/log/journal; systemctl restart systemd-journald' 2>/dev/null; done
 echo "=== $(date) CLUSTER BRING-UP ==="
 bash setup_4node_cluster.sh 2>&1 | tail -10

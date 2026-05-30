@@ -1974,3 +1974,40 @@ marker) with the exact fix command. Fail loud, no silent 20-minute stall.
 **Reference:** the two SSH-key paths — build-iso's baked testbed key
 (`build-iso.sh:91`, `--testbed` only) vs spawn.py's `~/.ssh/id_ed25519` — must
 agree; they do, but only when the ISO is a testbed build.
+
+## L48 — the e2e must gate cluster bring-up on STABLE + REACHABLE mgmt IPs
+**2026-05-30**
+
+**What happened:** with the `--testbed` ISO fixed (L47), the fresh install
+bootstrapped (bedrock-d 4/4, `.bootstrap-done` 4/4) — but `setup_4node_cluster.sh`
+ran immediately after and **never formed the cluster**: sim-1 ended a solo rqlite
+leader (`nodes=0`), sims 3/4 had no identity. Its log referenced **old IPs
+(.168/.170) and an old node name** from the prior install.
+
+**Root cause:** the sims' mgmt IPs are NOT stable in the window right after
+`.bootstrap-done`. `get_mgmt_ip` resolves via `virsh domifaddr --source arp`
+(the mgmt NIC is bridged to the LAN on `br0`; DHCP comes from the home router,
+so libvirt has no lease records). In the churn window three things lie:
+  1. the host **ARP cache holds stale entries** from the prior install (the old
+     VM's MAC→IP, not yet expired);
+  2. before the new VM has ARP'd, `get_mgmt_ip` falls through to its
+     **hardcoded `.201+i` last resort**, which the router does NOT honor — a
+     plausible-but-wrong, unreachable IP that callers can't tell from a real one;
+  3. firstboot reconfigures the mesh NICs, cycling the real DHCP lease
+     (observed .201→.172 within ~minutes) before it settles.
+`setup_4node_cluster.sh` resolves IPs live and ran mid-churn → joined a wrong IP
+→ no cluster. Each reset gives the VM a **new MAC** (hence new node name, which
+is MAC-derived: `52:54:00:48:84:c1` → `bedrock-4884c1`), so old ARP/lease entries
+never match the new node.
+
+**What we changed:** `backup_e2e.sh` now runs an **IP-settle gate** after the
+bootstrap poll and before clustering: flush `br0`'s ARP (`ip neigh flush dev
+br0`), then require each node's `get_mgmt_ip` to be **stable across two reads**
+AND **SSH-reachable as a fresh bedrock node** before proceeding. The
+reachability check is what rejects the bogus `.201+i` fallback (nothing answers
+there) and stale ARP (old VM gone).
+
+**Follow-up (not yet done):** `get_mgmt_ip`'s hardcoded `.201+i` fallback is a
+latent footgun for every caller — returning a wrong-but-plausible IP instead of
+`None`. Consider returning `None` when ARP+agent both miss, so callers wait
+instead of acting on a bogus address.
