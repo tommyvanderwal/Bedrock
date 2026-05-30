@@ -631,6 +631,7 @@ LIB_FILES=(
     election.py
     witness.py
     witness_file.py
+    storage_mount.py
     state_shared.py
     workload.py
     cluster_ca.py
