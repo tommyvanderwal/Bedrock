@@ -12,8 +12,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
 
+import types                   # noqa: E402
+
 from lib import witness        # noqa: E402
 from lib import witness_file   # noqa: E402
+from lib import netd           # noqa: E402
 
 
 _KEY = b"k" * 32
@@ -229,3 +232,44 @@ def test_run_io_cycle_isolates_a_bad_witness_from_a_good_one(tmp_path):
     witness_file.run_io_cycle(ws, now_mono=1000.0, log=lambda m: None)
     assert "bad" not in ws.file_witnesses
     assert ws.file_witnesses["good"].valid_confirmed is True
+
+
+# ── netd._witness_file_worker (the background-thread body) ────────────────
+
+def test_witness_file_worker_runs_real_cycle_then_stops(tmp_path):
+    """The worker drives the REAL run_io_cycle and produces a verdict, then
+    honours should_stop. Exercised inline (not in a Thread) for determinism."""
+    d = str(tmp_path)
+    witness_file.write_own_slot(_ws(1, members={1, 2}, marker=b"m1"), d)
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.configured_file_witnesses = [("fs1", d)]
+    stop = {"v": False}
+
+    def cycle_then_stop(w, **kw):
+        witness_file.run_io_cycle(w, **kw)   # the real thing
+        stop["v"] = True                     # one pass, then ask to stop
+
+    netd._witness_file_worker(
+        ws, types.SimpleNamespace(run_io_cycle=cycle_then_stop),
+        lambda: stop["v"], interval=0.01)
+    assert ws.file_witnesses["fs1"].valid_confirmed is True
+
+
+def test_witness_file_worker_survives_a_cycle_exception(tmp_path):
+    """A raise inside run_io_cycle must NOT kill the worker (fail-loud): it
+    logs and loops again."""
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.configured_file_witnesses = [("fs1", "/x")]
+    calls = {"n": 0}
+    stop = {"v": False}
+
+    def flaky(w, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")       # first pass blows up
+        stop["v"] = True                     # second pass: survived → stop
+
+    netd._witness_file_worker(
+        ws, types.SimpleNamespace(run_io_cycle=flaky),
+        lambda: stop["v"], interval=0.001)
+    assert calls["n"] >= 2                    # ran again after the exception

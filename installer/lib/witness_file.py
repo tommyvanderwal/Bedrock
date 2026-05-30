@@ -136,25 +136,35 @@ def run_io_cycle(ws: "witness.WitnessState", *,
         absent, our readback didn't match) records a FRESH False — a real
         "not certifying right now", counted as 0 immediately.
 
-    Verdicts for witnesses no longer configured are pruned up front so a removed
-    fileshare witness drops out at once (belt-and-suspenders with the tally's
-    configured-id binding). Only OSError is caught here (the expected IO
-    failures); anything else propagates to the worker loop, which logs loudly
-    and keeps the thread alive (fail-loud, never silently dead)."""
+    Verdicts for witnesses no longer configured are pruned (absent from the
+    rebuilt map) so a removed fileshare witness drops out at once
+    (belt-and-suspenders with the tally's configured-id binding). Only OSError
+    is caught here (the expected IO failures); anything else propagates to the
+    worker loop, which logs loudly and keeps the thread alive (fail-loud, never
+    silently dead).
+
+    THREAD SAFETY: this builds a FRESH verdict map and atomically reassigns
+    ``ws.file_witnesses`` — it never mutates the live dict in place. The
+    election tick reads ``ws.file_witnesses`` on another thread; under the GIL
+    the reassign is atomic, so a mid-read tick simply finishes iterating the old
+    map (which is no longer being mutated). No lock, and never a "dict changed
+    size during iteration"."""
     if now_mono is None:
         now_mono = time.monotonic()
-    configured = list(ws.configured_file_witnesses)
-    configured_ids = {wid for wid, _ in configured}
-    for wid in list(ws.file_witnesses):
-        if wid not in configured_ids:
-            del ws.file_witnesses[wid]      # removed witness → drop its verdict
-    for wid, path in configured:
+    prior = ws.file_witnesses
+    new_verdicts: Dict[str, "witness.FileWitnessVerdict"] = {}
+    for wid, path in list(ws.configured_file_witnesses):
         try:
             write_own_slot(ws, path, now_ms=now_ms)
             ok = is_valid_confirmed(ws, path, now_local_ms=now_ms)
         except OSError as e:
             if log is not None:
                 log(f"fileshare witness {wid} ({path}) IO error: {e!r}")
-            continue                        # leave prior verdict to age out
-        ws.file_witnesses[wid] = witness.FileWitnessVerdict(
+            # Carry the PRIOR verdict forward UNCHANGED so a transient blip ages
+            # out over the freshness window instead of flipping to False now.
+            if wid in prior:
+                new_verdicts[wid] = prior[wid]
+            continue
+        new_verdicts[wid] = witness.FileWitnessVerdict(
             witness_id=wid, valid_confirmed=ok, evaluated_monotonic=now_mono)
+    ws.file_witnesses = new_verdicts        # atomic swap (see THREAD SAFETY)

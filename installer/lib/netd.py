@@ -1241,6 +1241,18 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
             if (w.get("backend") or "echo") == "echo"
         ) if ep is not None
     ]
+    # Refresh the fileshare-witness list (backend=='fileshare') for the
+    # off-hot-path slot-IO worker: (witness_id, local mount path). The worker
+    # writes/reads slot-<NN>.bin there and caches a verdict in ws.file_witnesses
+    # that count_valid_confirmed folds. The election tick itself NEVER touches
+    # the share (SMB/S3 latency stays off the 1Hz path); it only sets this list.
+    # witness_id stays in configured_witness_ids above (set() over ALL backends),
+    # so the tally's identity binding covers fileshare witnesses too.
+    ws.configured_file_witnesses = [
+        (wid, w.get("addr", ""))
+        for wid, w in _witnesses.items()
+        if (w.get("backend") or "echo") == "fileshare" and w.get("addr")
+    ]
     # M10 multi-witness: count CONFIGURED witnesses that are INDIVIDUALLY
     # valid+confirmed (capped at n_configured), not a hard-coded 0/1.
     # Single-witness testbed still yields 0/1; multiple valid witnesses
@@ -1568,6 +1580,40 @@ def _run_silent_capture(cmd: list[str]) -> tuple[int, str, str]:
     return r.returncode, r.stdout or "", r.stderr or ""
 
 
+WITNESS_FILE_IO_INTERVAL_S = 3.0   # off-hot-path slot-IO cadence (< the 12s
+#                                    witness freshness window even at S3 ~1.2s/op)
+
+
+def _witness_file_worker(ws, _witness_file, should_stop,
+                         *, interval: float = WITNESS_FILE_IO_INTERVAL_S):
+    """Background thread body: drive fileshare-witness slot IO OFF the 1Hz
+    election tick (an SMB/S3 share's multi-hundred-ms latency must never stall
+    mesh routing + election). Each pass calls witness_file.run_io_cycle, which
+    writes our slot + caches a verdict in ws.file_witnesses for the tick to
+    fold. A no-op while no fileshare witness is configured (the common case),
+    so it is always safe to run.
+
+    Fail-loud + always-alive: every iteration is wrapped in a broad except that
+    logs and continues — a bug or an unexpected error must never silently kill
+    witnessing (a dead worker would let every fileshare witness age out and
+    quietly disable that arbitration path). Sleeps in small slices so shutdown
+    is prompt (<=0.2s)."""
+    while not should_stop():
+        try:
+            if ws.configured_file_witnesses:
+                _witness_file.run_io_cycle(
+                    ws,
+                    log=lambda m: sys.stderr.write(f"bedrock-net: {m}\n"),
+                )
+        except Exception as e:   # fail-loud, never let the worker die
+            sys.stderr.write(
+                f"bedrock-net: witness-file worker error: {e!r}\n")
+        slept = 0.0
+        while slept < interval and not should_stop():
+            time.sleep(0.2)
+            slept += 0.2
+
+
 def run_daemon(shared_state=None):
     """Main netd loop. If `shared_state` is a state_shared.BedrockState
     instance, the constructed Daemon is also attached as `shared_state.netd`
@@ -1672,10 +1718,12 @@ def run_daemon(shared_state=None):
     # (split-brain prevention), which is the correct behaviour.
     try:
         from . import witness as _witness, election as _election
+        from . import witness_file as _witness_file
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import witness as _witness, election as _election  # type: ignore
+        from lib import witness_file as _witness_file  # type: ignore
     # node_id is the last octet of our /32 loopback (1-250 per
     # cluster-quorum-spec.md). Always present in N>=1 once state.json
     # has been initialised by mgmt_install/agent_install.
@@ -1719,6 +1767,18 @@ def run_daemon(shared_state=None):
         if shared_state is not None and shared_state.stop_event.is_set():
             return True
         return False
+
+    # Fileshare-witness slot IO runs on its OWN thread so an SMB/S3 share's
+    # latency can never stall the 1Hz election/mesh loop below. It shares `ws`
+    # (reads cluster_key/member_ids/own_marker set by the tick; atomically
+    # reassigns ws.file_witnesses for the tick to fold). It is a no-op until a
+    # backend=='fileshare' witness is configured, so it is always safe to start.
+    _wf_thread = threading.Thread(
+        target=_witness_file_worker,
+        args=(ws, _witness_file, _should_stop),
+        name="bedrock-witness-file", daemon=True,
+    )
+    _wf_thread.start()
 
     while not _should_stop():
         try:
@@ -1823,6 +1883,11 @@ def run_daemon(shared_state=None):
         except Exception as e:
             sys.stderr.write(f"bedrock-net: tick error: {e!r}\n")
         time.sleep(TICK_INTERVAL)
+
+    # Stop requested: the worker is a daemon thread that polls _should_stop()
+    # every <=0.2s, so it exits on its own; join briefly for a clean stop, but
+    # bounded so a hung share's in-flight IO can't block daemon shutdown.
+    _wf_thread.join(timeout=2.0)
 
 
 def tick(d: Daemon, last_probe: float, last_route_emit: float) -> None:
