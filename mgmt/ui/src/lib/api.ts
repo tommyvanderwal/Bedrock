@@ -272,6 +272,10 @@ export interface BackupTarget {
 	filesystem_path?: string;
 	override_source_prefix?: string;
 	cache_directory?: string;
+	// Multi-target replication
+	is_mirror?: boolean;       // a sync-to destination (never independently created)
+	sync_to?: string[];        // secondary target ids this primary mirrors to
+	delete_orphans?: boolean;  // kopia sync-to --delete (prune mirrors)
 }
 
 export interface VmBackupDisk {
@@ -312,6 +316,10 @@ export interface BackupTargetSetRequest {
 	s3_secret_key?: string;
 	encryption_password?: string;
 	force_password_overwrite?: boolean;
+	// Multi-target replication
+	is_mirror?: boolean;
+	sync_to?: string[];
+	delete_orphans?: boolean;
 }
 
 export interface BackupCredsStatus {

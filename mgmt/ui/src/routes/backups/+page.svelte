@@ -26,6 +26,20 @@
 	let filesystem_path = $state('');
 	let override_source_prefix = $state('');  // server fills with cluster_uuid:vms
 
+	// Multi-target replication
+	let is_mirror = $state(false);            // this target is a sync-to destination
+	let sync_to = $state<string[]>([]);       // mirror targets this primary replicates to
+	let delete_orphans = $state(false);       // kopia sync-to --delete
+	// Targets eligible to be sync-to secondaries: other targets marked is_mirror.
+	const mirrorTargets = $derived(
+		Object.values(targets)
+			.filter((t: any) => t.is_mirror && t.id !== target_id)
+			.map((t: any) => t.id as string)
+	);
+	function toggleSyncTo(id: string) {
+		sync_to = sync_to.includes(id) ? sync_to.filter((s) => s !== id) : [...sync_to, id];
+	}
+
 	let s3_access_key = $state('');
 	let s3_secret_key = $state('');
 	let encryption_password = $state('');
@@ -71,6 +85,9 @@
 				s3_region = existing.s3_region || s3_region;
 				filesystem_path = existing.filesystem_path || '';
 				override_source_prefix = existing.override_source_prefix || '';
+				is_mirror = !!existing.is_mirror;
+				sync_to = Array.isArray(existing.sync_to) ? [...existing.sync_to] : [];
+				delete_orphans = !!existing.delete_orphans;
 			}
 		} catch (e: any) {
 			banner = { kind: 'err', text: `Load failed: ${e.message}` };
@@ -165,6 +182,10 @@
 				encryption_password: encryption_password || undefined,
 				// force_password_overwrite intentionally omitted — UI
 				// never rotates passwords; CLI-only emergency path.
+				is_mirror,
+				// A mirror destination has no mirrors of its own.
+				sync_to: is_mirror ? [] : sync_to,
+				delete_orphans,
 				reason: 'set via dashboard',
 			});
 			const warns = (r as any)?.warnings as string[] | undefined;
@@ -239,7 +260,13 @@
 			<tbody>
 				{#each Object.entries(targets) as [id, t]}
 					<tr>
-						<td><code>{id}</code></td>
+						<td>
+							<code>{id}</code>
+							{#if t.is_mirror}<span class="badge mirror">mirror</span>{/if}
+							{#if t.sync_to && t.sync_to.length > 0}
+								<span class="badge sync">→ {t.sync_to.join(', ')}</span>
+							{/if}
+						</td>
 						<td>{t.kind}</td>
 						<td>
 							{#if t.kind === 'kopia-s3'}
@@ -458,6 +485,43 @@
 		</label>
 	</div>
 
+	<div class="row">
+		<label class="check">
+			<input type="checkbox" bind:checked={is_mirror} />
+			This is a replication <strong>mirror</strong> destination
+			<span class="hint">A mirror receives data from a primary via <code>kopia sync-to</code>;
+				it is never initialized directly + nothing backs up to it. Leave unchecked for a normal target.</span>
+		</label>
+	</div>
+
+	{#if !is_mirror}
+		<div class="row">
+			<label class="grow">Replicate to mirrors <span class="muted">(multi-target)</span>
+				{#if mirrorTargets.length === 0}
+					<span class="hint">No mirror targets exist yet. Create one with “mirror destination” checked, then come back to wire it here.</span>
+				{:else}
+					<div class="mirror-list">
+						{#each mirrorTargets as mid}
+							<label class="check inline">
+								<input type="checkbox" checked={sync_to.includes(mid)} onchange={() => toggleSyncTo(mid)} />
+								<code>{mid}</code>
+							</label>
+						{/each}
+					</div>
+					<span class="hint">After each backup to this target, mirror it to the selected repos (source read once).</span>
+				{/if}
+			</label>
+		</div>
+		{#if sync_to.length > 0}
+			<div class="row">
+				<label class="check">
+					<input type="checkbox" bind:checked={delete_orphans} />
+					Prune mirror snapshots not in the primary <span class="muted">(sync-to --delete)</span>
+				</label>
+			</div>
+		{/if}
+	{/if}
+
 	<div class="actions">
 		<button class="btn primary" onclick={submit} disabled={submitting}>
 			{submitting ? 'Saving…' : 'Save target'}
@@ -672,4 +736,16 @@
 		background: #21262d; padding: 1px 6px; border-radius: 3px; color: #c9d1d9;
 	}
 	.critical-notice p { margin: 8px 0 0; }
+
+	/* multi-target replication controls */
+	.check { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+		font-size: 13px; color: #c9d1d9; cursor: pointer; }
+	.check input[type="checkbox"] { width: auto; margin: 0; }
+	.check.inline { display: inline-flex; margin-right: 14px; font-size: 12px; }
+	.check .hint { flex-basis: 100%; margin-top: 2px; }
+	.mirror-list { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0; }
+	.badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 3px;
+		font-size: 10px; vertical-align: middle; }
+	.badge.mirror { background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb55; }
+	.badge.sync { background: #23863622; color: #3fb950; border: 1px solid #23863655; font-family: ui-monospace, monospace; }
 </style>
