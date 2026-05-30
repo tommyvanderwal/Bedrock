@@ -320,7 +320,18 @@ def drain_replies(ws: WitnessState, max_packets: int = 32) -> None:
             continue
         if body.get("t") != "ack":
             continue
-        echo_id = str(body.get("echo_id") or src[0])
+        # Require a STABLE witness identity (echo_id). Keying by source IP
+        # (the old fallback) let ONE physical Echo answering from two source
+        # IPs — multi-homed / NAT'd, or reachable by BOTH broadcast AND a
+        # directed by-IP probe — create TWO discovered entries and be counted
+        # twice in count_valid_confirmed, manufacturing false witness quorum
+        # (split-brain risk). An Echo that omits echo_id can't be safely
+        # deduped, so its replies are IGNORED — fail-safe (under-count, never
+        # over-count). A conformant Echo always sets echo_id.
+        raw_echo_id = body.get("echo_id")
+        if not raw_echo_id:
+            continue
+        echo_id = str(raw_echo_id)
         now_ms = int(time.time() * 1000)
         ep = ws.discovered.get(echo_id)
         if ep is None:

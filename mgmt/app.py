@@ -3356,29 +3356,17 @@ def api_witness_add(req: WitnessAddRequest):
             f"failover. (The fileshare/S3 witness backend is a future build.)")
     addr = (req.addr or "").strip()
     if not addr:
-        raise HTTPException(400, "addr is required (host or host:port)")
-    # Parse host[:port]. Support bracketed IPv6 ([::1]:port / [::1]); a bare
-    # IPv6 literal (2+ colons, no brackets) is taken as the host with the
-    # default port (rpartition would otherwise mangle it). Port must be valid.
+        raise HTTPException(400, "addr is required (ipv4 or ipv4:port)")
+    # An Echo witness must be an IPv4 UNICAST literal: netd directed-probes it
+    # from the single-threaded 1Hz election tick over an AF_INET socket, so a
+    # hostname (synchronous getaddrinfo would stall failover detection), an
+    # IPv6 literal (unreachable on AF_INET), or a multicast/broadcast/0.0.0.0
+    # addr (would flood the segment) are all refused HERE — fail loud at add
+    # time rather than register an unusable witness that silently raises the
+    # quorum bar. host:port, default port 12321.
+    import ipaddress as _ipaddr
+    host, _, port_s = addr.partition(":") if ":" in addr else (addr, "", "")
     port = 12321
-    if addr.startswith("["):
-        host, sep, rest = addr[1:].partition("]")
-        if not sep:
-            raise HTTPException(400, f"malformed bracketed address {addr!r}")
-        if rest.startswith(":"):
-            port_s = rest[1:]
-        elif rest == "":
-            port_s = ""
-        else:
-            raise HTTPException(400, f"malformed address after ] in {addr!r}")
-    elif addr.count(":") >= 2:
-        host, port_s = addr, ""          # bare IPv6 literal, default port
-    elif ":" in addr:
-        host, _, port_s = addr.partition(":")
-    else:
-        host, port_s = addr, ""
-    if not host:
-        raise HTTPException(400, f"address {addr!r} has no host")
     if port_s:
         try:
             port = int(port_s)
@@ -3386,8 +3374,19 @@ def api_witness_add(req: WitnessAddRequest):
             raise HTTPException(400, f"invalid port {port_s!r} in addr {addr!r}")
         if not (1 <= port <= 65535):
             raise HTTPException(400, f"port {port} out of range (1-65535)")
-    # Re-bracket IPv6 hosts so the stored addr round-trips unambiguously.
-    stored_addr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    try:
+        ip = _ipaddr.ip_address(host)
+    except ValueError:
+        raise HTTPException(
+            400, f"Echo witness address must be an IPv4 literal, not a "
+            f"hostname ({host!r}). A hostname would block the election tick on "
+            f"DNS. Add the Echo by its IP.")
+    if (ip.version != 4 or ip.is_multicast or ip.is_unspecified
+            or ip.is_reserved or ip.is_loopback or ip.is_link_local):
+        raise HTTPException(
+            400, f"Echo witness address {host!r} is not a usable IPv4 unicast "
+            f"address (no multicast/broadcast/loopback/link-local/unspecified).")
+    stored_addr = f"{host}:{port}"
     pubkey = (req.witness_pubkey or "").strip().lower()
     if backend == "echo":
         # An Echo's X25519 public key is 32 bytes = 64 hex chars. Validate

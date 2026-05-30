@@ -16,14 +16,29 @@ from lib import witness as w          # noqa: E402
 from lib.netd import _parse_echo_addr  # noqa: E402
 
 
-def test_parse_echo_addr_forms():
+def test_parse_echo_addr_accepts_only_ipv4_unicast():
+    # Valid IPv4 unicast literals (the only thing the directed probe may target)
     assert _parse_echo_addr("192.168.9.50") == ("192.168.9.50", 12321)
     assert _parse_echo_addr("192.168.9.50:12321") == ("192.168.9.50", 12321)
-    assert _parse_echo_addr("host:9999") == ("host", 9999)
-    assert _parse_echo_addr("[fe80::1]:5000") == ("fe80::1", 5000)
-    assert _parse_echo_addr("fe80::1") == ("fe80::1", 12321)   # bare IPv6
-    # rejects (return None — skipped, never probed with a garbage target)
-    for bad in ("", "  ", "bad:x", "h:99999", "h:0", "h:-1", "[::1", "[::1]:x"):
+    assert _parse_echo_addr("10.0.0.9:9999") == ("10.0.0.9", 9999)
+    # Rejected — return None so the election tick never sends to a bad target:
+    rejects = [
+        "",                  # empty
+        "host:9999",         # HOSTNAME → would block the tick on DNS
+        "echo.lan",          # hostname, no port
+        "fe80::1",           # IPv6 → unreachable on AF_INET
+        "[fe80::1]:5000",    # bracketed IPv6
+        "224.0.0.1",         # multicast → would flood
+        "255.255.255.255",   # broadcast
+        "0.0.0.0",           # unspecified
+        "127.0.0.1",         # loopback
+        "169.254.1.1",       # link-local
+        "192.168.9.50:99999",  # port out of range
+        "192.168.9.50:0",    # port 0
+        "192.168.9.50:x",    # bad port
+        "a:b:c",             # garbage
+    ]
+    for bad in rejects:
         assert _parse_echo_addr(bad) is None, bad
 
 
@@ -65,7 +80,7 @@ def test_unicast_probe_noop_without_socket():
 
 
 if __name__ == "__main__":
-    test_parse_echo_addr_forms()
+    test_parse_echo_addr_accepts_only_ipv4_unicast()
     test_unicast_probe_targets_exactly_the_configured_endpoints()
     test_unicast_probe_skips_bad_endpoints_without_raising()
     test_unicast_probe_noop_without_socket()

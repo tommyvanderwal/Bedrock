@@ -2099,3 +2099,42 @@ validation moved BEFORE the writes (no partial commit) + strong-read +
 is_mirror-required; witness addr IPv6/port-range validation; witness-remove
 404; a vm_failover temp-fd leak. (Deferred low: delete_orphans fan-in guard,
 _read_cluster transient-error message, spawn.py dead-code tail.)
+
+## L51 — Echo-by-IP review: directed probes on the election hot path are dangerous; witness identity must be echo_id
+**2026-05-30** · adversarial review of the Echo-by-IP unicast probe (quorum-critical)
+
+Adding a netd UNICAST probe of configured Echo witnesses (so an Echo added BY
+IP that's off the broadcast domain can vote) surfaced two classes of bug — one
+introduced, one PRE-EXISTING and widened:
+
+1. **The directed probe runs inside the single-threaded 1Hz election tick, so
+   its target MUST be an IPv4 unicast literal.** `sock.sendto((host, port))`:
+   - a HOSTNAME forces a SYNCHRONOUS `getaddrinfo` (the non-blocking socket
+     flag does NOT govern name resolution) → a slow/unreachable resolver during
+     a partition freezes the election+heartbeat loop → can trip the missed-beat
+     detector → SPURIOUS failover;
+   - a MULTICAST/BROADCAST/0.0.0.0 addr re-floods the segment with an
+     authenticated probe every second;
+   - an IPv6 addr is unreachable on the AF_INET witness socket → gaierror
+     silently swallowed → the witness still inflates the quorum denominator.
+   Fix: `_parse_echo_addr` accepts ONLY IPv4 unicast (ipaddress check); the
+   mgmt API refuses anything else at add-time (fail loud, never store an
+   unusable witness).
+
+2. **Witness identity MUST be a stable echo_id, never the reply source IP.**
+   `drain_replies` keyed `ws.discovered` by `echo_id OR src[0]`. A single
+   physical Echo answering from two source IPs (multi-homed/NAT, or reachable
+   by BOTH broadcast AND a directed probe) made TWO discovered entries, each
+   valid+confirmed → counted twice in count_valid_confirmed → manufactured
+   FULL witness quorum while a configured witness was actually down → SPLIT
+   BRAIN (`min(count, n_configured)` only caps quantity, not substitution).
+   Fix: require echo_id; ignore replies without it (fail-safe: under-count,
+   never over-count). The directed probe widened a latent pre-existing hole.
+
+**Deferred pre-existing follow-ups (NOT introduced here, larger protocol work):**
+witness replies are authenticated only by the shared cluster_key — the stored
+per-witness `witness_pubkey` is NEVER used, so a rogue key-holder or a stale
+not-yet-pruned entry (ws.discovered isn't pruned on witness removal, only ages
+out after 12s) can supply the deciding vote. Proper fix = bind a voting
+endpoint to a configured witness (verify pubkey / match echo_id to a configured
+id) + prune ws.discovered when a witness leaves the configured set.

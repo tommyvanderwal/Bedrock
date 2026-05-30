@@ -1069,30 +1069,43 @@ def _failover_ack_target(d, node_loopbacks: dict, peer_liveness: dict) -> str:
 
 
 def _parse_echo_addr(addr):
-    """Parse a witness `host:port` / `[ipv6]:port` / bare host into
-    (host, port) for a directed Echo probe. Default port 12321. Returns None
-    if unparseable (skipped, never raises)."""
+    """Parse a witness addr into (ipv4_literal, port) for a DIRECTED Echo probe,
+    or None if it is not a usable IPv4 UNICAST literal.
+
+    Deliberately strict — accepts ONLY an IPv4 unicast literal, because the
+    directed probe runs INSIDE the 1Hz election tick:
+      * a HOSTNAME would make sock.sendto do a SYNCHRONOUS getaddrinfo that
+        blocks the whole election/heartbeat loop (a slow resolver during a
+        partition could trip the missed-beat detector → spurious failover);
+      * a MULTICAST / BROADCAST / 0.0.0.0 addr would re-flood the segment with
+        an authenticated probe every second;
+      * an IPv6 addr is unreachable on the AF_INET witness socket (it would
+        gaierror + be silently swallowed).
+    A rejected addr is simply not directed-probed; the witness still works via
+    broadcast if it is on the local L2. Never raises."""
+    import ipaddress
     addr = (addr or "").strip()
-    if not addr:
+    if not addr or addr.startswith("["):          # bracket ⇒ IPv6, unreachable
         return None
     port = 12321
-    try:
-        if addr.startswith("["):
-            host, sep, rest = addr[1:].partition("]")
-            if not sep:
-                return None
-            if rest.startswith(":"):
-                port = int(rest[1:])
-        elif addr.count(":") >= 2:
-            host = addr                       # bare IPv6 literal, default port
-        elif ":" in addr:
-            host, _, ps = addr.partition(":")
+    host = addr
+    n_colon = addr.count(":")
+    if n_colon == 1:
+        host, _, ps = addr.partition(":")
+        try:
             port = int(ps)
-        else:
-            host = addr
-    except ValueError:
+        except ValueError:
+            return None
+    elif n_colon > 1:
+        return None                               # bare IPv6 ⇒ unreachable
+    if not (1 <= port <= 65535):
         return None
-    if not host or not (1 <= port <= 65535):
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None                               # hostname/garbage ⇒ no DNS
+    if (ip.version != 4 or ip.is_multicast or ip.is_unspecified
+            or ip.is_reserved or ip.is_loopback or ip.is_link_local):
         return None
     return (host, port)
 
