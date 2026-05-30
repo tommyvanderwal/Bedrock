@@ -112,3 +112,49 @@ def is_valid_confirmed(ws: "witness.WitnessState", base_dir: str,
     slots = read_slots(ws, base_dir)
     return (witness._slots_valid(ws, slots)
             and witness._slots_confirmed(ws, slots, now_local_ms))
+
+
+def run_io_cycle(ws: "witness.WitnessState", *,
+                 now_ms: Optional[int] = None,
+                 now_mono: Optional[float] = None,
+                 log=None) -> None:
+    """One off-hot-path IO pass over the configured fileshare witnesses.
+
+    For each ``(witness_id, path)`` in ``ws.configured_file_witnesses``: write
+    our own slot, then evaluate validity, and cache the result as a
+    ``FileWitnessVerdict`` in ``ws.file_witnesses`` for the election tick to
+    fold via ``count_valid_confirmed``. The election tick NEVER calls this —
+    only the worker thread does — because SMB/S3 latency must not stall the 1Hz
+    tick.
+
+    Per-witness isolation + Echo-equivalent blip tolerance:
+      * one witness's IO ERROR (share unreachable / unwritable) is logged and
+        SKIPPED — its PRIOR verdict is left to age out of the tally over the
+        freshness window, exactly like a missed Echo reply, rather than being
+        flipped to False on a single transient hiccup;
+      * a successful pass that simply isn't valid+confirmed (a member's slot is
+        absent, our readback didn't match) records a FRESH False — a real
+        "not certifying right now", counted as 0 immediately.
+
+    Verdicts for witnesses no longer configured are pruned up front so a removed
+    fileshare witness drops out at once (belt-and-suspenders with the tally's
+    configured-id binding). Only OSError is caught here (the expected IO
+    failures); anything else propagates to the worker loop, which logs loudly
+    and keeps the thread alive (fail-loud, never silently dead)."""
+    if now_mono is None:
+        now_mono = time.monotonic()
+    configured = list(ws.configured_file_witnesses)
+    configured_ids = {wid for wid, _ in configured}
+    for wid in list(ws.file_witnesses):
+        if wid not in configured_ids:
+            del ws.file_witnesses[wid]      # removed witness → drop its verdict
+    for wid, path in configured:
+        try:
+            write_own_slot(ws, path, now_ms=now_ms)
+            ok = is_valid_confirmed(ws, path, now_local_ms=now_ms)
+        except OSError as e:
+            if log is not None:
+                log(f"fileshare witness {wid} ({path}) IO error: {e!r}")
+            continue                        # leave prior verdict to age out
+        ws.file_witnesses[wid] = witness.FileWitnessVerdict(
+            witness_id=wid, valid_confirmed=ok, evaluated_monotonic=now_mono)

@@ -167,3 +167,65 @@ def test_valid_even_when_other_member_slot_is_stale(tmp_path):
     witness_file.write_own_slot(ws1, d, now_ms=old)   # peer slot ancient
     witness_file.write_own_slot(ws2, d)               # own slot fresh
     assert witness_file.is_valid_confirmed(ws2, d) is True
+
+
+# ── run_io_cycle (the off-hot-path worker's per-pass logic) ──────────────
+
+def test_run_io_cycle_populates_fresh_valid_verdict(tmp_path):
+    """Peer wrote its slot; our cycle writes ours + reads back → fresh
+    valid_confirmed verdict stamped with the given monotonic."""
+    d = str(tmp_path)
+    witness_file.write_own_slot(_ws(1, members={1, 2}, marker=b"m1"), d)
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.configured_file_witnesses = [("fs1", d)]
+    witness_file.run_io_cycle(ws, now_mono=1000.0)
+    v = ws.file_witnesses["fs1"]
+    assert v.valid_confirmed is True
+    assert v.evaluated_monotonic == 1000.0
+
+
+def test_run_io_cycle_fresh_false_when_member_missing(tmp_path):
+    """No peer slot → a real 'not certifying' → FRESH False (counted as 0 at
+    once, not aged out)."""
+    d = str(tmp_path)
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.configured_file_witnesses = [("fs1", d)]
+    witness_file.run_io_cycle(ws, now_mono=1000.0)
+    v = ws.file_witnesses["fs1"]
+    assert v.valid_confirmed is False
+    assert v.evaluated_monotonic == 1000.0
+
+
+def test_run_io_cycle_io_error_leaves_prior_verdict_to_age_out(tmp_path):
+    """A share that can't be written (dir gone) is logged + skipped; the prior
+    verdict is untouched so it ages out over the freshness window rather than
+    flipping on a single transient blip (Echo-equivalent)."""
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.file_witnesses["fs1"] = witness.FileWitnessVerdict("fs1", True, 500.0)
+    ws.configured_file_witnesses = [("fs1", "/nonexistent/share/dir")]
+    logged = []
+    witness_file.run_io_cycle(ws, now_mono=1000.0, log=logged.append)
+    assert ws.file_witnesses["fs1"].evaluated_monotonic == 500.0   # untouched
+    assert ws.file_witnesses["fs1"].valid_confirmed is True
+    assert logged and "fs1" in logged[0]                           # fail-loud
+
+
+def test_run_io_cycle_prunes_unconfigured_verdict(tmp_path):
+    """A verdict for a witness no longer configured is dropped at once."""
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.file_witnesses["old"] = witness.FileWitnessVerdict("old", True, 500.0)
+    ws.configured_file_witnesses = []
+    witness_file.run_io_cycle(ws, now_mono=1000.0)
+    assert "old" not in ws.file_witnesses
+
+
+def test_run_io_cycle_isolates_a_bad_witness_from_a_good_one(tmp_path):
+    """One unreachable share must not stop a healthy one in the same pass."""
+    good = str(tmp_path / "good")
+    os.makedirs(good)
+    witness_file.write_own_slot(_ws(1, members={1, 2}, marker=b"m1"), good)
+    ws = _ws(2, members={1, 2}, marker=b"m2")
+    ws.configured_file_witnesses = [("bad", "/nonexistent/x"), ("good", good)]
+    witness_file.run_io_cycle(ws, now_mono=1000.0, log=lambda m: None)
+    assert "bad" not in ws.file_witnesses
+    assert ws.file_witnesses["good"].valid_confirmed is True

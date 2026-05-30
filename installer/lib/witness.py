@@ -182,6 +182,14 @@ class WitnessState:
     # fileshare witness is configured and its worker starts populating this).
     file_witnesses: dict = field(default_factory=dict)
 
+    # Configured fileshare witnesses as (witness_id, local_path) pairs, refreshed
+    # each netd tick from the rqlite `witnesses` table (backend=='fileshare').
+    # The off-hot-path IO worker (witness_file.run_io_cycle) reads this to know
+    # WHICH shares to write/read slots on. The path is a directory the operator
+    # has mounted the NFS/SMB share at on every node. Empty = no fileshare
+    # witnesses (the worker is a no-op / not started).
+    configured_file_witnesses: list = field(default_factory=list)
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Crypto helpers
