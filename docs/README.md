@@ -69,6 +69,7 @@ emitted, and the failure modes.
 | List & delete backups | dashboard `/backups` (cluster-wide) or VM card | [`actions/backup-list-delete.md`](actions/backup-list-delete.md) |
 | Schedule periodic backups | dashboard VM page → Schedule cron field | [`actions/backup-schedule.md`](actions/backup-schedule.md) |
 | Add / remove a witness (Echo or fileshare) | dashboard `/witness` or `bedrock witness add` | [`actions/witness-manage.md`](actions/witness-manage.md) |
+| Move / recover a metrics-logs backend | `bedrock observability promote` | [`actions/observability-backends.md`](actions/observability-backends.md) |
 
 ## Failure scenarios (what happens when things break)
 
