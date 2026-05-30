@@ -54,6 +54,7 @@ emitted, and the failure modes.
 | Install a node | `curl | bash` + `bedrock bootstrap` | [`actions/install-bootstrap.md`](actions/install-bootstrap.md) |
 | Start a new cluster | `bedrock init` | [`actions/init-cluster.md`](actions/init-cluster.md) |
 | Add a node to a cluster | `bedrock join` | [`actions/join-cluster.md`](actions/join-cluster.md) |
+| Drain (maintenance) or remove a node | `bedrock node maintenance` / `bedrock node leave` | [`actions/node-decommission.md`](actions/node-decommission.md) |
 | Manage ISOs (upload / list / delete) | dashboard `/isos` | [`actions/iso-library.md`](actions/iso-library.md) |
 | Create a VM | dashboard `+ New VM` / `bedrock vm create` | [`actions/vm-create.md`](actions/vm-create.md) |
 | Change HA level | PET / ViPet checkboxes in Settings | [`actions/vm-convert.md`](actions/vm-convert.md) |
