@@ -350,8 +350,16 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
             if STATE_JSON.exists():
                 try:
                     existing = json.loads(STATE_JSON.read_text())
-                except Exception:
-                    pass
+                except Exception as e:
+                    # A corrupt / 0-byte state.json is a real node-bricking
+                    # failure mode (see lessons-log: state.json self-heal). We
+                    # DO self-heal — rebuild from the rqlite projection below
+                    # (existing stays {}) — but make it LOUD: a silent rebuild
+                    # would hide the underlying cause (disk fault, prior crash
+                    # mid-write) until it bites again.
+                    log.warning("rqlite_subscriber: existing state.json "
+                                "unreadable (%s) — rebuilding from rqlite "
+                                "projection at rev %d", e, revision)
             existing.update(view_builder._state_view(_SNAPSHOT, self_name))
             view_builder._atomic_write_json(STATE_JSON, existing)
     except Exception as e:
