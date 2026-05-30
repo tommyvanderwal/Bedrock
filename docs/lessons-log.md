@@ -2145,3 +2145,31 @@ per-witness identity — sign the ack with the Echo's key, verify with the store
 `witness_pubkey` (pubkey + encrypted_witness_key columns exist but are unused) —
 to also stop a rogue that KNOWS a configured witness_id. The echo_id binding
 closes the main gap; pubkey signing hardens the holds-key-AND-knows-an-id case.
+
+## L52 — new lib module silently missing from the network-install manifest; the offline guard doesn't cover HTTP
+
+**Symptom (latent, caught before it shipped):** `installer/lib/witness_file.py`
+(the new fileshare-witness backend) was added but NOT listed in install.sh's
+`LIB_FILES=(...)` array. A network/HTTP install (`BEDROCK_REPO=http://…`)
+fetches lib/ ONLY from that explicit list, so the module would be absent and
+`netd`'s `from . import witness_file` would raise `ModuleNotFoundError` on a
+fresh install — bedrock-net dead on every node.
+
+**Why the existing backstop didn't catch it:** after the first iso-payload-drift
+lesson we added a completeness check to install.sh that walks the payload `lib/`
+dir and fetches anything missing from LIB_FILES — but it is guarded by
+`if [[ "$BEDROCK_REPO" == file://* ]]`, i.e. it ONLY runs for the offline ISO
+(where build-iso.sh's `rsync --include='*.py'` had already copied every module).
+The **HTTP path has no such guard**, so the manual LIB_FILES list is the sole
+source of truth there — and it drifted. The offline ISO was fine; only network
+installs were broken.
+
+**Fix:** (1) added `witness_file.py` to LIB_FILES; (2) added
+`tests/test_iso_payload_manifest.py` — the CI check the first lesson said was
+missing — which fails if `LIB_FILES` ≠ the set of `installer/lib/*.py|*.sql`.
+A new/removed lib module now breaks the test until LIB_FILES is updated in the
+same change, so this class of drift can't reach an install again.
+
+**Deeper fix (deferred):** ship lib/ as a tarball like bedrock_d/ and mgmt/ (no
+manual manifest at all), OR drop the `file://`-only guard so the HTTP path
+self-heals too. The test makes either optional rather than urgent.

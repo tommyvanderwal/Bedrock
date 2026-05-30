@@ -630,6 +630,7 @@ LIB_FILES=(
     rqlite_setup.py
     election.py
     witness.py
+    witness_file.py
     state_shared.py
     workload.py
     cluster_ca.py
