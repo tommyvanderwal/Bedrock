@@ -52,12 +52,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
-from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "installer"))
-from lib import rqlite_client  # type: ignore  # noqa: E402
+# Route rqlite I/O through the canonical state surface (bedrock_d.state owns it
+# + sets up the lib path shim internally), not lib.rqlite_client directly — see
+# tests/test_state_source_lint. This loop is a pure rqlite READER (it polls
+# bedrock_meta.revision), so it only needs the client constructor.
+from bedrock_d.state import RqliteClient  # noqa: E402
 
 log = logging.getLogger("bedrock.cluster_loop")
 
@@ -196,7 +197,7 @@ class ClusterStateSource:
         """One revision read at `level` with a FRESH client. Returns None on
         any rqlite error (caller decides fallback)."""
         try:
-            with rqlite_client.RqliteClient() as rc:
+            with RqliteClient() as rc:
                 row = rc.query_one("SELECT revision FROM bedrock_meta",
                                    level=level)
             return int(row["revision"]) if row else None
