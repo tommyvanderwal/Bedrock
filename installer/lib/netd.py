@@ -119,9 +119,19 @@ STATE_JSON       = Path("/etc/bedrock/state.json")
 PROBE_GROUP = "239.7.7.7"        # private-block multicast
 PROBE_PORT  = 7732               # 'BR' = 0x4252 → 7732 prime nearby
 PROBE_TTL   = 1                  # link-local only; never crosses routers
-PROBE_INTERVAL = 1.0             # seconds between probes per interface
+# Mesh path-liveness cadences. These are DELIBERATELY decoupled from the
+# 10s cluster master-loss window: that window is MASTER_LOSS_MISSES(10) ×
+# ELECTION_INTERVAL_S, so ONLY ELECTION_INTERVAL_S feeds it. The probe +
+# route re-emit below are mesh path/route maintenance (neighbour RTT,
+# stale-adv expiry, route-table re-validation) — slowing them to 1.5s cuts
+# per-second netd work without touching failover detection. Neighbour-down
+# is separately gated by DOWN_HYSTERESIS_S=10s, so a 1.5s probe is fine.
+PROBE_INTERVAL = 1.5             # seconds between probes per interface
+ROUTE_EMIT_INTERVAL_S = 1.5      # periodic route re-emit (changes are event-
+                                 # driven via adv-drain; this is the backstop)
 TICK_INTERVAL  = 0.25            # main loop tick
-ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote)
+ELECTION_INTERVAL_S = 1.0        # election tick (witness HB + vote). Stays 1s:
+                                 # the 10s master-loss = 10 beats × THIS.
 
 # Node-to-node election heartbeat (protocol 4) — DISTINCT from the
 # mesh discovery probe (protocol 1). The discovery probe answers
@@ -2029,7 +2039,7 @@ def run_daemon(shared_state=None):
                 write_switch_state_file(d)
                 write_mesh_state_file(d)
                 last_switch_state = now
-            if now - last_route_emit >= 1.0:
+            if now - last_route_emit >= ROUTE_EMIT_INTERVAL_S:
                 emit_routes(d)
                 last_route_emit = now
             # Protocol 4: node-to-node election heartbeat. Drain every
