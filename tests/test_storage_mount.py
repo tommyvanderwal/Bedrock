@@ -70,3 +70,76 @@ def test_s3_is_not_mountable():
 def test_test_endpoint_s3_is_noop_ok():
     ok, reason = sm.test_endpoint({"type": "s3"})
     assert ok is True and "s3" in reason
+
+
+# ── lifecycle: desired-set derivation + reconcile planning ──────────────
+def _view():
+    return {
+        "storage_endpoints": {
+            "nas1": {"type": "nfs", "fs_server": "nas.lan", "fs_share": "/b"},
+            "smb1": {"type": "smb", "fs_server": "win.lan", "fs_share": "b",
+                     "fs_username": "svc"},
+            "s3a":  {"type": "s3", "s3_endpoint": "https://s3", "s3_bucket": "b"},
+        },
+        "backup_targets": {
+            "t1": {"endpoint_id": "nas1"},          # → kopia mount of nas1
+            "t2": {"endpoint_id": "s3a"},           # s3 → NO mount
+            "tL": {"endpoint_id": ""},              # legacy inline target → none
+        },
+        "witnesses": {
+            "w1": {"endpoint_id": "smb1"},          # → witness mount of smb1
+            "w2": {"endpoint_id": "nas1"},          # → witness mount of nas1 too
+            "wE": {"endpoint_id": "s3a"},           # s3 witness → NO mount
+        },
+    }
+
+
+def test_desired_mounts_from_view_splits_usage_and_skips_s3():
+    specs = sm.desired_mounts_from_view(_view())
+    keys = {s.key for s in specs}
+    assert keys == {("nas1", sm.KOPIA), ("smb1", sm.WITNESS),
+                    ("nas1", sm.WITNESS)}
+    # s3 endpoints never produce a mount; legacy ''-endpoint targets neither
+    assert not any(eid == "s3a" for eid, _ in keys)
+
+
+def test_reconcile_plan_is_set_difference():
+    desired = {("a", "kopia"), ("b", "witness")}
+    present = {("b", "witness"), ("c", "kopia")}
+    to_mount, to_unmount = sm._reconcile_plan(desired, present)
+    assert to_mount == {("a", "kopia")}
+    assert to_unmount == {("c", "kopia")}        # only ever within /mnt/bedrock
+
+
+def test_reconcile_mounts_mounts_missing_and_unmounts_extra(monkeypatch):
+    calls = {"mount": [], "unmount": []}
+    monkeypatch.setattr(sm, "current_bedrock_mounts",
+                        lambda: {("old", sm.WITNESS)})
+    monkeypatch.setattr(sm, "mount_endpoint",
+                        lambda eid, ep, usage, **kw: calls["mount"].append((eid, usage, kw)))
+    monkeypatch.setattr(sm, "unmount_endpoint",
+                        lambda eid, usage: calls["unmount"].append((eid, usage)))
+    specs = [sm.MountSpec("nas1", {"type": "nfs"}, sm.KOPIA),
+             sm.MountSpec("smb1", {"type": "smb", "fs_username": "svc"}, sm.WITNESS)]
+    out = sm.reconcile_mounts(specs, unseal_password=lambda eid: "p4ss")
+    assert set(out["mounted"]) == {("nas1", sm.KOPIA), ("smb1", sm.WITNESS)}
+    assert out["unmounted"] == [("old", sm.WITNESS)]      # no longer desired
+    # smb mount received the unsealed password + username; nfs got neither
+    smb = next(c for c in calls["mount"] if c[0] == "smb1")
+    assert smb[2]["username"] == "svc" and smb[2]["password"] == "p4ss"
+
+
+def test_reconcile_isolates_a_failing_mount(monkeypatch):
+    monkeypatch.setattr(sm, "current_bedrock_mounts", lambda: set())
+
+    def _flaky(eid, ep, usage, **kw):
+        if eid == "bad":
+            raise RuntimeError("share unreachable")
+
+    monkeypatch.setattr(sm, "mount_endpoint", _flaky)
+    monkeypatch.setattr(sm, "unmount_endpoint", lambda *a: None)
+    specs = [sm.MountSpec("bad", {"type": "nfs"}, sm.KOPIA),
+             sm.MountSpec("good", {"type": "nfs"}, sm.WITNESS)]
+    out = sm.reconcile_mounts(specs, log=lambda m: None)
+    assert out["mounted"] == [("good", sm.WITNESS)]       # good still mounted
+    assert out["failed"] == [("bad", sm.KOPIA)]           # bad isolated, logged

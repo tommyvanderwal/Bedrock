@@ -572,6 +572,29 @@ async def _start_local_services():
         log.warning("services: seaweedfs start failed "
                     "(will retry on next role change): %s", e)
 
+    # Re-mount Bedrock-managed SMB/NFS storage endpoints. The two mountpoints
+    # (/mnt/bedrock/{kopia,witness}/<id>) hold no systemd units, so nothing else
+    # restores them after a reboot; a kopia backup target or a fileshare witness
+    # whose share isn't mounted simply can't function. Reconcile from the view:
+    # mount every endpoint a backup_target (kopia) or witness (witness) refers to,
+    # unmount any stale one. Best-effort + per-endpoint isolated — a share that
+    # won't mount is logged, never blocks boot (the witness/backup just stays
+    # down until its share returns, which the slot protocol already tolerates).
+    try:
+        from lib import storage_mount as _sm
+        from lib import bedrock_state as _bs
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _sm.reconcile_from_cluster(
+                cluster,
+                unseal_password=lambda eid: _bs.storage_endpoint_secret(
+                    eid, "fs_password"),
+                log=lambda m: log.warning("services: %s", m)),
+        )
+    except Exception as e:
+        log.warning("services: storage-endpoint mount reconcile failed "
+                    "(will retry on next role change/boot): %s", e)
+
     # libvirtd only after the DRBD devices its VMs need are up.
     log.info("services: starting libvirtd")
     subprocess.run(["systemctl", "start", "libvirtd"], check=False)

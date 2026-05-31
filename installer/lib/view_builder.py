@@ -322,13 +322,17 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             "SELECT target_id, kind, s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
-            "is_mirror "
+            "is_mirror, endpoint_id "
             "FROM backup_targets",
             level=level,
         ):
             out["backup_targets"][row["target_id"]] = {
                 "id":   row["target_id"],
                 "kind": row.get("kind", "kopia-s3"),
+                # endpoint_id: the shared storage_endpoints row this target uses
+                # (the consolidated S3/SMB/NFS definition). '' on legacy targets
+                # that carry their own inline s3_*/filesystem_path fields.
+                "endpoint_id":     row.get("endpoint_id", ""),
                 "s3_endpoint":     row.get("s3_endpoint", ""),
                 "s3_bucket":       row.get("s3_bucket", ""),
                 "s3_region":       row.get("s3_region", ""),

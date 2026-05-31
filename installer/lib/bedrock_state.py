@@ -955,6 +955,25 @@ def storage_endpoint_removed(endpoint_id: str,
         raise
 
 
+def storage_endpoint_secret(endpoint_id: str, which: str,
+                            client: Optional[rqlite_client.RqliteClient] = None) -> str:
+    """Read + unseal one secret of a storage endpoint, on demand (the cluster
+    view never carries the sealed blob). ``which`` is 's3_secret_key' or
+    'fs_password'. Returns '' if the endpoint/secret is absent or auth fails —
+    a caller that NEEDS the secret must check for '' and fail loud."""
+    col = {"s3_secret_key": "s3_secret_key_enc",
+           "fs_password": "fs_password_enc"}[which]
+    c, owns = _client(client)
+    try:
+        rows = list(c.query(
+            f"SELECT {col} AS enc FROM storage_endpoints WHERE endpoint_id = ?",
+            params=[endpoint_id]))
+        return unseal_secret(rows[0]["enc"]) if rows else ""
+    finally:
+        if owns:
+            c.close()
+
+
 def backup_target_set(target_id: str, kind: str, *,
                       s3_endpoint: str = "", s3_bucket: str = "",
                       s3_region: str = "",

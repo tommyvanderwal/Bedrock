@@ -23,8 +23,9 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 MOUNT_ROOT = Path("/mnt/bedrock")
 CRED_DIR = Path("/etc/bedrock/storage-credentials")   # 0700; per-endpoint cifs creds
@@ -134,6 +135,129 @@ def unmount_endpoint(endpoint_id: str, usage: str) -> None:
     mp = mountpoint(endpoint_id, usage)
     if is_mounted(mp):
         subprocess.run(["umount", str(mp)], capture_output=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Lifecycle: reconcile the live mounts to what the cluster wants
+# ─────────────────────────────────────────────────────────────────
+@dataclass
+class MountSpec:
+    """One desired mount: an SMB/NFS endpoint at one usage's mountpoint.
+    Secrets are NOT carried here — an SMB password is unsealed on-demand at
+    mount time (the cluster view never projects the sealed blob), matching the
+    'read+unseal directly from rqlite when you must mount' rule."""
+    endpoint_id: str
+    endpoint: dict
+    usage: str
+
+    @property
+    def key(self) -> tuple:
+        return (self.endpoint_id, self.usage)
+
+
+def desired_mounts_from_view(view: dict) -> list:
+    """Derive the desired set of SMB/NFS mounts from a cluster view: every
+    backup_target that references a storage_endpoint needs that endpoint at the
+    KOPIA mountpoint; every witness that references one needs it at the WITNESS
+    mountpoint. S3 endpoints produce NO mount (hit directly). De-duplicated by
+    (endpoint_id, usage) — one endpoint used by two targets mounts once."""
+    eps = view.get("storage_endpoints") or {}
+    specs: dict = {}
+
+    def _add(eid: str, usage: str) -> None:
+        ep = eps.get(eid)
+        if not ep or ep.get("type") not in ("smb", "nfs"):
+            return                         # missing, or S3 (needs no mount)
+        specs[(eid, usage)] = MountSpec(endpoint_id=eid, endpoint=ep, usage=usage)
+
+    for t in (view.get("backup_targets") or {}).values():
+        if t.get("endpoint_id"):
+            _add(t["endpoint_id"], KOPIA)
+    for w in (view.get("witnesses") or {}).values():
+        if w.get("endpoint_id"):
+            _add(w["endpoint_id"], WITNESS)
+    return list(specs.values())
+
+
+def current_bedrock_mounts() -> set:
+    """The set of (endpoint_id, usage) currently mounted under /mnt/bedrock.
+    Scans both usage dirs and checks each child is a real mountpoint."""
+    present: set = set()
+    for usage in USAGES:
+        base = MOUNT_ROOT / usage
+        try:
+            children = list(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and is_mounted(child):
+                present.add((child.name, usage))
+    return present
+
+
+def _reconcile_plan(desired: set, present: set) -> tuple:
+    """Pure planner: (to_mount, to_unmount) given the desired and present
+    (endpoint_id, usage) sets. to_mount = desired-not-present;
+    to_unmount = present-not-desired (only ever within /mnt/bedrock, so we
+    never touch an operator's own mount)."""
+    to_mount = desired - present
+    to_unmount = present - desired
+    return to_mount, to_unmount
+
+
+def reconcile_mounts(specs: list, *,
+                     unseal_password: Optional[Callable[[str], str]] = None,
+                     log: Optional[Callable[[str], None]] = None) -> dict:
+    """Make the live mounts match ``specs``: mount each desired-but-absent
+    endpoint, unmount each present-but-no-longer-desired one (only under
+    /mnt/bedrock). Per-endpoint fail-loud-but-continue — one share that won't
+    mount is logged and recorded in 'failed', never aborting the others (a
+    backup target that can't mount must not block a witness, or the boot path).
+    ``unseal_password(endpoint_id)->str`` supplies the SMB password on demand.
+    Returns {'mounted','unmounted','failed'} lists of (endpoint_id, usage)."""
+    by_key = {s.key: s for s in specs}
+    desired = set(by_key)
+    present = current_bedrock_mounts()
+    to_mount, to_unmount = _reconcile_plan(desired, present)
+    out = {"mounted": [], "unmounted": [], "failed": []}
+
+    for key in sorted(to_mount):
+        eid, usage = key
+        spec = by_key[key]
+        try:
+            username, password = "", ""
+            if spec.endpoint.get("type") == "smb":
+                username = spec.endpoint.get("fs_username", "") or ""
+                if unseal_password is not None:
+                    password = unseal_password(eid) or ""
+            mount_endpoint(eid, spec.endpoint, usage,
+                           username=username, password=password)
+            out["mounted"].append(key)
+        except Exception as e:           # fail-loud per endpoint, keep going
+            if log is not None:
+                log(f"mount reconcile: endpoint {eid!r} ({usage}) failed: {e}")
+            out["failed"].append(key)
+
+    for key in sorted(to_unmount):
+        eid, usage = key
+        try:
+            unmount_endpoint(eid, usage)
+            out["unmounted"].append(key)
+        except Exception as e:
+            if log is not None:
+                log(f"mount reconcile: unmount {eid!r} ({usage}) failed: {e}")
+            out["failed"].append(key)
+    return out
+
+
+def reconcile_from_cluster(view: dict, *,
+                           unseal_password: Optional[Callable[[str], str]] = None,
+                           log: Optional[Callable[[str], None]] = None) -> dict:
+    """Convenience: derive the desired mounts from a cluster view and reconcile.
+    Best-effort + idempotent — safe to call at boot, on endpoint activate/
+    deactivate, and as a periodic safety net."""
+    return reconcile_mounts(desired_mounts_from_view(view),
+                            unseal_password=unseal_password, log=log)
 
 
 def test_endpoint(endpoint: dict, usage: str = WITNESS,
