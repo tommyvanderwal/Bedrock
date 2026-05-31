@@ -3680,6 +3680,60 @@ def api_storage_endpoint_test(req: StorageEndpointTestRequest):
     return {"ok": ok, "reason": reason}
 
 
+class EndpointActivateRequest(BaseModel):
+    # Optional explicit id; defaults to deriving one from the endpoint id.
+    witness_id: str = ""
+    skip_test: bool = False           # operator override of the master pre-test
+
+
+@app.post("/api/storage-endpoints/{endpoint_id}/enable-witness")
+def api_storage_endpoint_enable_witness(endpoint_id: str,
+                                        req: EndpointActivateRequest =
+                                        EndpointActivateRequest()):
+    """The "Enable as fileshare-Witness" box: register a witness backed by this
+    endpoint. The witness backend follows the endpoint type (s3 → native S3
+    witness; smb/nfs → fileshare witness at the Bedrock-managed strict mount). netd
+    (increment 4) resolves the endpoint to its S3 client / mountpoint and writes
+    slots there; the slot protocol seals with the CLUSTER key, so no per-witness
+    key is needed. Tests on the MASTER first (unless skip_test)."""
+    cluster = load_cluster()
+    ep = (cluster.get("storage_endpoints") or {}).get(endpoint_id)
+    if ep is None:
+        raise HTTPException(404, f"storage endpoint {endpoint_id!r} not found")
+    typ = (ep.get("type") or "").lower()
+    backend = "s3" if typ == "s3" else "fileshare"
+    wid = (req.witness_id or f"wit-{endpoint_id}").strip()
+    # Test-on-master-before-commit (the share must be usable here before we raise
+    # the quorum bar cluster-wide). Reads the sealed creds from rqlite.
+    if not req.skip_test:
+        s3_secret = _bs.storage_endpoint_secret(endpoint_id, "s3_secret_key")
+        fs_password = _bs.storage_endpoint_secret(endpoint_id, "fs_password")
+        endpoint = dict(ep); endpoint["type"] = typ
+        try:
+            from lib import storage_mount as _sm
+            ok, reason = _sm.test_endpoint(
+                endpoint, _sm.WITNESS, username=ep.get("fs_username", ""),
+                password=fs_password or "", s3_secret_key=s3_secret or "")
+        except Exception as e:
+            raise HTTPException(500, f"witness pre-test error: {e}")
+        if not ok:
+            raise HTTPException(
+                400, f"endpoint {endpoint_id!r} failed the master witness test: "
+                f"{reason}. Fix it before enabling as a witness (a witness that "
+                f"can't be written would raise the quorum bar without ever voting).")
+    try:
+        rev = _bs.witness_register(witness_id=wid, addr="",
+                                   witness_pubkey_hex="",
+                                   encrypted_witness_key_hex="",
+                                   backend=backend, endpoint_id=endpoint_id)
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"witness {wid!r} enabled on endpoint {endpoint_id!r} ({backend})",
+             app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "witness_id": wid,
+            "backend": backend, "endpoint_id": endpoint_id}
+
+
 @app.post("/api/vms/{vm_name}/backup")
 async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()):
     """Take a backup of `vm_name` to `target_id`. Returns 202 + task_id;
