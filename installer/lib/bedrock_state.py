@@ -342,24 +342,28 @@ def witness_register(witness_id: str, addr: str,
                      witness_pubkey_hex: str,
                      encrypted_witness_key_hex: str,
                      backend: str = "echo",
+                     endpoint_id: str = "",
                      client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """Upsert a witness row. `backend` records which kind of witness
-    this is so the operator UI can show it. Default 'echo' for the
-    BedRock Echo UDP/12321 path."""
+    """Upsert a witness row. `backend` is 'echo' | 'fileshare' | 's3'. For
+    fileshare/s3 the storage comes from a shared storage_endpoints row named by
+    `endpoint_id` (and witness_pubkey/encrypted_witness_key are unused — the slot
+    protocol seals with the CLUSTER key, not a per-witness Echo key). Default
+    backend 'echo' = the BedRock Echo UDP/12321 path with its inline `addr`."""
     c, owns = _client(client)
     try:
         c.execute(
             "INSERT INTO witnesses(witness_id, addr, witness_pubkey, "
-            "encrypted_witness_key, backend, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?) "
+            "encrypted_witness_key, backend, endpoint_id, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(witness_id) DO UPDATE SET "
             "addr = excluded.addr, "
             "witness_pubkey = excluded.witness_pubkey, "
             "encrypted_witness_key = excluded.encrypted_witness_key, "
             "backend = excluded.backend, "
+            "endpoint_id = excluded.endpoint_id, "
             "updated_at = excluded.updated_at",
             params=[witness_id, addr, witness_pubkey_hex,
-                    encrypted_witness_key_hex, backend, _now()],
+                    encrypted_witness_key_hex, backend, endpoint_id, _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:
