@@ -297,9 +297,10 @@ class TestApplySchema(unittest.TestCase):
         # With a mock client the PRAGMA check reports each column absent,
         # so every ALTER is issued — so call_count = 2 + (#migrations).
         # Today: vms.priority, nodes.state, backup_targets.is_mirror,
-        # vms.libvirt_xml, backup_targets.endpoint_id, witnesses.endpoint_id
-        # — 6 migrations, so call_count = 2 + 6 = 8.
-        self.assertEqual(client.execute.call_count, 8)
+        # vms.libvirt_xml, backup_targets.endpoint_id, witnesses.endpoint_id,
+        # backup_targets.repo_password_enc
+        # — 7 migrations, so call_count = 2 + 7 = 9.
+        self.assertEqual(client.execute.call_count, 9)
         first_call_args = client.execute.call_args_list[0]
         statements = first_call_args.args[0]
         self.assertEqual(len(statements), 2)
@@ -320,6 +321,9 @@ class TestApplySchema(unittest.TestCase):
                             for s in alter_sqls))
         self.assertTrue(any("ALTER TABLE witnesses ADD COLUMN endpoint_id" in s
                             for s in alter_sqls))
+        self.assertTrue(any(
+            "ALTER TABLE backup_targets ADD COLUMN repo_password_enc" in s
+            for s in alter_sqls))
 
 
 class TestAsyncClient(unittest.IsolatedAsyncioTestCase):

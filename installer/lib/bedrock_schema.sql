@@ -282,6 +282,11 @@ CREATE TABLE IF NOT EXISTS backup_targets (
     -- (the consolidated definition); the inline s3_*/filesystem_path columns
     -- above remain for back-compat with pre-unification targets.
     endpoint_id                     TEXT NOT NULL DEFAULT '',
+    -- The kopia repo ENCRYPTION password for THIS repo, AEAD(cluster_key)-sealed.
+    -- '' means "use the published PUBLIC default" (backup.PUBLIC_REPO_PASSWORD —
+    -- effectively unencrypted, zero setup). A real value here = the operator
+    -- opted this repo into real encryption (e.g. an untrusted offsite S3).
+    repo_password_enc               TEXT NOT NULL DEFAULT '',
     updated_at                      INTEGER NOT NULL
 );
 

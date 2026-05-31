@@ -982,8 +982,14 @@ def backup_target_set(target_id: str, kind: str, *,
                       filesystem_path: str = "",
                       override_source_prefix: str = "",
                       cache_directory: str = "", is_mirror: bool = False,
+                      repo_password: str = "",
                       reason: str = "",
                       client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Upsert a backup target. ``repo_password`` is the per-repo kopia encryption
+    password (AEAD-sealed before storage). Pass '' to LEAVE AN EXISTING PASSWORD
+    UNCHANGED (so a bucket/region edit can't silently wipe it) — on a NEW target
+    '' means "use the published PUBLIC default" (effectively unencrypted). Setting
+    a real value opts this repo into real encryption."""
     c, owns = _client(client)
     try:
         c.execute(
@@ -991,8 +997,8 @@ def backup_target_set(target_id: str, kind: str, *,
             "s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
-            "is_mirror, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "is_mirror, repo_password_enc, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(target_id) DO UPDATE SET "
             "kind = excluded.kind, "
             "s3_endpoint = excluded.s3_endpoint, "
@@ -1004,18 +1010,41 @@ def backup_target_set(target_id: str, kind: str, *,
             "override_source_prefix = excluded.override_source_prefix, "
             "cache_directory = excluded.cache_directory, "
             "is_mirror = excluded.is_mirror, "
+            # CASE-preserve: an empty incoming password KEEPS the stored one (a
+            # partial update / reactor re-apply never wipes a real password); a
+            # non-empty one replaces it.
+            "repo_password_enc = CASE WHEN excluded.repo_password_enc = '' "
+            "THEN backup_targets.repo_password_enc "
+            "ELSE excluded.repo_password_enc END, "
             "updated_at = excluded.updated_at",
             params=[target_id, kind, s3_endpoint, s3_bucket, s3_region,
                     1 if s3_disable_tls else 0,
                     1 if s3_disable_tls_verification else 0,
                     filesystem_path, override_source_prefix,
-                    cache_directory, 1 if is_mirror else 0, _now()],
+                    cache_directory, 1 if is_mirror else 0,
+                    _seal_secret(repo_password), _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:
         if owns:
             c.close()
         raise
+
+
+def backup_target_repo_password(target_id: str,
+                                client: Optional[rqlite_client.RqliteClient] = None) -> str:
+    """The unsealed per-repo kopia password for a target, or '' if none is set
+    (meaning: the caller should use the published PUBLIC default). Read on demand
+    — the cluster view never carries the sealed blob, only has_repo_password."""
+    c, owns = _client(client)
+    try:
+        rows = list(c.query(
+            "SELECT repo_password_enc AS enc FROM backup_targets "
+            "WHERE target_id = ?", params=[target_id]))
+        return unseal_secret(rows[0]["enc"]) if rows else ""
+    finally:
+        if owns:
+            c.close()
 
 
 def backup_target_removed(target_id: str, reason: str = "",

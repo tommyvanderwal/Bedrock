@@ -579,6 +579,11 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
                            "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(client, "witnesses", "endpoint_id",
                            "TEXT NOT NULL DEFAULT ''")
+    # Per-repo kopia encryption password (AEAD-sealed). '' = the published
+    # PUBLIC default (effectively unencrypted); a real value = operator opted
+    # this repo into encryption. Stored per backup_target = per kopia repo.
+    _add_column_if_missing(client, "backup_targets", "repo_password_enc",
+                           "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,
