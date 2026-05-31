@@ -1741,7 +1741,24 @@ def _witness_health_check(ws, _witness_file, *, log=None):
             _flag(wid, f"fileshare: {detail}")
 
 
-def _witness_file_worker(ws, _witness_file, should_stop,
+def _drive_casting_saga(my_node, log):
+    """Drive ONE step of the 2-node casting-vote saga (#7) off the hot path. Loads
+    the cached cluster view (level='none', revision-cached → ~free) and lets
+    casting_saga decide the next vote-config transition; only the master ever acts,
+    and only when a witness is corrupt on an N=2 cluster (else a pure no-op). Kept
+    here in the witness worker — same cadence + same off-tick isolation as the #6
+    health check that flags the corrupt witness this saga reacts to."""
+    try:
+        from . import cluster_state as _cs        # type: ignore
+        from . import casting_saga as _saga        # type: ignore
+    except ImportError:                            # pragma: no cover
+        from lib import cluster_state as _cs       # type: ignore
+        from lib import casting_saga as _saga      # type: ignore
+    cluster = _cs.load_cluster(level="none")
+    _saga.drive(cluster, my_node, log=log)
+
+
+def _witness_file_worker(ws, _witness_file, should_stop, my_node="",
                          *, interval: float = WITNESS_FILE_IO_INTERVAL_S):
     """Background thread body: drive fileshare-witness slot IO OFF the 1Hz
     election tick (an SMB/S3 share's multi-hundred-ms latency must never stall
@@ -1782,6 +1799,15 @@ def _witness_file_worker(ws, _witness_file, should_stop,
             except Exception as e:
                 sys.stderr.write(
                     f"bedrock-net: witness health-check error: {e!r}\n")
+        # 2-node casting-vote saga (#7): react to a corrupt-flagged witness —
+        # arm the casting vote + drop the witness from the denominator, one
+        # all-applied-gated step per pass. Master-only + N=2-only inside; a pure
+        # no-op otherwise. Isolated try so a saga error never kills witnessing.
+        try:
+            if my_node:
+                _drive_casting_saga(my_node, _log)
+        except Exception as e:
+            sys.stderr.write(f"bedrock-net: casting-saga error: {e!r}\n")
         slept = 0.0
         while slept < interval and not should_stop():
             time.sleep(0.2)
@@ -1949,7 +1975,7 @@ def run_daemon(shared_state=None):
     # backend=='fileshare' witness is configured, so it is always safe to start.
     _wf_thread = threading.Thread(
         target=_witness_file_worker,
-        args=(ws, _witness_file, _should_stop),
+        args=(ws, _witness_file, _should_stop, my_node),
         name="bedrock-witness-file", daemon=True,
     )
     _wf_thread.start()

@@ -302,9 +302,9 @@ class TestApplySchema(unittest.TestCase):
         # backup_targets.s3_secret_key_enc, witnesses.corrupt,
         # witnesses.corrupt_reason, witnesses.corrupt_at,
         # cluster_info.casting_vote_node, cluster_info.vote_config_epoch,
-        # nodes.applied_epoch
-        # — 15 migrations, so call_count = 2 + 15 = 17.
-        self.assertEqual(client.execute.call_count, 17)
+        # nodes.applied_epoch, witnesses.disabled
+        # — 16 migrations, so call_count = 2 + 16 = 18.
+        self.assertEqual(client.execute.call_count, 18)
         first_call_args = client.execute.call_args_list[0]
         statements = first_call_args.args[0]
         self.assertEqual(len(statements), 2)

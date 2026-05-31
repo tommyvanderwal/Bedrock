@@ -32,6 +32,8 @@ ALLOWED = {
     "installer/lib/view_builder.py",     # snapshot reader; not a writer
     "installer/lib/netd.py",             # election tick reads cluster.json + rqlite
     "installer/lib/cluster_arbiter.py",
+    "installer/lib/casting_saga.py",     # #7 saga executor: arms/disables vote config
+
     "installer/lib/operator_auth.py",
     "installer/lib/join_handshake.py",
     "installer/lib/tier_storage.py",

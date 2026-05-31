@@ -634,6 +634,7 @@ LIB_FILES=(
     witness_file.py
     witness_s3.py
     storage_mount.py
+    casting_saga.py
     state_shared.py
     workload.py
     cluster_ca.py
