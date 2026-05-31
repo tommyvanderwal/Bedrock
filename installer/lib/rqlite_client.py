@@ -598,6 +598,12 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
                            "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(client, "witnesses", "corrupt_at",
                            "INTEGER NOT NULL DEFAULT 0")
+    # Casting vote + vote-config epoch watermark (2-node witness-loss rescue, #7).
+    _add_column_if_missing(client, "cluster_info", "casting_vote_node", "TEXT")
+    _add_column_if_missing(client, "cluster_info", "vote_config_epoch",
+                           "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(client, "nodes", "applied_epoch",
+                           "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

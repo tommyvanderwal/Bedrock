@@ -600,3 +600,85 @@ def test_believed_master_roundtrip(monkeypatch):
     assert lstate.get_believed_master(saved) == "sim-3"
     lstate.set_believed_master(None, saved)
     assert lstate.get_believed_master(saved) is None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Casting vote (2-node witness-loss rescue) — the split-brain proof.
+#  Scenario: 2 nodes, the only witness is gone (n_configured_witnesses=0 →
+#  total=200, majority=101), the two nodes are PARTITIONED from each other,
+#  and the saga has armed casting_vote_node = the master. The master must STAY
+#  (101), the follower must HALT (100). The +1 is credited ONLY in the
+#  steady-state-master branch — never promote/follower — which is the proof.
+# ─────────────────────────────────────────────────────────────────
+
+def test_casting_vote_keeps_partitioned_master_sticky():
+    # master sim-1, peer sim-2 unreachable, no witness, casting armed to sim-1.
+    r = election.compute(
+        self_name="sim-1", self_loopback="100.64.0.1",
+        peer_liveness={"sim-2": False}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1",
+        n_configured_witnesses=0, n_valid_witnesses=0,
+        casting_vote_node="sim-1",
+        no_quorum_marker_path=NO_MARKER,
+    )
+    assert r.total_votes == 200 and r.majority == 101
+    assert r.my_votes == 101                      # 100 self + 1 casting
+    assert r.outcome is election.Outcome.LEADER
+
+
+def test_without_casting_partitioned_master_loses_quorum():
+    r = election.compute(
+        self_name="sim-1", self_loopback="100.64.0.1",
+        peer_liveness={"sim-2": False}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1",
+        n_configured_witnesses=0, n_valid_witnesses=0,
+        casting_vote_node=None,                   # not armed
+        no_quorum_marker_path=NO_MARKER,
+    )
+    assert r.my_votes == 100
+    assert r.outcome is election.Outcome.NO_QUORUM
+
+
+def test_GUARD_partitioned_follower_never_credits_casting():
+    # THE load-bearing guard: the follower sees the master (sim-1) gone, and the
+    # casting vote is armed to that peer. It must compute EXACTLY 100 → NoQuorum,
+    # NEVER borrow the casting +1 to promote. (promote branch, casting==peer.)
+    r = election.compute(
+        self_name="sim-2", self_loopback="100.64.0.2",
+        peer_liveness={"sim-1": False}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1",
+        n_configured_witnesses=0, n_valid_witnesses=0,
+        casting_vote_node="sim-1",
+        no_quorum_marker_path=NO_MARKER,
+    )
+    assert r.my_votes == 100
+    assert r.outcome is election.Outcome.NO_QUORUM
+
+
+def test_GUARD_casting_never_helps_a_promoting_candidate_even_if_self():
+    # Even if casting were (mis)armed to the promoting node itself, the promote
+    # branch must NOT credit it — casting rescues only the STEADY-STATE master.
+    r = election.compute(
+        self_name="sim-2", self_loopback="100.64.0.2",
+        peer_liveness={"sim-1": False}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1",            # master gone → promote branch
+        n_configured_witnesses=0, n_valid_witnesses=0,
+        casting_vote_node="sim-2",              # armed to self, but promoting
+        no_quorum_marker_path=NO_MARKER,
+    )
+    assert r.my_votes == 100                    # NOT 101
+    assert r.outcome is election.Outcome.NO_QUORUM
+
+
+def test_casting_not_credited_when_following_a_live_master():
+    # follower with a LIVE master: casting must not inflate the follower's tally.
+    r = election.compute(
+        self_name="sim-2", self_loopback="100.64.0.2",
+        peer_liveness={"sim-1": True}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1",
+        n_configured_witnesses=0, n_valid_witnesses=0,
+        casting_vote_node="sim-1",
+        no_quorum_marker_path=NO_MARKER,
+    )
+    assert r.outcome is election.Outcome.FOLLOWER
+    assert r.my_votes == 200                    # 100 self + 100 reachable peer; no casting term

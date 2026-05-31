@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS cluster_info (
     cluster_uuid  TEXT NOT NULL,
     cluster_name  TEXT,
     mgmt_master   TEXT,
+    -- 2-node witness-loss rescue: when set to a node NAME, that node (the
+    -- incumbent master) gets +1 in the steady-state-master election branch ONLY
+    -- (stays sticky at 101/200, no failover). NULL/'' = disarmed. Armed/disarmed
+    -- by the casting-vote saga under the all-nodes-applied epoch watermark.
+    casting_vote_node  TEXT,
+    -- Monotonic vote-config epoch. The master bumps it when a vote-config that
+    -- LOWERS the bar changes (arm casting / drop a witness from the denominator);
+    -- it acts only once min(nodes.applied_epoch) over ACTIVE nodes (arbiter
+    -- EXCLUDED) reaches it. (VOTE-CHANGE SAFETY PRINCIPLE.)
+    vote_config_epoch  INTEGER NOT NULL DEFAULT 0,
     updated_at    INTEGER NOT NULL
 );
 
@@ -66,6 +76,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     bedrock_pubkey   TEXT NOT NULL DEFAULT '',          -- inter-node API signing
     maintenance      INTEGER NOT NULL DEFAULT 0,        -- bool 0/1
     state            TEXT NOT NULL DEFAULT 'active',     -- 'joining' | 'active'
+    -- Vote-config epoch this node has APPLIED (advertised so the master can wait
+    -- for the all-nodes-applied watermark before lowering the quorum bar). The
+    -- node writes its own row when its election tick has adopted the new config.
+    applied_epoch    INTEGER NOT NULL DEFAULT 0,
     updated_at       INTEGER NOT NULL
 );
 

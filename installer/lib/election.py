@@ -86,6 +86,7 @@ def compute(
     n_configured_witnesses: int = 0,
     n_valid_witnesses: int = 0,
     peer_acks: dict[str, bool] | None = None,
+    casting_vote_node: str | None = None,
     no_quorum_marker_path: Path = NO_QUORUM_MARKER,
 ) -> Election:
     """One-shot election decision. See module docstring for semantics.
@@ -154,6 +155,16 @@ def compute(
         # Already master. Steady-state quorum check uses reachability:
         # as long as we still see a majority we keep the role.
         my_votes = VOTES_PER_NODE * len(reachable) + witness_votes
+        # CASTING VOTE (2-node witness-loss rescue). When a 2-node cluster's only
+        # witness is confirmed-bad + cleanly removed, the saga arms an explicit
+        # casting_vote_node = the CURRENT MASTER, giving it +1 so it stays sticky
+        # at 101/200 (no failover; if the master dies the cluster halts — accepted).
+        # LOAD-BEARING: credited ONLY in this steady-state-master branch, NEVER the
+        # follower (171) or promote (182) branches — so a partitioned FOLLOWER that
+        # reads casting_vote_node==<the peer master> still computes exactly 100 →
+        # NoQuorum. That asymmetry is the whole split-brain proof; do not move it.
+        if casting_vote_node and casting_vote_node == self_name:
+            my_votes += VOTE_PER_WITNESS
         if my_votes < majority:
             return Election(
                 outcome=Outcome.NO_QUORUM, my_votes=my_votes,

@@ -128,6 +128,68 @@ def set_mgmt_master(node_name: str,
         raise
 
 
+def casting_vote_arm(node_name: str,
+                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Arm the 2-node casting vote to ``node_name`` (the current master) and bump
+    the vote-config epoch in ONE atomic write. The master then waits for the
+    all-nodes-applied watermark (min nodes.applied_epoch over ACTIVE nodes,
+    arbiter excluded) to reach this epoch before relying on the +1 — see the
+    casting-vote saga. Idempotent-ish: a re-arm to the same node still bumps the
+    epoch (a fresh all-applied round)."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE cluster_info SET casting_vote_node = ?, "
+            "vote_config_epoch = vote_config_epoch + 1, updated_at = ? "
+            "WHERE id = 1",
+            params=[node_name, _now()])
+        log.warning("bedrock_state: casting_vote ARMED to %s (epoch bumped)",
+                    node_name)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def casting_vote_disarm(client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Disarm the casting vote (NULL it) and bump the epoch. DISARM RAISES the bar
+    (master 100+casting → 100), so it is safe-to-lag; still bump the epoch so the
+    reverse saga can confirm all nodes dropped the +1 before re-adding a witness."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE cluster_info SET casting_vote_node = NULL, "
+            "vote_config_epoch = vote_config_epoch + 1, updated_at = ? "
+            "WHERE id = 1",
+            params=[_now()])
+        log.info("bedrock_state: casting_vote DISARMED (epoch bumped)")
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def node_applied_epoch_set(node_name: str, epoch: int,
+                           client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """A node advertises the vote-config epoch it has APPLIED. Monotonic — only
+    moves forward (a stale write can't lower a node's watermark). The master reads
+    min(applied_epoch) over ACTIVE nodes (arbiter excluded) to gate lowering the
+    quorum bar."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE nodes SET applied_epoch = ?, updated_at = ? "
+            "WHERE node_name = ? AND applied_epoch < ?",
+            params=[int(epoch), _now(), node_name, int(epoch)])
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Membership
 # ─────────────────────────────────────────────────────────────────────

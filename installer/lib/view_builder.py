@@ -74,7 +74,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
 
         # cluster_info (singleton row)
         ci = client.query_one(
-            "SELECT cluster_uuid, cluster_name, mgmt_master "
+            "SELECT cluster_uuid, cluster_name, mgmt_master, "
+            "casting_vote_node, vote_config_epoch "
             "FROM cluster_info WHERE id = 1",
             level=level,
         )
@@ -82,6 +83,10 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             out["cluster_uuid"] = ci["cluster_uuid"]
             out["cluster_name"] = ci["cluster_name"]
             out["mgmt_master"] = ci["mgmt_master"]
+            # 2-node casting-vote rescue (#7): the armed node (if any) + the
+            # vote-config epoch the master has published.
+            out["casting_vote_node"] = ci.get("casting_vote_node") or None
+            out["vote_config_epoch"] = ci.get("vote_config_epoch") or 0
 
         # bedrock_meta.revision → exposed under the "log_index" key
         meta = client.query_one(
@@ -94,7 +99,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         # nodes
         for row in client.query(
             "SELECT node_name, host, loopback_ip, role, "
-            "pubkey, bedrock_pubkey, maintenance, state FROM nodes",
+            "pubkey, bedrock_pubkey, maintenance, state, applied_epoch FROM nodes",
             level=level,
         ):
             entry = {
@@ -109,6 +114,9 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 # exclude a drained node consistently.
                 "maintenance": bool(row.get("maintenance")),
                 "state": row.get("state") or "active",
+                # Vote-config epoch this node has applied (the watermark the
+                # casting-vote saga waits on, arbiter excluded).
+                "applied_epoch": int(row.get("applied_epoch") or 0),
             }
             out["nodes"][row["node_name"]] = entry
 

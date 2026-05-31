@@ -300,9 +300,11 @@ class TestApplySchema(unittest.TestCase):
         # vms.libvirt_xml, backup_targets.endpoint_id, witnesses.endpoint_id,
         # backup_targets.repo_password_enc, backup_targets.s3_access_key,
         # backup_targets.s3_secret_key_enc, witnesses.corrupt,
-        # witnesses.corrupt_reason, witnesses.corrupt_at
-        # — 12 migrations, so call_count = 2 + 12 = 14.
-        self.assertEqual(client.execute.call_count, 14)
+        # witnesses.corrupt_reason, witnesses.corrupt_at,
+        # cluster_info.casting_vote_node, cluster_info.vote_config_epoch,
+        # nodes.applied_epoch
+        # — 15 migrations, so call_count = 2 + 15 = 17.
+        self.assertEqual(client.execute.call_count, 17)
         first_call_args = client.execute.call_args_list[0]
         statements = first_call_args.args[0]
         self.assertEqual(len(statements), 2)
@@ -334,6 +336,12 @@ class TestApplySchema(unittest.TestCase):
             for s in alter_sqls))
         self.assertTrue(any(
             "ALTER TABLE witnesses ADD COLUMN corrupt" in s
+            for s in alter_sqls))
+        self.assertTrue(any(
+            "ALTER TABLE cluster_info ADD COLUMN casting_vote_node" in s
+            for s in alter_sqls))
+        self.assertTrue(any(
+            "ALTER TABLE nodes ADD COLUMN applied_epoch" in s
             for s in alter_sqls))
 
 
