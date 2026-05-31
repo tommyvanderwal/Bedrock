@@ -63,10 +63,16 @@ from bedrock_d.state import RqliteClient  # noqa: E402
 log = logging.getLogger("bedrock.cluster_loop")
 
 # rqlite read-consistency (see installer/lib/rqlite_client.py):
-#   'strong' = linearizable, routed to the leader  -> the "master" read
-#   'weak'   = this node's local replica, sub-second stale -> the fallback
-_READ_MASTER = "strong"
-_READ_LOCAL = "weak"
+#   'none' = this node's LOCAL replica, no leader round-trip, NO Raft barrier.
+# Change DETECTION uses 'none': it only needs to NOTICE a new committed revision,
+# which the local replica applies via Raft within ms (the CDC webhook + the poll
+# floor catch it). Reading at 'strong' here was a self-sustaining Raft-BARRIER
+# storm (RCA L55, 2026-05-31): a strong read appends a no-op to the leader's log →
+# that is an applied commit → the rqlite-v10 CDC webhook fires to every node →
+# wakes them to strong-read again → ~64 barriers/s, ~30 MB/s of pointless fsync,
+# zero data changing. Critical reactors (DRBD takeover/promote) still read
+# 'strong' at THEIR OWN call site, so linearizable decisions are unaffected.
+_READ_LOCAL = "none"
 
 # Dispatcher: (revision, read_level) -> awaitable. Injected by the orchestrator.
 OnChange = Callable[[int, str], Awaitable[None]]
@@ -94,9 +100,7 @@ class ClusterStateSource:
         # just stop blocking the loop on it.
         self._dispatch_timeout_s = dispatch_timeout_s
         self._wake = asyncio.Event()
-        self._mode = _READ_MASTER
         self._last_rev = -1
-        self._local_ticks = 0
         # Single-flight: the in-flight reactor-dispatch task, if any. Detection
         # keeps running while it does; a new trigger never piles a second
         # dispatch on top of a slow/hung one.
@@ -110,8 +114,9 @@ class ClusterStateSource:
     async def run(self) -> None:
         """The central loop. Runs forever; wrap in the orchestrator's
         supervise() so a crash is loud + restarts."""
-        log.info("cluster_loop: starting (poll=%.2fs, %s-first reads)",
-                 self._poll_interval_s, _READ_MASTER)
+        log.info("cluster_loop: starting (poll=%.2fs, local '%s' detection reads "
+                 "— no Raft barrier; critical reactors read 'strong' at their "
+                 "call site)", self._poll_interval_s, _READ_LOCAL)
         await self._tick(force=True)   # converge current state at startup
         while True:
             try:
@@ -163,35 +168,21 @@ class ClusterStateSource:
         self._last_rev = rev
 
     def _read_revision(self):
-        """(revision, level) at the current read level, with a master->local
-        fallback that is REALLY handled. Returns (None, level) only if rqlite
-        is unreachable at BOTH the leader and the local replica."""
-        # Periodically re-probe the leader once we've fallen back to local.
-        if self._mode == _READ_LOCAL:
-            self._local_ticks += 1
-            if self._local_ticks * self._poll_interval_s >= self._leader_retry_s:
-                self._local_ticks = 0
-                if self._try_revision(_READ_MASTER) is not None:
-                    log.warning("cluster_loop: leader reachable again — "
-                                "resuming master (strong) reads")
-                    self._mode = _READ_MASTER
-
-        rev = self._try_revision(self._mode)
+        """(revision, 'none'). Reads the LOCAL replica only — change DETECTION
+        does not need the leader (and reading the leader at 'strong' was the
+        Raft-barrier storm, see _READ_LOCAL). The local replica applies committed
+        revisions via Raft within ms; the CDC webhook + 500ms poll floor catch
+        every change. The reactors get level='none' too — convergence reads may
+        run on local state (the two-read-classes rule); DRBD-takeover/promote
+        reactors re-read 'strong' at their OWN call site, so nothing that needs
+        linearizability loses it. Returns (None, 'none') only if THIS node's
+        local rqlite replica is unreachable (logged loud; retried next tick)."""
+        rev = self._try_revision(_READ_LOCAL)
         if rev is not None:
-            return rev, self._mode
-
-        if self._mode == _READ_MASTER:
-            log.warning("cluster_loop: leader unreachable for strong read — "
-                        "falling back to LOCAL replica (weak); will keep "
-                        "converging on local state and re-probe the leader")
-            self._mode = _READ_LOCAL
-            self._local_ticks = 0
-            rev = self._try_revision(_READ_LOCAL)
-            if rev is not None:
-                return rev, self._mode
-        log.error("cluster_loop: rqlite unreachable at BOTH leader and local "
-                  "replica — no cluster-state read this tick")
-        return None, self._mode
+            return rev, _READ_LOCAL
+        log.error("cluster_loop: local rqlite replica unreachable — no "
+                  "cluster-state read this tick (retries next poll)")
+        return None, _READ_LOCAL
 
     def _try_revision(self, level: str) -> Optional[int]:
         """One revision read at `level` with a FRESH client. Returns None on

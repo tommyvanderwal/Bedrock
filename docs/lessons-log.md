@@ -2249,3 +2249,38 @@ expensive than on bare metal — each fork is a VM exit. "Ensure X" helpers on a
 1 Hz converge MUST be no-ops in steady state (check before acting), and dashboards
 should read cluster state from the existing rqlite store, not re-probe every node
 over SSH every few seconds.
+
+## L55 — central event loop's `level=strong` revision poll ⇄ rqlite CDC = a self-sustaining Raft-barrier storm (30 MB/s, all idle)
+
+**Symptom:** an idle 4-node cluster wrote ~30 MB/s to the host disk CONTINUOUSLY
+and burned ~1 core/node. rqlited was the top consumer (3.1 MB/s disk + ~14% CPU
+PER NODE). Yet `bedrock_meta.revision` grew 0/sec, no table grew, and the
+write-logger on `RqliteClient.execute` caught ZERO writes — the data store was
+idle, but the Raft log (`applied_index`) grew ~64/sec.
+
+**Root cause (a feedback loop):** `bedrock_d/orchestrator/cluster_loop.py`'s
+`ClusterStateSource` polled `SELECT revision FROM bedrock_meta` at **level='strong'**
+(every 500 ms, on every node) for change detection. A `strong` read is NOT free:
+rqlite appends a **no-op barrier entry to the leader's Raft log** to prove
+leadership/linearizability. That barrier is an *applied commit* → which fires the
+**rqlite-v10 CDC webhook to every node** → which wakes each node to `check_now` →
+which does another `strong` revision read → another barrier → another webhook …
+self-sustaining at ~64 barriers/sec, each BoltDB-fsync'd, with ZERO data changing.
+The `strong` reads never showed in the execute-logger because they go through
+`/db/query?level=strong`, not `/db/execute`.
+
+**Fix:** change DETECTION to **level='none'** (this node's local replica). A
+change-detection poll only needs to NOTICE a new committed revision, which the
+local replica applies via Raft within ms — and the CDC webhook + 500 ms poll
+floor still catch every change. Critical reactors (DRBD takeover/promote) already
+read `strong` at THEIR OWN call site, so nothing linearizable is lost. Removed the
+master-first/retry-to-strong machinery that would have flipped back and re-stormed.
+
+**Result (measured):** strong reads ~18/s/node → ~0; applied_index 64/s → 1/s;
+rqlited disk 3.1 MB/s → 27 KB/s; **host disk write 30 MB/s → 0.0 MB/s.**
+
+**Lesson:** in rqlite, `level=strong` is a Raft WRITE (a barrier), not a cheap
+read — NEVER use it for a high-frequency poll, and NEVER on a path that a
+commit-triggered webhook can re-trigger (instant feedback loop). Change detection
+reads the local replica; only a decision that must be linearizable pays for
+`strong`, at its own call site, once.
