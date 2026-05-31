@@ -896,9 +896,15 @@ def vm_migrated(name: str, src_host: str, dst_host: str,
 
 
 def vm_state_change(name: str, host: str, state: str,
+                    reason: str = "",
                     client: Optional[rqlite_client.RqliteClient] = None) -> int:
-    """state: 'running', 'shut off', 'paused', etc. — verbatim
-    libvirt label."""
+    """state: 'running', 'shut off', 'paused', etc. — verbatim libvirt label.
+
+    Every VM transition flows through here, so this is the chokepoint that records
+    a BASELINE 'vm_lifecycle' event to VictoriaLogs — the complete on/off/migrate
+    timeline can never miss one. Richer + ERROR events (the exact virsh/qemu text,
+    a storage move's source→dest) are emitted at the call sites that hold the
+    detail. ``reason`` says why (operator / failover / crash / boot)."""
     c, owns = _client(client)
     try:
         c.execute(
@@ -906,7 +912,17 @@ def vm_state_change(name: str, host: str, state: str,
             "updated_at = ? WHERE vm_name = ?",
             params=[state, host or None, _now(), name],
         )
-        return _bump_and_close(c, owns)
+        rev = _bump_and_close(c, owns)
+        # Best-effort event (never blocks/raises — see event_log).
+        try:
+            from . import event_log
+            event_log.emit(
+                "vm_lifecycle",
+                f"VM {name} → {state}" + (f" ({reason})" if reason else ""),
+                vm=name, node=host or "", state=state, reason=reason)
+        except Exception:
+            pass
+        return rev
     except Exception:
         if owns:
             c.close()

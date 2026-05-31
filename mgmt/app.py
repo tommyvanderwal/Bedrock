@@ -33,6 +33,7 @@ from lib import join_handshake as _join_hs     # noqa: E402
 from lib import bedrock_state as _bs           # noqa: E402
 from lib import rqlite_client as _rqlite       # noqa: E402
 from lib import cluster_state as _cluster_state  # noqa: E402
+from lib import event_log as _events            # noqa: E402
 
 
 async def require_peer(request: Request) -> str:
@@ -3758,8 +3759,15 @@ def _vm_start(vm_name: str) -> dict:
         ssh_cmd_rc(nodes_cfg[target]["host"], f"drbdadm primary {resource}")
 
     out, rc = ssh_cmd_rc(nodes_cfg[target]["host"], f"virsh start {vm_name}")
-    if rc != 0: raise HTTPException(500, f"Failed: {out}")
-    push_log(f"VM {vm_name} started on {target}", node=target, app="bedrock-mgmt", level="info")
+    if rc != 0:
+        # The exact virsh/qemu error is the most useful thing to keep — record it
+        # as a per-VM event so it's findable later (the baseline lifecycle event
+        # never fires here because the state didn't change).
+        _events.emit("vm_error", f"VM {vm_name} start FAILED on {target}: {out}",
+                     vm=vm_name, node=target, level="error", op="start", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator started {vm_name} on {target}",
+                 vm=vm_name, node=target, reason="operator", op="start")
     return {"status": "started", "node": target}
 
 
@@ -3768,9 +3776,14 @@ def _vm_shutdown(vm_name: str) -> dict:
     vm = state["vms"].get(vm_name)
     if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
     nodes_cfg = get_nodes()
-    ssh_cmd_rc(nodes_cfg[vm["running_on"]]["host"], f"virsh shutdown {vm_name}")
-    push_log(f"VM {vm_name} shutdown requested on {vm['running_on']}",
-             node=vm["running_on"], app="bedrock-mgmt")
+    on = vm["running_on"]
+    out, rc = ssh_cmd_rc(nodes_cfg[on]["host"], f"virsh shutdown {vm_name}")
+    if rc != 0:
+        _events.emit("vm_error", f"VM {vm_name} shutdown FAILED on {on}: {out}",
+                     vm=vm_name, node=on, level="error", op="shutdown", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator shutdown {vm_name} on {on}",
+                 vm=vm_name, node=on, reason="operator", op="shutdown")
     return {"status": "shutdown sent"}
 
 
@@ -3779,7 +3792,14 @@ def _vm_poweroff(vm_name: str) -> dict:
     vm = state["vms"].get(vm_name)
     if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
     nodes_cfg = get_nodes()
-    ssh_cmd_rc(nodes_cfg[vm["running_on"]]["host"], f"virsh destroy {vm_name}")
+    on = vm["running_on"]
+    out, rc = ssh_cmd_rc(nodes_cfg[on]["host"], f"virsh destroy {vm_name}")
+    if rc != 0:
+        _events.emit("vm_error", f"VM {vm_name} poweroff FAILED on {on}: {out}",
+                     vm=vm_name, node=on, level="error", op="poweroff", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator powered off {vm_name} on {on}",
+                 vm=vm_name, node=on, reason="operator", op="poweroff")
     return {"status": "powered off"}
 
 

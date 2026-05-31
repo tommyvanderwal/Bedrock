@@ -40,6 +40,7 @@ from typing import Optional
 sys.path.insert(0, "/usr/local/lib/bedrock")
 
 from lib import bedrock_state as bs, state as state_mod
+from lib import event_log as events
 
 log = logging.getLogger("bedrock.backup")
 
@@ -1070,6 +1071,13 @@ def run_backup(target_id: str, vm_name: str, *, label: str = "") -> dict:
              "fs_freeze_used=%s, metadata=%s",
              vm_name, len(disk_results), total_bytes, duration, fs_freeze_used,
              metadata_kopia_id or "—")
+    # Storage move: source = the VM's disks on its home node, dest = the backup
+    # repo (target_id). bytes_added = what actually crossed the wire (dedup).
+    events.emit("storage_move", f"backed up {vm_name} ({home_node_name}) → {target_id}",
+                vm=vm_name, node=home_node_name, op="backup",
+                source=home_node_name, dest=target_id, label=snap_label,
+                disks=len(disk_results), bytes_added=total_bytes,
+                duration_s=round(duration, 1))
     bs.backup_done(
         vm=vm_name, target_id=target_id,
         disks=disk_results,
@@ -1433,6 +1441,14 @@ def run_restore(target_id: str, kopia_snapshot_id: str, vm_name: str, *,
     duration = time.monotonic() - started
     log.info("restore[%s] done: %d disk(s) in %.1fs",
              vm_name, len(restored), duration)
+    # Storage move: source = the backup repo (target_id + snapshot), dest = the
+    # VM's disks on dest_node. Recorded so "where did this restore come from /
+    # land" is findable later.
+    dests = ",".join(d.get("target_lv_path", "") for d in restored)
+    events.emit("storage_move", f"restored {vm_name} from {target_id} → {dest_node_name}",
+                vm=vm_name, node=dest_node_name, op="restore",
+                source=f"{target_id}:{kopia_snapshot_id}", dest=dests,
+                disks=len(restored), duration_s=round(duration, 1))
     bs.restore_done(
         vm=vm_name, target_id=target_id,
         kopia_snapshot_id=kopia_snapshot_id,
