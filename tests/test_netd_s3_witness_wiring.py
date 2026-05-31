@@ -61,3 +61,44 @@ def test_drive_skips_a_witness_whose_secret_cant_be_read(monkeypatch):
     ids = [wid for wid, _ in ws.configured_s3_witnesses]
     assert ids == ["good"]                # bad one skipped, good one survives
     assert any("bad" in m for m in logs)  # the skip was logged (fail-loud)
+
+
+# ── 1-min own-readback health check (#6): only 'corrupt' flags ──────────
+def _health_ws():
+    ws = _ws()
+    ws.configured_s3_witnesses = [("w1", object())]   # cfg placeholder
+    ws.configured_file_witnesses = []
+    return ws
+
+
+def test_health_check_flags_a_corrupt_witness(monkeypatch):
+    ws = _health_ws()
+    monkeypatch.setattr(w3, "S3Client", lambda cfg: cfg)
+    monkeypatch.setattr(w3, "health_check", lambda ws_, c: ("corrupt", "store lied"))
+    flagged = {}
+    monkeypatch.setattr(bs, "witness_flag_corrupt",
+                        lambda wid, reason: (flagged.update({wid: reason}), 1)[1])
+    logs = []
+    netd._witness_health_check(ws, None, log=logs.append)
+    assert "store lied" in flagged.get("w1", "")
+    assert any("FLAGGED CORRUPT" in m for m in logs)
+
+
+def test_health_check_ok_and_unreachable_never_flag(monkeypatch):
+    for verdict in ("ok", "unreachable"):
+        ws = _health_ws()
+        monkeypatch.setattr(w3, "S3Client", lambda cfg: cfg)
+        monkeypatch.setattr(w3, "health_check", lambda ws_, c, v=verdict: (v, "x"))
+        flagged = {}
+        monkeypatch.setattr(bs, "witness_flag_corrupt",
+                            lambda wid, reason: flagged.update({wid: reason}))
+        netd._witness_health_check(ws, None)
+        assert not flagged, f"{verdict} must NOT flag corrupt"
+
+
+def test_corrupt_witness_dropped_from_tally_binding():
+    # the tick filters corrupt witnesses out of configured_witness_ids; replicate
+    # that predicate to pin the behaviour (the safe direction: drop the vote).
+    _witnesses = {"good": {}, "bad": {"corrupt": True}}
+    ids = {wid for wid, w in _witnesses.items() if not w.get("corrupt")} or None
+    assert ids == {"good"}

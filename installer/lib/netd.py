@@ -1230,7 +1230,16 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # SET would then drop every live, legit Echo. None means "membership not
     # known here, don't filter" — and when there genuinely are 0 witnesses,
     # count_valid_confirmed returns 0 anyway (n_configured<=0), so no over-count.
-    ws.configured_witness_ids = set(_witnesses.keys()) or None
+    # Bind the tally to NON-CORRUPT witnesses: a witness flagged corrupt (its
+    # own-readback failed somewhere — a lying store) is dropped from the vote
+    # NUMERATOR stickily (it can never count again until the flag clears). This
+    # is the SAFE direction (removes a vote → raises the bar); the DENOMINATOR
+    # stays at len(_witnesses) until the casting-vote saga (#7) drops it under the
+    # all-nodes-applied watermark. None (no filter) only when there are 0 live
+    # witness ids, matching the lagging-replica convention below.
+    ws.configured_witness_ids = {
+        wid for wid, w in _witnesses.items() if not w.get("corrupt")
+    } or None
     # Refresh the directed-probe list for next tick's witness IO: every
     # backend=='echo' witness's (host, port). Lets an Echo added BY IP that is
     # off the broadcast domain still get probed + vote.
@@ -1634,6 +1643,53 @@ def _drive_s3_witnesses(ws, *, log=None):
     _w3.run_io_cycle(ws, log=log)
 
 
+WITNESS_HEALTH_INTERVAL_S = 60.0    # own-readback health-check cadence (#6)
+
+
+def _witness_health_check(ws, _witness_file, *, log=None):
+    """Own-readback health probe for EVERY configured slot-store witness (s3 +
+    fileshare). On a 'corrupt' verdict (the store accepted our slot write but
+    can't return it — a lying/non-coherent store) flag the witness corrupt in
+    rqlite: any node may flag, it's idempotent first-flag, and it drops the
+    witness from the vote tally + signals the operator. 'unreachable'/'ok' do
+    nothing (a transient just ages the slot out — split-brain-safe)."""
+    try:
+        from . import witness_s3 as _w3       # type: ignore
+        from . import bedrock_state as _bs     # type: ignore
+    except ImportError:                        # pragma: no cover
+        from lib import witness_s3 as _w3       # type: ignore
+        from lib import bedrock_state as _bs    # type: ignore
+
+    def _flag(wid, reason):
+        try:
+            if _bs.witness_flag_corrupt(wid, reason) and log is not None:
+                log(f"WITNESS {wid} FLAGGED CORRUPT (own-readback): {reason}")
+        except Exception as e:
+            if log is not None:
+                log(f"could not flag witness {wid} corrupt: {e}")
+
+    # S3 witnesses — clients resolved this cycle by _drive_s3_witnesses.
+    for wid, cfg in list(ws.configured_s3_witnesses):
+        try:
+            status, detail = _w3.health_check(ws, _w3.S3Client(cfg))
+        except Exception as e:
+            if log is not None:
+                log(f"s3 witness {wid} health probe error: {e}")
+            continue
+        if status == "corrupt":
+            _flag(wid, f"s3: {detail}")
+    # Fileshare witnesses — (witness_id, mount path).
+    for wid, path in list(ws.configured_file_witnesses):
+        try:
+            status, detail = _witness_file.health_check(ws, path)
+        except Exception as e:
+            if log is not None:
+                log(f"fileshare witness {wid} health probe error: {e}")
+            continue
+        if status == "corrupt":
+            _flag(wid, f"fileshare: {detail}")
+
+
 def _witness_file_worker(ws, _witness_file, should_stop,
                          *, interval: float = WITNESS_FILE_IO_INTERVAL_S):
     """Background thread body: drive fileshare-witness slot IO OFF the 1Hz
@@ -1649,6 +1705,7 @@ def _witness_file_worker(ws, _witness_file, should_stop,
     quietly disable that arbitration path). Sleeps in small slices so shutdown
     is prompt (<=0.2s)."""
     _log = lambda m: sys.stderr.write(f"bedrock-net: {m}\n")
+    _last_health = time.monotonic()   # first own-readback probe at +60s
     while not should_stop():
         try:
             if ws.configured_file_witnesses:
@@ -1665,6 +1722,15 @@ def _witness_file_worker(ws, _witness_file, should_stop,
                 _drive_s3_witnesses(ws, log=_log)
         except Exception as e:
             sys.stderr.write(f"bedrock-net: witness-s3 worker error: {e!r}\n")
+        # ~1-min own-readback health check (#6): flag a lying store corrupt.
+        if time.monotonic() - _last_health >= WITNESS_HEALTH_INTERVAL_S:
+            _last_health = time.monotonic()
+            try:
+                if ws.configured_s3_witnesses or ws.configured_file_witnesses:
+                    _witness_health_check(ws, _witness_file, log=_log)
+            except Exception as e:
+                sys.stderr.write(
+                    f"bedrock-net: witness health-check error: {e!r}\n")
         slept = 0.0
         while slept < interval and not should_stop():
             time.sleep(0.2)

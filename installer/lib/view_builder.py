@@ -143,7 +143,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         # witnesses
         for row in client.query(
             "SELECT witness_id, addr, witness_pubkey, "
-            "encrypted_witness_key, backend, endpoint_id FROM witnesses",
+            "encrypted_witness_key, backend, endpoint_id, "
+            "corrupt, corrupt_reason FROM witnesses",
             level=level,
         ):
             entry = {
@@ -160,6 +161,11 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             # storage_endpoints row.
             if row.get("endpoint_id"):
                 entry["endpoint_id"] = row["endpoint_id"]
+            # Corruption flag (own-readback health check): a corrupt witness is
+            # dropped from the vote tally + signalled to the operator.
+            if row.get("corrupt"):
+                entry["corrupt"] = True
+                entry["corrupt_reason"] = row.get("corrupt_reason", "")
             out["witnesses"][row["witness_id"]] = entry
 
         # storage_endpoints — the consolidated S3/SMB/NFS definition shared by
