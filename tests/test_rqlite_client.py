@@ -407,5 +407,40 @@ class TestConnectionPool(unittest.TestCase):
                           "weak reads keep using the warm pool")
 
 
+class TestFreshness(unittest.TestCase):
+    """level='none' + freshness — the cheap isolation gate (no Raft barrier)."""
+
+    def _client(self):
+        c = rc.RqliteClient.__new__(rc.RqliteClient)
+        c._client = mock.MagicMock()
+        return c
+
+    def test_freshness_params_go_in_the_url(self):
+        c = self._client()
+        c._client.request.return_value = _fake_response(
+            200, {"results": [{"columns": ["1"], "values": [[1]]}]})
+        c.query("SELECT 1", level="none", freshness="2s", freshness_strict=True)
+        url = c._client.request.call_args.args[1]
+        self.assertIn("level=none", url)
+        self.assertIn("freshness=2s", url)
+        self.assertIn("freshness_strict=true", url)
+
+    def test_no_freshness_no_params(self):
+        c = self._client()
+        c._client.request.return_value = _fake_response(
+            200, {"results": [{"columns": ["1"], "values": [[1]]}]})
+        c.query("SELECT 1", level="none")
+        self.assertNotIn("freshness", c._client.request.call_args.args[1])
+
+    def test_stale_read_top_level_error_raises(self):
+        # rqlite returns {"results":[],"error":"stale read"} when the node is
+        # out of contact beyond the freshness window — must RAISE, not return [].
+        c = self._client()
+        c._client.request.return_value = _fake_response(
+            200, {"results": [], "error": "stale read"})
+        with self.assertRaises(rc.RqliteError):
+            c.query("SELECT 1", level="none", freshness="2s")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

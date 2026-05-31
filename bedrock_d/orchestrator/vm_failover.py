@@ -88,6 +88,13 @@ KILL_AFTER_QUORUM_LOSS_S   = 5 * 60  # kill 5 min after QUORUM LOSS (not after
 
 TICK_S = 5.0     # all three tasks run on this cadence
 
+# Freshness window for the _rqlite_quorate isolation gate (a Go duration string
+# passed to rqlite's level='none'+freshness read). Comfortably above rqlite's
+# ~1 s leader heartbeat (so a healthy node never trips on a blip) and far below
+# TAKEOVER_AFTER_PEER_DOWN_S (so a real partition is caught well before takeover).
+# Cheap enough to run every tick — it's a local read, no Raft barrier.
+QUORATE_FRESHNESS_S = "2s"
+
 # Local "this node currently does NOT see cluster quorum" marker.
 # Written by netd's election layer when our weighted-vote sum falls
 # below majority.
@@ -324,10 +331,26 @@ def _peers_observed_down(max_age_s: float) -> list[str]:
 
 
 def _rqlite_quorate() -> bool:
-    """True if local rqlite has a quorate leader reachable. Reuses
-    netd's _rqlite_ready probe semantics — a level='strong' SELECT 1
-    succeeds only when the cluster has a leader and we can talk to
-    it."""
+    """True if this node is NOT an isolated rqlite minority — i.e. it has heard
+    from the Raft leader recently. Gates the takeover loop so a partitioned
+    minority never DRBD-promotes a VM the majority also runs.
+
+    This used to be a level='strong' SELECT 1 — but that question is 'am I in
+    contact with a leader', a LIVENESS check, not a linearizable read. A strong
+    read pays a Raft barrier (a WRITE) on EVERY tick (the L55 storm class) and
+    forwards from a follower (the L59 desync class) for no reason here. Instead
+    use a level='none' read with a `freshness` window: rqlite serves locally
+    only if this node heard from the leader within the window, else it returns
+    a 'stale read' error (which query() raises). An isolated follower fails it
+    → not quorate → won't take over; a connected node passes it for ~free (no
+    barrier, no forward, reuses the warm connection pool). The genuinely
+    linearizable safety still lives in is_safe_to_start_vm's strong UUID read at
+    the actual promote — this is only the cheap 'don't even try if cut off' gate.
+
+    Window = QUORATE_FRESHNESS_S, comfortably above rqlite's ~1 s leader
+    heartbeat and far below the ~35 s takeover timer, so a healthy node never
+    false-negatives on a blip yet a real partition is caught long before any
+    takeover."""
     try:
         try:
             from lib import rqlite_client
@@ -336,7 +359,8 @@ def _rqlite_quorate() -> bool:
             _sys.path.insert(0, "/usr/local/lib/bedrock")
             from lib import rqlite_client  # type: ignore
         with rqlite_client.RqliteClient() as rc:
-            rc.query("SELECT 1", level="strong")
+            rc.query("SELECT 1", level="none",
+                     freshness=QUORATE_FRESHNESS_S, freshness_strict=True)
         return True
     except Exception:
         return False

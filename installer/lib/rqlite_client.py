@@ -274,8 +274,20 @@ class RqliteClient:
         params: Optional[Sequence[Any]] = None,
         *,
         level: str = "weak",       # 'none' | 'weak' | 'strong'
+        freshness: str = "",       # e.g. "2s" — only meaningful with level='none'
+        freshness_strict: bool = False,
     ) -> list[dict]:
         """SELECT helper. Returns a list of dict rows (column→value).
+
+        `freshness` (a Go duration like "2s") is a CHEAP isolation gate on a
+        level='none' read: rqlite serves locally only if this node heard from
+        the leader within `freshness`, else it returns a top-level 'stale read'
+        error (which this method RAISES). Use it to ask "is my rqlite NOT
+        isolated?" without paying a strong-read Raft barrier — e.g. the takeover
+        quorum pre-gate. `freshness_strict` additionally asks rqlite to apply the
+        check on the leader; NOTE on rqlite v10.0.5 the leader is always
+        considered fresh regardless, so on N>=3 a just-isolated old leader is
+        caught by the downstream linearizable takeover read, not by this gate.
 
         `level` follows rqlite's read-consistency model:
           * 'none'   — read locally, no leader consult. Fastest, can
@@ -290,11 +302,22 @@ class RqliteClient:
             payload = [[sql, *params]]
         else:
             payload = [sql]
+        url = f"/db/query?level={level}"
+        if freshness:
+            url += f"&freshness={freshness}"
+            if freshness_strict:
+                url += "&freshness_strict=true"
         body = self._request_with_retry(
-            "POST", f"/db/query?level={level}",
+            "POST", url,
             json=payload,
             close_conn=(level == "strong"),   # L59: don't pool forwarded strong reads
         )
+        # Top-level (request-level) error — e.g. a freshness 'stale read'
+        # rejection comes back as {"results":[],"error":"stale read"}. RAISE it
+        # rather than silently returning [], so a freshness-gated caller treats
+        # 'I'm out of contact with the leader' as a failure, not as empty data.
+        if body.get("error"):
+            raise RqliteError(f"rqlite query error: {body['error']!r}")
         results = body.get("results") or []
         if not results:
             return []
