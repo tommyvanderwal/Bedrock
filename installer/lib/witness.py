@@ -198,12 +198,18 @@ class WitnessState:
     # for clusters with no S3 witness (the fold below is then a no-op).
     s3_witnesses: dict = field(default_factory=dict)
 
-    # Configured S3 witnesses as (witness_id, witness_s3.S3Config) pairs, refreshed
-    # each netd tick from the rqlite `witnesses` table (backend=='s3'). The
-    # off-hot-path IO worker (witness_s3.run_io_cycle) reads this to know WHICH
-    # buckets/prefixes to write/read slots on (no mount — direct SigV4 over HTTP).
-    # Empty = no S3 witnesses (the worker is a no-op / not started).
+    # Configured S3 witnesses as (witness_id, witness_s3.S3Config) pairs. RESOLVED
+    # by the off-hot-path worker from configured_s3_witness_refs (below) — the
+    # worker reads the sealed S3 secret from rqlite + builds the client, then
+    # witness_s3.run_io_cycle reads this list. Empty = no S3 witnesses.
     configured_s3_witnesses: list = field(default_factory=list)
+
+    # LIGHTWEIGHT S3-witness refs (witness_id, endpoint_id, endpoint_dict) set by
+    # the 1Hz tick from the view (witnesses backend=='s3' joined to
+    # storage_endpoints). Deliberately carries NO secret — the sealed S3 secret
+    # stays out of the snapshot AND off the hot path; the worker unseals it from
+    # rqlite when it builds the S3Config. Empty = no S3 witnesses (worker no-op).
+    configured_s3_witness_refs: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────

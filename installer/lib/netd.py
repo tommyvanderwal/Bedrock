@@ -1248,10 +1248,36 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # the share (SMB/S3 latency stays off the 1Hz path); it only sets this list.
     # witness_id stays in configured_witness_ids above (set() over ALL backends),
     # so the tally's identity binding covers fileshare witnesses too.
+    # storage_endpoints (S3/SMB/NFS) from the view — used to resolve an
+    # endpoint-backed witness to its mount path (fileshare) or S3 client (s3).
+    _endpoints = cluster.get("storage_endpoints") or {}
+    try:
+        from . import storage_mount as _sm
+    except ImportError:                       # pragma: no cover
+        from lib import storage_mount as _sm  # type: ignore
+
+    def _fileshare_path(w):
+        # An endpoint-backed fileshare witness lives at the Bedrock-managed
+        # witness mountpoint (/mnt/bedrock/witness/<id>); a legacy one carries
+        # its operator-provided path inline in `addr`.
+        eid = w.get("endpoint_id")
+        if eid:
+            return str(_sm.mountpoint(eid, _sm.WITNESS))
+        return w.get("addr", "")
+
     ws.configured_file_witnesses = [
-        (wid, w.get("addr", ""))
+        (wid, p)
         for wid, w in _witnesses.items()
-        if (w.get("backend") or "echo") == "fileshare" and w.get("addr")
+        if (w.get("backend") or "echo") == "fileshare"
+        for p in (_fileshare_path(w),) if p
+    ]
+    # S3 witnesses → lightweight refs (no secret on the hot path / in the
+    # snapshot). The worker unseals the S3 secret from rqlite to build the client.
+    ws.configured_s3_witness_refs = [
+        (wid, w["endpoint_id"], _endpoints[w["endpoint_id"]])
+        for wid, w in _witnesses.items()
+        if (w.get("backend") or "echo") == "s3"
+        and w.get("endpoint_id") and w["endpoint_id"] in _endpoints
     ]
     # M10 multi-witness: count CONFIGURED witnesses that are INDIVIDUALLY
     # valid+confirmed (capped at n_configured), not a hard-coded 0/1.
@@ -1584,6 +1610,30 @@ WITNESS_FILE_IO_INTERVAL_S = 3.0   # off-hot-path slot-IO cadence (< the 12s
 #                                    witness freshness window even at S3 ~1.2s/op)
 
 
+def _drive_s3_witnesses(ws, *, log=None):
+    """Resolve the lightweight S3-witness refs to (witness_id, S3Config) by
+    unsealing each endpoint's S3 secret from rqlite, then run one slot-IO cycle.
+    The secret read + the HTTP IO both happen HERE (off the 1Hz tick). A witness
+    whose secret can't be read/unsealed is skipped — it gets no verdict this pass
+    and ages out of the tally (counts 0, the split-brain-safe direction)."""
+    try:
+        from . import witness_s3 as _w3       # type: ignore
+        from . import bedrock_state as _bs     # type: ignore
+    except ImportError:                        # pragma: no cover
+        from lib import witness_s3 as _w3       # type: ignore
+        from lib import bedrock_state as _bs    # type: ignore
+    specs = []
+    for wid, eid, ep in list(ws.configured_s3_witness_refs):
+        try:
+            secret = _bs.storage_endpoint_secret(eid, "s3_secret_key")
+            specs.append((wid, _w3.S3Config.from_endpoint(ep, secret)))
+        except Exception as e:
+            if log is not None:
+                log(f"s3 witness {wid} ({eid}) resolve failed: {e}")
+    ws.configured_s3_witnesses = specs
+    _w3.run_io_cycle(ws, log=log)
+
+
 def _witness_file_worker(ws, _witness_file, should_stop,
                          *, interval: float = WITNESS_FILE_IO_INTERVAL_S):
     """Background thread body: drive fileshare-witness slot IO OFF the 1Hz
@@ -1598,16 +1648,23 @@ def _witness_file_worker(ws, _witness_file, should_stop,
     witnessing (a dead worker would let every fileshare witness age out and
     quietly disable that arbitration path). Sleeps in small slices so shutdown
     is prompt (<=0.2s)."""
+    _log = lambda m: sys.stderr.write(f"bedrock-net: {m}\n")
     while not should_stop():
         try:
             if ws.configured_file_witnesses:
-                _witness_file.run_io_cycle(
-                    ws,
-                    log=lambda m: sys.stderr.write(f"bedrock-net: {m}\n"),
-                )
+                _witness_file.run_io_cycle(ws, log=_log)
         except Exception as e:   # fail-loud, never let the worker die
             sys.stderr.write(
                 f"bedrock-net: witness-file worker error: {e!r}\n")
+        # S3 witnesses on the SAME off-hot-path worker: resolve each ref (unseal
+        # the S3 secret from rqlite + build the SigV4 client) then run its slot
+        # IO. Isolated in its own try so an S3 error never kills the fileshare
+        # path (or the worker). No-op until a backend=='s3' witness is configured.
+        try:
+            if ws.configured_s3_witness_refs:
+                _drive_s3_witnesses(ws, log=_log)
+        except Exception as e:
+            sys.stderr.write(f"bedrock-net: witness-s3 worker error: {e!r}\n")
         slept = 0.0
         while slept < interval and not should_stop():
             time.sleep(0.2)
