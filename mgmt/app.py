@@ -1574,6 +1574,10 @@ async def websocket_endpoint(ws: WebSocket):
     await hub.connect(ws)
     # Push cached state immediately so the UI renders before the next refresh.
     await hub.send_to(ws, "cluster", _last_state)
+    # The push loop only probes WHILE a client is connected, so the cache may be
+    # stale after an idle period. Kick a fresh gather now (off the handler) so
+    # this client sees current state promptly; the loop keeps it fresh after.
+    asyncio.create_task(_gather_and_push())
     try:
         while True:
             data = await ws.receive_text()
@@ -1605,14 +1609,26 @@ async def handle_rpc(method: str, params: dict) -> dict:
 
 # ── Background task: push cluster state every 3 seconds ────────────────────
 
-async def state_push_loop():
+async def _gather_and_push():
+    """One expensive cluster gather (per-node SSH fanout) → cache → broadcast."""
     global _last_state
+    loop = asyncio.get_event_loop()
+    state = await loop.run_in_executor(None, build_cluster_state)
+    _last_state = state
+    await hub.broadcast("cluster", state)
+
+
+async def state_push_loop():
     while True:
         try:
-            loop = asyncio.get_event_loop()
-            state = await loop.run_in_executor(None, build_cluster_state)
-            _last_state = state
-            await hub.broadcast("cluster", state)
+            # Only probe the cluster while a dashboard is actually OPEN. With no
+            # WebSocket client connected, build_cluster_state's per-node SSH +
+            # `virsh list --all` fanout is pure waste — nobody is watching — and
+            # it is the DRBD-modprobe fork storm of RCA L54. A connecting client
+            # triggers an immediate fresh gather (see websocket_endpoint), and
+            # this loop keeps it fresh only for as long as someone is looking.
+            if hub.has_clients():
+                await _gather_and_push()
         except Exception as e:
             log.error("State push error: %s", e)
         await asyncio.sleep(3)

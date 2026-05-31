@@ -25,6 +25,13 @@ class WSHub:
             self.clients.remove(ws)
         log.info("Client disconnected (%d total)", len(self.clients))
 
+    def has_clients(self) -> bool:
+        """True iff at least one dashboard is connected. The state-push loop
+        gates its per-node SSH probes on this — no point gathering cluster state
+        when nobody is watching (RCA L54: the gather is a DRBD-modprobe fork
+        storm)."""
+        return bool(self.clients)
+
     async def broadcast(self, channel: str, data: dict):
         msg = json.dumps({"channel": channel, **data})
         dead = []
