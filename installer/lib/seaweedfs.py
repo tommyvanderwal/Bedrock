@@ -599,20 +599,32 @@ def ensure_iso_library_mount() -> None:
     if needs_restart:
         unit_path.write_text(unit)
         subprocess.run(["systemctl", "daemon-reload"], check=False, timeout=10)
-    # --no-block so we never deadlock the caller waiting for the FUSE
-    # mount to come up; weed retries internally until the filer is
-    # reachable.
-    subprocess.run(
-        ["systemctl", "enable", "--no-block", ISO_MOUNT_UNIT],
-        check=False, timeout=10,
-    )
-    action = "restart" if needs_restart else "start"
-    subprocess.run(
-        ["systemctl", action, "--no-block", ISO_MOUNT_UNIT],
-        check=False, timeout=10,
-    )
-    log.info("seaweedfs: FUSE namespace mounted at %s via filer=%s",
-             FUSE_MOUNTPOINT, filer_target)
+    # IDEMPOTENCY GUARD (RCA L54): this runs on EVERY converge pass (~1/s). Blindly
+    # re-`enable`+`start`ing an already-enabled+running unit churns systemd every
+    # cycle (sd-exec helpers, symlink rewrites) and was a measurable chunk of the
+    # idle-node fork storm. Only act when the state actually needs changing:
+    #   * enable only if not already enabled,
+    #   * restart if the unit text changed, else start only if not already active.
+    # In steady state this is two cheap is-enabled/is-active checks and no writes.
+    enabled = subprocess.run(
+        ["systemctl", "is-enabled", "--quiet", ISO_MOUNT_UNIT],
+        check=False, timeout=10).returncode == 0
+    if not enabled:
+        # --no-block so we never deadlock the caller waiting for the FUSE mount.
+        subprocess.run(["systemctl", "enable", "--no-block", ISO_MOUNT_UNIT],
+                       check=False, timeout=10)
+    active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", ISO_MOUNT_UNIT],
+        check=False, timeout=10).returncode == 0
+    if needs_restart:
+        subprocess.run(["systemctl", "restart", "--no-block", ISO_MOUNT_UNIT],
+                       check=False, timeout=10)
+    elif not active:
+        subprocess.run(["systemctl", "start", "--no-block", ISO_MOUNT_UNIT],
+                       check=False, timeout=10)
+    if needs_restart or not enabled or not active:
+        log.info("seaweedfs: FUSE namespace (re)mounted at %s via filer=%s",
+                 FUSE_MOUNTPOINT, filer_target)
 
 
 def init_collections() -> None:

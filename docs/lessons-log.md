@@ -2211,3 +2211,41 @@ matches the kopia_snapshot_id against a vm_backups row), so a snapshot that was
 can't be restored through the API until a backup row is registered for it. When
 migrate-based tiering is wired into Bedrock, the tiering step must also write the
 vm_backups record for the destination tier.
+
+## L54 — idle nodes burned ~2 host cores each: self-inflicted fork storms (~181 forks/s), amplified by virtualization
+
+**Symptom:** on the 4-sim testbed each "idle" node's qemu showed ~190-253% host
+CPU (host load ~7 on 32 cores). Inside the guest it *looked* ~75% idle, but the 4
+vCPU threads each burned ~35% host CPU. The gap = virtualization overhead: every
+fork/exec/exit in the guest is a VM exit. Measured ~181 forks/sec and ~16500
+context-switches/sec on a node doing no real work.
+
+**Root cause — two reconcile/dashboard loops spawning a storm of short-lived
+processes (caught by sampling /proc for new PIDs):**
+
+1. **Dashboard node-status polling → DRBD modprobe storm (dominant).**
+   `mgmt/app.py get_node_info()` is fanned out to EVERY node by the state-push
+   loop, and the dashboard runs on EVERY node (N backends × N targets). Each
+   gather SSHes in and runs `virsh list --all` + `drbdadm status`; enumerating the
+   DRBD-backed disks makes the kernel auto-load `block-major-147-N` (147 = DRBD) →
+   ~13 `modprobe`/s + ~19 `bash`/s. The module is already loaded, so every
+   modprobe (re-reads modules.dep) is pure waste.
+
+2. **FUSE-mount reconcile re-enabling a unit every pass.**
+   `seaweedfs.ensure_iso_library_mount()` ran `systemctl enable --no-block` +
+   `start` on `bedrock-fuse-mount` UNCONDITIONALLY every converge cycle (~1/s),
+   even when already enabled+running → systemd sd-exec/sd-close churn + the
+   `init.scope: Reloading...` 19×/20s + `rc.local not marked executable` spam.
+
+**Fix (this commit):** #2 — idempotency guard: `is-enabled --quiet` before enable,
+`is-active --quiet` before start, restart only on unit-text change; steady state =
+two cheap checks, no writes. #1 (the dominant one) needs an operator decision
+(touches the live dashboard): source VM state from rqlite/libvirt-API instead of
+shelling `virsh list --all` per poll, and/or lengthen the interval / poll only when
+a client is connected — proposed, not yet done.
+
+**Lesson:** in a VM, a reconcile loop that shells out unconditionally is far more
+expensive than on bare metal — each fork is a VM exit. "Ensure X" helpers on a
+1 Hz converge MUST be no-ops in steady state (check before acting), and dashboards
+should read cluster state from the existing rqlite store, not re-probe every node
+over SSH every few seconds.
