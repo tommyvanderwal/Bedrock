@@ -242,16 +242,39 @@ if [ $DRY_RUN -eq 1 ]; then
     echo "[publish] DRY RUN — no upload"
 fi
 
-echo "[publish] syncing $STAGE/ → $REMOTE/$PREFIX/"
-rclone sync $SYNC_FLAGS "$STAGE/" "$REMOTE/$PREFIX/"
+# ISO PROTECTION (load-bearing): `rclone sync` makes the destination MATCH the
+# stage tree — so a publish WITHOUT --with-iso (no ISOs staged) would DELETE the
+# installer ISOs already on S3. The ISOs are long-lived release artifacts that must
+# ALWAYS stay (they may lag the payload a little — fine). So EXCLUDE them from every
+# sync: rclone never lists an excluded path on EITHER side, so an excluded ISO in
+# the destination is invisible to the delete pass and is left untouched. The sync
+# still prunes stale NON-iso payload as before. Fresh ISOs are then uploaded
+# ADDITIVELY via `rclone copy` (which never deletes) only when --with-iso.
+ISO_EXCLUDE='bedrock-installer-*.iso'
+
+upload_isos_to() {  # $1 = destination remote path; copies whatever ISOs are staged
+    local dest="$1" iso
+    for iso in "bedrock-installer-${PREFIX}.iso" \
+               "bedrock-installer-${PREFIX}-offline.iso"; do
+        if [ -f "$STAGE/$iso" ]; then
+            echo "[publish] copying ISO $iso → $dest (additive, never deletes)"
+            rclone copy $SYNC_FLAGS "$STAGE/$iso" "$dest"
+        fi
+    done
+}
+
+echo "[publish] syncing $STAGE/ → $REMOTE/$PREFIX/ (ISOs excluded — never deleted)"
+rclone sync $SYNC_FLAGS --exclude "$ISO_EXCLUDE" "$STAGE/" "$REMOTE/$PREFIX/"
+[ $WITH_ISO -eq 1 ] && upload_isos_to "$REMOTE/$PREFIX/"
 
 # ── Copy to /latest/ if requested ────────────────────────────────────────
 if [ $AS_LATEST -eq 1 ]; then
     if [ $TAG_MODE -ne 1 ]; then
         echo "WARNING: --as-latest without --tag is unusual; skipping latest update." >&2
     else
-        echo "[publish] copying $PREFIX/ → latest/"
-        rclone sync $SYNC_FLAGS "$STAGE/" "$REMOTE/latest/"
+        echo "[publish] copying $PREFIX/ → latest/ (ISOs excluded from sync)"
+        rclone sync $SYNC_FLAGS --exclude "$ISO_EXCLUDE" "$STAGE/" "$REMOTE/latest/"
+        [ $WITH_ISO -eq 1 ] && upload_isos_to "$REMOTE/latest/"
     fi
 fi
 
