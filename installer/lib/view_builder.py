@@ -449,6 +449,11 @@ def _cluster_view(v: dict) -> dict:
         "cluster_name":   v["cluster_name"],
         "cluster_uuid":   v["cluster_uuid"],
         "mgmt_master":    v.get("mgmt_master"),
+        # 2-node casting-vote rescue (#7): the armed node + the vote-config epoch
+        # netd reads to pass casting_vote_node to election.compute + to gate the
+        # all-nodes-applied watermark. (nodes[].applied_epoch rides in "nodes".)
+        "casting_vote_node":  v.get("casting_vote_node"),
+        "vote_config_epoch":  v.get("vote_config_epoch", 0),
         "nodes":          v["nodes"],
         "tiers":          v["tiers"],
         "witnesses":      v["witnesses"],

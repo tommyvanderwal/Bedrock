@@ -1222,6 +1222,11 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     ws.member_ids = member_ids or None
     _witnesses = cluster.get("witnesses") or {}
     n_configured_witnesses = len(_witnesses)
+    # 2-node casting-vote rescue (#7): the armed node (the incumbent master) gets
+    # +1 in election.compute's steady-state-master branch. Read it here; the saga
+    # only ever arms it on an N=2 cluster, and compute() ignores it everywhere
+    # except when self IS that master — so an unarmed cluster sees no change.
+    casting_vote_node = cluster.get("casting_vote_node") or None
     # Bind voting witnesses to the configured set: only a reply whose echo_id
     # matches a configured witness_id is admitted/counted (drops a rogue Echo
     # and a just-removed witness's stale entry from the tally). EMPTY → None
@@ -1397,6 +1402,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         n_configured_witnesses=n_configured_witnesses,
         n_valid_witnesses=n_valid_witnesses,
         peer_acks=peer_acks,
+        casting_vote_node=casting_vote_node,
     )
 
     # 4b. Publish our own election-heartbeat fields for the next
