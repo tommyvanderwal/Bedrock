@@ -720,6 +720,11 @@ class Daemon:
     hb_transitioning: bool = False
     hb_arbiter_uuid: str = ""
     hb_ack_target: str = ""
+    # Last vote-config epoch THIS node advertised as applied (node_applied_epoch_set).
+    # Cached so the 4 Hz tick only writes rqlite when the epoch actually advances —
+    # an unconditional write every tick would re-create the L57 storm. -1 = unknown
+    # (forces a first advertise on startup so a fresh node publishes its epoch).
+    applied_epoch_cache: int = -1
     # L2 switch/router neighbour discovery (LLDP, CDP, MNDP). Per-NIC
     # raw sockets are opened on NIC bringup and closed on teardown.
     # switch_neighbors is keyed by (my_nic, protocol) → dict, where
@@ -1221,12 +1226,51 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
             pass
     ws.member_ids = member_ids or None
     _witnesses = cluster.get("witnesses") or {}
-    n_configured_witnesses = len(_witnesses)
+    # ── Vote-config epoch + all-nodes-applied watermark (#7) ──────────────
+    # Bar-LOWERING vote-config changes (credit the casting vote; drop a 'disabled'
+    # witness from the DENOMINATOR) must NOT take effect at the master until EVERY
+    # active node has applied the new config — else a lagging follower still
+    # computing the OLD (still-quorate-for-it) config PLUS the master's lowered bar
+    # = split-brain. Watermark = min(applied_epoch) over ACTIVE nodes; the arbiter
+    # is not a nodes row so it's excluded by construction (counting it re-opens the
+    # hole — see project_storage_unification_design / VOTE-CHANGE SAFETY PRINCIPLE).
+    vote_config_epoch = int(cluster.get("vote_config_epoch") or 0)
+    _applied_epochs = [int(info.get("applied_epoch") or 0)
+                       for info in active_nodes.values()]
+    all_applied_epoch = min(_applied_epochs) if _applied_epochs else 0
+    config_fully_applied = all_applied_epoch >= vote_config_epoch
+    # Advertise that THIS node has ingested the current epoch (its tick now uses the
+    # new config). Churn-free: only write when our cached epoch is behind —
+    # node_applied_epoch_set is ALSO monotonic + no-bump-on-noop (L57); this cache
+    # just spares the rqlite round-trip on the 4 Hz steady state.
+    if vote_config_epoch > d.applied_epoch_cache:
+        try:
+            try:
+                from . import bedrock_state as _bs_ae     # type: ignore
+            except ImportError:                            # pragma: no cover
+                from lib import bedrock_state as _bs_ae    # type: ignore
+            _bs_ae.node_applied_epoch_set(d.my_node, vote_config_epoch)
+            d.applied_epoch_cache = vote_config_epoch
+        except Exception as _e:
+            sys.stderr.write(
+                f"bedrock-net: applied_epoch advertise failed: {_e}\n")
+    # DENOMINATOR: a 'disabled' witness leaves the count ONLY once the config is
+    # fully applied cluster-wide. Until then it stays counted (higher bar = safe).
+    # (corrupt ≠ disabled: corrupt drops the NUMERATOR immediately below; disabled
+    # drops the DENOMINATOR under this gate — the two halves of the saga.)
+    if config_fully_applied:
+        n_configured_witnesses = sum(
+            1 for w in _witnesses.values() if not w.get("disabled"))
+    else:
+        n_configured_witnesses = len(_witnesses)
     # 2-node casting-vote rescue (#7): the armed node (the incumbent master) gets
-    # +1 in election.compute's steady-state-master branch. Read it here; the saga
-    # only ever arms it on an N=2 cluster, and compute() ignores it everywhere
-    # except when self IS that master — so an unarmed cluster sees no change.
-    casting_vote_node = cluster.get("casting_vote_node") or None
+    # +1 in election.compute's steady-state-master branch. Crediting +1 is also
+    # bar-lowering → gate it on the SAME all-applied watermark (pass None until
+    # then, so the master holds the higher bar while a follower catches up). The
+    # saga only ever arms it on N=2, and compute() ignores it everywhere except
+    # when self IS that master — so an unarmed cluster sees no change.
+    casting_vote_node = ((cluster.get("casting_vote_node") or None)
+                         if config_fully_applied else None)
     # Bind voting witnesses to the configured set: only a reply whose echo_id
     # matches a configured witness_id is admitted/counted (drops a rogue Echo
     # and a just-removed witness's stale entry from the tally). EMPTY → None
@@ -1243,7 +1287,8 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     # all-nodes-applied watermark. None (no filter) only when there are 0 live
     # witness ids, matching the lagging-replica convention below.
     ws.configured_witness_ids = {
-        wid for wid, w in _witnesses.items() if not w.get("corrupt")
+        wid for wid, w in _witnesses.items()
+        if not w.get("corrupt") and not w.get("disabled")
     } or None
     # Refresh the directed-probe list for next tick's witness IO: every
     # backend=='echo' witness's (host, port). Lets an Echo added BY IP that is
