@@ -35,6 +35,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, "/usr/local/lib/bedrock")
 
@@ -345,18 +346,11 @@ def _kopia_password_export(target_id: str = "") -> str:
             f"|| printf %s {pub} )\"")
 
 
-def _sync_target_password_file(target_id: str) -> None:
-    """Mirror this target's per-repo password from rqlite to its 0600 override
-    file on THIS node: write it if a real password is set, remove it otherwise
-    (so the repo falls back to backup.key/public). Best-effort — an rqlite blip
-    leaves the prior file in place (the backup just keeps using the last-known
-    password), never raising into the configure path."""
-    try:
-        pw = bs.backup_target_repo_password(target_id)
-    except Exception as e:
-        log.warning("backup: could not read repo password for %s "
-                    "(leaving override as-is): %s", target_id, e)
-        return
+def _materialize_target_password(target_id: str, pw: str) -> None:
+    """Write the per-repo override file (0600, tmp+rename) when a real password
+    is given, or remove it when empty (so the repo falls back to backup.key/
+    public). The file is a LOCAL materialization of rqlite — rqlite is the
+    source of truth; this is just the on-disk cache kopia reads."""
     path = _target_password_file(target_id)
     if pw:
         CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -369,6 +363,20 @@ def _sync_target_password_file(target_id: str) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _sync_target_password_file(target_id: str) -> None:
+    """Mirror this target's per-repo password FROM RQLITE (the source of truth)
+    to its 0600 override file on THIS node. Best-effort — an rqlite blip leaves
+    the prior file in place (the backup keeps using the last-known password),
+    never raising into the configure path."""
+    try:
+        pw = bs.backup_target_repo_password(target_id)
+    except Exception as e:
+        log.warning("backup: could not read repo password for %s "
+                    "(leaving override as-is): %s", target_id, e)
+        return
+    _materialize_target_password(target_id, pw)
 
 
 def _kopia_config_file(target_id: str) -> str:
@@ -451,7 +459,8 @@ def configure_target_locally(target_id: str, kind: str,
                              s3_disable_tls_verification: bool = False,
                              filesystem_path: str = "",
                              override_source_prefix: str = "",
-                             cache_directory: str = "") -> None:
+                             cache_directory: str = "",
+                             repo_password: Optional[str] = None) -> None:
     """Connect (or create + connect) the kopia repo on THIS node so
     subsequent backup/restore invocations Just Work. Reads the
     encryption password from /etc/bedrock/backup.key and credentials
@@ -486,11 +495,15 @@ def configure_target_locally(target_id: str, kind: str,
     # backups must work with ZERO setup. An operator who wants real encryption
     # sets a password (per repo); this never overwrites an existing one.
     _ensure_repo_password_file()
-    # Mirror this repo's per-target password override from rqlite (write it if a
-    # real one is set, else remove the override so it falls back to backup.key).
-    # The reactor calls configure_target_locally on EVERY node when a target
-    # changes, so each node's override file stays in sync with the sealed value.
-    _sync_target_password_file(target_id)
+    # Materialize this repo's per-target password override (write if real, else
+    # remove → falls back to backup.key). rqlite is the source of truth:
+    #   * repo_password given (master's own set, before rqlite is written) →
+    #     materialize it directly so the kopia connect below uses it;
+    #   * None (the reactor path, after rqlite has the value) → read from rqlite.
+    if repo_password is None:
+        _sync_target_password_file(target_id)
+    else:
+        _materialize_target_password(target_id, repo_password)
     # Per-target credentials file is required for S3 (KOPIA_S3_*) but
     # optional for kopia-fs targets — those just need a writable
     # directory + the encryption password. Avoiding the requirement for

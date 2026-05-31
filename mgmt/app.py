@@ -2932,10 +2932,13 @@ class BackupTargetSetRequest(BaseModel):
     # to have dropped the files manually.
     s3_access_key: Optional[str] = None    # → KOPIA_S3_ACCESS_KEY in env file
     s3_secret_key: Optional[str] = None    # → KOPIA_S3_SECRET_KEY in env file
-    encryption_password: Optional[str] = None  # → /etc/bedrock/backup.key
-    # If True, overwrite /etc/bedrock/backup.key even if it already
-    # exists. Defaults to False — changing the password makes existing
-    # backups unreadable, so this is a deliberate destructive action.
+    # The per-repo kopia password → sealed in rqlite (backup_targets.
+    # repo_password_enc), the cluster-internal source of truth. None = unchanged;
+    # nodes materialize their own 0600 override from rqlite via the reactor.
+    encryption_password: Optional[str] = None
+    # If True, overwrite this repo's existing REAL password. Defaults to False —
+    # changing it makes existing encrypted backups unreadable, a deliberate
+    # destructive action. (Switching off the public default needs no force.)
     force_password_overwrite: bool = False
 
 
@@ -3179,30 +3182,26 @@ def api_backup_target_set(req: BackupTargetSetRequest):
     # against a stale replica).
     current_mirrors = (strong_targets.get(req.target_id) or {}).get("sync_to") or []
 
-    # ── (1a) Encryption password ──────────────────────────────────
+    # ── (1a) Encryption password → RQLITE (the central, cluster-internal store) ─
+    # The repo password is NOT pushed to per-node files here; it is persisted
+    # sealed in rqlite (backup_targets.repo_password_enc) in step (3), and each
+    # node's reactor materializes its own 0600 override from rqlite. rqlite (mTLS,
+    # cluster-internal) is the single source of truth — so a repo's key survives
+    # any node loss and is never out of sync across the cluster.
     if req.encryption_password is not None:
-        import backup as _bk
-        # Only a REAL (non-public-default) password is protected from overwrite —
-        # changing THAT makes existing real-encrypted backups unreadable. A key
-        # that's still the published PUBLIC default (or absent) means no real
-        # password is set, so switching to a real one is frictionless (no force).
-        has_real_password = (Path(BACKUP_KEY_FILE).exists()
-                             and not _bk.repo_password_is_default())
-        if has_real_password and not req.force_password_overwrite:
+        # Only a REAL (non-public-default) password already on THIS repo is
+        # protected from overwrite — changing it makes existing encrypted backups
+        # unreadable. has_repo_password (from the strong rqlite read) is True only
+        # when a real per-repo password is set; the public default is not.
+        existing_has_real = bool(
+            (strong_targets.get(req.target_id) or {}).get("has_repo_password"))
+        if existing_has_real and not req.force_password_overwrite:
             raise HTTPException(
                 400,
-                "encryption_password supplied but a real /etc/bedrock/backup.key "
-                "is already set. Changing it makes existing encrypted backups "
+                "encryption_password supplied but this repo already has a real "
+                "password. Changing it makes existing encrypted backups "
                 "unreadable. Pass force_password_overwrite=true to confirm — or "
                 "omit encryption_password to keep the current key."
-            )
-        ok, failed = _propagate_secret(
-            BACKUP_KEY_FILE, req.encryption_password, mode=0o600
-        )
-        if failed:
-            propagation_warnings.append(
-                f"backup.key not deployed to: "
-                + ", ".join(f"{n}({e})" for n, e in failed)
             )
 
     # ── (1b) S3 credentials ────────────────────────────────────────
@@ -3239,6 +3238,9 @@ def api_backup_target_set(req: BackupTargetSetRequest):
                 filesystem_path=req.filesystem_path,
                 override_source_prefix=req.override_source_prefix,
                 cache_directory=req.cache_directory,
+                # Master's own setup runs BEFORE the rqlite write below, so pass
+                # the new password explicitly; None (unchanged) → read rqlite.
+                repo_password=req.encryption_password,
             )
         except Exception as e:
             raise HTTPException(400, f"backup target setup failed locally: {e}")
@@ -3255,6 +3257,9 @@ def api_backup_target_set(req: BackupTargetSetRequest):
             override_source_prefix=req.override_source_prefix,
             cache_directory=req.cache_directory,
             is_mirror=req.is_mirror,
+            # The repo password lands sealed in rqlite here (the source of truth).
+            # '' when unchanged → CASE-preserve keeps the stored value.
+            repo_password=req.encryption_password or "",
             reason=req.reason,
         )
     except Exception as e:
