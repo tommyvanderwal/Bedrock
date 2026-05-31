@@ -2808,29 +2808,32 @@ def _direct_neighbour_by_node(d: Daemon) -> dict:
 
 
 def _cluster_node_loopbacks(my_node: str) -> dict:
-    """Read rqlite's nodes -> loopback_ip mapping (best-effort,
-    level='none'). Used to know who to address advertisements to. Mesh
-    routing decisions themselves never depend on this — cluster
-    membership is membership-of-record, not routing-of-record, per the
-    design invariants. Returns {} on any error."""
+    """nodes -> loopback_ip mapping (best-effort). Used to know who to address
+    advertisements/heartbeats to. Mesh routing decisions themselves never depend
+    on this — membership is membership-of-record, not routing-of-record. Returns
+    {} on any error.
+
+    Reads via the REVISION-CACHED load_cluster (level='none'), NOT a fresh
+    `SELECT ... FROM nodes` — this is called a few times per second and the nodes
+    table never changes at idle, so the direct SELECT was pure rqlite load (RCA:
+    ~3 uncached q/s into rqlited). load_cluster does one cheap revision read and
+    returns the SHARED cached snapshot that the 4 Hz election tick already
+    populated this tick — so on a cache hit there's no nodes scan + no rebuild."""
     try:
         try:
-            from . import rqlite_client as _rc_mod
+            from . import cluster_state as _cs
         except ImportError:
             import sys as _sys2
             _sys2.path.insert(0, "/usr/local/lib/bedrock")
-            from lib import rqlite_client as _rc_mod  # type: ignore
-        with _rc_mod.RqliteClient() as _rc:
-            rows = _rc.query(
-                "SELECT node_name, loopback_ip FROM nodes WHERE node_name != ?",
-                params=[my_node], level="none",
-            )
+            from lib import cluster_state as _cs  # type: ignore
+        nodes = _cs.load_cluster(level="none").get("nodes") or {}
     except Exception:
         return {}
     out: dict[str, str] = {}
-    for r in rows:
-        nm = r.get("node_name", "")
-        lo = r.get("loopback_ip") or ""
+    for nm, info in nodes.items():
+        if nm == my_node:
+            continue
+        lo = (info or {}).get("loopback_ip") or ""
         if lo:
             out[nm] = lo
     return out

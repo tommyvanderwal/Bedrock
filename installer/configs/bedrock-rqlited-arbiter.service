@@ -38,8 +38,10 @@ ExecStart=/bin/sh -c '/usr/local/bin/rqlited \
     -raft-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
     -http-adv-addr "$BEDROCK_ARBITER_BIND_IP:4011" \
     -raft-adv-addr "$BEDROCK_ARBITER_BIND_IP:4012" \
-    -raft-election-timeout 2s \
-    -raft-leader-lease-timeout 1s \
+    -raft-election-timeout 3s \
+    -raft-heartbeat-timeout 3s \
+    -raft-leader-lease-timeout 1500ms \
+    -raft-commit-timeout 500ms \
     -http-cert /var/lib/bedrock/cluster/ca/arbiter.crt \
     -http-key /var/lib/bedrock/cluster/ca/arbiter.key.pem \
     -http-ca-cert /var/lib/bedrock/cluster/ca/ca.crt \
@@ -58,6 +60,8 @@ RestartSec=3s
 # the GC paces to hold the heap near it, no kernel throttle). Deliberately
 # NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
 Environment=GOMEMLIMIT=256MiB
+# Cap Go to 2 Ps — see bedrock-rqlited.service: stops the idle scheduler spin.
+Environment=GOMAXPROCS=2
 
 # Arbiter is a 3rd voter; doesn't carry much state. Cap RAM lower
 # than the per-node unit since arbiter shouldn't have a large
