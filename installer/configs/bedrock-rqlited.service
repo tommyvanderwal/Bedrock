@@ -66,12 +66,6 @@ RestartSec=2s
 # the GC paces to hold the heap near it, no kernel throttle). Deliberately
 # NO cgroup MemoryHigh/MemoryMax — those throttle pathologically (RCA 2026-05-29).
 Environment=GOMEMLIMIT=512MiB
-# Cap the Go runtime to 2 Ps. rqlite at Bedrock's load is never CPU-bound, but
-# with GOMAXPROCS defaulting to all cores the scheduler/netpoller SPINS idle
-# (RCA: ~75% futex + 20µs runtime.usleep spin-yields dominate rqlited's ~3%
-# idle CPU). Two Ps is plenty for the Raft loop + HTTP + SQLite and cuts the
-# idle wakeup churn with no functional impact.
-Environment=GOMAXPROCS=2
 # Loop guard — if rqlited refuses to come up repeatedly, let
 # systemd's limit catch it rather than hammering forever.
 
