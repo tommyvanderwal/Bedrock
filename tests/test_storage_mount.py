@@ -67,9 +67,24 @@ def test_s3_is_not_mountable():
         sm._mount_opts({"type": "s3"}, sm.WITNESS)
 
 
-def test_test_endpoint_s3_is_noop_ok():
-    ok, reason = sm.test_endpoint({"type": "s3"})
-    assert ok is True and "s3" in reason
+def test_test_endpoint_s3_does_a_real_probe(monkeypatch):
+    """S3 test is no longer a no-op: it runs a real PUT/GET/DELETE round-trip via
+    witness_s3.probe_writable (empty string = OK). We stub probe_writable so the
+    unit test needs no live bucket, and assert test_endpoint threads it through."""
+    from lib import witness_s3 as w3
+    ep = {"type": "s3", "s3_endpoint": "https://x", "s3_bucket": "b",
+          "s3_access_key": "AK"}
+    # success: probe returns "" → ok True
+    monkeypatch.setattr(w3.S3Config, "from_endpoint",
+                        classmethod(lambda cls, e, sk: object()))
+    monkeypatch.setattr(w3, "probe_writable", lambda cfg, **k: "")
+    ok, reason = sm.test_endpoint(ep, s3_secret_key="SK")
+    assert ok is True and "round-trip" in reason
+    # failure: probe returns a reason → ok False, reason surfaced
+    monkeypatch.setattr(w3, "probe_writable",
+                        lambda cfg, **k: "read-after-write mismatch")
+    ok, reason = sm.test_endpoint(ep, s3_secret_key="SK")
+    assert ok is False and "read-after-write" in reason
 
 
 # ── lifecycle: desired-set derivation + reconcile planning ──────────────

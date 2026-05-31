@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -261,14 +262,37 @@ def reconcile_from_cluster(view: dict, *,
 
 
 def test_endpoint(endpoint: dict, usage: str = WITNESS,
-                  *, username: str = "", password: str = "") -> tuple[bool, str]:
-    """Add-time probe for the Test button / test-on-master-before-commit: mount
-    the endpoint at a throwaway mountpoint, prove a real write (create+unlink),
-    and unmount. Returns (ok, reason). Never raises. The witness usage is the
-    strict mount; pass usage=KOPIA to test the cached one."""
+                  *, username: str = "", password: str = "",
+                  s3_secret_key: str = "") -> tuple[bool, str]:
+    """Add-time probe for the Test button / test-on-master-before-commit. Returns
+    (ok, reason); never raises. Proves a REAL round-trip on THIS (master) node so a
+    write-only, unreachable, or inconsistent store is caught before it is trusted
+    for backups/quorum. The witness usage is the strict mount; pass usage=KOPIA to
+    test the cached one.
+
+      * s3  — PUT→GET→DELETE a probe object via the native client and verify the
+        read-back content (witness_s3.probe_writable): catches bad creds, an
+        unwritable bucket, AND an eventually-consistent endpoint (witness-unfit).
+        No mount.
+      * smb/nfs — mount at a throwaway point, write a UNIQUE token, read it BACK
+        and compare, then unmount. The read-back (not just create+unlink) is the
+        best-effort DFS-R / redirect guard: a share that serves the read from a
+        lagging replica returns stale/missing content and FAILS here, the same
+        inconsistency the #6 own-readback health check would later flag."""
     typ = endpoint.get("type")
     if typ == "s3":
-        return True, "s3 endpoint needs no mount (validated by the s3 client)"
+        try:
+            from . import witness_s3 as _w3        # type: ignore
+        except ImportError:                        # pragma: no cover
+            from lib import witness_s3 as _w3       # type: ignore
+        try:
+            cfg = _w3.S3Config.from_endpoint(endpoint, s3_secret_key)
+        except Exception as e:
+            return False, f"s3 config error: {e}"
+        reason = _w3.probe_writable(cfg)
+        if reason:
+            return False, f"s3 probe failed: {reason}"
+        return True, "s3 PUT/GET/DELETE round-trip OK (read-after-write coherent)"
     if typ not in ("smb", "nfs"):
         return False, f"unknown endpoint type {typ!r}"
     cred = None
@@ -286,11 +310,16 @@ def test_endpoint(endpoint: dict, usage: str = WITNESS,
             return False, f"mount failed: {(r.stderr or r.stdout).strip()}"
         try:
             probe = tmp_mp / ".bedrock-write-probe"
-            probe.write_text("ok")
+            token = f"bedrock-probe-{int(time.time() * 1000)}"
+            probe.write_text(token)
+            got = probe.read_text()            # read-back = consistency/DFS-R guard
             probe.unlink()
         except OSError as e:
             return False, f"mounted but not writable: {e}"
-        return True, "mounted + writable"
+        if got != token:
+            return False, ("mounted but read-after-write INCONSISTENT (a DFS-R / "
+                           "redirecting share served a stale replica) — unfit")
+        return True, "mounted + writable + read-after-write coherent"
     except Exception as e:
         return False, f"test error: {e!r}"
     finally:

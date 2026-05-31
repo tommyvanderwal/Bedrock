@@ -3529,6 +3529,157 @@ def api_witnesses_discover():
         for e in (echoes or [])]}
 
 
+# ── Consolidated storage endpoints (S3 / SMB / NFS) — the unification (#5) ──
+# ONE endpoint row carries the location + storage creds; it is then ACTIVATED for
+# backups (a backup_target) and/or as a fileshare/S3 witness, each referencing it
+# by endpoint_id. Secrets (s3_secret_key, fs_password) are AEAD-sealed in rqlite by
+# the setter and NEVER returned by the list API (only has_* flags).
+
+class StorageEndpointSetRequest(BaseModel):
+    endpoint_id: str
+    type: str                                  # 's3' | 'smb' | 'nfs'
+    label: str = ""
+    # S3
+    s3_endpoint: str = ""
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_prefix: str = ""
+    s3_disable_tls: bool = False
+    s3_disable_tls_verification: bool = False
+    s3_access_key: str = ""
+    # SMB/NFS
+    fs_server: str = ""
+    fs_share: str = ""
+    fs_options: str = ""
+    fs_username: str = ""
+    reason: str = ""
+    # Secrets: None = KEEP the stored value (a label edit must not wipe a secret
+    # the operator didn't re-type); a string (incl. "") = set it.
+    s3_secret_key: Optional[str] = None
+    fs_password: Optional[str] = None
+
+
+class StorageEndpointTestRequest(StorageEndpointSetRequest):
+    # Test BEFORE committing: the operator may pass freshly-typed secrets that are
+    # not yet in rqlite, so the test request carries them inline (never logged).
+    usage: str = "witness"                     # 'witness' (strict) | 'kopia' (cached)
+
+
+def _endpoint_usage(cluster: dict, endpoint_id: str) -> dict:
+    """Which backup_targets + witnesses reference this endpoint (for the list UI
+    + the in-use delete guard)."""
+    bts = [tid for tid, t in (cluster.get("backup_targets") or {}).items()
+           if (t or {}).get("endpoint_id") == endpoint_id]
+    wits = [wid for wid, w in (cluster.get("witnesses") or {}).items()
+            if (w or {}).get("endpoint_id") == endpoint_id]
+    return {"backup_targets": bts, "witnesses": wits}
+
+
+@app.get("/api/storage-endpoints")
+def api_storage_endpoints_list():
+    cluster = load_cluster()
+    eps = cluster.get("storage_endpoints") or {}
+    out = []
+    for eid, ep in eps.items():
+        row = dict(ep)
+        row["endpoint_id"] = eid
+        row["usage"] = _endpoint_usage(cluster, eid)
+        out.append(row)
+    return {"endpoints": out}
+
+
+@app.post("/api/storage-endpoints")
+def api_storage_endpoint_set(req: StorageEndpointSetRequest):
+    eid = (req.endpoint_id or "").strip()
+    if not eid:
+        raise HTTPException(400, "endpoint_id is required")
+    typ = (req.type or "").strip().lower()
+    if typ not in ("s3", "smb", "nfs"):
+        raise HTTPException(400, f"type must be s3|smb|nfs, not {typ!r}")
+    # Secret-reuse on edit: None → keep the stored (sealed) secret, so editing the
+    # label/region can't silently wipe a password the operator didn't re-type.
+    s3_secret = req.s3_secret_key
+    if s3_secret is None:
+        s3_secret = _bs.storage_endpoint_secret(eid, "s3_secret_key")
+    fs_password = req.fs_password
+    if fs_password is None:
+        fs_password = _bs.storage_endpoint_secret(eid, "fs_password")
+    try:
+        rev = _bs.storage_endpoint_set(
+            eid, typ, label=req.label,
+            s3_endpoint=req.s3_endpoint, s3_bucket=req.s3_bucket,
+            s3_region=req.s3_region, s3_prefix=req.s3_prefix,
+            s3_disable_tls=req.s3_disable_tls,
+            s3_disable_tls_verification=req.s3_disable_tls_verification,
+            s3_access_key=req.s3_access_key, s3_secret_key=s3_secret or "",
+            fs_server=req.fs_server, fs_share=req.fs_share,
+            fs_options=req.fs_options, fs_username=req.fs_username,
+            fs_password=fs_password or "", reason=req.reason)
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"storage endpoint {eid!r} ({typ}) saved",
+             app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "endpoint_id": eid}
+
+
+@app.delete("/api/storage-endpoints/{endpoint_id}")
+def api_storage_endpoint_remove(endpoint_id: str, reason: str = ""):
+    cluster = load_cluster()
+    if endpoint_id not in (cluster.get("storage_endpoints") or {}):
+        raise HTTPException(404, f"storage endpoint {endpoint_id!r} not found")
+    usage = _endpoint_usage(cluster, endpoint_id)
+    if usage["backup_targets"] or usage["witnesses"]:
+        raise HTTPException(
+            409, f"endpoint {endpoint_id!r} is still in use by "
+            f"backup_targets={usage['backup_targets']} "
+            f"witnesses={usage['witnesses']} — deactivate those first")
+    try:
+        rev = _bs.storage_endpoint_removed(endpoint_id)
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"storage endpoint {endpoint_id!r} removed", app="bedrock-mgmt",
+             level="info")
+    return {"status": "ok", "revision": rev}
+
+
+@app.post("/api/storage-endpoints/test")
+def api_storage_endpoint_test(req: StorageEndpointTestRequest):
+    """Test-on-MASTER-before-commit (this handler runs on the mgmt master). Mounts
+    /connects the endpoint with the SUPPLIED creds, proves a real write + read-back
+    round-trip (S3 PUT/GET/DELETE; SMB/NFS mount + read-after-write = best-effort
+    DFS-R guard), and returns (ok, reason). Never writes to rqlite — pure probe."""
+    typ = (req.type or "").strip().lower()
+    if typ not in ("s3", "smb", "nfs"):
+        raise HTTPException(400, f"type must be s3|smb|nfs, not {typ!r}")
+    # Secrets: prefer the freshly-typed value; fall back to the stored one when the
+    # operator re-tests an existing endpoint without re-typing.
+    s3_secret = req.s3_secret_key
+    if s3_secret is None:
+        s3_secret = _bs.storage_endpoint_secret(req.endpoint_id, "s3_secret_key")
+    fs_password = req.fs_password
+    if fs_password is None:
+        fs_password = _bs.storage_endpoint_secret(req.endpoint_id, "fs_password")
+    endpoint = {
+        "type": typ, "s3_endpoint": req.s3_endpoint, "s3_bucket": req.s3_bucket,
+        "s3_region": req.s3_region, "s3_prefix": req.s3_prefix,
+        "s3_disable_tls": req.s3_disable_tls,
+        "s3_disable_tls_verification": req.s3_disable_tls_verification,
+        "s3_access_key": req.s3_access_key,
+        "fs_server": req.fs_server, "fs_share": req.fs_share,
+        "fs_options": req.fs_options, "fs_username": req.fs_username,
+    }
+    try:
+        from lib import storage_mount as _sm
+        usage = _sm.WITNESS if (req.usage or "witness") == "witness" else _sm.KOPIA
+        ok, reason = _sm.test_endpoint(
+            endpoint, usage,
+            username=req.fs_username, password=fs_password or "",
+            s3_secret_key=s3_secret or "")
+    except Exception as e:
+        raise HTTPException(500, f"test error: {e}")
+    return {"ok": ok, "reason": reason}
+
+
 @app.post("/api/vms/{vm_name}/backup")
 async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()):
     """Take a backup of `vm_name` to `target_id`. Returns 202 + task_id;
