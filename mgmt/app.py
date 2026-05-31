@@ -3204,22 +3204,14 @@ def api_backup_target_set(req: BackupTargetSetRequest):
                 "omit encryption_password to keep the current key."
             )
 
-    # ── (1b) S3 credentials ────────────────────────────────────────
+    # ── (1b) S3 credentials → RQLITE (the central store), not per-node files ──
+    # The secret is sealed in rqlite (backup_targets.s3_secret_key_enc) in step
+    # (3); each node materializes its own 0600 .env cache from rqlite via the
+    # reactor (and the master directly, below). No _propagate_secret.
     if req.kind == "kopia-s3" and (req.s3_access_key or req.s3_secret_key):
         if not (req.s3_access_key and req.s3_secret_key):
             raise HTTPException(
                 400, "s3_access_key and s3_secret_key must be supplied together"
-            )
-        env_path = f"{BACKUP_CRED_DIR}/{req.target_id}.env"
-        ok, failed = _propagate_secret(
-            env_path,
-            _render_s3_creds_env(req.s3_access_key, req.s3_secret_key),
-            mode=0o600,
-        )
-        if failed:
-            propagation_warnings.append(
-                f"S3 credentials not deployed to: "
-                + ", ".join(f"{n}({e})" for n, e in failed)
             )
 
     # ── (2) Connect this node + verify hash floor ──────────────────
@@ -3239,8 +3231,10 @@ def api_backup_target_set(req: BackupTargetSetRequest):
                 override_source_prefix=req.override_source_prefix,
                 cache_directory=req.cache_directory,
                 # Master's own setup runs BEFORE the rqlite write below, so pass
-                # the new password explicitly; None (unchanged) → read rqlite.
+                # the new password + S3 creds explicitly; None/'' → read rqlite.
                 repo_password=req.encryption_password,
+                s3_access_key=req.s3_access_key or "",
+                s3_secret_key=req.s3_secret_key or "",
             )
         except Exception as e:
             raise HTTPException(400, f"backup target setup failed locally: {e}")
@@ -3257,9 +3251,11 @@ def api_backup_target_set(req: BackupTargetSetRequest):
             override_source_prefix=req.override_source_prefix,
             cache_directory=req.cache_directory,
             is_mirror=req.is_mirror,
-            # The repo password lands sealed in rqlite here (the source of truth).
+            # Every secret lands sealed in rqlite here (the source of truth).
             # '' when unchanged → CASE-preserve keeps the stored value.
             repo_password=req.encryption_password or "",
+            s3_access_key=req.s3_access_key or "",
+            s3_secret_key=req.s3_secret_key or "",
             reason=req.reason,
         )
     except Exception as e:

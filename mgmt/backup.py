@@ -379,6 +379,46 @@ def _sync_target_password_file(target_id: str) -> None:
     _materialize_target_password(target_id, pw)
 
 
+def _render_s3_creds_env(access_key: str, secret_key: str) -> str:
+    """Bash-sourceable env file kopia's S3 backend reads (KOPIA_S3_* + AWS_*)."""
+    return (
+        "# bedrock-managed; do not edit by hand. mode 0600.\n"
+        f"export KOPIA_S3_ACCESS_KEY={shlex.quote(access_key)}\n"
+        f"export KOPIA_S3_SECRET_KEY={shlex.quote(secret_key)}\n"
+        f"export AWS_ACCESS_KEY_ID={shlex.quote(access_key)}\n"
+        f"export AWS_SECRET_ACCESS_KEY={shlex.quote(secret_key)}\n"
+    )
+
+
+def _materialize_target_creds_env(target_id: str, access_key: str,
+                                  secret_key: str) -> None:
+    """Write the per-node 0600 S3 .env cache from creds (tmp+rename) when BOTH
+    are present. Never removes an existing .env (kopia-fs has none; a legacy
+    cluster's propagated .env must survive until rqlite carries the creds) — it
+    only writes when there is something real to write."""
+    if not (access_key and secret_key):
+        return
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    path = CREDENTIALS_DIR / f"{target_id}.env"
+    tmp = CREDENTIALS_DIR / f".{target_id}.env.tmp.{os.getpid()}"
+    tmp.write_text(_render_s3_creds_env(access_key, secret_key))
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def _sync_target_creds_env(target_id: str) -> None:
+    """Mirror this target's S3 creds FROM RQLITE to the 0600 .env cache on THIS
+    node. Best-effort — an rqlite blip leaves the prior .env in place (keeps
+    backing up with the last-known creds), never raising into configure."""
+    try:
+        ak, sk = bs.backup_target_s3_creds(target_id)
+    except Exception as e:
+        log.warning("backup: could not read S3 creds for %s "
+                    "(leaving .env as-is): %s", target_id, e)
+        return
+    _materialize_target_creds_env(target_id, ak, sk)
+
+
 def _kopia_config_file(target_id: str) -> str:
     """Per-target kopia config file path. Always passed via
     --config-file so the location is independent of $HOME (which the
@@ -460,7 +500,9 @@ def configure_target_locally(target_id: str, kind: str,
                              filesystem_path: str = "",
                              override_source_prefix: str = "",
                              cache_directory: str = "",
-                             repo_password: Optional[str] = None) -> None:
+                             repo_password: Optional[str] = None,
+                             s3_access_key: str = "",
+                             s3_secret_key: str = "") -> None:
     """Connect (or create + connect) the kopia repo on THIS node so
     subsequent backup/restore invocations Just Work. Reads the
     encryption password from /etc/bedrock/backup.key and credentials
@@ -504,6 +546,13 @@ def configure_target_locally(target_id: str, kind: str,
         _sync_target_password_file(target_id)
     else:
         _materialize_target_password(target_id, repo_password)
+    # Same for the S3 .env: explicit creds (master's own set, before the rqlite
+    # write) materialize directly; otherwise pull them from rqlite (the reactor /
+    # boot / VM-home-node paths, where rqlite already has them).
+    if s3_access_key and s3_secret_key:
+        _materialize_target_creds_env(target_id, s3_access_key, s3_secret_key)
+    else:
+        _sync_target_creds_env(target_id)
     # Per-target credentials file is required for S3 (KOPIA_S3_*) but
     # optional for kopia-fs targets — those just need a writable
     # directory + the encryption password. Avoiding the requirement for

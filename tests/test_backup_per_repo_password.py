@@ -82,3 +82,44 @@ def test_sync_is_best_effort_on_rqlite_error(tmp_path, monkeypatch):
     monkeypatch.setattr(bk.bs, "backup_target_repo_password", _boom)
     bk._sync_target_password_file("t1")          # must not raise
     assert f.read_text() == "last-known"         # left as-is (keeps backing up)
+
+
+# ── S3 creds materialized from rqlite (the .env is a cache) ────────────
+def test_creds_env_written_0600_with_both_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "CREDENTIALS_DIR", tmp_path)
+    bk._materialize_target_creds_env("t1", "AKIA123", "se cr/et")  # space → quoted
+    env = tmp_path / "t1.env"
+    body = env.read_text()
+    assert (env.stat().st_mode & 0o777) == 0o600
+    assert "export KOPIA_S3_ACCESS_KEY=AKIA123" in body          # no special → bare
+    assert "export KOPIA_S3_SECRET_KEY='se cr/et'" in body       # space → quoted
+    assert "export AWS_SECRET_ACCESS_KEY='se cr/et'" in body
+
+
+def test_creds_env_noop_when_incomplete_keeps_legacy_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "CREDENTIALS_DIR", tmp_path)
+    legacy = tmp_path / "t1.env"
+    legacy.write_text("legacy propagated content")
+    bk._materialize_target_creds_env("t1", "AKIA", "")   # missing secret → no-op
+    assert legacy.read_text() == "legacy propagated content"   # never clobbered
+
+
+def test_sync_creds_env_from_rqlite(tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "CREDENTIALS_DIR", tmp_path)
+    monkeypatch.setattr(bk.bs, "backup_target_s3_creds",
+                        lambda tid: ("AK", "SK"))
+    bk._sync_target_creds_env("t1")
+    assert "KOPIA_S3_ACCESS_KEY=AK" in (tmp_path / "t1.env").read_text()
+
+
+def test_sync_creds_env_best_effort_on_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "CREDENTIALS_DIR", tmp_path)
+    f = tmp_path / "t1.env"
+    f.write_text("keep-me")
+
+    def _boom(tid):
+        raise RuntimeError("rqlite down")
+
+    monkeypatch.setattr(bk.bs, "backup_target_s3_creds", _boom)
+    bk._sync_target_creds_env("t1")              # must not raise
+    assert f.read_text() == "keep-me"            # left as-is
