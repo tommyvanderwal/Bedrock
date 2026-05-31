@@ -2375,3 +2375,54 @@ corrupt-clear cycle; bounded, corrupt is sticky) are accepted/minor.
 disable) doesn't make the cluster safe — EVERY denominator-shrinking transition
 (node leave, maintenance, future node-vote-weight changes) must ride the same gate,
 or the unguarded ones reintroduce the exact split-brain the gate was built to stop.
+
+## L59 — load_cluster(level='strong') is broken FROM A FOLLOWER (forwarded strong reads desync across the 16-query snapshot)
+
+Found while live-validating the storage unification on a cluster whose rqlite leader
+had moved to sim-4 after an all-node restart. `cluster_state.load_cluster(level=
+'strong')` failed reproducibly with KeyError on a RANDOM column each attempt —
+'host' (nodes), 'mode' (tiers), 'addr' (witnesses), 'revision' (bedrock_meta) — i.e.
+build_snapshot's per-table SELECTs were each, intermittently, returning a row dict
+missing one of its SELECTed columns (dict(zip(cols,row)) short by one).
+
+DECISIVE ISOLATION:
+  * On the LEADER node (sim-4): load_cluster('strong') 3/3 OK.
+  * On a FOLLOWER node (sim-1): load_cluster('strong') 0/3 FAIL.
+  * level='none' (local replica, no forward): 3/3 OK on both.
+  * A SINGLE strong query (SELECT * FROM nodes) from a follower: OK.
+  * 16 rapid strong queries from a follower (build_snapshot): FAIL — even with a
+    fresh RqliteClient, so it is NOT client-instance reuse across load_cluster calls.
+
+CONCLUSION: a follower's rqlited FORWARDS strong reads to the leader; rapid forwarded
+strong reads on the keep-alive HTTP connection desync (a query gets a *previous*
+query's columns/values), so the projection KeyErrors on the expected column. PRE-
+EXISTING + LATENT — only manifests when the node doing strong reads is NOT the leader
+(prior sessions kept leader+master on sim-1, so its strong reads were never
+forwarded). FAIL-SAFE (raises, never returns wrong data → callers fail loud/defer,
+no split-brain) but can STALL recovery paths that run load_cluster('strong') on a
+follower (mgmt/orchestrator _start_local_services / _reconcile_paused_vms after a
+no-quorum heal).
+
+FIX DIRECTION (not yet built — needs its own focused change + deploy test): make
+strong reads not reuse the keep-alive connection — e.g. for level='strong' send
+`Connection: close` (or a fresh httpx connection per request), OR batch
+build_snapshot's reads into ONE multi-statement /db/query POST so there is a single
+forwarded round-trip with no per-query desync. Keep none/weak on the hot path
+unchanged (the 4 Hz netd tick must stay keep-alive). Verify the fix from a FOLLOWER,
+not just the leader.
+
+**UPDATE (2026-05-31, after the #1 connection-pool change, commit 4276b9e):** the
+`Connection: close` half of the fix shipped (strong reads opt out of the keep-alive
+pool) and load_cluster('strong') now passes 4/4 on the QUIET followers (sim-2/3) and
+the leader. BUT the busy master (sim-1: mgmt-master + arbiter + saga + mgmt, the most
+concurrent local rqlite traffic) STILL fails 0/4 — AND a decisive test (each strong
+query on a brand-new no-keepalive httpx connection, zero reuse) ALSO failed 0/4 with
+the same random-column KeyErrors. So the residual desync is SERVER-SIDE, not client
+connection reuse: the busy node's local rqlited mixes up FORWARDED strong-read
+responses under concurrent load (a strong query gets another query's columns even on
+a fresh connection). Client-side changes cannot fix this. REAL FIX: batch
+build_snapshot's ~16 strong reads into ONE multi-statement `/db/query?level=strong`
+POST → a SINGLE forwarded round-trip the rqlited can't mis-pair → no desync, and
+faster. (Until then, load_cluster('strong') on a busy follower-master can stall a
+post-quorum recovery — fail-safe, raises, never wrong data.) Lower priority: serialize
+forwarded strong reads per node behind a lock, or read strong from the leader directly.
