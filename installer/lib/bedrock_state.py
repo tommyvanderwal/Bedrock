@@ -130,8 +130,8 @@ def set_mgmt_master(node_name: str,
             "(SELECT role FROM nodes WHERE node_name = ?) AS myrole, "
             "(SELECT revision FROM bedrock_meta WHERE id=1) AS rev",
             [node_name, node_name], level="none")
-        if (guard and guard["m"] == node_name and guard["others"] == 0
-                and guard["myrole"] == "mgmt+compute"):
+        if (guard and guard.get("m") == node_name and guard.get("others") == 0
+                and guard.get("myrole") == "mgmt+compute"):
             if owns:
                 c.close()
             return int(guard["rev"] or 0)   # already correct → no write, no bump
@@ -202,13 +202,24 @@ def node_applied_epoch_set(node_name: str, epoch: int,
     """A node advertises the vote-config epoch it has APPLIED. Monotonic — only
     moves forward (a stale write can't lower a node's watermark). The master reads
     min(applied_epoch) over ACTIVE nodes (arbiter excluded) to gate lowering the
-    quorum bar."""
+    quorum bar.
+
+    Churn-free (RCA L57 discipline): only bumps bedrock_meta.revision when the
+    monotonic guard actually advanced this node's epoch. A re-advertise of an
+    already-current epoch (the common case — every node holds steady most ticks)
+    matches 0 rows → no revision bump → no Raft commit. The netd caller ALSO
+    skips this call entirely while its cached epoch is current, so the steady
+    state is zero rqlite traffic; this guard is the belt to that caller's braces."""
     c, owns = _client(client)
     try:
-        c.execute(
+        res = c.execute(
             "UPDATE nodes SET applied_epoch = ?, updated_at = ? "
             "WHERE node_name = ? AND applied_epoch < ?",
             params=[int(epoch), _now(), node_name, int(epoch)])
+        if not (res and res[0].get("rows_affected", 0)):
+            if owns:
+                c.close()
+            return 0
         return _bump_and_close(c, owns)
     except Exception:
         if owns:
@@ -518,6 +529,71 @@ def witness_clear_corrupt(witness_id: str,
             params=[_now(), witness_id],
         )
         log.info("bedrock_state: witness_clear_corrupt %s", witness_id)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def witness_disable(witness_id: str,
+                    client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Remove a witness from the election DENOMINATOR (disabled=1) and bump the
+    vote-config epoch atomically. This LOWERS the quorum bar (one fewer vote in the
+    denominator → a lone survivor reaches majority more easily), so it is the
+    UNSAFE-to-lag direction: the netd tick only actually drops it from the
+    denominator once min(nodes.applied_epoch over ACTIVE nodes, arbiter excluded)
+    reaches this epoch (the all-nodes-applied watermark). Master-only, called by the
+    casting-vote saga AFTER the casting vote is armed + all-applied. Idempotent
+    FIRST-disable: a re-disable of an already-disabled witness does NOT bump the
+    epoch (no needless all-applied round)."""
+    c, owns = _client(client)
+    try:
+        res = c.execute([
+            ["UPDATE witnesses SET disabled = 1, updated_at = ? "
+             "WHERE witness_id = ? AND disabled = 0", _now(), witness_id],
+        ])
+        changed = bool(res and res[0].get("rows_affected", 0))
+        if not changed:
+            if owns:
+                c.close()
+            return 0
+        # Bar-lowering → bump the shared vote-config epoch so the saga can wait
+        # for the all-nodes-applied watermark before the denominator actually drops.
+        c.execute(
+            "UPDATE cluster_info SET vote_config_epoch = vote_config_epoch + 1, "
+            "updated_at = ? WHERE id = 1", params=[_now()])
+        log.warning("bedrock_state: witness_disable %s (denominator drop, epoch "
+                    "bumped — gated by all-applied watermark)", witness_id)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def witness_enable(witness_id: str,
+                   client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Re-add a witness to the denominator (disabled=0) and bump the epoch. Re-adding
+    RAISES the bar (one more denominator vote) so it is SAFE-to-lag; the epoch is
+    still bumped so the reverse saga can confirm propagation. Idempotent FIRST-enable
+    (no churn / no epoch bump when already enabled)."""
+    c, owns = _client(client)
+    try:
+        res = c.execute([
+            ["UPDATE witnesses SET disabled = 0, updated_at = ? "
+             "WHERE witness_id = ? AND disabled = 1", _now(), witness_id],
+        ])
+        changed = bool(res and res[0].get("rows_affected", 0))
+        if not changed:
+            if owns:
+                c.close()
+            return 0
+        c.execute(
+            "UPDATE cluster_info SET vote_config_epoch = vote_config_epoch + 1, "
+            "updated_at = ? WHERE id = 1", params=[_now()])
+        log.info("bedrock_state: witness_enable %s (re-added to denominator, epoch "
+                 "bumped)", witness_id)
         return _bump_and_close(c, owns)
     except Exception:
         if owns:

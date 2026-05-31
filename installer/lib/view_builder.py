@@ -152,7 +152,7 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
         for row in client.query(
             "SELECT witness_id, addr, witness_pubkey, "
             "encrypted_witness_key, backend, endpoint_id, "
-            "corrupt, corrupt_reason FROM witnesses",
+            "corrupt, corrupt_reason, disabled FROM witnesses",
             level=level,
         ):
             entry = {
@@ -174,6 +174,10 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             if row.get("corrupt"):
                 entry["corrupt"] = True
                 entry["corrupt_reason"] = row.get("corrupt_reason", "")
+            # Denominator-drop flag the casting-vote saga sets (gated by the
+            # all-applied epoch watermark). Distinct from corrupt (numerator drop).
+            if row.get("disabled"):
+                entry["disabled"] = True
             out["witnesses"][row["witness_id"]] = entry
 
         # storage_endpoints — the consolidated S3/SMB/NFS definition shared by

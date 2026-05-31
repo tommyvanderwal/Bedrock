@@ -132,6 +132,14 @@ CREATE TABLE IF NOT EXISTS witnesses (
     corrupt                 INTEGER NOT NULL DEFAULT 0,
     corrupt_reason          TEXT NOT NULL DEFAULT '',
     corrupt_at              INTEGER NOT NULL DEFAULT 0,
+    -- DENOMINATOR drop (distinct from corrupt's NUMERATOR drop). corrupt=1 stops
+    -- every node counting this witness's VOTE (node-local, always-safe, sticky).
+    -- disabled=1 additionally removes it from the election DENOMINATOR — which
+    -- LOWERS the quorum bar, so it is gated by the all-nodes-applied epoch
+    -- watermark (vote_config_epoch) and only ever set by the master's casting-vote
+    -- saga after the casting vote is armed + all nodes have caught up. The saga
+    -- bumps cluster_info.vote_config_epoch on every disable/enable.
+    disabled                INTEGER NOT NULL DEFAULT 0,
     updated_at              INTEGER NOT NULL
 );
 

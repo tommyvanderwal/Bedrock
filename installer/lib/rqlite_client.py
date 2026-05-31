@@ -604,6 +604,10 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
                            "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(client, "nodes", "applied_epoch",
                            "INTEGER NOT NULL DEFAULT 0")
+    # witnesses.disabled: the DENOMINATOR drop the casting-vote saga sets (distinct
+    # from corrupt's numerator drop). Existing rows default 0 = still counted.
+    _add_column_if_missing(client, "witnesses", "disabled",
+                           "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

@@ -137,6 +137,55 @@ class TestWitnesses(unittest.TestCase):
         self.assertIn("mikrotik-1", params)
         self.assertIn("echo", params)
 
+    def test_witness_disable_sets_flag_and_bumps_epoch(self):
+        """disable = denominator drop → must (a) set disabled=1 only when it was 0,
+        and (b) bump vote_config_epoch (bar-lowering needs the all-applied gate)."""
+        c = _fake_client()                      # rows_affected=1 → newly disabled
+        rev = bs.witness_disable("w-1", client=c)
+        sqls = _executed_sql(c)
+        self.assertTrue(any("disabled = 1" in s and "disabled = 0" in s for s in sqls),
+                        "first-disable guarded on disabled=0")
+        self.assertTrue(any("vote_config_epoch = vote_config_epoch + 1" in s
+                            for s in sqls), "epoch bumped on disable")
+        self.assertEqual(rev, 42)
+
+    def test_witness_disable_idempotent_no_epoch_bump(self):
+        """A re-disable (already disabled → rows_affected=0) must NOT bump the epoch
+        or revision — no needless all-applied round / no churn."""
+        c = _fake_client()
+        c.execute = mock.MagicMock(return_value=[{"rows_affected": 0}])
+        rev = bs.witness_disable("w-1", client=c)
+        sqls = _executed_sql(c)
+        self.assertFalse(any("vote_config_epoch" in s for s in sqls),
+                         "no epoch bump when already disabled")
+        self.assertEqual(rev, 0)
+
+    def test_witness_enable_clears_flag_and_bumps_epoch(self):
+        c = _fake_client()
+        bs.witness_enable("w-1", client=c)
+        sqls = _executed_sql(c)
+        self.assertTrue(any("disabled = 0" in s and "disabled = 1" in s for s in sqls))
+        self.assertTrue(any("vote_config_epoch = vote_config_epoch + 1" in s
+                            for s in sqls))
+
+
+class TestAppliedEpoch(unittest.TestCase):
+    def test_applied_epoch_advances_and_bumps(self):
+        c = _fake_client()                      # rows_affected=1 → advanced
+        rev = bs.node_applied_epoch_set("sim-1", 5, client=c)
+        sqls = _executed_sql(c)
+        self.assertTrue(any("applied_epoch = ?" in s and "applied_epoch < ?" in s
+                            for s in sqls), "monotonic guard present")
+        self.assertEqual(rev, 42)
+
+    def test_applied_epoch_noop_is_churn_free(self):
+        """The hot path: a node re-advertising its current epoch (rows_affected=0)
+        must NOT bump revision — else 4 Hz × N nodes re-creates the L57 write storm."""
+        c = _fake_client()
+        c.execute = mock.MagicMock(return_value=[{"rows_affected": 0}])
+        rev = bs.node_applied_epoch_set("sim-1", 5, client=c)
+        self.assertEqual(rev, 0)
+
 
 class TestParams(unittest.TestCase):
     def test_param_value_round_trips_via_json(self):
