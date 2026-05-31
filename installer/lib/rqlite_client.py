@@ -584,6 +584,12 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
     # this repo into encryption. Stored per backup_target = per kopia repo.
     _add_column_if_missing(client, "backup_targets", "repo_password_enc",
                            "TEXT NOT NULL DEFAULT ''")
+    # S3 creds in rqlite (the central store) — access key plain, secret sealed.
+    # Each node materializes its own 0600 .env cache from these.
+    _add_column_if_missing(client, "backup_targets", "s3_access_key",
+                           "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(client, "backup_targets", "s3_secret_key_enc",
+                           "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

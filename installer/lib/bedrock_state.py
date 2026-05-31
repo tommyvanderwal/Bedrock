@@ -983,13 +983,16 @@ def backup_target_set(target_id: str, kind: str, *,
                       override_source_prefix: str = "",
                       cache_directory: str = "", is_mirror: bool = False,
                       repo_password: str = "",
+                      s3_access_key: str = "", s3_secret_key: str = "",
                       reason: str = "",
                       client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Upsert a backup target. ``repo_password`` is the per-repo kopia encryption
-    password (AEAD-sealed before storage). Pass '' to LEAVE AN EXISTING PASSWORD
-    UNCHANGED (so a bucket/region edit can't silently wipe it) — on a NEW target
-    '' means "use the published PUBLIC default" (effectively unencrypted). Setting
-    a real value opts this repo into real encryption."""
+    password and ``s3_secret_key`` the S3 secret — both AEAD-sealed before storage
+    (rqlite is the cluster-internal source of truth for every secret). Pass '' for
+    any secret to LEAVE THE EXISTING VALUE UNCHANGED (so a bucket/region edit can't
+    silently wipe creds); on a NEW target '' password means "use the published
+    PUBLIC default". ``s3_access_key`` ('' also = keep) is an identifier, stored
+    in the clear."""
     c, owns = _client(client)
     try:
         c.execute(
@@ -997,8 +1000,9 @@ def backup_target_set(target_id: str, kind: str, *,
             "s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
-            "is_mirror, repo_password_enc, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "is_mirror, repo_password_enc, s3_access_key, s3_secret_key_enc, "
+            "updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(target_id) DO UPDATE SET "
             "kind = excluded.kind, "
             "s3_endpoint = excluded.s3_endpoint, "
@@ -1010,19 +1014,26 @@ def backup_target_set(target_id: str, kind: str, *,
             "override_source_prefix = excluded.override_source_prefix, "
             "cache_directory = excluded.cache_directory, "
             "is_mirror = excluded.is_mirror, "
-            # CASE-preserve: an empty incoming password KEEPS the stored one (a
-            # partial update / reactor re-apply never wipes a real password); a
-            # non-empty one replaces it.
+            # CASE-preserve every secret/cred: an empty incoming value KEEPS the
+            # stored one (a partial update / reactor re-apply never wipes creds);
+            # a non-empty one replaces it.
             "repo_password_enc = CASE WHEN excluded.repo_password_enc = '' "
             "THEN backup_targets.repo_password_enc "
             "ELSE excluded.repo_password_enc END, "
+            "s3_access_key = CASE WHEN excluded.s3_access_key = '' "
+            "THEN backup_targets.s3_access_key "
+            "ELSE excluded.s3_access_key END, "
+            "s3_secret_key_enc = CASE WHEN excluded.s3_secret_key_enc = '' "
+            "THEN backup_targets.s3_secret_key_enc "
+            "ELSE excluded.s3_secret_key_enc END, "
             "updated_at = excluded.updated_at",
             params=[target_id, kind, s3_endpoint, s3_bucket, s3_region,
                     1 if s3_disable_tls else 0,
                     1 if s3_disable_tls_verification else 0,
                     filesystem_path, override_source_prefix,
                     cache_directory, 1 if is_mirror else 0,
-                    _seal_secret(repo_password), _now()],
+                    _seal_secret(repo_password),
+                    s3_access_key, _seal_secret(s3_secret_key), _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:
@@ -1042,6 +1053,24 @@ def backup_target_repo_password(target_id: str,
             "SELECT repo_password_enc AS enc FROM backup_targets "
             "WHERE target_id = ?", params=[target_id]))
         return unseal_secret(rows[0]["enc"]) if rows else ""
+    finally:
+        if owns:
+            c.close()
+
+
+def backup_target_s3_creds(target_id: str,
+                           client: Optional[rqlite_client.RqliteClient] = None) -> tuple:
+    """(access_key, secret_key) for a target, secret unsealed on demand. Either
+    may be '' if unset. rqlite is the source of truth; the per-node .env is a
+    cache materialized from this."""
+    c, owns = _client(client)
+    try:
+        rows = list(c.query(
+            "SELECT s3_access_key AS ak, s3_secret_key_enc AS sk "
+            "FROM backup_targets WHERE target_id = ?", params=[target_id]))
+        if not rows:
+            return ("", "")
+        return (rows[0]["ak"] or "", unseal_secret(rows[0]["sk"]))
     finally:
         if owns:
             c.close()

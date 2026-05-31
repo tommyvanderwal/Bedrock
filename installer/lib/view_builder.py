@@ -322,7 +322,8 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
             "SELECT target_id, kind, s3_endpoint, s3_bucket, s3_region, "
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
-            "is_mirror, endpoint_id, repo_password_enc "
+            "is_mirror, endpoint_id, repo_password_enc, "
+            "s3_access_key, s3_secret_key_enc "
             "FROM backup_targets",
             level=level,
         ):
@@ -337,6 +338,10 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 # set on this repo. The sealed blob itself is NEVER projected —
                 # the dashboard only needs to know default-vs-encrypted.
                 "has_repo_password": bool(row.get("repo_password_enc")),
+                # S3 access key is an identifier (safe to show); the secret is
+                # NEVER projected — only a has-flag (read+unseal on demand).
+                "s3_access_key":  row.get("s3_access_key", ""),
+                "has_s3_secret":  bool(row.get("s3_secret_key_enc")),
                 "s3_endpoint":     row.get("s3_endpoint", ""),
                 "s3_bucket":       row.get("s3_bucket", ""),
                 "s3_region":       row.get("s3_region", ""),

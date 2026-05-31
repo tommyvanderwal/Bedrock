@@ -287,6 +287,11 @@ CREATE TABLE IF NOT EXISTS backup_targets (
     -- effectively unencrypted, zero setup). A real value here = the operator
     -- opted this repo into real encryption (e.g. an untrusted offsite S3).
     repo_password_enc               TEXT NOT NULL DEFAULT '',
+    -- S3 credentials for this target, IN RQLITE (the cluster-internal source of
+    -- truth) — access key in the clear (it's an identifier), secret AEAD-sealed.
+    -- Each node materializes its own 0600 .env cache from these. '' = none yet.
+    s3_access_key                   TEXT NOT NULL DEFAULT '',
+    s3_secret_key_enc               TEXT NOT NULL DEFAULT '',
     updated_at                      INTEGER NOT NULL
 );
 
