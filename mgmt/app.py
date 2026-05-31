@@ -3181,15 +3181,20 @@ def api_backup_target_set(req: BackupTargetSetRequest):
 
     # ── (1a) Encryption password ──────────────────────────────────
     if req.encryption_password is not None:
-        already_have_local_key = Path(BACKUP_KEY_FILE).exists()
-        if already_have_local_key and not req.force_password_overwrite:
+        import backup as _bk
+        # Only a REAL (non-public-default) password is protected from overwrite —
+        # changing THAT makes existing real-encrypted backups unreadable. A key
+        # that's still the published PUBLIC default (or absent) means no real
+        # password is set, so switching to a real one is frictionless (no force).
+        has_real_password = (Path(BACKUP_KEY_FILE).exists()
+                             and not _bk.repo_password_is_default())
+        if has_real_password and not req.force_password_overwrite:
             raise HTTPException(
                 400,
-                "encryption_password supplied but /etc/bedrock/backup.key "
-                "already exists. Changing the password makes existing "
-                "backups unreadable. Pass force_password_overwrite=true "
-                "to confirm — or omit encryption_password to keep the "
-                "current key."
+                "encryption_password supplied but a real /etc/bedrock/backup.key "
+                "is already set. Changing it makes existing encrypted backups "
+                "unreadable. Pass force_password_overwrite=true to confirm — or "
+                "omit encryption_password to keep the current key."
             )
         ok, failed = _propagate_secret(
             BACKUP_KEY_FILE, req.encryption_password, mode=0o600

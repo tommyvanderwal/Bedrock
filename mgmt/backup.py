@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import subprocess
 import sys
@@ -44,6 +45,44 @@ log = logging.getLogger("bedrock.backup")
 CLUSTER_JSON = Path("/etc/bedrock/cluster.json")
 ENCRYPTION_KEY_FILE = Path("/etc/bedrock/backup.key")
 CREDENTIALS_DIR = Path("/etc/bedrock/backup-credentials")  # per-target .env files
+
+# The DEFAULT repo password. kopia forces *a* password (no passwordless mode —
+# kopia/kopia#3656), so by default Bedrock uses this DELIBERATELY-PUBLIC constant:
+# it is NOT a secret, it is published in the source/docs/GitHub on purpose. A repo
+# locked with it is *effectively unencrypted* — any Bedrock install already knows
+# the string, so it can read any default repo it has file/bucket access to. That
+# is the point: recoverability over secrecy. Losing your data (forgotten key) is
+# the bigger risk than a "hacker kid" reading a backup on a trusted local NAS —
+# exactly like v1 leaves local disks unencrypted. An operator who wants REAL
+# encryption (e.g. an untrusted offsite S3) sets a real password per repo, and
+# then owns the no-recovery tradeoff. The name says all this out loud.
+PUBLIC_REPO_PASSWORD = "PublicBedrockNotAPasswordBecauseKopiaForcesThisEvenWhenNotNeeded"
+
+
+def _ensure_repo_password_file() -> Path:
+    """Guarantee /etc/bedrock/backup.key exists. If absent, seed it with the
+    PUBLIC default (effectively-unencrypted repo, zero operator setup). An
+    operator who set a real password already has the file, so this never
+    overwrites one. Idempotent. Returns the path."""
+    if not ENCRYPTION_KEY_FILE.exists():
+        ENCRYPTION_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # tmp+rename so a reader never sees a half-written key
+        tmp = ENCRYPTION_KEY_FILE.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(PUBLIC_REPO_PASSWORD)
+        tmp.chmod(0o600)
+        tmp.replace(ENCRYPTION_KEY_FILE)
+    return ENCRYPTION_KEY_FILE
+
+
+def repo_password_is_default(path: Path = ENCRYPTION_KEY_FILE) -> bool:
+    """True if the repo password is the PUBLIC default (or absent) — i.e. NO real
+    password is set, so it is free to overwrite without a confirm. False once an
+    operator has set a real (non-public) password (overwriting THAT needs intent,
+    as it makes existing real-encrypted backups unreadable)."""
+    try:
+        return path.read_text().strip() == PUBLIC_REPO_PASSWORD
+    except OSError:
+        return True            # absent → no real password set
 
 # Per-target kopia config + cache. We pass --config-file explicitly to
 # every kopia invocation rather than letting it default to
@@ -399,11 +438,10 @@ def configure_target_locally(target_id: str, kind: str,
     via the `bedrock backup target set` CLI on the master propagates to
     every peer automatically. This standalone function is for the
     master's own setup and for ad-hoc reconnects."""
-    if not ENCRYPTION_KEY_FILE.exists():
-        raise RuntimeError(
-            f"missing {ENCRYPTION_KEY_FILE}; "
-            f"create it (32+ random bytes, mode 0600) before configuring a target"
-        )
+    # No password file? Seed the PUBLIC default (effectively-unencrypted repo) —
+    # backups must work with ZERO setup. An operator who wants real encryption
+    # sets a password (per repo); this never overwrites an existing one.
+    _ensure_repo_password_file()
     # Per-target credentials file is required for S3 (KOPIA_S3_*) but
     # optional for kopia-fs targets — those just need a writable
     # directory + the encryption password. Avoiding the requirement for
