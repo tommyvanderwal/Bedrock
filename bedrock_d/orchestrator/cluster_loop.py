@@ -85,7 +85,15 @@ class ClusterStateSource:
         self,
         on_change: OnChange,
         *,
-        poll_interval_s: float = 0.5,
+        # CDC (the leader's per-commit webhook → check_now) is the real
+        # detector: a committed revision wakes every node's loop within ms.
+        # This poll is only the correctness BACKSTOP for the rare CDC-silent
+        # case (a dropped loopback POST, a leader-change gap). At 0.5s it did
+        # ~2 idle SELECT-revision reads/s/node forever while nothing changed;
+        # 2s cuts that 4x with a backstop still far tighter than any
+        # convergence reactor (obs/drbd-secondary/arbiter/iso) needs — the
+        # failover path is netd's separate 1Hz loop, never this.
+        poll_interval_s: float = 2.0,
         leader_retry_s: float = 5.0,
         dispatch_timeout_s: float = 45.0,
     ) -> None:
@@ -171,7 +179,7 @@ class ClusterStateSource:
         """(revision, 'none'). Reads the LOCAL replica only — change DETECTION
         does not need the leader (and reading the leader at 'strong' was the
         Raft-barrier storm, see _READ_LOCAL). The local replica applies committed
-        revisions via Raft within ms; the CDC webhook + 500ms poll floor catch
+        revisions via Raft within ms; the CDC webhook + 2s poll floor catch
         every change. The reactors get level='none' too — convergence reads may
         run on local state (the two-read-classes rule); DRBD-takeover/promote
         reactors re-read 'strong' at their OWN call site, so nothing that needs
