@@ -1216,6 +1216,7 @@ def backup_target_set(target_id: str, kind: str, *,
                       cache_directory: str = "", is_mirror: bool = False,
                       repo_password: str = "",
                       s3_access_key: str = "", s3_secret_key: str = "",
+                      endpoint_id: str = "",
                       reason: str = "",
                       client: Optional[rqlite_client.RqliteClient] = None) -> int:
     """Upsert a backup target. ``repo_password`` is the per-repo kopia encryption
@@ -1224,7 +1225,14 @@ def backup_target_set(target_id: str, kind: str, *,
     any secret to LEAVE THE EXISTING VALUE UNCHANGED (so a bucket/region edit can't
     silently wipe creds); on a NEW target '' password means "use the published
     PUBLIC default". ``s3_access_key`` ('' also = keep) is an identifier, stored
-    in the clear."""
+    in the clear.
+
+    ``endpoint_id`` links this target to a consolidated storage_endpoints row (the
+    S3/SMB/NFS unification). When set, the STORAGE location + creds are resolved
+    FROM the endpoint at read time (view_builder fills s3_*/filesystem_path;
+    backup_target_s3_creds reads the endpoint secret) — the target row then carries
+    only the backup-specific fields (kind, repo_password, schedule), no duplicated
+    storage config. '' = a legacy inline target (its own s3_*/filesystem_path)."""
     c, owns = _client(client)
     try:
         c.execute(
@@ -1233,10 +1241,11 @@ def backup_target_set(target_id: str, kind: str, *,
             "s3_disable_tls, s3_disable_tls_verification, "
             "filesystem_path, override_source_prefix, cache_directory, "
             "is_mirror, repo_password_enc, s3_access_key, s3_secret_key_enc, "
-            "updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "endpoint_id, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(target_id) DO UPDATE SET "
             "kind = excluded.kind, "
+            "endpoint_id = excluded.endpoint_id, "
             "s3_endpoint = excluded.s3_endpoint, "
             "s3_bucket = excluded.s3_bucket, "
             "s3_region = excluded.s3_region, "
@@ -1265,7 +1274,8 @@ def backup_target_set(target_id: str, kind: str, *,
                     filesystem_path, override_source_prefix,
                     cache_directory, 1 if is_mirror else 0,
                     _seal_secret(repo_password),
-                    s3_access_key, _seal_secret(s3_secret_key), _now()],
+                    s3_access_key, _seal_secret(s3_secret_key),
+                    endpoint_id, _now()],
         )
         return _bump_and_close(c, owns)
     except Exception:
@@ -1294,13 +1304,25 @@ def backup_target_s3_creds(target_id: str,
                            client: Optional[rqlite_client.RqliteClient] = None) -> tuple:
     """(access_key, secret_key) for a target, secret unsealed on demand. Either
     may be '' if unset. rqlite is the source of truth; the per-node .env is a
-    cache materialized from this."""
+    cache materialized from this. When the target references a storage_endpoint
+    (endpoint_id set), the creds are resolved FROM that endpoint — the unified
+    path, so a single bucket's creds live in ONE place and editing the endpoint
+    re-points every backup target that uses it."""
     c, owns = _client(client)
     try:
         rows = list(c.query(
-            "SELECT s3_access_key AS ak, s3_secret_key_enc AS sk "
+            "SELECT s3_access_key AS ak, s3_secret_key_enc AS sk, endpoint_id AS eid "
             "FROM backup_targets WHERE target_id = ?", params=[target_id]))
         if not rows:
+            return ("", "")
+        eid = rows[0].get("eid") or ""
+        if eid:
+            erows = list(c.query(
+                "SELECT s3_access_key AS ak, s3_secret_key_enc AS sk "
+                "FROM storage_endpoints WHERE endpoint_id = ?", params=[eid]))
+            if erows:
+                return (erows[0]["ak"] or "", unseal_secret(erows[0]["sk"]))
+            # endpoint_id set but endpoint gone → no creds (fail loud at use site)
             return ("", "")
         return (rows[0]["ak"] or "", unseal_secret(rows[0]["sk"]))
     finally:

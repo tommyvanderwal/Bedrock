@@ -3734,6 +3734,58 @@ def api_storage_endpoint_enable_witness(endpoint_id: str,
             "backend": backend, "endpoint_id": endpoint_id}
 
 
+class EnableBackupRequest(BaseModel):
+    target_id: str = ""
+    # Optional per-repo encryption password. "" / None = the published PUBLIC
+    # default (effectively-unencrypted); a real value opts this repo into encryption.
+    encryption_password: Optional[str] = None
+    skip_test: bool = False
+
+
+@app.post("/api/storage-endpoints/{endpoint_id}/enable-backup")
+def api_storage_endpoint_enable_backup(endpoint_id: str,
+                                       req: EnableBackupRequest =
+                                       EnableBackupRequest()):
+    """The "Enable for backups" box: create a backup_target that REFERENCES this
+    endpoint (endpoint_id) — the storage location + creds resolve from the endpoint
+    at read time (view_builder fills s3_*/filesystem_path; backup_target_s3_creds
+    reads the endpoint secret), so there is no duplicated/stale inline config. kind
+    follows the endpoint type (s3 → kopia-s3; smb/nfs → kopia-fs at the managed
+    cached mount /mnt/bedrock/kopia/<id>). Tests on the MASTER first unless skip_test."""
+    cluster = load_cluster()
+    ep = (cluster.get("storage_endpoints") or {}).get(endpoint_id)
+    if ep is None:
+        raise HTTPException(404, f"storage endpoint {endpoint_id!r} not found")
+    typ = (ep.get("type") or "").lower()
+    kind = "kopia-s3" if typ == "s3" else "kopia-fs"
+    tid = (req.target_id or f"bk-{endpoint_id}").strip()
+    if not req.skip_test:
+        s3_secret = _bs.storage_endpoint_secret(endpoint_id, "s3_secret_key")
+        fs_password = _bs.storage_endpoint_secret(endpoint_id, "fs_password")
+        endpoint = dict(ep); endpoint["type"] = typ
+        try:
+            from lib import storage_mount as _sm
+            ok, reason = _sm.test_endpoint(
+                endpoint, _sm.KOPIA, username=ep.get("fs_username", ""),
+                password=fs_password or "", s3_secret_key=s3_secret or "")
+        except Exception as e:
+            raise HTTPException(500, f"backup pre-test error: {e}")
+        if not ok:
+            raise HTTPException(
+                400, f"endpoint {endpoint_id!r} failed the master backup test: "
+                f"{reason}. Fix it before enabling for backups.")
+    try:
+        rev = _bs.backup_target_set(
+            tid, kind, endpoint_id=endpoint_id,
+            repo_password=(req.encryption_password or ""), reason="enable-backup")
+    except Exception as e:
+        raise HTTPException(500, f"rqlite write failed: {e}")
+    push_log(f"backup target {tid!r} enabled on endpoint {endpoint_id!r} ({kind})",
+             app="bedrock-mgmt", level="info")
+    return {"status": "ok", "revision": rev, "target_id": tid, "kind": kind,
+            "endpoint_id": endpoint_id}
+
+
 @app.post("/api/vms/{vm_name}/backup")
 async def api_vm_backup(vm_name: str, req: BackupRunRequest = BackupRunRequest()):
     """Take a backup of `vm_name` to `target_id`. Returns 202 + task_id;

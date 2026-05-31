@@ -375,6 +375,35 @@ def build_snapshot(client: Optional[rqlite_client.RqliteClient] = None,
                 "delete_orphans": False,
             }
 
+        # Resolve endpoint-backed targets (#5 unification): when a target carries an
+        # endpoint_id, its STORAGE location comes from the shared storage_endpoints
+        # row, NOT inline columns — fill s3_*/filesystem_path here so every consumer
+        # (backup saga, the per-node reactor, the dashboard) sees the effective config
+        # with no per-caller change and no stale inline copy (single source = the
+        # endpoint). s3 → the native fields; smb/nfs → the kopia CACHED mountpoint
+        # /mnt/bedrock/kopia/<id> (storage_mount mounts it on every node). The S3
+        # SECRET is resolved separately at use time (backup_target_s3_creds reads the
+        # endpoint). storage_endpoints is projected ABOVE, so it is already populated;
+        # a missing endpoint leaves the (empty) inline fields → fails loud at use.
+        for _bt in out["backup_targets"].values():
+            _eid = _bt.get("endpoint_id") or ""
+            _ep = out["storage_endpoints"].get(_eid) if _eid else None
+            if not _ep:
+                continue
+            if _ep.get("type") == "s3":
+                _bt["kind"] = "kopia-s3"
+                _bt["s3_endpoint"] = _ep.get("s3_endpoint", "")
+                _bt["s3_bucket"] = _ep.get("s3_bucket", "")
+                _bt["s3_region"] = _ep.get("s3_region", "")
+                _bt["s3_disable_tls"] = bool(_ep.get("s3_disable_tls"))
+                _bt["s3_disable_tls_verification"] = bool(
+                    _ep.get("s3_disable_tls_verification"))
+                _bt["s3_access_key"] = _ep.get("s3_access_key", "")
+                _bt["has_s3_secret"] = bool(_ep.get("has_s3_secret"))
+            else:  # smb | nfs → kopia filesystem backend at the managed mountpoint
+                _bt["kind"] = "kopia-fs"
+                _bt["filesystem_path"] = f"/mnt/bedrock/kopia/{_eid}"
+
         # backup multi-target mirrors — attach the ordered secondary list onto
         # each primary target's dict (no new top-level key; the dashboard/API
         # see it inline on the target). Defensive: backup_target_sync is a
