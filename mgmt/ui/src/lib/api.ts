@@ -479,3 +479,63 @@ export interface WitnessCandidate { ip: string; echo_id: string; pubkey: string;
 export async function discoverWitnesses(): Promise<{ candidates: WitnessCandidate[] }> {
 	return apiGet('/api/witnesses/discover');
 }
+
+// ── Consolidated storage endpoints (S3 / SMB / NFS) — the unification (#5) ──
+export interface StorageEndpoint {
+	endpoint_id: string;
+	type: 's3' | 'smb' | 'nfs';
+	label?: string;
+	s3_endpoint?: string; s3_bucket?: string; s3_region?: string; s3_prefix?: string;
+	s3_disable_tls?: boolean; s3_disable_tls_verification?: boolean;
+	s3_access_key?: string; has_s3_secret?: boolean;
+	fs_server?: string; fs_share?: string; fs_options?: string; fs_username?: string;
+	has_fs_password?: boolean;
+	// which backup_targets + witnesses already reference this endpoint
+	usage?: { backup_targets: string[]; witnesses: string[] };
+}
+
+// Secrets: omit a field (undefined) to KEEP the stored value; send '' to clear.
+export interface StorageEndpointInput {
+	endpoint_id: string;
+	type: 's3' | 'smb' | 'nfs';
+	label?: string;
+	s3_endpoint?: string; s3_bucket?: string; s3_region?: string; s3_prefix?: string;
+	s3_disable_tls?: boolean; s3_disable_tls_verification?: boolean;
+	s3_access_key?: string; s3_secret_key?: string | null;
+	fs_server?: string; fs_share?: string; fs_options?: string; fs_username?: string;
+	fs_password?: string | null;
+}
+
+export async function listStorageEndpoints(): Promise<{ endpoints: StorageEndpoint[] }> {
+	return apiGet('/api/storage-endpoints');
+}
+
+export async function setStorageEndpoint(body: StorageEndpointInput) {
+	return apiPost('/api/storage-endpoints', body);
+}
+
+export async function removeStorageEndpoint(endpoint_id: string) {
+	const r = await fetch(`/api/storage-endpoints/${encodeURIComponent(endpoint_id)}`, { method: 'DELETE' });
+	if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+	return r.json();
+}
+
+// Test-on-master before commit: returns { ok, reason }.
+export async function testStorageEndpoint(
+	body: StorageEndpointInput & { usage?: 'witness' | 'kopia' }
+): Promise<{ ok: boolean; reason: string }> {
+	return apiPost('/api/storage-endpoints/test', body);
+}
+
+export async function enableWitnessOnEndpoint(
+	endpoint_id: string, body: { witness_id?: string; skip_test?: boolean } = {}
+) {
+	return apiPost(`/api/storage-endpoints/${encodeURIComponent(endpoint_id)}/enable-witness`, body);
+}
+
+export async function enableBackupOnEndpoint(
+	endpoint_id: string,
+	body: { target_id?: string; encryption_password?: string | null; skip_test?: boolean } = {}
+) {
+	return apiPost(`/api/storage-endpoints/${encodeURIComponent(endpoint_id)}/enable-backup`, body);
+}

@@ -140,6 +140,9 @@
 			<a class="tree-top" class:active={isActive('/imports')} href="/imports">
 				<span class="tree-icon">↥</span> Imports
 			</a>
+			<a class="tree-top" class:active={isActive('/storage')} href="/storage">
+				<span class="tree-icon">▤</span> Storage
+			</a>
 			<a class="tree-top" class:active={isActive('/backups')} href="/backups">
 				<span class="tree-icon">⎘</span> Backups
 			</a>
