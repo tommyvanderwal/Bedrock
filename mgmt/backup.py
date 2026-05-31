@@ -317,14 +317,58 @@ def _ssh(host: str, cmd: str, check: bool = True, timeout: int = 600) -> str:
     return r.stdout.strip()
 
 
-def _kopia_password_export() -> str:
-    """Bash snippet that exports KOPIA_PASSWORD from the repo password
-    file. kopia 0.21 dropped `--password-file`; passwords go via
-    KOPIA_PASSWORD or the deprecated `--password` (which leaks on
-    /proc/<pid>/cmdline). Env var keeps the secret off the cmdline."""
-    return (
-        f"export KOPIA_PASSWORD=\"$(cat {shlex.quote(str(ENCRYPTION_KEY_FILE))})\""
-    )
+def _target_password_file(target_id: str) -> Path:
+    """Per-repo password OVERRIDE file. It exists ONLY when the operator set a
+    real password on this target; otherwise the repo uses the node-wide
+    backup.key (which itself defaults to the PUBLIC constant)."""
+    return CREDENTIALS_DIR / f"{target_id}.kopiapass"
+
+
+def _kopia_password_export(target_id: str = "") -> str:
+    """Bash snippet that exports KOPIA_PASSWORD. kopia 0.21 dropped
+    `--password-file`; passwords go via KOPIA_PASSWORD or the deprecated
+    `--password` (which leaks on /proc/<pid>/cmdline), so we keep it off the
+    cmdline by `cat`-ing a 0600 file.
+
+    Resolution (decided at execution time so a just-written override is seen):
+    per-repo override file → node-wide backup.key → the PUBLIC default constant.
+    The override is present only for repos the operator encrypted; everyone else
+    falls back to backup.key UNCHANGED (so existing real-password clusters and
+    the public-default common case both keep working)."""
+    key = shlex.quote(str(ENCRYPTION_KEY_FILE))
+    pub = shlex.quote(PUBLIC_REPO_PASSWORD)        # public on purpose — safe inline
+    if target_id:
+        tgt = shlex.quote(str(_target_password_file(target_id)))
+        return (f"export KOPIA_PASSWORD=\"$( [ -f {tgt} ] && cat {tgt} "
+                f"|| {{ [ -f {key} ] && cat {key} || printf %s {pub}; }} )\"")
+    return (f"export KOPIA_PASSWORD=\"$( [ -f {key} ] && cat {key} "
+            f"|| printf %s {pub} )\"")
+
+
+def _sync_target_password_file(target_id: str) -> None:
+    """Mirror this target's per-repo password from rqlite to its 0600 override
+    file on THIS node: write it if a real password is set, remove it otherwise
+    (so the repo falls back to backup.key/public). Best-effort — an rqlite blip
+    leaves the prior file in place (the backup just keeps using the last-known
+    password), never raising into the configure path."""
+    try:
+        pw = bs.backup_target_repo_password(target_id)
+    except Exception as e:
+        log.warning("backup: could not read repo password for %s "
+                    "(leaving override as-is): %s", target_id, e)
+        return
+    path = _target_password_file(target_id)
+    if pw:
+        CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(pw)
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _kopia_config_file(target_id: str) -> str:
@@ -373,7 +417,7 @@ def _credentials_env(target_id: str) -> str:
     return (
         f"{{ [ -f {shlex.quote(str(p))} ] && set -a && . {shlex.quote(str(p))} && set +a; "
         f"true; }} && "
-        f"{_kopia_password_export()}"
+        f"{_kopia_password_export(target_id)}"
     )
 
 
@@ -442,6 +486,11 @@ def configure_target_locally(target_id: str, kind: str,
     # backups must work with ZERO setup. An operator who wants real encryption
     # sets a password (per repo); this never overwrites an existing one.
     _ensure_repo_password_file()
+    # Mirror this repo's per-target password override from rqlite (write it if a
+    # real one is set, else remove the override so it falls back to backup.key).
+    # The reactor calls configure_target_locally on EVERY node when a target
+    # changes, so each node's override file stays in sync with the sealed value.
+    _sync_target_password_file(target_id)
     # Per-target credentials file is required for S3 (KOPIA_S3_*) but
     # optional for kopia-fs targets — those just need a writable
     # directory + the encryption password. Avoiding the requirement for
