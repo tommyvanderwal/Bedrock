@@ -120,6 +120,12 @@ async def require_operator_or_peer(request: Request) -> str:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bedrock")
+# Silence per-request HTTP chatter: httpx/httpcore log EVERY rqlite call at INFO
+# ("HTTP Request: POST .../db/query ... 200 OK"). On the central loop + netd that
+# is a steady stream into journald (wakeups + disk) for zero diagnostic value —
+# rqlite errors still surface via our own loggers. (RCA L56 follow-up.)
+for _noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
