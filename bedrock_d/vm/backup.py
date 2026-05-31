@@ -54,40 +54,43 @@ class VmBackup:
                  res.get("metadata_kopia_id") or "—",
                  res.get("bytes_added", 0))
 
-    @step("sync_to_secondaries")
-    def step_sync(self, ctx):
-        # Multi-target replication: mirror the just-written primary backup to
-        # any configured SECONDARY targets via `kopia repository sync-to`. The
-        # list is resolved at submit time and carried in params (durable across
-        # resume); empty means single-target — nothing to do. Declared AFTER
-        # step_backup so it runs second (steps run in source order).
+    @step("migrate_to_secondaries")
+    def step_migrate(self, ctx):
+        # Per-VM replication: copy the just-written VM backup to any configured
+        # SECONDARY targets via `kopia snapshot migrate` — the single
+        # replication path (sync-to is gone). Only THIS VM's sources are
+        # migrated; each secondary is independent + idempotent (a retry tops up
+        # only what's new). The list is resolved at submit time and carried in
+        # params (durable across resume); empty means single-target. Declared
+        # AFTER step_backup so it runs second (steps run in source order).
         secondaries = ctx.get("secondary_target_ids") or []
         if not secondaries:
             return
         primary = ctx["target_id"]
         vm_name = ctx["vm_name"]
         from mgmt import backup as _bk
-        res = _bk.run_sync_to_secondaries(primary, secondaries, vm_name=vm_name)
+        res = _bk.run_migrate_to_secondaries(primary, secondaries, vm_name=vm_name)
         ok = res.get("ok", [])
         failed = res.get("failed", [])
-        log.info("vm_backup[%s]: mirrored to %d/%d secondary target(s)%s",
-                 vm_name, len(ok), len(secondaries),
+        log.info("vm_backup[%s]: replicated to %d/%d secondary target(s) via "
+                 "migrate (%d source(s))%s",
+                 vm_name, len(ok), len(secondaries), len(res.get("sources", [])),
                  "" if not failed
                  else f"; FAILED: {[f['target'] for f in failed]}")
         if failed:
             # Fail LOUD, but make it unmistakable that the PRIMARY backup
-            # SUCCEEDED and is restorable — only the mirror(s) failed. The op
-            # is marked failed so the operator actually sees it;
-            # `kopia repository sync-to` is idempotent, so retrying the op
-            # safely re-attempts only the mirrors (the 'backup' step is
-            # already done and is skipped on retry).
+            # SUCCEEDED and is restorable — only the secondary copy(ies) failed.
+            # The op is marked failed so the operator sees it; migrate is
+            # idempotent, so retrying the op safely re-attempts only the
+            # replication (the 'backup' step is done + skipped on retry).
             names = ", ".join(
                 f"{f['target']} ({(f['reason'] or '')[:120]})" for f in failed)
             raise RuntimeError(
                 f"primary backup of {vm_name!r} to {primary!r} SUCCEEDED and "
-                f"is restorable; replication to {len(failed)} secondary "
-                f"target(s) FAILED: {names}. Retry this operation to re-mirror "
-                f"(safe — the primary backup is not re-run).")
+                f"is restorable; migrate to {len(failed)} secondary "
+                f"target(s) FAILED: {names}. Retry this operation to "
+                f"re-replicate (safe — the primary backup is not re-run; "
+                f"migrate is idempotent).")
 
 
 @saga("vm_restore")
