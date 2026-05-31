@@ -111,11 +111,29 @@ def _run(cmd: list[str], check: bool = False, timeout: int = 30) -> tuple[int, s
         return (127, "", str(e))
 
 
+# Process-lifetime memo of the derived arbiter .254 IP. cluster_uuid is
+# IMMUTABLE for the life of a cluster: the ONLY writer is cluster_init()'s
+# one-time INSERT (see bedrock_state.py; set_cluster_name() — the rename saga
+# — touches cluster_name only, never cluster_uuid). A different uuid can only
+# arise from a reset→reinit, which restarts bedrock-d and drops this memo with
+# the process. So no in-process invalidation is needed or possible.
+# Why this matters: arbiter_loopback_ip() is the single funnel for
+# _arbiter_ip_present / _ip_add / _ip_del / arbiter_status, so a steady Leader
+# tick was issuing 5-8 identical "SELECT cluster_uuid" rqlite round-trips/sec
+# for a constant (py-spy: ~16% of bedrock-d). The memo collapses that to one
+# attribute read after the first successful resolve.
+_ARBITER_IP_MEMO: str = ""
+
+
 def arbiter_loopback_ip() -> str:
     """The arbiter's `100.X.Y.254/32` IP for this cluster. Reads
     cluster_uuid from local rqlite (level='none', works without
     quorum) and derives the deterministic cluster prefix (same
-    algorithm as for node loopback IPs)."""
+    algorithm as for node loopback IPs). Memoized: cluster_uuid is
+    immutable, so after the first resolve this is a constant."""
+    global _ARBITER_IP_MEMO
+    if _ARBITER_IP_MEMO:
+        return _ARBITER_IP_MEMO
     try:
         try:
             from . import rqlite_client
@@ -131,6 +149,9 @@ def arbiter_loopback_ip() -> str:
         uuid = (row or {}).get("cluster_uuid", "") or ""
     except Exception:
         return ""
+    # Do NOT memoize the empty/error result: pre-init or a transient rqlite
+    # blip must self-heal on the next tick (and _ip_add still raises loud on
+    # an unknown IP rather than acting on a guess).
     if not uuid:
         return ""
     try:
@@ -140,7 +161,8 @@ def arbiter_loopback_ip() -> str:
         sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import cluster_addr  # type: ignore
     prefix = cluster_addr.cluster_loopback_prefix(uuid)
-    return f"{prefix}.{ARBITER_OCTET}"
+    _ARBITER_IP_MEMO = f"{prefix}.{ARBITER_OCTET}"
+    return _ARBITER_IP_MEMO
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -369,16 +391,19 @@ def promote_to_arbiter_host() -> dict:
                 import sys as _sys
                 _sys.path.insert(0, "/usr/local/lib/bedrock")
                 from lib import seaweedfs  # type: ignore
-            seaweedfs.promote_to_filer_host()
+            # Only (re)start the filer when it's actually down — was an
+            # unconditional 3-fork systemctl burst on every converge tick.
+            if not seaweedfs.is_filer_active():
+                seaweedfs.promote_to_filer_host()
         except Exception as e:
             log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
-        log.info("arbiter: promotion complete (N=1; ip=%s mount=%s)",
-                 ip, MOUNT_POINT)
         # H5/INV-6: mgmt_master is a RESULT of a confirmed promote, never
         # the trigger. At N=1 there's no arbiter rqlite, so write it as
-        # soon as hosting (filer + .254) is confirmed.
-        _set_mgmt_master_after_promote(drbd_present=False)
-        return arbiter_status()
+        # soon as hosting (filer + .254) is confirmed. One status read,
+        # reused for the mgmt_master gate and the return value.
+        status = arbiter_status()
+        _set_mgmt_master_after_promote(drbd_present=False, status=status)
+        return status
 
     # N>=2 with cluster DRBD. Run the takeover protocol.
     log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
@@ -393,17 +418,6 @@ def promote_to_arbiter_host() -> dict:
         and _arbiter_ip_present()
     )
 
-    if not am_already_host:
-        # Steps 1-5: takeover protocol. Refuse to promote if it fails.
-        if not _run_takeover_protocol():
-            log.error("arbiter: takeover protocol REFUSED — not promoting")
-            return arbiter_status()
-
-    # Steps 6: hardware/software state changes.
-    _drbd_promote()
-    _mount()
-    ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
-    ip = _ip_add()
     try:
         from . import rqlite_setup
         from . import seaweedfs
@@ -412,23 +426,56 @@ def promote_to_arbiter_host() -> dict:
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import rqlite_setup  # type: ignore
         from lib import seaweedfs  # type: ignore
+
+    if not am_already_host:
+        # Steps 1-5: takeover protocol. Refuse to promote if it fails.
+        if not _run_takeover_protocol():
+            log.error("arbiter: takeover protocol REFUSED — not promoting")
+            return arbiter_status()
+        # Steps 6: hardware/software state changes — assert the
+        # DRBD-primary + mount + .254 trio.
+        _drbd_promote()
+        _mount()
+        ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ip = _ip_add()
+        log.info("arbiter: promotion complete (ip=%s mount=%s)",
+                 ip, MOUNT_POINT)
+    # else: steady-state self-renew. converge_retry calls promote on EVERY
+    # 1Hz tick; the DRBD-primary + mount + .254 trio was JUST confirmed live
+    # by the am_already_host probe above. Re-running _drbd_promote/_mount/
+    # _ip_add would only re-fork drbdadm/mount/ip to re-discover what we
+    # already know — a ~10+ fork/s no-op on the steady master (py-spy RCA
+    # 2026-06-01). Any drift (a peer steals primary, an unmount, a flushed
+    # .254) flips am_already_host False next tick and the full actuation
+    # above fires. So skip the trio re-assertion when already hosting.
+
+    # Heal the targets the trio-probe does NOT cover — every tick, but
+    # cheaply (only fork to FIX when actually down). The arbiter rqlited
+    # service, the env file, and the SeaweedFS filer can each die
+    # independently of the DRBD/mount/.254 trio, so they must be re-checked
+    # even on the already-hosting path.
     rqlite_setup.render_arbiter_env_file()
     _svc_start(ARBITER_SVC)
-    try:
-        seaweedfs.promote_to_filer_host()
-    except Exception as e:
-        log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
-    log.info("arbiter: promotion complete (ip=%s mount=%s)",
-             ip, MOUNT_POINT)
-    # H5/INV-6: write mgmt_master only AFTER the arbiter rqlite is back,
-    # as a RESULT of a confirmed promote — never as the promote trigger.
-    # _set_mgmt_master_after_promote re-reads arbiter_status() and only
-    # writes when DRBD primary + .254 + arbiter service are all up.
-    _set_mgmt_master_after_promote(drbd_present=True)
-    return arbiter_status()
+    if not seaweedfs.is_filer_active():
+        # Was an unconditional reset-failed + 2× systemctl start every tick;
+        # now only when the filer is actually down.
+        try:
+            seaweedfs.promote_to_filer_host()
+        except Exception as e:
+            log.warning("arbiter: SeaweedFS filer promote failed: %s", e)
+    # H5/INV-6: write mgmt_master only AFTER the arbiter rqlite is back, as a
+    # RESULT of a confirmed promote — never the trigger. ONE arbiter_status()
+    # read (was two: here + inside _set_mgmt_master_after_promote). It only
+    # writes when DRBD primary + .254 + arbiter service are all up;
+    # set_mgmt_master is write-if-changed (L57), so the steady tick is a cheap
+    # local read, not a Raft write.
+    status = arbiter_status()
+    _set_mgmt_master_after_promote(drbd_present=True, status=status)
+    return status
 
 
-def _set_mgmt_master_after_promote(*, drbd_present: bool) -> None:
+def _set_mgmt_master_after_promote(*, drbd_present: bool,
+                                   status: Optional[dict] = None) -> None:
     """Write this node as the rqlite ``mgmt_master`` — but ONLY once a
     promote has actually taken hold (H5 / INV-6 two-tier ordering).
 
@@ -446,8 +493,12 @@ def _set_mgmt_master_after_promote(*, drbd_present: bool) -> None:
     No deadlock: this never gates the promote on mgmt_master already
     being set; it runs strictly after the promote. If the write fails
     (rqlite still electing), the next converge tick re-promotes
-    (idempotent, a no-op) and retries the write."""
-    status = arbiter_status()
+    (idempotent, a no-op) and retries the write.
+
+    `status` lets the caller pass the arbiter_status() it just read so we
+    don't re-fork drbdadm/mountpoint/ip a second time within one promote
+    (the caller reads it once and reuses it for the return value too)."""
+    status = arbiter_status() if status is None else status
     if drbd_present:
         hosting = (status.get("service_active")
                    and status.get("ip_present")
