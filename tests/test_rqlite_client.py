@@ -365,5 +365,47 @@ class TestAsyncClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, [{"rows_affected": 1}])
 
 
+class TestConnectionPool(unittest.TestCase):
+    """The process-shared pool: instances reuse one warm client (no per-query
+    TLS handshake), close() is a no-op, and strong reads opt out of keep-alive
+    (the L59 forwarded-read desync fix)."""
+
+    def tearDown(self):
+        rc.close_all_pools()
+
+    @unittest.skipIf(rc.httpx is None, "httpx not installed (runs on a node)")
+    def test_instances_share_one_pooled_client(self):
+        a = rc.RqliteClient()
+        b = rc.RqliteClient()
+        self.assertIs(a._client, b._client,
+                      "RqliteClient instances must share the process pool "
+                      "(else every query pays a TLS handshake)")
+
+    @unittest.skipIf(rc.httpx is None, "httpx not installed (runs on a node)")
+    def test_close_is_noop_keeps_pool_alive(self):
+        a = rc.RqliteClient()
+        client = a._client
+        a.close()
+        self.assertFalse(client.is_closed,
+                         "close() must NOT close the shared pool")
+        b = rc.RqliteClient()
+        self.assertIs(b._client, client, "pool survives a per-instance close()")
+
+    def test_strong_read_sends_connection_close_weak_does_not(self):
+        c = rc.RqliteClient.__new__(rc.RqliteClient)
+        c._client = mock.MagicMock()
+        ok = {"results": [{"columns": ["x"], "values": [[1]]}]}
+        c._client.request.return_value = _fake_response(200, ok)
+        c.query("SELECT x", level="strong")
+        self.assertEqual(c._client.request.call_args.kwargs.get("headers"),
+                         {"Connection": "close"},
+                         "strong reads must not be pooled (L59)")
+        c._client.request.reset_mock()
+        c._client.request.return_value = _fake_response(200, ok)
+        c.query("SELECT x", level="weak")
+        self.assertIsNone(c._client.request.call_args.kwargs.get("headers"),
+                          "weak reads keep using the warm pool")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional, Sequence, Union
@@ -84,6 +85,95 @@ def _check_httpx() -> None:
         )
 
 
+# ── Process-shared connection pool ────────────────────────────────────
+# rqlite is queried HOT: netd's 4 Hz tick, the central cluster_loop, the
+# witness worker, the reactors. The old "fresh RqliteClient() per call"
+# pattern built a NEW httpx.Client — and a NEW mTLS connection (TLS handshake)
+# + a NEW SSL context (load_cert_chain) — on EVERY query. py-spy showed that
+# as the single biggest idle-CPU cost in bedrock-d (do_handshake + the SSL
+# __init__ dominate ~10 handshakes/s).
+#
+# Fix: keep ONE long-lived httpx.Client per (scheme, host, port) for the
+# process. httpx pools keep-alive connections under it, so a steady-state
+# query reuses a WARM TLS connection — zero handshake, zero cert load. The
+# pool SELF-HEALS: httpx discards a dead connection and dials a fresh one on
+# the next request, so an rqlited restart needs no explicit reset. The SSL
+# context (cert chain) is built ONCE and shared.
+#
+# LAZY + thread-safe: a client built BEFORE rqlited is listening must never
+# wedge the loop (the 2026-05-29 bug). So the pool is filled on FIRST USE
+# (rqlited is up by then), under a lock, never at import. RqliteClient
+# instances are now cheap handles onto this shared pool; .close() is a no-op
+# (closing the shared pool would tear it out from under every other caller).
+_POOL_LOCK = threading.Lock()
+_POOL: dict = {}            # (scheme, host, port) -> httpx.Client
+_SSL_CTX = None             # cached mTLS context (cert chain loaded once)
+_SSL_CTX_LOCK = threading.Lock()
+
+_NODE_CRT = "/etc/bedrock/node.crt"
+_NODE_KEY = "/etc/bedrock/node.key.pem"
+_CA_CRT = "/etc/bedrock/ca.crt"
+
+
+def _mtls_available() -> bool:
+    """True once cluster_ca has issued this node's cert (then permanent)."""
+    return (os.path.exists(_NODE_CRT) and os.path.exists(_NODE_KEY)
+            and os.path.exists(_CA_CRT))
+
+
+def _ssl_context():
+    """The per-node mTLS context, built ONCE (load_cert_chain is expensive)."""
+    global _SSL_CTX
+    if _SSL_CTX is not None:
+        return _SSL_CTX
+    with _SSL_CTX_LOCK:
+        if _SSL_CTX is None:
+            import ssl as _ssl
+            ctx = _ssl.create_default_context(cafile=_CA_CRT)
+            ctx.load_cert_chain(certfile=_NODE_CRT, keyfile=_NODE_KEY)
+            _SSL_CTX = ctx
+    return _SSL_CTX
+
+
+def _pooled_client(scheme: str, host: str, port: int, timeout: float):
+    """The process-shared httpx.Client for this endpoint — created lazily,
+    thread-safe. httpx keep-alives connections under it; we never close it
+    per-call (only close_all_pools() at shutdown)."""
+    key = (scheme, host, port)
+    c = _POOL.get(key)
+    if c is not None and not c.is_closed:
+        return c
+    with _POOL_LOCK:
+        c = _POOL.get(key)
+        if c is None or c.is_closed:
+            base = f"{scheme}://{host}:{port}"
+            if scheme == "https":
+                transport = httpx.HTTPTransport(verify=_ssl_context(), retries=0)
+            else:
+                transport = httpx.HTTPTransport(retries=0)
+            c = httpx.Client(
+                base_url=base, timeout=timeout, transport=transport,
+                # A handful of warm connections is plenty — the netd thread,
+                # the asyncio loop's to_thread calls, and the workers query
+                # sequentially per thread. Bounds the fd/memory footprint.
+                limits=httpx.Limits(max_keepalive_connections=4,
+                                    max_connections=8),
+            )
+            _POOL[key] = c
+    return c
+
+
+def close_all_pools() -> None:
+    """Close every pooled client — clean process shutdown / test teardown."""
+    with _POOL_LOCK:
+        for c in _POOL.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        _POOL.clear()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Sync client — for CLI, install scripts, anything outside FastAPI
 # ────────────────────────────────────────────────────────────────────
@@ -106,37 +196,25 @@ class RqliteClient:
         timeout: float = DEFAULT_TIMEOUT_S,
     ):
         _check_httpx()
-        from pathlib import Path as _P
-        node_crt = _P("/etc/bedrock/node.crt")
-        node_key = _P("/etc/bedrock/node.key.pem")
-        ca_crt   = _P("/etc/bedrock/ca.crt")
-        if node_crt.exists() and node_key.exists() and ca_crt.exists():
-            # httpx 0.28's `cert=` parameter doesn't reliably trigger
-            # mTLS client-cert presentation, and when a custom
-            # transport= is also provided, the Client-level verify=
-            # is silently ignored (verify only configures the default
-            # transport). Build an explicit ssl.SSLContext and pass
-            # it as the transport's verify=. Verified on 2026-05-25
-            # against rqlite v10 + httpx 0.28.1.
-            import ssl as _ssl
-            ctx = _ssl.create_default_context(cafile=str(ca_crt))
-            ctx.load_cert_chain(certfile=str(node_crt), keyfile=str(node_key))
-            self._base = f"https://{host}:{port}"
-            self._client = httpx.Client(
-                base_url=self._base,
-                timeout=timeout,
-                transport=httpx.HTTPTransport(verify=ctx, retries=0),
-            )
-        else:
-            self._base = f"http://{host}:{port}"
-            self._client = httpx.Client(
-                base_url=self._base,
-                timeout=timeout,
-                transport=httpx.HTTPTransport(retries=0),
-            )
+        # mTLS once cluster_ca has issued the node cert (then permanent);
+        # plain http only at very-early bootstrap. The explicit SSLContext is
+        # required because httpx 0.28's `cert=` doesn't reliably present the
+        # client cert and Client-level verify= is ignored when a custom
+        # transport= is set (verified 2026-05-25, rqlite v10 + httpx 0.28.1) —
+        # so the context is passed as the transport's verify= (see
+        # _pooled_client / _ssl_context). This instance is a THIN HANDLE onto
+        # the process-shared pool: no per-call client/handshake/cert-load.
+        scheme = "https" if _mtls_available() else "http"
+        self._base = f"{scheme}://{host}:{port}"
+        self._timeout = timeout
+        self._client = _pooled_client(scheme, host, port, timeout)
 
     def close(self) -> None:
-        self._client.close()
+        # No-op: self._client is the PROCESS-SHARED pool, not owned here.
+        # Closing it would tear the pool out from under every other caller.
+        # The `with RqliteClient() as c` pattern stays valid (close just does
+        # nothing); call close_all_pools() at process shutdown instead.
+        pass
 
     def __enter__(self) -> "RqliteClient":
         return self
@@ -215,6 +293,7 @@ class RqliteClient:
         body = self._request_with_retry(
             "POST", f"/db/query?level={level}",
             json=payload,
+            close_conn=(level == "strong"),   # L59: don't pool forwarded strong reads
         )
         results = body.get("results") or []
         if not results:
@@ -294,11 +373,27 @@ class RqliteClient:
         url: str,
         *,
         json: Optional[Any] = None,
+        close_conn: bool = False,
     ) -> dict:
+        # close_conn=True sends `Connection: close` so httpx does NOT return
+        # this connection to the keep-alive pool. STRONG reads use it: a
+        # follower forwards a strong read to the leader, and reusing the
+        # keep-alive connection for a *sequence* of forwarded strong reads
+        # desyncs the responses (RCA L59 — a read got the previous read's
+        # columns). Closing after each strong read means no strong read ever
+        # reuses (or leaves behind) a forwarded-response connection, so the
+        # desync can't happen — at the cost of one handshake per strong read,
+        # which is fine since strong reads are rare (recovery/decision paths).
+        # none/weak reads (the hot path) keep reusing the warm pool → no
+        # handshake. self._timeout is passed per-request because the shared
+        # pooled client's own timeout is whatever the first caller set.
+        headers = {"Connection": "close"} if close_conn else None
         last_exc: Optional[Exception] = None
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                resp = self._client.request(method, url, json=json)
+                resp = self._client.request(
+                    method, url, json=json, headers=headers,
+                    timeout=getattr(self, "_timeout", DEFAULT_TIMEOUT_S))
             except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as e:
                 last_exc = e
             else:
