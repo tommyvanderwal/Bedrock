@@ -590,6 +590,14 @@ def apply_schema(client: RqliteClient, schema_sql_path: str) -> None:
                            "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(client, "backup_targets", "s3_secret_key_enc",
                            "TEXT NOT NULL DEFAULT ''")
+    # Witness corruption flag (own-readback health check). Any node sets corrupt=1
+    # when a witness store accepts a slot write but can't return it (lying store).
+    _add_column_if_missing(client, "witnesses", "corrupt",
+                           "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(client, "witnesses", "corrupt_reason",
+                           "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(client, "witnesses", "corrupt_at",
+                           "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column_if_missing(client: RqliteClient, table: str, column: str,

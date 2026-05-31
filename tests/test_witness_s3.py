@@ -179,6 +179,36 @@ def test_foreign_cluster_key_blob_is_dropped():
     assert w3.read_slots(n1, fake) == {}            # AEAD-invalid → dropped
 
 
+def test_health_check_ok_unreachable_corrupt():
+    key = b"k" * 32
+    now = int(time.time() * 1000)
+    n1 = _ws(1, key)
+    # ok: a normal store returns our slot
+    assert w3.health_check(n1, _FakeS3(), now_ms=now)[0] == "ok"
+
+    # corrupt: store ACCEPTS the write but the slot is absent on read-back —
+    # a read-after-own-write violation (lying store) → flaggable.
+    class _Amnesiac(_FakeS3):
+        def put_object(self, k, d):
+            pass
+    st, detail = w3.health_check(n1, _Amnesiac(), now_ms=now)
+    assert st == "corrupt" and "absent" in detail
+
+    # unreachable: the PUT itself errors (network) → NOT corrupt (ages out).
+    class _Down(_FakeS3):
+        def put_object(self, k, d):
+            raise w3.S3Error("connection refused")
+    assert w3.health_check(n1, _Down(), now_ms=now)[0] == "unreachable"
+
+    # corrupt: store returns a STALE marker (old version) after our write.
+    class _StaleMarker(_FakeS3):
+        def get_object(self, k):
+            other = _ws(1, key)
+            other.own_marker = b"\x00" * 16          # different marker than n1
+            return witness._encode_slot(other, now)
+    assert w3.health_check(n1, _StaleMarker(), now_ms=now)[0] == "corrupt"
+
+
 def test_own_readback_ok_detects_a_lying_store():
     key = b"k" * 32
     now = int(time.time() * 1000)

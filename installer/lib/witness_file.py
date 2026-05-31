@@ -138,6 +138,38 @@ def probe_writable(base_dir: str) -> str:
     return ""
 
 
+def health_check(ws: "witness.WitnessState", base_dir: str,
+                 *, now_ms: Optional[int] = None) -> tuple:
+    """The 1-minute own-readback health probe for a fileshare witness. Same
+    3-state contract as witness_s3.health_check: ('unreachable'|'corrupt'|'ok',
+    detail). A 'corrupt' result means the share accepted our slot write but a
+    same-instant read returned it missing/stale/wrong — a write-through/
+    coherence failure (e.g. a CIFS server that doesn't honour cache=none), which
+    can never be trusted for quorum. A write/read IO error is 'unreachable' (the
+    share just dropped offline; the slot ages out)."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    try:
+        write_own_slot(ws, base_dir, now_ms=now_ms)
+    except OSError as e:
+        return ("unreachable", f"slot write failed: {e}")
+    path = os.path.join(base_dir, slot_filename(ws.my_node_id))
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        return ("unreachable", f"slot read-back failed: {e}")
+    s = witness._decode_slot(ws.cluster_key, blob)
+    if s is None or s.node_id != int(ws.my_node_id):
+        return ("corrupt", "own slot unreadable / wrong node after write")
+    if ws.own_marker and s.marker != ws.own_marker:
+        return ("corrupt", "own slot has a STALE marker after write "
+                           "(share returned an old version)")
+    if s.is_stale(now_ms):
+        return ("corrupt", "own slot stale immediately after write")
+    return ("ok", "")
+
+
 def run_io_cycle(ws: "witness.WitnessState", *,
                  now_ms: Optional[int] = None,
                  now_mono: Optional[float] = None,

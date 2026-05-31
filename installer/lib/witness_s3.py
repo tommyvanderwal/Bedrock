@@ -352,6 +352,42 @@ def own_readback_ok(ws: "witness.WitnessState", client: S3Client,
     return not s.is_stale(now_ms)
 
 
+def health_check(ws: "witness.WitnessState", client: S3Client,
+                 *, now_ms: Optional[int] = None) -> tuple:
+    """The 1-minute own-readback health probe. Write our own slot, then read it
+    straight back, and classify into (status, detail):
+      * 'unreachable' — the PUT or GET itself failed (network/transient); do NOT
+        flag corrupt, the slot just ages out of the tally normally;
+      * 'corrupt'     — the PUT SUCCEEDED but the store can't return our slot, or
+        returns a stale/wrong one: a read-after-OWN-write violation. Such a store
+        can never be trusted for quorum → flag it;
+      * 'ok'          — our slot read back with our current marker, fresh.
+    Distinguishing lying from unreachable is the whole point: only a lie is
+    permanent corruption."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    own_key = slot_key(client.cfg.prefix, ws.my_node_id)
+    try:
+        write_own_slot(ws, client, now_ms=now_ms)
+    except S3Error as e:
+        return ("unreachable", f"slot PUT failed: {e}")
+    try:
+        blob = client.get_object(own_key)
+    except S3Error as e:
+        return ("unreachable", f"slot GET failed: {e}")
+    if blob is None:
+        return ("corrupt", "own slot absent immediately after a successful PUT")
+    s = witness._decode_slot(ws.cluster_key, blob)
+    if s is None or s.node_id != int(ws.my_node_id):
+        return ("corrupt", "own slot unreadable / wrong node after PUT")
+    if ws.own_marker and s.marker != ws.own_marker:
+        return ("corrupt", "own slot has a STALE marker after PUT "
+                           "(store returned an old version)")
+    if s.is_stale(now_ms):
+        return ("corrupt", "own slot stale immediately after PUT")
+    return ("ok", "")
+
+
 def probe_writable(cfg: S3Config, *, timeout: float = DEFAULT_TIMEOUT_S) -> str:
     """Add-time UX guard: PUT then GET then DELETE a probe object. Returns "" if
     the bucket+prefix is reachable, writable, AND read-after-write coherent on

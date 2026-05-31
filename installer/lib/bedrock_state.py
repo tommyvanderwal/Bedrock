@@ -389,6 +389,54 @@ def witness_unregister(witness_id: str, reason: str = "",
         raise
 
 
+def witness_flag_corrupt(witness_id: str, reason: str,
+                         client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Flag a witness corrupt (a node's own-readback found the store accepted its
+    slot write but couldn't return it). Idempotent FIRST-flag: only writes when
+    corrupt is still 0, so the original detector's reason+time are preserved and
+    repeated detections from every node don't churn rqlite. Returns the new
+    revision when it newly flags, else 0 (already flagged — caller skips logging)."""
+    c, owns = _client(client)
+    try:
+        res = c.execute(
+            "UPDATE witnesses SET corrupt = 1, corrupt_reason = ?, "
+            "corrupt_at = ?, updated_at = ? WHERE witness_id = ? AND corrupt = 0",
+            params=[reason, _now(), _now(), witness_id],
+        )
+        # rows_affected == 0 → it was already flagged (or gone); don't bump/churn.
+        changed = bool(res and res[0].get("rows_affected", 0))
+        if not changed:
+            if owns:
+                c.close()
+            return 0
+        log.warning("bedrock_state: witness_flag_corrupt %s reason=%r",
+                    witness_id, reason)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
+def witness_clear_corrupt(witness_id: str,
+                          client: Optional[rqlite_client.RqliteClient] = None) -> int:
+    """Clear a witness's corrupt flag (recovered + healthy cluster-wide, or
+    operator override). Lets a previously-lying witness re-enter the vote."""
+    c, owns = _client(client)
+    try:
+        c.execute(
+            "UPDATE witnesses SET corrupt = 0, corrupt_reason = '', "
+            "corrupt_at = 0, updated_at = ? WHERE witness_id = ?",
+            params=[_now(), witness_id],
+        )
+        log.info("bedrock_state: witness_clear_corrupt %s", witness_id)
+        return _bump_and_close(c, owns)
+    except Exception:
+        if owns:
+            c.close()
+        raise
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Params
 # ─────────────────────────────────────────────────────────────────────

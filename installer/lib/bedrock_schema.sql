@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS witnesses (
     -- echo host:port for backend='echo'. One bucket/share can serve BOTH a
     -- backup target and this witness (see storage_endpoints.s3_prefix).
     endpoint_id             TEXT NOT NULL DEFAULT '',
+    -- Corruption flag: any node that detects a read-after-OWN-write failure on
+    -- this witness (the store accepted our slot PUT but can't return it — a
+    -- LYING / inconsistent store, NOT mere unreachability) sets corrupt=1 with a
+    -- reason. A corrupt witness is dropped from the vote tally (sticky — survives
+    -- the store flapping back), the operator is signalled, and the casting-vote
+    -- saga (disable + denominator drop) is triggered. Cleared only when healthy
+    -- again across the whole cluster (or by the operator).
+    corrupt                 INTEGER NOT NULL DEFAULT 0,
+    corrupt_reason          TEXT NOT NULL DEFAULT '',
+    corrupt_at              INTEGER NOT NULL DEFAULT 0,
     updated_at              INTEGER NOT NULL
 );
 
