@@ -2284,3 +2284,43 @@ read — NEVER use it for a high-frequency poll, and NEVER on a path that a
 commit-triggered webhook can re-trigger (instant feedback loop). Change detection
 reads the local replica; only a decision that must be linearizable pays for
 `strong`, at its own call site, once.
+
+## L57 — the no-op-WRITE twin of L55: idempotent `set_mgmt_master` every converge tick ⇄ cluster_loop = ~1 write/s of Raft commits at total idle
+
+After L55 killed the strong-read storm, the host disk still wrote **~2.76 MB/s
+"all the time"** on a fully idle 4-sim cluster. Scrappy RCA: `/proc/<pid>/io`
+`write_bytes` deltas showed the writer was **`rqlited` at ~226 KB/s on an idle
+FOLLOWER** — and a follower only writes when the leader commits. So something was
+committing continuously. `bedrock_meta.revision` was advancing **1.0/s** with
+ZERO operator activity. Hashing every cluster-state table twice pinned it to
+`cluster_info` + `nodes`, both via **`set_mgmt_master`** — and the value was
+*unchanged* (`mgmt_master` stayed the same node).
+
+**Mechanism (a feedback loop, exactly like L55 but write-driven):** the arbiter's
+`promote()` is deliberately idempotent and `converge_retry` / the cluster_loop run
+it on the master every tick. It UNCONDITIONALLY called `set_mgmt_master(self)`,
+whose three UPDATEs commit + bump `bedrock_meta.revision` even when nothing
+changed. That revision bump is a committed change → the central `cluster_loop`
+detects it → dispatches the reactors → arbiter `promote()` → `set_mgmt_master`
+again → … self-sustaining at ~1 write/s. Each iteration = a Raft append + BoltDB
+fsync on EVERY node (`raft.db`) + a SQLite WAL append (`db.sqlite-wal`) + a CDC
+fifo write (`cdc/fifo.db`) — all to rewrite identical rows.
+
+**Fix:** make `set_mgmt_master` idempotent at the WRITE level. A `level='none'`
+guard read first checks `mgmt_master == self AND no other node is mgmt+compute AND
+self.role == mgmt+compute`; if already satisfied it returns the current revision
+and writes NOTHING (no commit, no bump, no CDC). Local read is safe: this only
+runs on the node that is/expects-to-be master (its local replica is the leader's
+own store), and a genuine failover write is never skipped because the *other*
+node's replica still shows the stale master.
+
+**Result (measured):** `bedrock_meta.revision` 1.0/s → **0.00/s**; rqlited
+`write_bytes` 226 KB/s → ~30 KB/s/node; host disk 2.76 → 1.69 MB/s; per-sim host
+CPU master 24→22%, followers ~25→8-13% (sim-3/4 now <10%).
+
+**Lesson:** an "idempotent, safe to call every tick" reconcile action must be
+idempotent at the **write** layer too, not just the effect layer — a no-op UPDATE
+is still a full Raft commit + fsync on every node, and if a central change-loop
+re-triggers the reconcile on that very commit, you get L55's feedback loop with no
+`strong` read in sight. Setters that run on a hot converge path must read-then-
+skip when the target state already holds.

@@ -106,9 +106,35 @@ def set_mgmt_master(node_name: str,
     """Atomically (a) set cluster_info.mgmt_master and (b) update
     the per-node role columns so downstream reads see a consistent
     snapshot — old master's role drops back to 'compute', new
-    master gets 'mgmt+compute'."""
+    master gets 'mgmt+compute'.
+
+    Idempotent at the WRITE level (RCA L57): the arbiter's promote() is
+    deliberately idempotent and calls this on EVERY converge tick. Without
+    a guard the three UPDATEs below commit + bump bedrock_meta.revision every
+    tick even when nothing changes — and that revision bump wakes the central
+    cluster_loop, which re-runs the reactors (arbiter promote), which calls
+    this again: a self-sustaining ~1 write/s of Raft commit + fsync + CDC at a
+    completely idle cluster (the no-op-write twin of the strong-read storm).
+    So FIRST read the current state locally; if mgmt_master is already this
+    node AND the role columns already reflect it, write NOTHING and return the
+    current revision. The read is level='none' (local replica) — this only ever
+    runs on the node that is/expects-to-be master, whose local replica is the
+    leader's own store, so a needed failover write is never skipped (the OTHER
+    node's replica would still show the stale master and write)."""
     c, owns = _client(client)
     try:
+        guard = c.query_one(
+            "SELECT (SELECT mgmt_master FROM cluster_info WHERE id=1) AS m, "
+            "(SELECT count(*) FROM nodes WHERE role='mgmt+compute' "
+            "AND node_name <> ?) AS others, "
+            "(SELECT role FROM nodes WHERE node_name = ?) AS myrole, "
+            "(SELECT revision FROM bedrock_meta WHERE id=1) AS rev",
+            [node_name, node_name], level="none")
+        if (guard and guard["m"] == node_name and guard["others"] == 0
+                and guard["myrole"] == "mgmt+compute"):
+            if owns:
+                c.close()
+            return int(guard["rev"] or 0)   # already correct → no write, no bump
         ts = _now()
         c.execute([
             ["UPDATE cluster_info SET mgmt_master = ?, updated_at = ? "
