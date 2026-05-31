@@ -2324,3 +2324,54 @@ is still a full Raft commit + fsync on every node, and if a central change-loop
 re-triggers the reconcile on that very commit, you get L55's feedback loop with no
 `strong` read in sight. Setters that run on a hot converge path must read-then-
 skip when the target state already holds.
+
+## L58 — node maintenance / leave drop a node from the election DENOMINATOR with NO all-applied gate → confirmed N=2 split-brain (adversarial review of #7)
+
+The #7 casting-vote work added an all-nodes-applied epoch watermark so bar-LOWERING
+vote-config changes (credit casting, drop a disabled witness from the denominator)
+can't take effect at the master until every active node has applied them — the
+VOTE-CHANGE SAFETY PRINCIPLE. An adversarial review of that saga (workflow
+wf_1181f70e-3bc, 5 lenses) confirmed the saga + gate are CORRECT, but surfaced that
+the SAME principle's other listed cases — **"remove a node" / put a node in
+maintenance** — were NEVER gated, and that is a real **pre-existing split-brain**.
+
+**Scenario (confirmed by arithmetic).** 2-node cluster {A=master, B} + one healthy
+witness W reachable by both (a central S3/fileshare witness; a node↔node partition
+removes NO slot from a shared store, so W stays valid+confirmed for BOTH sides —
+witness.py `_slots_valid` only invalidates on a *missing* member slot, stale is
+fine). Operator runs `bedrock node maint B on` (one rqlite write,
+nodes.B.maintenance=1) — or `node leave B` where B survives the best-effort SSH
+stop — then A|B partition before B applies it:
+  * A (`_is_active` excludes maintenance): active_nodes={A} → denom = 100·1 + 1(W)
+    = 101, majority 51; A = 100 + W(1) = 101 ≥ 51 → LEADER.
+  * B (stale level='none' replica, hasn't applied B.maintenance; `_is_active` keeps
+    SELF unconditionally): active_nodes={A,B} → denom 201, majority 101; A gone →
+    promote branch → 100 + W(1) = 101 ≥ 101 → LEADER.
+  * BOTH leader → split-brain. The casting saga/watermark are NOT involved (this
+    path has no vote_config_epoch change, so it BYPASSES the gate entirely).
+
+**Root cause.** Removing a node from the denominator LOWERS the surviving node's
+quorum bar — the unsafe-to-lag direction — but `node_maintenance` / `node_unregister`
+commit a single rqlite write with no epoch bump and no all-nodes-applied wait, while
+the drained-but-still-running node keeps itself in its own denominator on a stale
+replica. Asymmetric denominators + a both-reachable witness = both sides quorate.
+NOT a regression from #7 (these paths predate it); #7 built exactly the machinery
+(vote_config_epoch + applied_epoch watermark, arbiter excluded) that fixes it.
+
+**Fix direction (not yet built).** Treat a node leaving the active set (maintenance
+ON, or leave) as a vote-config transition: bump vote_config_epoch on the change and
+gate the denominator shrink in the netd tick on `config_fully_applied` (same as the
+witness-disable path), so the master keeps the higher bar until the departing node
+has applied it (or is provably gone via fencing). Also: finding #1 — with C≥3
+shared witnesses reachable by both partition sides, >half of them hand each lone
+node a majority (an N=2 even-node-vote tiebreaker property); cure is at witness
+topology/vote-weighting (odd witness count / one-side-only lease), a design note
+before multi-witness shared-store clusters ship. Findings #4 (partner death during
+the arm window pins the watermark → master halts until operator removes the dead
+peer; inherent, same as the no-saga baseline) and #5 (≤2 epoch bumps per operator
+corrupt-clear cycle; bounded, corrupt is sticky) are accepted/minor.
+
+**Lesson:** an all-applied watermark for ONE class of bar-lowering change (witness
+disable) doesn't make the cluster safe — EVERY denominator-shrinking transition
+(node leave, maintenance, future node-vote-weight changes) must ride the same gate,
+or the unguarded ones reintroduce the exact split-brain the gate was built to stop.
