@@ -405,8 +405,11 @@ def promote_to_arbiter_host() -> dict:
         _set_mgmt_master_after_promote(drbd_present=False, status=status)
         return status
 
-    # N>=2 with cluster DRBD. Run the takeover protocol.
-    log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
+    # N>=2 with cluster DRBD. converge_retry calls this every 1Hz tick, so
+    # only log at INFO when we actually actuate (the cold path below) — the
+    # steady-state self-renew must stay silent (it was spamming "promoting"
+    # + "mgmt_master written" every second into journald + the obs pipeline).
+    log.debug("arbiter: promote tick (N=%d, cluster DRBD present)", n)
 
     # Idempotent fast-path: if I am already hosting (DRBD primary +
     # mounted + .254 bound), skip the witness protocol. This handles
@@ -434,6 +437,7 @@ def promote_to_arbiter_host() -> dict:
             return arbiter_status()
         # Steps 6: hardware/software state changes — assert the
         # DRBD-primary + mount + .254 trio.
+        log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
         _drbd_promote()
         _mount()
         ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -534,8 +538,13 @@ def _set_mgmt_master_after_promote(*, drbd_present: bool,
             _sys.path.insert(0, "/usr/local/lib/bedrock")
             from lib import bedrock_state as _bs  # type: ignore
         rev = _bs.set_mgmt_master(self_name)
-        log.info("arbiter: mgmt_master=%s written after confirmed "
-                 "promote (rqlite rev=%s)", self_name, rev)
+        # DEBUG not INFO: this runs every 1Hz converge tick, but
+        # set_mgmt_master is write-if-changed (L57) so it's a no-op read on
+        # the steady master — an INFO line/sec of "written" was both spammy
+        # and misleading (nothing was written). A real role change still
+        # shows up via the netd election + the rev bump.
+        log.debug("arbiter: mgmt_master=%s confirmed after promote "
+                  "(rqlite rev=%s)", self_name, rev)
     except Exception as e:
         log.warning("arbiter: set_mgmt_master deferred — %s "
                     "(will retry next converge tick)", e)

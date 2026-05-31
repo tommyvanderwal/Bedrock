@@ -361,9 +361,14 @@ def is_bridge_slave(nic: str) -> bool:
     """A bridge port has /sys/class/net/<nic>/master pointing at the
     bridge interface. We never address such NICs ourselves — assigning
     them an IP fights the bridge and breaks the LAN side. The bridge
-    itself (e.g. br0) is what we treat as the routable endpoint."""
-    return Path(f"/sys/class/net/{nic}/master").is_symlink() or \
-           Path(f"/sys/class/net/{nic}/brport").exists()
+    itself (e.g. br0) is what we treat as the routable endpoint.
+
+    os.path.* not pathlib: this runs per-NIC on every 4Hz tick; Path
+    object construction + canonicalization showed up as ~22% of the netd
+    thread's CPU in the 2026-06-01 py-spy. os.path.islink/exists are bare
+    stat/lstat syscalls with no object churn."""
+    return os.path.islink(f"/sys/class/net/{nic}/master") or \
+           os.path.exists(f"/sys/class/net/{nic}/brport")
 
 
 def list_interfaces() -> list[str]:
@@ -375,7 +380,15 @@ def list_interfaces() -> list[str]:
             continue
         if is_bridge_slave(nic):
             continue
-        oper = Path(f"/sys/class/net/{nic}/operstate").read_text().strip()
+        # try/except (like get_mac): a NIC that vanishes between listdir and
+        # this read raised FileNotFoundError → the broad tick handler aborted
+        # the WHOLE tick (election + sweep). Treating a vanished NIC as
+        # not-up and continuing is the correct behavior, not a crash.
+        try:
+            with open(f"/sys/class/net/{nic}/operstate") as f:
+                oper = f.read().strip()
+        except OSError:
+            continue
         if oper != "up":
             continue
         out.append(nic)
@@ -425,22 +438,25 @@ def nic_speed_mbps(nic: str) -> int:
         every documented Linux platform. The mesh-link preference
         still picks Thunderbolt over a 2.5G LAN bridge.
     """
-    base = Path(f"/sys/class/net/{nic}")
+    # os.path.* + open() not pathlib throughout: this is called once per
+    # neighbour across several per-tick loops (probe/adv/quality/route emit),
+    # so it ran many times/sec — Path construction + the .resolve() realpath
+    # walk for the driver symlink dominated the netd thread's pathlib cost
+    # (~27%, py-spy 2026-06-01). Same syscalls, no object churn, and
+    # os.readlink replaces resolve()'s full canonicalization.
+    base = f"/sys/class/net/{nic}"
 
     # Bridge: walk slaves, return min physical speed.
-    if (base / "bridge").is_dir():
-        brif = base / "brif"
-        if brif.is_dir():
+    if os.path.isdir(f"{base}/bridge"):
+        brif = f"{base}/brif"
+        if os.path.isdir(brif):
             speeds: list[int] = []
-            for slave in brif.iterdir():
-                name = slave.name
+            for name in os.listdir(brif):
                 if name.startswith(("vnet", "veth", "tap", "macvtap")):
                     continue
                 try:
-                    sp = int(
-                        Path(f"/sys/class/net/{name}/speed")
-                        .read_text().strip()
-                    )
+                    with open(f"/sys/class/net/{name}/speed") as f:
+                        sp = int(f.read().strip())
                     if sp > 0:
                         speeds.append(sp)
                 except (OSError, ValueError):
@@ -451,19 +467,21 @@ def nic_speed_mbps(nic: str) -> int:
 
     # Thunderbolt-net: kernel doesn't expose speed; report 15 Gbps —
     # an honest Linux real-world midpoint (see docstring for the
-    # platform-by-platform breakdown).
+    # platform-by-platform breakdown). os.readlink (the immediate link
+    # target's basename = driver name) instead of Path.resolve() — same
+    # answer, no realpath canonicalization walk.
     try:
-        drv_link = base / "device" / "driver"
-        if drv_link.is_symlink():
-            drv = (drv_link).resolve().name
-            if drv == "thunderbolt-net":
+        drv_link = f"{base}/device/driver"
+        if os.path.islink(drv_link):
+            if os.path.basename(os.readlink(drv_link)) == "thunderbolt-net":
                 return 15000
     except OSError:
         pass
 
     # Default path: read the kernel-reported speed.
     try:
-        speed = int((base / "speed").read_text().strip())
+        with open(f"{base}/speed") as f:
+            speed = int(f.read().strip())
         return max(0, speed)  # -1 means "unknown" on virtio sometimes
     except (OSError, ValueError):
         return 0
@@ -3695,33 +3713,33 @@ def compute_routes(d: Daemon) -> list[str]:
 
 
 def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
-    """Read (mgmt_master_node_name, master_loopback_ip) from rqlite's
-    cluster_info/nodes tables (level='none', works without quorum).
-    Returns ('', '') if rqlite is unreachable, has no master set, or the
-    master node has no loopback recorded. Used by
-    compute_routes() for the /24-via-master panic catch-all.
-    Master may be `my_node` itself — caller decides to skip in that case.
-    """
+    """Return (mgmt_master_node_name, '') for compute_routes()'s
+    /24-via-master panic catch-all. Master may be `my_node` itself — the
+    caller decides to skip in that case. Returns ('', '') if rqlite is
+    unreachable or no master is set (the caller then falls back to the
+    freshest-neighbour rule, so a stale/empty read is always safe).
+
+    The second element (master loopback IP) is always '' — it's DEAD: the
+    caller derives the next-hop purely from the in-memory neighbour /
+    transit tables, never from a recorded loopback. Kept only for the
+    call site's 2-tuple unpack.
+
+    Reuses the SAME revision-cached load_cluster(none) snapshot the
+    election tick already populated THIS tick (same netd thread, same 1Hz)
+    instead of issuing a fresh, uncached cluster_info⋈nodes JOIN on every
+    emit_routes. mgmt_master writes bump bedrock_meta.revision, so the
+    snapshot self-invalidates — no stale-master risk."""
     try:
         try:
-            from . import rqlite_client as _rc_mod
+            from . import cluster_state as _cs
         except ImportError:
             import sys as _sys2
             _sys2.path.insert(0, "/usr/local/lib/bedrock")
-            from lib import rqlite_client as _rc_mod  # type: ignore
-        with _rc_mod.RqliteClient() as _rc:
-            row = _rc.query_one(
-                "SELECT ci.mgmt_master, n.loopback_ip "
-                "FROM cluster_info ci "
-                "LEFT JOIN nodes n ON n.node_name = ci.mgmt_master "
-                "WHERE ci.id = 1",
-                level="none",
-            )
+            from lib import cluster_state as _cs  # type: ignore
+        master = _cs.load_cluster(level="none").get("mgmt_master") or ""
     except Exception:
         return ("", "")
-    master = (row or {}).get("mgmt_master") or ""
-    lo = (row or {}).get("loopback_ip") or ""
-    return (master, lo)
+    return (master, "")
 
 
 def current_cluster_routes(cluster_uuid: str) -> list[str]:
