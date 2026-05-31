@@ -2173,3 +2173,41 @@ same change, so this class of drift can't reach an install again.
 **Deeper fix (deferred):** ship lib/ as a tarball like bedrock_d/ and mgmt/ (no
 manual manifest at all), OR drop the `file://`-only guard so the HTTP path
 self-heals too. The test makes either optional rather than urgent.
+
+## L53 — Bedrock-managed NFS/SMB mounting needs nfs-utils + cifs-utils, which a stock node lacks
+
+**Symptom (caught in the multi-tier backup e2e, 2026-05-31):** the storage-
+unification work added Bedrock-managed mounting of SMB/NFS shares (kopia repos +
+fileshare witnesses) via `storage_mount.py`, which shells out to `mount -t nfs`
+/ `mount -t cifs`. On a stock AlmaLinux-10 node every such mount failed with
+`NFS: mount program didn't pass remote address` — across *all* NFS versions
+(v3/v4.0/4.1/4.2). Connectivity was fine (port 2049 open); the cause was that the
+node has **no `mount.nfs` helper** — `nfs-utils` is not installed (nor is
+`cifs-utils` for SMB). Without the helper, util-linux falls back to a raw kernel
+mount that never gets the server address.
+
+**Why it hid:** the witness/backup design, the storage_mount module, and all its
+unit tests are pure option/command-string logic — none of them actually run
+`mount`, so nothing in the suite or the design review exercised the real
+dependency. It only surfaces the first time a real NFS/SMB endpoint is mounted on
+a real node, which the e2e did (migrate a VM backup onto an NFS-backed kopia
+repo, then restore from it).
+
+**Fix:** add `nfs-utils` and `cifs-utils` to the kickstart `%packages`
+(`installer/iso-build/bedrock-almalinux-10.ks`) so every node ships the
+mount helpers. (For the running-cluster test they were `dnf install`ed by hand.)
+
+**Adjacent finding (not yet fixed):** deploying new code that QUERIES new rqlite
+columns (e.g. `endpoint_id`, `repo_password_enc`) without first running
+`apply_schema` breaks `load_cluster` cluster-wide (`no such column`). The additive
+`_add_column_if_missing` migrations must run on any code upgrade, not just at
+install — a code-only `sync-to-sims` left every node unable to read cluster state
+until `apply_schema` was run on the master. An upgrade path should always re-run
+the migrations.
+
+**Adjacent finding #2 (design):** Bedrock restore is RECORD-driven (run_restore
+matches the kopia_snapshot_id against a vm_backups row), so a snapshot that was
+`kopia snapshot migrate`d to another tier (new manifest id, no Bedrock record)
+can't be restored through the API until a backup row is registered for it. When
+migrate-based tiering is wired into Bedrock, the tiering step must also write the
+vm_backups record for the destination tier.

@@ -180,6 +180,12 @@ xfsprogs
 chrony
 curl
 tar
+# Bedrock-managed SMB/NFS storage endpoints (kopia repos + fileshare witnesses)
+# mount shares on every node — without these the mount.{nfs,cifs} helpers are
+# absent and `mount -t nfs/cifs` fails "didn't pass remote address" (RCA
+# 2026-05-31: a stock node could not mount any NFS/SMB witness or backup share).
+nfs-utils
+cifs-utils
 %end
 
 # ── Post-install (stage A — outside chroot): stage the bedrock
