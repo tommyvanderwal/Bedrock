@@ -107,7 +107,7 @@ Walk every neighbour and emit LINK_UP / LINK_DOWN / LINK_QUALITY at the hysteres
 ### Routing advertisement (protocol 3)
 - `_direct_neighbour_by_node(d)` — best (lowest `local_metric`) logged-up neighbour per peer.
 - `_cluster_node_loopbacks(my_node)` — `{node: loopback_ip}` from rqlite `nodes` (level `none`); membership-of-record, used only to *address* advertisements, never to make routing decisions.
-- `build_advertisement_paths(d)` — the `paths[]` list: one direct entry per logged-up peer + one per selected transit dest (prepending us to its `via_chain`); direct beats transit.
+- `build_advertisement_paths(d)` — the `paths[]` list: one direct entry per logged-up peer + one per selected transit dest (prepending us to its `via_chain`); direct beats transit. The mgmt master also appends the cluster VIP as a `@vip` entry (connected: `via_chain=[me]`, `∞` bw, `0` lat) so `.254` propagates as an ordinary `/32` — no extra packet. Withdrawn by simply not emitting it on demote.
 - `adv_send_round(d, now_ts)` — one signed unicast per known peer (direct neighbours ∪ rqlite nodes); kernel picks the NIC. **Side effects:** `sendto`.
 - `adv_drain(d, now_ts) -> bool` — ingest advertisements; True if `adv_table` changed.
 - `process_advertisement(d, body, sender_addr, now_ts) -> bool` — validate (advertiser must be a direct neighbour; seq must advance, wrap-aware) + store.
@@ -139,10 +139,10 @@ Persist a LINK_UP/DOWN/QUALITY observation. **Side effects:** the mgmt master wr
 Compute desired routes (`compute_routes`), diff against the kernel's current cluster routes (`current_cluster_routes`), and apply only the delta. **Side effects:** `ip route del` for removals, `ip route replace` for additions; caches a signature so an unchanged set is a no-op.
 
 ### `compute_routes(d) -> list[str]`
-Build the full route spec list. (Detail below.) Calls `_detect_and_handle_ll_collision`, `local_metric`, `_cluster_node_loopbacks`, `_mgmt_master_loopback`, `cluster_addr.cluster_loopback_net`.
+Build the full route spec list. (Detail below.) Calls `_detect_and_handle_ll_collision`, `local_metric`, `_cluster_node_loopbacks`, `_loopback_octet`, `cluster_addr.cluster_loopback_net`, `cluster_addr.cluster_vip`. **Reads nothing from rqlite** — fully master-independent. The cluster VIP (`.254`) is installed from the `@vip` advertised `/32` (see `build_advertisement_paths`), and the `/24` panic catch-all points at the lowest-octet lower-than-self neighbour (loop-free; the global-lowest node installs none and sinks). See `docs/vip-route-decoupling.md`.
 
-### `_mgmt_master_loopback(my_node) -> (master_name, master_loopback)`
-Read the current mgmt master + its loopback from rqlite (`cluster_info` JOIN `nodes`, level `none`); `("","")` if unreachable/unset.
+### `_loopback_octet(loopback_ip) -> int`
+Last octet of a cluster loopback `/32` (== `node_index`, 1..254), or `0` if unparseable. The node's stable rank in the lowest-octet catch-all total order.
 
 ### `current_cluster_routes(cluster_uuid) -> list[str]` / `_normalize_route_line(line) -> str`
 Read the kernel routes this daemon owns (cluster `/24`, its `/32`s, and `169.254.*/32 scope link`), joining multipath continuation lines. `_normalize_route_line` rewrites `ip route show` output into the exact form `compute_routes` emits (add `/32`, strip `proto`/`pref`/`src`/`table`/`linkdown`/`onlink`, move `metric` before the nexthop list) so set-diffs round-trip without churn.
@@ -202,11 +202,13 @@ persists even if its link later goes silent.
                    (per peer, one tier per tied local_metric; tied paths
                     become an ECMP multipath route, kernel L4-hashes flows)
   3. transit /32s  100.D.E.F/32 via <next-hop> dev <my_nic> metric 100+i
-                   (peers not directly reachable, learned via protocol 3)
+                   (peers not directly reachable, learned via protocol 3;
+                    includes the .254 VIP via the @vip advertisement)
   ──────────────────────────────────────────────────────────────────────
-  panic catch-all  100.A.B.0/24 via <best path to mgmt master> metric 999
-                   (falls back to freshest neighbour if master unknown/
-                    unreachable; the master itself installs no /24-via-self)
+  panic catch-all  100.A.B.0/24 via <lowest-octet lower-than-self nbr> 999
+                   (master-independent, no rqlite; loop-free by octet
+                    well-ordering; the global-lowest node installs none
+                    and sinks unknown traffic)
 ```
 
 Monotonic metrics let the kernel fail a peer's traffic over to a backup path for

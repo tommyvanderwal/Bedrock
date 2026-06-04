@@ -448,10 +448,9 @@ class ClusterInit:
         )
 
         # 4. Sign the arbiter cert. The arbiter's loopback IP is the
-        #    cluster prefix + .254 (matches cluster_arbiter.ARBITER_OCTET).
-        from lib import cluster_arbiter as _arb, cluster_addr as _caddr
-        prefix = _caddr.cluster_loopback_prefix(ctx["cluster_uuid"])
-        arbiter_ip = f"{prefix}.{_arb.ARBITER_OCTET}"
+        #    cluster VIP (.254) — single source in cluster_addr.cluster_vip.
+        from lib import cluster_addr as _caddr
+        arbiter_ip = _caddr.cluster_vip(ctx["cluster_uuid"])
         _ca.generate_arbiter_keypair_and_cert(arbiter_ip)
 
     # ─── rqlite ──────────────────────────────────────────────────────

@@ -59,10 +59,9 @@ ARBITER_SVC     = "bedrock-rqlited-arbiter.service"
 # Path MUST agree with tier_storage.CLUSTER_DRBD_MARKER.
 CLUSTER_DRBD_MARKER = Path("/etc/bedrock/cluster-drbd-ready")
 
-# Reserved arbiter octet at the top of the cluster /24.
-# Derivation of the cluster_byte itself lives in cluster_addr; we just
-# combine here.
-ARBITER_OCTET   = 254
+# The reserved arbiter octet + the full VIP derivation now live in
+# cluster_addr (cluster_addr.ARBITER_VIP_OCTET / cluster_addr.cluster_vip)
+# so bedrock-net and the arbiter share one source of truth.
 
 # Peer-heartbeat freshness for the steal-back guard (C2/M12) and the
 # last-standing check (H6). netd sends an election heartbeat ~1 Hz, so a
@@ -160,8 +159,7 @@ def arbiter_loopback_ip() -> str:
         import sys
         sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import cluster_addr  # type: ignore
-    prefix = cluster_addr.cluster_loopback_prefix(uuid)
-    _ARBITER_IP_MEMO = f"{prefix}.{ARBITER_OCTET}"
+    _ARBITER_IP_MEMO = cluster_addr.cluster_vip(uuid)
     return _ARBITER_IP_MEMO
 
 

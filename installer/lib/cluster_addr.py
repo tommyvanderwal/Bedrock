@@ -57,6 +57,21 @@ def cluster_loopback_net(cluster_uuid: str) -> str:
     return f"{cluster_loopback_prefix(cluster_uuid)}.0/24"
 
 
+# The arbiter / cluster-VIP lives at the top of the /24 (octet 254),
+# above the node-index range (1..250). It is a pure function of
+# cluster_uuid — every node can derive it without rqlite — which is
+# what lets bedrock-net advertise it as an ordinary connected /32 and
+# keeps the routing data-plane decoupled from "who is master".
+ARBITER_VIP_OCTET = 254
+
+
+def cluster_vip(cluster_uuid: str) -> str:
+    """The cluster arbiter VIP `100.X.Y.254` for this cluster. Single
+    source of truth for the octet; cluster_arbiter binds it, bedrock-net
+    advertises a /32 to it, and receivers resolve it locally (no rqlite)."""
+    return f"{cluster_loopback_prefix(cluster_uuid)}.{ARBITER_VIP_OCTET}"
+
+
 def node_loopback_ip(cluster_uuid: str, node_index: int) -> str:
     """The /32 cluster identity address for `node_index` (1..250).
     Indices are assigned by registration order — the node that runs

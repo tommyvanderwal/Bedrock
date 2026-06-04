@@ -296,9 +296,11 @@ class TestComputeRoutes(unittest.TestCase):
 
     # ── D-13: Panic-via-master ───────────────────────────────────────
 
-    def test_follower_panic_route_uses_master_path(self):
-        """On a follower, the /24 panic route uses the next-hop that
-        leads to the master."""
+    def test_follower_panic_route_uses_lowest_octet_neighbour(self):
+        """The /24 panic route uses the next-hop to the lowest-octet
+        neighbour whose octet is strictly lower than ours."""
+        # cluster.json content is irrelevant now — routing is
+        # master-independent — but we still write one to prove it's unused.
         self._write_cluster_json(
             mgmt_master="sim-1",
             nodes={"sim-1": "100.42.42.1", "sim-2": "100.42.42.2"},
@@ -310,117 +312,94 @@ class TestComputeRoutes(unittest.TestCase):
         routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(len(panic_routes), 1)
-        # Master's link_addr is the next-hop
+        # sim-1 (octet 1 < our 2) is the next-hop
         self.assertIn("via 169.254.10.1", panic_routes[0])
         self.assertIn("dev enp2s0", panic_routes[0])
 
-    def test_master_does_not_install_panic_via_self(self):
-        """The master itself doesn't install a /24-via-self route —
-        that would be a routing loop."""
+    def test_lowest_octet_node_installs_no_panic_route(self):
+        """The global-lowest-octet node has no lower-octet neighbour, so
+        it installs NO catch-all and sinks unknown traffic (the loop-free
+        base case). No rqlite/master lookup is consulted."""
         self._write_cluster_json(
             mgmt_master="sim-1",
             nodes={"sim-1": "100.42.42.1", "sim-2": "100.42.42.2"},
         )
         d = self._make_daemon("sim-1", "100.42.42.1", "test-cluster")
-        # Even with a neighbour, the master should emit NO panic route
+        # Even with a (higher-octet) neighbour, sim-1 emits NO panic route.
         d.neighbours[("sim-2", "enp2s0", "enp2s0")] = _make_neighbour(
             "sim-2", "enp2s0", "100.42.42.2", "169.254.10.2", "enp2s0")
 
-        # The mgmt-master is read from rqlite (cluster_info) at runtime;
-        # patch that lookup since there's no rqlited in the unit test.
-        with mock.patch.object(netd, "_mgmt_master_loopback",
-                               return_value=("sim-1", "100.42.42.1")):
-            routes = netd.compute_routes(d)
+        routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(
             len(panic_routes), 0,
-            f"master should not emit panic route, got: {panic_routes}",
+            f"lowest-octet node should sink, not emit panic, got: {panic_routes}",
         )
 
-    def test_panic_falls_back_to_freshest_when_no_cluster_json(self):
-        """Bootstrap case: before cluster.json is written, fall back
-        to the historical freshest-neighbour rule so the cluster is
-        still routable."""
-        # No cluster.json created
-        d = self._make_daemon("sim-2", "100.42.42.2", "test-cluster")
+    def test_panic_prefers_lowest_octet_over_freshest(self):
+        """Lowest octet wins over recency: a fresher higher-octet
+        neighbour does NOT beat an older lower-octet one."""
+        d = self._make_daemon("sim-4", "100.42.42.4", "test-cluster")
         now = time.time()
         n1 = _make_neighbour(
             "sim-1", "enp2s0", "100.42.42.1", "169.254.10.1", "enp2s0")
-        n1.last_seen = now - 100   # older
+        n1.last_seen = now - 100   # older, but lowest octet
         n3 = _make_neighbour(
             "sim-3", "enp3s0", "100.42.42.3", "169.254.30.3", "enp3s0")
-        n3.last_seen = now   # freshest
+        n3.last_seen = now         # freshest, but higher octet
         d.neighbours[("sim-1", "enp2s0", "enp2s0")] = n1
         d.neighbours[("sim-3", "enp3s0", "enp3s0")] = n3
 
         routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(len(panic_routes), 1)
-        # Freshest neighbour (sim-3) wins
-        self.assertIn("via 169.254.30.3", panic_routes[0])
+        # Lowest octet (sim-1) wins, NOT freshest (sim-3)
+        self.assertIn("via 169.254.10.1", panic_routes[0])
+        self.assertNotIn("via 169.254.30.3", panic_routes[0])
 
-    def test_panic_uses_master_link_addr_not_freshest_when_both_known(self):
-        """When the master is set in cluster.json, the panic route
-        goes via the master's link_addr — NOT the freshest neighbour.
-        This is the core D-13 change."""
+    def test_panic_is_master_independent(self):
+        """Routing ignores who cluster.json names as master: the panic
+        next-hop is the lowest-octet neighbour even when a different
+        node is master. This is the decoupling guarantee."""
+        # cluster.json says sim-3 is master — routing must NOT care.
         self._write_cluster_json(
-            mgmt_master="sim-1",
+            mgmt_master="sim-3",
             nodes={"sim-1": "100.42.42.1", "sim-3": "100.42.42.3",
                    "sim-2": "100.42.42.2"},
         )
         d = self._make_daemon("sim-2", "100.42.42.2", "test-cluster")
-        now = time.time()
-        # sim-1 (master) seen 100s ago; sim-3 seen NOW. Pre-D-13 this
-        # would route panic via sim-3 (freshest); post-D-13 it must
-        # route via sim-1 (master).
-        n_master = _make_neighbour(
+        d.neighbours[("sim-1", "enp2s0", "enp2s0")] = _make_neighbour(
             "sim-1", "enp2s0", "100.42.42.1", "169.254.10.1", "enp2s0")
-        n_master.last_seen = now - 100
-        n_other = _make_neighbour(
-            "sim-3", "enp3s0", "100.42.42.3", "169.254.30.3", "enp3s0")
-        n_other.last_seen = now
-        d.neighbours[("sim-1", "enp2s0", "enp2s0")] = n_master
-        d.neighbours[("sim-3", "enp3s0", "enp3s0")] = n_other
 
-        # mgmt-master is read from rqlite at runtime; patch the lookup.
-        with mock.patch.object(netd, "_mgmt_master_loopback",
-                               return_value=("sim-1", "100.42.42.1")):
-            routes = netd.compute_routes(d)
+        routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(len(panic_routes), 1)
-        # Master's link_addr is what we want, NOT sim-3's
+        # Via sim-1 (lowest octet), regardless of master == sim-3
         self.assertIn("via 169.254.10.1", panic_routes[0])
-        self.assertNotIn("via 169.254.30.3", panic_routes[0])
 
-    def test_panic_falls_back_when_master_unreachable(self):
-        """If cluster.json names a master but we have no neighbour
-        for it (transient outage, master just went away), fall back
-        to the freshest available neighbour rather than no panic
-        route at all."""
-        self._write_cluster_json(
-            mgmt_master="sim-1",
-            nodes={"sim-1": "100.42.42.1", "sim-2": "100.42.42.2",
-                   "sim-3": "100.42.42.3"},
-        )
+    def test_panic_sinks_when_only_higher_octet_neighbours(self):
+        """If every reachable neighbour has a HIGHER octet than ours, we
+        are a local sink (forwarding up would risk a loop) — install NO
+        catch-all. (The old freshest-rule would have routed via the
+        higher-octet neighbour and could loop.)"""
         d = self._make_daemon("sim-2", "100.42.42.2", "test-cluster")
-        # No neighbour for sim-1 (the master); only sim-3 reachable
+        # Only sim-3 (octet 3 > our 2) reachable.
         d.neighbours[("sim-3", "enp3s0", "enp3s0")] = _make_neighbour(
             "sim-3", "enp3s0", "100.42.42.3", "169.254.30.3", "enp3s0")
 
         routes = netd.compute_routes(d)
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(
-            len(panic_routes), 1,
-            "expected fallback panic route when master unreachable",
+            len(panic_routes), 0,
+            "no lower-octet neighbour → must sink, not forward upward",
         )
-        self.assertIn("via 169.254.30.3", panic_routes[0])
 
     # ── Combined: routes for a realistic 2-node testbed ─────────────
 
-    def test_realistic_2node_panic_via_master_plus_ecmp(self):
-        """Realistic 2-node setup: sim-2 (follower) sees sim-1 (master)
-        across 4 NIC pairs all at the same speed. Expect ONE ECMP
-        route to sim-1 + ONE panic route via that same ECMP path."""
+    def test_realistic_2node_panic_plus_ecmp(self):
+        """Realistic 2-node setup: sim-2 sees sim-1 (lowest octet)
+        across 3 NIC pairs at the same speed. Expect ONE ECMP route to
+        sim-1 + ONE single-path panic route via sim-1's best link."""
         self._write_cluster_json(
             mgmt_master="sim-1",
             nodes={"sim-1": "100.42.42.1", "sim-2": "100.42.42.2"},
@@ -439,16 +418,14 @@ class TestComputeRoutes(unittest.TestCase):
         self.assertEqual(len(sim1_routes), 1)
         self.assertEqual(sim1_routes[0].count("nexthop via"), 3)
 
-        # Exactly one panic /24 route, single-path via master's
-        # best link (panic uses by_peer[master][0], not multipath —
-        # by design: panic is a fallback, not a hot path)
+        # Exactly one panic /24 route, single-path via sim-1's best link
+        # (panic is a fallback, not a hot path — no multipath).
         panic_routes = [r for r in routes if "metric 999" in r]
         self.assertEqual(len(panic_routes), 1)
-        # It points at one of the master's link addresses
-        link_addrs_master = ["169.254.10.1", "169.254.20.1", "169.254.30.1"]
+        link_addrs_sim1 = ["169.254.10.1", "169.254.20.1", "169.254.30.1"]
         self.assertTrue(
-            any(la in panic_routes[0] for la in link_addrs_master),
-            f"panic should use one of master's link addrs, got: "
+            any(la in panic_routes[0] for la in link_addrs_sim1),
+            f"panic should use one of sim-1's link addrs, got: "
             f"{panic_routes[0]}",
         )
 

@@ -40,15 +40,16 @@ loopback IP." The short version:
     loopback /32s in metric order) PLUS transit /32s computed from
     protocol-3 routing advertisements (path-vector, BGP-shaped, with
     via_chain loop detection). Backup routes installed at monotonic
-    metrics so the kernel fails over for free on link-down. Panic
-    catch-all `<cluster /24> via <freshest peer> metric 999` covers
-    the gap between a peer's withdrawal and the next adv-table
-    recompute. Loops bounded by IP TTL.
-  * Panic-neighbour catch-all `<cluster /24> via <freshest peer>
-    metric 999` is always installed when at least one neighbour is
-    reachable. Cluster /24 is derived from cluster_uuid (RFC 6598
-    100.64.0.0/10). Loops are bounded by IP TTL; TCP backoff and
-    UDP's low volume keep the worst case from being noisy.
+    metrics so the kernel fails over for free on link-down. The cluster
+    VIP (.254 arbiter IP) is one such advertised route, originated by
+    whoever currently hosts it — so routing never reads "who is master".
+  * Panic catch-all `<cluster /24> via <lowest-octet lower-than-self
+    neighbour> metric 999` covers the gap between a peer's withdrawal /
+    a fresh joiner and the next adv-table recompute. Master-INDEPENDENT
+    (no rqlite read). Forwarding only ever toward a strictly-lower octet
+    makes it loop-free by the well-ordering of octets; the global-lowest
+    node installs none and sinks unknown traffic (the base case). Cluster
+    /24 is derived from cluster_uuid (RFC 6598 100.64.0.0/10).
 
 Concretely this file holds:
   * `Daemon` dataclass — the run-loop state. Started by
@@ -201,6 +202,20 @@ INTERFACE_BLOCKLIST_PREFIXES = (
 METRIC_DIRECT_BASE  = 10
 METRIC_TRANSIT_BASE = 100
 METRIC_PANIC        = 999
+
+# The cluster VIP (.254 arbiter IP) is advertised as an ordinary
+# path-vector route originated by whoever currently hosts it (the
+# mgmt master). It rides the SAME advertisement packet as every other
+# path — no extra hello. `dest` is a sentinel that can't collide with a
+# hostname; the address is resolved locally from cluster_uuid on install
+# (cluster_addr.cluster_vip), so receivers never read "who is master".
+VIP_DEST_SENTINEL   = "@vip"
+# Origin bandwidth/latency = the identity elements of the path-composition
+# algebra (bw=min(...), lat=sum(...)). Advertising ~infinite bandwidth /
+# zero latency at the source makes the composed cost to .254 collapse to
+# the true cost of reaching the host — exactly right, since the VIP IS at
+# the host. ("connected at 4 TB/s, 0.0 µs".)
+VIP_ADV_BW_MBPS     = 1_000_000_000
 
 
 # ── Codec ────────────────────────────────────────────────────────────
@@ -2900,6 +2915,20 @@ def build_advertisement_paths(d: Daemon) -> list:
             "bottleneck_bw_mbps":   int(sel["bw"]),
             "cumulative_latency_us": int(sel["lat"]),
         })
+
+    # The mgmt master originates the cluster VIP (.254) as a connected
+    # /32, folded into this same packet. Gating on the local single-writer
+    # role (i_am_mgmt_master) is self-knowledge, not a remote lookup, so it
+    # doesn't reintroduce the master dependency on the receiver side. On
+    # demote the entry simply stops being emitted → ages out cluster-wide
+    # (ADV_STALE_S) → the /32 is withdrawn → the new host re-originates it.
+    if i_am_mgmt_master(d):
+        paths.append({
+            "dest":                 VIP_DEST_SENTINEL,
+            "via_chain":            [d.my_node],
+            "bottleneck_bw_mbps":   VIP_ADV_BW_MBPS,
+            "cumulative_latency_us": 0,
+        })
     return paths
 
 
@@ -3651,7 +3680,14 @@ def compute_routes(d: Daemon) -> list[str]:
     for i, (dest, sel) in enumerate(transit_items):
         if dest in by_peer:
             continue   # direct already covers it
-        dest_lo = dest_loopbacks.get(dest, "")
+        if dest == VIP_DEST_SENTINEL:
+            # The cluster VIP: address is a pure function of cluster_uuid,
+            # resolved locally — never an rqlite/membership lookup. This is
+            # what keeps the VIP route on the data plane only.
+            from . import cluster_addr as _ca
+            dest_lo = _ca.cluster_vip(d.cluster_uuid)
+        else:
+            dest_lo = dest_loopbacks.get(dest, "")
         if not dest_lo:
             continue   # rqlite hasn't caught up yet; retry next tick
         nb = sel["neighbour"]
@@ -3661,95 +3697,57 @@ def compute_routes(d: Daemon) -> list[str]:
                 f"dev {nb.my_nic} metric {METRIC_TRANSIT_BASE + i}")
         routes.append(spec)
 
-    # Panic-via-master catch-all: route the whole cluster /24 via the
-    # current mgmt-master's best-known path. The arbiter's "cluster IP"
-    # at the top of the /24 reaches the master this way without any extra
-    # advertisement; cluster-singleton service IPs ride the same path.
+    # Panic catch-all for the cluster /24: route the rest of the subnet
+    # toward the lowest-loopback-octet node we can directly reach whose
+    # octet is STRICTLY LOWER than our own. This is master-INDEPENDENT —
+    # compute_routes reads nothing from rqlite. The VIP (.254) no longer
+    # rides this route; it has its own advertised /32 (see the @vip
+    # origination in build_advertisement_paths). The catch-all is now a
+    # pure transient safety net covering the gap between a peer's
+    # withdrawal / a fresh joiner and the next adv-table recompute.
     #
-    # Fallback: if rqlite is unreachable or the master is unknown at this
-    # tick (bootstrap, before mgmt is up), fall back to the freshest-
-    # neighbour rule. Master itself doesn't install a /24-via-self route
-    # (loop) — it terminates the .254 traffic locally via the secondary
-    # /32 on its lo (set by orchestrator on role transition).
+    # Loop-freedom: every node forwards only toward a strictly-lower
+    # octet, so packets descend monotonically over the total order on
+    # octets and terminate at the global-lowest node in <= N hops — no
+    # loop is possible even mid-convergence or under partial connectivity.
+    # The global-lowest node has no lower-octet neighbour, so it installs
+    # NO catch-all and SINKS unknown traffic (drops it) rather than
+    # bouncing it back up — the well-ordering base case. Worst case is a
+    # black-hole on a genuine partition, which is the correct behaviour.
+    # (The old "freshest neighbour" fallback had no such guarantee: two
+    # nodes could each pick the other and loop until IP TTL expired.)
     if d.neighbours:
         from . import cluster_addr as _ca
         net = _ca.cluster_loopback_net(d.cluster_uuid)
 
-        master_node, master_lo = _mgmt_master_loopback(d.my_node)
-        panic_spec: str | None = None
+        my_octet = _loopback_octet(d.my_loopback)
+        best_nh: Optional[Neighbour] = None
+        if my_octet > 0:
+            for nb in _direct_neighbour_by_node(d).values():
+                if not (nb.logged_up and nb.peer_link_addr and nb.peer_loopback):
+                    continue
+                oct_ = _loopback_octet(nb.peer_loopback)
+                if oct_ <= 0 or oct_ >= my_octet:
+                    continue   # only ever forward toward a lower octet
+                if best_nh is None or oct_ < _loopback_octet(best_nh.peer_loopback):
+                    best_nh = nb
 
-        if master_node and master_node == d.my_node:
-            # I am the master — don't install /24-via-self.
-            pass
-        elif master_node:
-            # Find a next-hop to reach the master. Direct beats transit.
-            direct_list = by_peer.get(master_node, [])
-            if direct_list:
-                # by_peer entries were sorted by _path_cost above; the
-                # first entry is the best direct path to master.
-                best = direct_list[0]
-                if best.peer_link_addr:
-                    panic_spec = (
-                        f"{net} via {best.peer_link_addr} "
-                        f"dev {best.my_nic} metric {METRIC_PANIC}"
-                    )
-            elif master_node in d.best_transit_paths:
-                nb = d.best_transit_paths[master_node].get("neighbour")
-                if nb and nb.peer_link_addr:
-                    panic_spec = (
-                        f"{net} via {nb.peer_link_addr} "
-                        f"dev {nb.my_nic} metric {METRIC_PANIC}"
-                    )
-
-        if panic_spec is None and master_node != d.my_node:
-            # Master unknown OR known but unreachable — fall back to
-            # freshest neighbour so the cluster is still routable
-            # during bootstrap and master-down transients.
-            freshest = max(
-                (n for n in d.neighbours.values()
-                 if n.logged_up and n.peer_link_addr),
-                key=lambda n: n.last_seen,
-                default=None,
+        if best_nh is not None:
+            routes.append(
+                f"{net} via {best_nh.peer_link_addr} "
+                f"dev {best_nh.my_nic} metric {METRIC_PANIC}"
             )
-            if freshest:
-                panic_spec = (
-                    f"{net} via {freshest.peer_link_addr} "
-                    f"dev {freshest.my_nic} metric {METRIC_PANIC}"
-                )
-
-        if panic_spec:
-            routes.append(panic_spec)
     return routes
 
 
-def _mgmt_master_loopback(my_node: str) -> tuple[str, str]:
-    """Return (mgmt_master_node_name, '') for compute_routes()'s
-    /24-via-master panic catch-all. Master may be `my_node` itself — the
-    caller decides to skip in that case. Returns ('', '') if rqlite is
-    unreachable or no master is set (the caller then falls back to the
-    freshest-neighbour rule, so a stale/empty read is always safe).
-
-    The second element (master loopback IP) is always '' — it's DEAD: the
-    caller derives the next-hop purely from the in-memory neighbour /
-    transit tables, never from a recorded loopback. Kept only for the
-    call site's 2-tuple unpack.
-
-    Reuses the SAME revision-cached load_cluster(none) snapshot the
-    election tick already populated THIS tick (same netd thread, same 1Hz)
-    instead of issuing a fresh, uncached cluster_info⋈nodes JOIN on every
-    emit_routes. mgmt_master writes bump bedrock_meta.revision, so the
-    snapshot self-invalidates — no stale-master risk."""
+def _loopback_octet(loopback_ip: str) -> int:
+    """Last octet of a cluster loopback /32 (== node_index, 1..254), or 0
+    if unparseable. The node's stable rank in the lowest-octet catch-all
+    total order; the VIP at .254 never participates as a next-hop."""
     try:
-        try:
-            from . import cluster_state as _cs
-        except ImportError:
-            import sys as _sys2
-            _sys2.path.insert(0, "/usr/local/lib/bedrock")
-            from lib import cluster_state as _cs  # type: ignore
-        master = _cs.load_cluster(level="none").get("mgmt_master") or ""
-    except Exception:
-        return ("", "")
-    return (master, "")
+        return int(loopback_ip.rsplit(".", 1)[-1])
+    except (ValueError, AttributeError, IndexError):
+        return 0
 
 
 def current_cluster_routes(cluster_uuid: str) -> list[str]:
