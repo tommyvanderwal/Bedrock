@@ -909,7 +909,12 @@ def _cold_boot_uuid_ok(ws, _witness) -> bool:
         own = None
     if own is None or not own.marker:
         return True
-    slot_marker = own.marker.decode("ascii", errors="replace").strip()
+    # Role-bit-mask the slot marker, symmetric with takeover step 3: compare
+    # data GENERATION, never DRBD's primary-role bit 0 (DRBD masks & ~((u64)1)).
+    # local_uuid is already masked by _read_local_drbd_uuid. Markers we publish
+    # are masked-at-source, so this is a no-op today, but it must not trust that
+    # invariant any more than step 3 does.
+    slot_marker = _mask_drbd_role_bit(own.marker.decode("ascii", errors="replace"))
     local_uuid = _read_local_drbd_uuid()
     if not local_uuid or local_uuid == slot_marker:
         return True

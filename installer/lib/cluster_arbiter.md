@@ -51,10 +51,10 @@ Single-shot reconcile: actuate local hosting state to match `i_should_host_arbit
 - **In:** none.
 - **Out:** result of `promote_to_arbiter_host()`, `demote_arbiter_host()`, or `arbiter_status()` when already in the desired state. No direct rqlite write — only transitively via promote's `mgmt_master` write.
 
-### `ensure_lms_if_last_standing(ws) -> bool`
-H6: when this node is Leader, hosting, has no fresh peer, and the witness is valid+confirmed, claim last-man-standing. Called from netd's Leader branch each tick.
-- **In:** `ws` — netd's witness handle.
-- **Out:** `True` iff it (re)asserted LMS this call. Side effect: `witness.set_own_slot(ws, marker=<local DRBD UUID>, tag=TAG_LMS)` then readback (3 × 1.5 s). No-op while any peer heartbeat is fresh, while not hosting, while the witness isn't valid+confirmed, or when the own slot already holds `lms=1`.
+### `ensure_witness_claim(ws, *, node_has_majority) -> bool`
+H6: maintain THIS node's witness claim each Leader tick. The claim is an exclusive reservation of the witness's pivotal vote. **Set** it only when the witness is PIVOTAL (`node_has_majority` is False — our node-votes alone fall short of quorum, i.e. an even node-split). **Release** it (set tag=0) the moment a node-majority is (re)established. Owned solely by the claiming node; never auto-expires. Called from netd's Leader branch with `node_has_majority = 100*len(reachable_peers) >= majority`.
+- **In:** `ws` — netd's witness handle; `node_has_majority` — bool from the election result.
+- **Out:** `True` iff it changed the claim bit. Side effect: `witness.set_own_slot(ws, marker=<masked local DRBD UUID>, tag=TAG_CLAIM)` + readback (3 × 1.5 s) on the set path, or `tag=0` on the release path. No-op while not hosting / witness not valid+confirmed / already in the right state. (Replaces the old `ensure_lms_if_last_standing`, which set on "no fresh peer" and only cleared on self-demote — the stale-claim bug; see INV-3/INV-7 in cluster-quorum-spec.md.)
 
 Private helpers: `_run` (subprocess capture, never raises); DRBD steps `_drbd_role`, `_drbd_resource_exists` (gates on the `cluster-drbd-ready` marker), `_cluster_size`, `_drbd_promote`, `_drbd_secondary`; mount steps `_is_mounted` (uses `mountpoint -q`), `_mount` (resolves device via `drbdadm sh-dev`), `_umount`; IP steps `_arbiter_ip_present`, `_ip_add`, `_ip_del`; service steps `_svc_active`, `_svc_start`, `_svc_stop`; `_run_takeover_protocol` (the 5-step witness gate); `_set_mgmt_master_after_promote`; `_self_node_name`; `_fresh_peer_hbs`; `_peer_claims_master_now`; `_cold_boot_uuid_ok`; `_last_known_master_node_id`; `_read_local_drbd_uuid` (debugfs `data_gen_id`, fallback `drbdadm dump-md`).
 
@@ -144,11 +144,17 @@ failover the previous primary is unreachable, so DRBD refuses with "Need access 
 UpToDate data". Since the election + witness DRBD-UUID match already authorized
 this node as master, it retries with `--force`.
 
-**LMS lifecycle.** `tag.lms=1` never times out. The arbiter owns the bit:
-`ensure_lms_if_last_standing()` sets it when this node is the only one left, and
-`demote_arbiter_host()` clears it (`tag=0`) on self-demote so a future survivor's
-takeover can proceed. If the node dies before that clear lands at the witness, the
-slot stays `lms=1` and an operator override is required.
+**Witness-claim lifecycle.** A claim (`tag.claim=1`, the bit formerly called "lms")
+never auto-expires. The arbiter owns the bit: `ensure_witness_claim()` SETS it only
+while the witness is PIVOTAL for this node's quorum (an even node-split,
+`node_has_majority` False) and RELEASES it (`tag=0`) the moment a node-majority is
+restored; `demote_arbiter_host()` also clears it on self-demote. The everyday
+set/release is fully automatic — an operator decommission (`bedrock node leave`) is
+needed ONLY when a genuinely-pivotal holder dies permanently before releasing. See
+INV-3/INV-7 in `docs/cluster-quorum-spec.md`. (The predecessor `ensure_lms_if_last_standing`
+SET on "only one left" and cleared only on self-demote → a node that went solo once,
+e.g. the N=1 init window, held a stale claim forever and disabled mgmt-master
+auto-failover.)
 
 **Reading the local DRBD UUID.** `_read_local_drbd_uuid()` reads DRBD9's debugfs
 `data_gen_id` while the resource is up (the takeover case), falling back to

@@ -18,10 +18,9 @@ failover sequence. Pure list arithmetic, no I/O.
 - **Out:** `bool`. False if either name is absent from the list, if the list is empty (cattle, no failover), or if `me` is not the next index after `dead_host`.
 
 ### `read_local_drbd_uuid(resource_name) -> str`
-Return this node's current-UUID for a DRBD resource as lowercase hex without
-the `0x` prefix.
+Return this node's live current-UUID for a DRBD resource as lowercase hex, **role-bit masked**.
 - **In:** `resource_name` — DRBD resource name (e.g. `vm-<name>-disk0`).
-- **Out:** `str`; `""` if the resource isn't configured here / no UUID readable. Reads debugfs file `/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id`; on `OSError` falls back to `subprocess` `drbdadm dump-md <resource>` (3 s timeout). No writes.
+- **Out:** `str`; `""` if unreadable (caller defers). **Delegates to `cluster_arbiter._read_local_drbd_uuid(resource_name)`** so the pet-VM DRBD gate reads + masks IDENTICALLY to the arbiter takeover: token-0 of debugfs `data_gen_id` line 1 (NOT the per-peer bitmap / history tokens), DRBD's primary-role flag (bit 0) masked `& ~((u64)1)` (the way DRBD's own `drbd_uuid_compare` masks it, so an ex-Primary's recorded marker and an in-sync Secondary's read compare equal on the data GENERATION), and `drbdadm dump-md` ONLY when the resource is genuinely detached. The pre-start safety check re-masks the recorded rqlite marker before comparing. No writes.
 
 ### `get_recorded_uuid(resource_name, *, level="strong") -> Optional[str]`
 Read the cluster's last-known authoritative DRBD UUID for a resource.
@@ -66,9 +65,10 @@ B already taken over ─┘ ───┐  peers_after_dead(.., me=C, dead=B) →
                            └→ cascade tertiary
 ```
 
-Reading the local UUID prefers debugfs (`data_gen_id`, valid while DRBD is UP)
-and falls back to `drbdadm dump-md` when the resource is detached. Both paths
-normalise to bare lowercase hex.
+Reading the local UUID is delegated to the single shared reader
+(`cluster_arbiter._read_local_drbd_uuid`): token-0 of debugfs `data_gen_id`
+(valid while DRBD is UP), `drbdadm dump-md` only when detached, and the DRBD
+primary-role bit 0 masked so the compare is on the data GENERATION, not role.
 
 ```
 read_local_drbd_uuid(r)

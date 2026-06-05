@@ -245,11 +245,12 @@ The single leader-loss detector is the missed-beat counter:
 On **LEADER**, netd drives `cluster_arbiter.promote_to_arbiter_host()` (which
 brings up DRBD primary + `.254` + arbiter rqlite + filer using witness + local
 commands only — no rqlite on that path — then writes `mgmt_master` as a result)
-and `ensure_lms_if_last_standing(ws)`. netd never writes `mgmt_master` itself.
+and `ensure_witness_claim(ws, node_has_majority=…)` where `node_has_majority =
+100*len(reachable_peers) >= majority`. netd never writes `mgmt_master` itself.
 On **NO_QUORUM**, after the self-demote streak it sets the no-quorum marker and,
 once per episode, demotes the singletons it was hosting. Each tick netd refreshes
-the witness slot marker (the current DRBD UUID) but never flips the LMS tag —
-that bit is owned solely by `cluster_arbiter`.
+the witness slot marker (the masked current DRBD UUID) but never flips the claim
+tag — that bit is owned solely by `cluster_arbiter` (pivotal-set, majority-released).
 
 ## Why
 
