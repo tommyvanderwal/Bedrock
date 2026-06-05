@@ -236,15 +236,25 @@ def set_believed_master(node_name: str | None,
 #  Arbiter-DRBD UUID history (local, 7-day, drives eligibility)
 # ─────────────────────────────────────────────────────────────────
 
-def _normalize_uuid(uuid: str) -> str:
-    """Lower-case, strip an 0x prefix and surrounding whitespace so
-    UUIDs compare equal regardless of how the source formatted them
-    (debugfs gives 0x…, dump-md gives 0x…;, the witness marker is the
-    bare hex). Matches cluster_arbiter._read_local_drbd_uuid()."""
+def _normalize_uuid(uuid: str | None) -> str:
+    """Lower-case, strip an 0x prefix and surrounding whitespace, AND clear
+    DRBD's primary-role flag (bit 0 of the current UUID), so UUIDs compare
+    equal regardless of source format OR node role (debugfs gives 0x…,
+    dump-md gives 0x…;, the witness marker is bare hex; an ex-Primary's
+    bit 0 is set, an in-sync Secondary's is not). Matches
+    cluster_arbiter._read_local_drbd_uuid(), which already masks at read —
+    masking here too keeps the 7-day-history classification role-independent
+    even if a raw value is passed in. Idempotent on already-masked input."""
     u = (uuid or "").strip().lower()
     if u.startswith("0x"):
         u = u[2:]
-    return u.rstrip(";")
+    u = u.rstrip(";")
+    if not u:
+        return ""
+    try:
+        return f"{int(u, 16) & ~1:x}"
+    except ValueError:
+        return u
 
 
 def _prune_history(history: list[dict], now: float) -> list[dict]:
@@ -314,9 +324,12 @@ def classify_arbiter_uuid(uuid: str, state: dict | None = None,
     history = _prune_history(list(state.get("arbiter_uuid_history") or []), now)
     if not history:
         return UUID_UNSEEN
-    if history[-1].get("uuid") == norm:
+    # Normalize stored entries on read too, so a history written before the
+    # role-bit mask landed (or by any other formatting) still classifies
+    # correctly. _normalize_uuid is idempotent on already-normalized values.
+    if _normalize_uuid(history[-1].get("uuid")) == norm:
         return UUID_CURRENT
-    if any(e.get("uuid") == norm for e in history):
+    if any(_normalize_uuid(e.get("uuid")) == norm for e in history):
         return UUID_SUPERSEDED
     return UUID_UNSEEN
 

@@ -705,21 +705,30 @@ def _run_takeover_protocol() -> bool:
         return False
     log.info("arbiter: slot[%d] stale and holds no witness claim; continuing",
              last_master_id)
-    # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
+    # Step 3: our local DRBD current-UUID must equal the master's published
+    # marker for the SAME data generation. Both are read role-bit-masked
+    # (`_read_local_drbd_uuid` here; netd publishes the marker via the same
+    # masked reader), and we re-mask the marker defensively so a marker from
+    # any other source still compares on the GENERATION, never DRBD's
+    # primary-role flag (bit 0). DRBD itself masks `& ~((u64)1)` on every
+    # current-UUID compare — without this an in-sync Secondary (UpToDate,
+    # oos:0) is wrongly refused as 'diverged' from the ex-Primary's marker.
+    # See docs/cluster-quorum-spec.md INV-5.
     local_uuid_step3 = _read_local_drbd_uuid()
-    slot_marker = slot_m.marker.decode("ascii", errors="replace").strip()
+    slot_marker = _mask_drbd_role_bit(
+        slot_m.marker.decode("ascii", errors="replace"))
     if not local_uuid_step3:
-        log.error("arbiter: takeover REFUSED — drbdadm current-uuid "
-                  "cluster failed")
+        log.error("arbiter: takeover REFUSED — local DRBD current-UUID "
+                  "unreadable (resource attaching?); deferring")
         return False
     if local_uuid_step3 != slot_marker:
         log.error("arbiter: takeover REFUSED — DRBD divergence: "
-                  "local current-uuid=%s vs slot[%d].marker=%s. "
+                  "local gen-uuid=%s vs slot[%d].marker=%s (role-masked). "
                   "Operator must reconcile (drbdadm invalidate or "
                   "wait for peer).",
                   local_uuid_step3[:12], last_master_id, slot_marker[:12])
         return False
-    log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
+    log.info("arbiter: DRBD generation match (%s); proceeding to claim",
              local_uuid_step3[:12])
 
     # Step 4: claim the witness as part of the takeover handshake — set our
@@ -949,20 +958,49 @@ def _last_known_master_node_id() -> "int | None":
         return None
 
 
+def _mask_drbd_role_bit(uuid_hex: str) -> str:
+    """Clear DRBD's primary-role flag (bit 0 of the current UUID) and return
+    bare lower-case hex; "" on junk.
+
+    DRBD overloads the least-significant bit of the current UUID as the
+    Primary/Secondary role flag, set/cleared on role change WITHOUT minting
+    a new UUID — so an ex-Primary and an in-sync Secondary that share a data
+    generation differ ONLY in bit 0. DRBD's own code masks it on every
+    current-UUID comparison (`drbd_uuid_compare`/`receive_uuids`:
+    `x & ~((u64)1)`). The takeover step-3 check must do the same, else a
+    healthy `UpToDate`/`oos:0` Secondary is wrongly refused as 'diverged'
+    from the master's published marker."""
+    u = (uuid_hex or "").strip().lower()
+    if u.startswith("0x"):
+        u = u[2:]
+    u = u.rstrip(";")
+    if not u:
+        return ""
+    try:
+        return f"{int(u, 16) & ~1:x}"
+    except ValueError:
+        return ""
+
+
 def _read_local_drbd_uuid() -> str:
-    """Read the cluster resource's current-UUID. Returns "" if DRBD isn't
-    configured (N=1) or no source has it.
+    """Read the cluster resource's **live current UUID, role-bit masked**.
+    Returns "" if DRBD isn't configured or the live value can't be read —
+    the caller then defers (never acts on a guess).
 
-    Primary source: DRBD9's debugfs at
-    ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``.
-    First line is the current UUID. Works while the resource is UP
-    (the takeover-protocol case).
+    Source of truth: DRBD9 debugfs
+    ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``. The
+    FIRST whitespace token of the first line is the current UUID; later
+    tokens are per-peer BITMAP UUIDs and later lines are HISTORY UUIDs — we
+    must NOT read those (an old current that has rolled into the bitmap is a
+    different generation). Bit 0 is the role flag, masked via
+    `_mask_drbd_role_bit` so the marker and a peer's read compare equal.
 
-    Fallback: ``drbdadm dump-md`` — only works when the resource is
-    detached (N=1 scratch path).
-
-    ``drbdadm current-uuid`` does NOT exist in DRBD 9.34 — removed
-    upstream after the 8.x → 9.x split. Don't reach for it."""
+    `drbdadm dump-md` is used ONLY when the resource is genuinely DETACHED
+    (debugfs file absent — the N=1 scratch path), where on-disk current-uuid
+    IS the live one. On an ATTACHED resource dump-md is unreliable (it can
+    report a value that has since become a bitmap UUID), so a transient
+    debugfs read error there returns "" (defer) rather than a stale guess.
+    `drbdadm current-uuid` does NOT exist in DRBD 9.x — don't reach for it."""
     debugfs = (
         f"/sys/kernel/debug/drbd/resources/{TIER_RESOURCE}/volumes/0/"
         "data_gen_id"
@@ -970,11 +1008,15 @@ def _read_local_drbd_uuid() -> str:
     try:
         with open(debugfs, "r") as f:
             first = f.readline().strip()
-        if first.startswith("0x"):
-            return first[2:].lower()
+        tok = first.split()[0] if first else ""   # current UUID = token 0
+        if tok.startswith("0x"):
+            return _mask_drbd_role_bit(tok)
+        # debugfs present but unparseable → defer; do NOT use stale dump-md.
+        return ""
+    except FileNotFoundError:
+        pass  # resource detached (N=1): dump-md current-uuid is authoritative
     except OSError:
-        pass
-    # Fallback for down/unattached resources.
+        return ""  # transient read error on an attached resource → defer
     try:
         out = subprocess.check_output(
             ["drbdadm", "dump-md", TIER_RESOURCE], timeout=3
@@ -984,7 +1026,7 @@ def _read_local_drbd_uuid() -> str:
             if s.startswith("current-uuid"):
                 parts = s.split()
                 if len(parts) >= 2:
-                    return parts[1].rstrip(";").lower().replace("0x", "")
+                    return _mask_drbd_role_bit(parts[1])
     except Exception:
         pass
     return ""

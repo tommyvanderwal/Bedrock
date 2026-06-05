@@ -566,18 +566,18 @@ def test_record_supersedes_previous_and_prunes_7_days(monkeypatch):
 
     # A new UUID supersedes the previous.
     later = now + 60
-    st = lstate.record_arbiter_uuid("bbbb", st, now=later)
+    st = lstate.record_arbiter_uuid("bbbc", st, now=later)
     hist = st["arbiter_uuid_history"]
-    assert [e["uuid"] for e in hist] == ["aaaa", "bbbb"]
+    assert [e["uuid"] for e in hist] == ["aaaa", "bbbc"]
     assert hist[0]["ts_superseded"] == later
     assert hist[1]["ts_superseded"] is None
 
     # Recording the same current UUID again is a no-op.
-    st = lstate.record_arbiter_uuid("bbbb", st, now=later + 1)
+    st = lstate.record_arbiter_uuid("bbbc", st, now=later + 1)
     assert len(st["arbiter_uuid_history"]) == 2
 
     # A third UUID far in the future prunes the now->8-day-old 'aaaa'
-    # but keeps 'bbbb' (superseded but within window) and 'cccc' (newest).
+    # but keeps 'bbbc' (superseded but within window) and 'cccc' (newest).
     much_later = later + lstate.UUID_HISTORY_RETENTION_S + 10
     st = lstate.record_arbiter_uuid("cccc", st, now=much_later)
     remaining = [e["uuid"] for e in st["arbiter_uuid_history"]]

@@ -216,17 +216,24 @@ def takeover_env(monkeypatch):
 
 
 def test_takeover_stale_lms0_proceeds(takeover_env):
-    # Master slot stale, lms=0, local DRBD UUID == slot marker, and the
-    # own-slot readback reflects lms=1 → proceed.
+    # Master slot stale, no claim, and the local DRBD generation matches the
+    # master's published marker → proceed. Crucially the master published its
+    # marker as PRIMARY (current-uuid bit0=1, "...33") while our local read is
+    # SECONDARY (bit0=0, "...32") — same data generation. Step 3 must mask the
+    # DRBD primary-role bit (like DRBD's own `& ~((u64)1)`) and treat these as
+    # equal, NOT refuse with "divergence".
+    MASTER_MARKER = b"abbf889778373633"   # ex-Primary, bit0=1
+    LOCAL_SECONDARY = "abbf889778373632"  # in-sync Secondary, bit0=0
     takeover_env.setattr(witness, "read_slot",
-                         lambda ws, nid: _slot(b"gen1", stale=True, lms=False))
-    takeover_env.setattr(ca, "_read_local_drbd_uuid", lambda: "gen1")
+                         lambda ws, nid: _slot(MASTER_MARKER, stale=True, lms=False))
+    takeover_env.setattr(ca, "_read_local_drbd_uuid", lambda: LOCAL_SECONDARY)
     takeover_env.setattr(witness, "set_own_slot",
                          lambda ws, **k: None)
     takeover_env.setattr(witness, "own_slot",
                          lambda ws: witness.Slot(node_id=2,
                             ts_writer_ms=int(time.time() * 1000),
-                            tag=witness.TAG_LMS, marker=b"gen1"))
+                            tag=witness.TAG_CLAIM,
+                            marker=LOCAL_SECONDARY.encode()))
     takeover_env.setattr(time, "sleep", lambda *_: None)  # no real waits
     assert ca._run_takeover_protocol() is True
 

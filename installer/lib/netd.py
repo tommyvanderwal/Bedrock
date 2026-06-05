@@ -1663,51 +1663,20 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
 
 
 def _read_cluster_uuid() -> str:
-    """Read the current-UUID of the `cluster` singleton DRBD resource.
-
-    DRBD9 stores live UUIDs in the kernel's debugfs at
-    ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``.
-    First line is the current UUID; subsequent lines are bitmap
-    UUIDs per peer + history UUIDs. We only want the current.
-
-    Falls back to ``drbdadm dump-md`` (which only works when the
-    resource is **down**) for N=1 setups where the resource isn't
-    yet attached — in that case the witness slot stays empty and
-    the takeover protocol's UUID check no-ops.
-
-    Resource name is sourced from cluster_arbiter.TIER_RESOURCE so it
-    stays in lockstep with the singleton rename.
-
-    Returns "" if neither source has the UUID."""
+    """The live current-UUID of the `cluster` singleton DRBD resource,
+    role-bit masked. Delegates to `cluster_arbiter._read_local_drbd_uuid()`
+    so the marker we PUBLISH to the witness here and the value the takeover
+    protocol reads LOCALLY there are byte-identical (debugfs-first, bit-0
+    masked, dump-md only when the resource is genuinely detached). Returns
+    "" if unavailable — the witness slot then stays empty and the takeover
+    UUID check no-ops. (Single source of truth for the read avoids the
+    apples-vs-oranges bug where the published marker and the local read came
+    from different sources / generations.)"""
     try:
         from . import cluster_arbiter as _ca
     except ImportError:
         from lib import cluster_arbiter as _ca  # type: ignore
-    resource = _ca.TIER_RESOURCE
-    debugfs = (
-        f"/sys/kernel/debug/drbd/resources/{resource}/volumes/0/"
-        "data_gen_id"
-    )
-    try:
-        with open(debugfs, "r") as f:
-            first = f.readline().strip()
-        # Format: "0xABCDEF0123456789" (16 hex chars + 0x prefix).
-        if first.startswith("0x"):
-            return first[2:].lower()
-    except OSError:
-        pass
-    # Fallback for down/unattached resources.
-    rc, out, _ = _run_silent_capture(["drbdadm", "dump-md", resource])
-    if rc != 0:
-        return ""
-    for line in out.splitlines():
-        s = line.strip()
-        if s.startswith("current-uuid"):
-            parts = s.split()
-            if len(parts) >= 2:
-                tok = parts[1].rstrip(";")
-                return tok.lower().replace("0x", "")
-    return ""
+    return _ca._read_local_drbd_uuid()
 
 
 def _run_silent_capture(cmd: list[str]) -> tuple[int, str, str]:
