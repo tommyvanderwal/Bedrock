@@ -73,38 +73,26 @@ def peers_after_dead(failover_order: list[str], me: str,
 
 
 def read_local_drbd_uuid(resource_name: str) -> str:
-    """Return the current-UUID for a DRBD resource on this node, as
-    a lowercase hex string without the `0x` prefix. Returns `""` if
-    the resource isn't configured here.
+    """Return `resource_name`'s live current-UUID on this node, **role-bit
+    masked**, as bare lower-case hex; "" if unreadable (caller defers).
 
-    Primary source: debugfs (works while DRBD is UP). Fallback:
-    `drbdadm dump-md` (works when DRBD is detached). Mirrors the
-    same logic cluster_arbiter._read_local_drbd_uuid uses for the
-    `cluster` singleton."""
-    debugfs = (
-        f"/sys/kernel/debug/drbd/resources/{resource_name}"
-        f"/volumes/0/data_gen_id"
-    )
+    Delegates to `cluster_arbiter._read_local_drbd_uuid` so the pet-VM DRBD
+    gate reads + masks IDENTICALLY to the arbiter takeover:
+      * token 0 of debugfs `data_gen_id` line 1 (NOT the per-peer bitmap or
+        history tokens — those are different generations),
+      * DRBD's primary-role flag (bit 0) masked — DRBD itself masks
+        `& ~((u64)1)` on every current-UUID compare, so an ex-Primary's
+        recorded marker and an in-sync Secondary's local read match,
+      * `drbdadm dump-md` only when the resource is genuinely detached.
+    One source of truth → no drift, and the recorded marker and the local
+    read can never be apples-vs-oranges."""
     try:
-        with open(debugfs, "r") as f:
-            first = f.readline().strip()
-        if first.startswith("0x"):
-            return first[2:].lower()
-    except OSError:
-        pass
-    try:
-        out = subprocess.check_output(
-            ["drbdadm", "dump-md", resource_name], timeout=3,
-        )
-        for line in out.decode().splitlines():
-            s = line.strip()
-            if s.startswith("current-uuid"):
-                parts = s.split()
-                if len(parts) >= 2:
-                    return parts[1].rstrip(";").lower().replace("0x", "")
-    except Exception:
-        pass
-    return ""
+        from lib import cluster_arbiter as _ca
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import cluster_arbiter as _ca  # type: ignore
+    return _ca._read_local_drbd_uuid(resource_name)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -201,8 +189,14 @@ def is_safe_to_start_vm(vm_name: str, disks: list[str]) -> _Verdict:
     populated on refusal for logging."""
     if not disks:
         return _Verdict(True, "no DRBD disks (cattle VM)")
+    try:
+        from lib import cluster_arbiter as _ca
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import cluster_arbiter as _ca  # type: ignore
     for resource in disks:
-        local = read_local_drbd_uuid(resource)
+        local = read_local_drbd_uuid(resource)   # already role-bit masked
         if not local:
             return _Verdict(
                 False, f"{resource}: no local DRBD UUID readable",
@@ -215,12 +209,16 @@ def is_safe_to_start_vm(vm_name: str, disks: list[str]) -> _Verdict:
                 f"(local={local[:12]}); refusing to start without "
                 f"a quorum-confirmed baseline",
             )
-        if recorded.lower() != local.lower():
+        # Mask the recorded marker too: it compares on DATA GENERATION, never
+        # DRBD's primary-role bit 0 (the recorder was Primary, this node may
+        # be Secondary). Masking is idempotent on already-masked records and
+        # repairs any pre-fix unmasked record. Mirrors DRBD's own & ~((u64)1).
+        if _ca._mask_drbd_role_bit(recorded) != local:
             return _Verdict(
                 False,
-                f"{resource}: UUID mismatch — local={local[:12]}, "
-                f"recorded={recorded[:12]}. Refusing to start VM "
-                f"{vm_name!r} — either local DRBD is behind or a "
+                f"{resource}: UUID generation mismatch — local={local[:12]}, "
+                f"recorded={_ca._mask_drbd_role_bit(recorded)[:12]}. Refusing "
+                f"to start VM {vm_name!r} — either local DRBD is behind or a "
                 f"later takeover has happened we don't yet know of. "
                 f"Operator must reconcile (drbdadm invalidate, or "
                 f"verify which node has the authoritative data).",

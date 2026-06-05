@@ -149,19 +149,27 @@ class VmMigrate:
         runs on the master, which has rqlite access). Mirrors the read
         in vm.failover.read_local_drbd_uuid."""
         from lib import bedrock_state as _bs
+        from lib import cluster_arbiter as _ca
         for r in ctx["resources"]:
             debugfs = (f"/sys/kernel/debug/drbd/resources/{r}"
                        f"/volumes/0/data_gen_id")
             rc, out, err = _lvm._run_on(
                 ctx["target_host"],
                 f"head -1 {debugfs} 2>/dev/null", check=False, timeout=10)
-            uuid = out.strip().lower()
-            if rc != 0 or not uuid.startswith("0x"):
+            # Token 0 of line 1 is the current UUID (later tokens are bitmap
+            # UUIDs); mask DRBD's primary-role bit 0 so what we record matches
+            # what a Secondary later reads locally (DRBD masks & ~((u64)1)).
+            tok = (out.strip().split() or [""])[0].lower()
+            if rc != 0 or not tok.startswith("0x"):
                 log.warning("vm_migrate: could not read post-promote UUID "
                             "for %s on %s (rc=%d): %s",
                             r, ctx["target"], rc, (err or out)[:200])
                 continue
-            uuid = uuid[2:]
+            uuid = _ca._mask_drbd_role_bit(tok)
+            if not uuid:
+                log.warning("vm_migrate: unparseable post-promote UUID for "
+                            "%s on %s: %r", r, ctx["target"], tok)
+                continue
             _bs.drbd_resource_uuid_set(r, uuid)
             log.info("vm_migrate: recorded UUID for %s = %s", r, uuid[:12])
 

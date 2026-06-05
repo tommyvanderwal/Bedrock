@@ -982,10 +982,11 @@ def _mask_drbd_role_bit(uuid_hex: str) -> str:
         return ""
 
 
-def _read_local_drbd_uuid() -> str:
-    """Read the cluster resource's **live current UUID, role-bit masked**.
-    Returns "" if DRBD isn't configured or the live value can't be read —
-    the caller then defers (never acts on a guess).
+def _read_local_drbd_uuid(resource: str = TIER_RESOURCE) -> str:
+    """Read `resource`'s **live current UUID, role-bit masked** (defaults to
+    the cluster singleton TIER_RESOURCE; the VM-failover path passes a pet
+    resource). Returns "" if DRBD isn't configured or the live value can't be
+    read — the caller then defers (never acts on a guess).
 
     Source of truth: DRBD9 debugfs
     ``/sys/kernel/debug/drbd/resources/<r>/volumes/0/data_gen_id``. The
@@ -1002,7 +1003,7 @@ def _read_local_drbd_uuid() -> str:
     debugfs read error there returns "" (defer) rather than a stale guess.
     `drbdadm current-uuid` does NOT exist in DRBD 9.x — don't reach for it."""
     debugfs = (
-        f"/sys/kernel/debug/drbd/resources/{TIER_RESOURCE}/volumes/0/"
+        f"/sys/kernel/debug/drbd/resources/{resource}/volumes/0/"
         "data_gen_id"
     )
     try:
@@ -1019,7 +1020,7 @@ def _read_local_drbd_uuid() -> str:
         return ""  # transient read error on an attached resource → defer
     try:
         out = subprocess.check_output(
-            ["drbdadm", "dump-md", TIER_RESOURCE], timeout=3
+            ["drbdadm", "dump-md", resource], timeout=3
         )
         for line in out.decode().splitlines():
             s = line.strip()
