@@ -1,7 +1,24 @@
 # Cluster quorum + witness — spec
 
 ## Purpose
-The witness lets a 2-node cluster make a safe arbiter failover when the peer link is gone, and lets a single node cold-boot without overwriting data the cluster advanced behind its back. **All decisions are local to the requesting node.** Witnesses are passive K/V stores; they store and return slot bytes signed by the cluster — no logic, no clocks, no policy.
+The witness lets a cluster make a safe arbiter failover across an exact even split, and lets a single node cold-boot without overwriting data the cluster advanced behind its back. **All decisions are local to the requesting node.** Witnesses are passive K/V stores; they store and return slot bytes signed by the cluster — no logic, no clocks, no policy.
+
+## Vote model + the witness claim (the load-bearing idea)
+
+**Weighted votes, 100 : 1.** Each node is worth **100** votes, each valid witness **1**, summed into one weighted tally; quorum is **strictly more than half**. The 100 : 1 ratio makes witnesses *pure tiebreakers*: they break ties between equal node-counts but can **never** override a node-majority. Safe as long as total witness weight stays below one node (`W ≤ 100`; at `W ≥ 101` a minority-node partition could sweep all witnesses and win). Run an odd, small `W` (1–5). A witness is decisive **only on an exact even node-split**, and the deficit a balanced split must cover is always `⌈W/2⌉` — independent of cluster size (same at 2 nodes and at 30).
+
+- `total_votes = 100·N_active + W_configured`, `majority = total_votes // 2 + 1`.
+- `node_votes = 100 · reachable_active_nodes (incl self)`. The witness is **pivotal** for this node iff `node_votes < majority ≤ node_votes + W`. For `W = 1` that is true only at the perfect even split (`reachable = N/2`).
+
+**A claim is an exclusive, persistent reservation (SCSI-3-PR semantics) of a witness's vote.** A node claims the witness **only at a membership change, and only when its node-votes alone fall short of quorum**; with a node-majority it claims nothing. To actually cross the line it must claim a **majority of witnesses** (`⌈W/2⌉`). The claim is **released by the claiming node itself** when a node-majority is restored. A node that dies *while still holding* a claim (it was genuinely pivotal) leaves it stuck → an operator decommission (`bedrock node leave`) + witness re-key is the only clear. This is the ONLY remaining manual case; the everyday set/release is automatic. (Implemented as `tag.claim` on the node's own slot; set/released by `cluster_arbiter.ensure_witness_claim()` each Leader tick from the live election result.)
+
+**Transition-only, then independent.** Claiming crosses the threshold *at the transition*; the node then records membership (the excluded side cannot be quorate) and runs independent of the witness afterward. A witness dropping after takeover does not drop the survivor. (This is deliberately *unlike* counting the witness vote continuously and having to hand-remove it in a last-man-standing — a footgun this design avoids.)
+
+**Witnesses are passive and self-revalidating.** They hold and report claim/epoch state but never decide; all enforcement lives in the acting nodes, which act only on a *valid* witness. Witness state is volatile/in-memory and re-bootstraps its epoch from the nodes on restart. A witness counts only if it holds **current, valid entries for every node in the locally-known membership**; a blanked/rebooted witness counts for nobody until all members re-register — which closes the reboot-during-partition split-brain window, since revalidation needs entries from *all* members and a partition cannot supply them. The model assumes honest nodes (the AEAD tag — X25519 + ChaCha20-Poly1305 — proves a key-holder wrote the payload, not *which* one); the DRBD arbiter UUID rides inside that encrypted payload.
+
+**Membership & maintenance.** The full node set is known locally by every node; it changes only with all nodes online, or by explicit operator override. There is **no automatic shrink** — auto-evicting an unreachable member would let each side of a partition evict the other. Maintenance is a *graceful* leave: the node is discounted from the total, so the quorum bar drops and is not put at risk. That is a separate path from claiming: graceful **recomputes the total**, ungraceful **claims witnesses against the fixed total**.
+
+**Safety reduces to:** strict majority + exclusive claims ⇒ no two partitions can both be quorate. The only thing that can break claim-exclusivity is a witness losing state, which the all-members-validity rule handles, with **DRBD generation as the independent backstop**.
 
 ## Witness shape
 - **One slot per cluster node.** Slot key = `node_id`, a single byte ∈ 1–250. `node_id` = last octet of the node's `100.X.Y.N/32` loopback (already deterministic in `rqlite_setup.py`).
@@ -18,7 +35,7 @@ Plaintext fields (msgpack):
 {
   n:           node_id,            # 1 byte 1-250 — must match envelope's `n`
   ts_writer:   u64 epoch_ms,       # the writer's local clock, signed
-  tag:         u8 bitflag,         # bit 0 = lms ("last man standing")
+  tag:         u8 bitflag,         # bit 0 = witness-claim (formerly "lms")
                                    # bits 1-7 = reserved (must be 0)
   marker:      bytes,              # "most relevant marker" for this slot's
                                    # purpose. For the arbiter slot: the
@@ -30,7 +47,7 @@ Plaintext fields (msgpack):
 
 `ts_writer` is the **node's own clock**. A reader uses its **own** clock for freshness: `now_local_ms - ts_writer_ms ≥ 10_000` → stale (the witness has no clock and declares nothing). Cluster nodes are NTP-synced (chronyd); the 10 s threshold pairs with the 10-missed-heartbeat leader-loss detector (`netd.MASTER_LOSS_MISSES = 10`) so a reader treats the master's slot as gone at the same moment a survivor concludes leader-loss. Implemented as `witness.SLOT_STALE_MS = 10_000`.
 
-`tag` as a bitflag (not a string) lets us add future flags (e.g. maintenance, draining) without a wire bump. Today only bit 0 = `lms` is defined.
+`tag` as a bitflag (not a string) lets us add future flags (e.g. maintenance, draining) without a wire bump. Today only bit 0 = `claim` (the witness claim) is defined.
 
 `marker` is the "single most relevant state fingerprint" for what the slot guards. Today only the arbiter slot is exercised; its marker is the `cluster` singleton's DRBD `current-uuid`. The witness doesn't interpret marker bytes; readers do.
 
@@ -80,9 +97,9 @@ The reader decrypts the envelope (proves cluster membership), then decrypts each
 ## Slot lifecycle
 - Each node writes its own slot every **1 s** with current `(ts_writer, tag, marker)`.
 - The witness REPLACES on every accepted write. No history.
-- A slot is **stale** (from the reader's POV) when `now_local_ms - slot.ts_writer ≥ 10 s`. 10 missed 1 s writes, pairing with the 10-missed-beat leader-loss detector (`netd.MASTER_LOSS_MISSES = 10`). Stale does NOT mean cleared — see INV-7 for `tag.lms`.
-- The witness **retains** an unrefreshed slot for **72 h** before it may drop the entry from its own store (a backend storage-cleanup policy of the ESP32 firmware; the testbed stub `bedrock_echo_stub.py` keeps slots until restart). It is NOT a cluster-side LMS-clear mechanism — see INV-7.
-- **Cluster-side membership filter**: a reader silently ignores any returned slot whose `node_id` is not an ACTIVE node (`state=='active'` and not in maintenance) in this reader's local rqlited's `nodes` table — netd plumbs that set onto `WitnessState.member_ids` each tick and `drain_replies` drops the rest. The `nodes` table is locally readable on every node via Raft-replicated rqlite (the cluster-wide source of truth). This is what makes "decommission the dead node" — a routine operator action that removes the row — also undo a stuck LMS belonging to that node, without ever touching the witness. The witness may still hold the entry until 72 h aging; the cluster just doesn't read it. (`member_ids=None` until netd first plumbs membership — no filtering, and the witness can't be `is_valid` either.)
+- A slot is **stale** (from the reader's POV) when `now_local_ms - slot.ts_writer ≥ 10 s`. 10 missed 1 s writes, pairing with the 10-missed-beat leader-loss detector (`netd.MASTER_LOSS_MISSES = 10`). Stale does NOT mean cleared — see INV-7 for `tag.claim`.
+- The witness **retains** an unrefreshed slot for **72 h** before it may drop the entry from its own store (a backend storage-cleanup policy of the ESP32 firmware; the testbed stub `bedrock_echo_stub.py` keeps slots until restart). It is NOT a cluster-side claim-clear mechanism — see INV-7.
+- **Cluster-side membership filter**: a reader silently ignores any returned slot whose `node_id` is not an ACTIVE node (`state=='active'` and not in maintenance) in this reader's local rqlited's `nodes` table — netd plumbs that set onto `WitnessState.member_ids` each tick and `drain_replies` drops the rest. The `nodes` table is locally readable on every node via Raft-replicated rqlite (the cluster-wide source of truth). This is what makes "decommission the dead node" — a routine operator action that removes the row — also undo a stuck witness claim belonging to that node, without ever touching the witness. The witness may still hold the entry until 72 h aging; the cluster just doesn't read it. (`member_ids=None` until netd first plumbs membership — no filtering, and the witness can't be `is_valid` either.)
 
 ## Arbiter takeover protocol (load-bearing — every step matters; no rqlite consensus)
 The arbiter rqlited is THE service being recovered, so the gating uses **only** the witness + local commands (`drbdadm`, `ip`, `mount`, `systemctl`). The cluster's rqlite Raft is not consulted and cannot be — at N=2 it has no quorum until the arbiter is back up. The one rqlite touch is a `level='none'` LOCAL replica read (no quorum) to learn who the last master was and the cluster size; it is never a consensus call. Implemented in `cluster_arbiter._run_takeover_protocol()`.
@@ -95,16 +112,16 @@ When taking over from another node M, P:
 
 1. **Identify the dying master M.** Read the last `mgmt_master` + its loopback from local rqlite (`level='none'`); M's node_id is the loopback's last octet (`_last_known_master_node_id()`). At N≤2 the witness must be reachable (a 5 s wait); at N≥3 P may proceed even without it (rqlite has natural quorum and the isolated old master self-demotes). Then inspect slot[M] from the most recent witness reply.
 2. **Inspect M's slot in the most recent witness reply:**
-   - No slot for M                            → worst-case assumed (the slot MIGHT have held `lms=1`). **REFUSE takeover.** Operator decommissions M from the rqlite `nodes` table or re-keys the witness — see INV-7.
-   - Stale `(age ≥ 10 s)` AND `tag.lms == 0` → M died without going solo. Continue to step 3.
-   - Stale AND `tag.lms == 1`                 → M went solo and never cleared the LMS bit. **REFUSE takeover.** LMS does not time out — see INV-7. Operator must clear M's LMS via the explicit override command (see `docs/operator-overrides.md`) before any peer can claim.
-   - Fresh AND `tag.lms == 0`                 → M is alive, the mesh is just flapping locally. P stays follower.
-   - Fresh AND `tag.lms == 1`                 → M is the legitimate last-man-standing. P stays follower.
+   - No slot for M                              → worst-case assumed (the slot MIGHT have held a claim). **REFUSE takeover.** Operator decommissions M from the rqlite `nodes` table or re-keys the witness — see INV-7.
+   - Stale `(age ≥ 10 s)` AND `claim == 0`     → M died without a live witness claim (it had a node-majority, or released the claim). Continue to step 3.
+   - Stale AND `claim == 1`                     → M died while the witness was pivotal for its quorum and never released the claim. **REFUSE takeover.** A claim does not time out — see INV-7. Operator must decommission M (`bedrock node leave`) before any peer can claim.
+   - Fresh AND `claim == 0`                     → M is alive, the mesh is just flapping locally. P stays follower.
+   - Fresh AND `claim == 1`                     → M is alive and legitimately holding the witness's pivotal vote. P stays follower.
 3. **Local DRBD freshness check** — read the `cluster` resource's current-UUID (via debugfs `data_gen_id`, `drbdadm dump-md` fallback for a detached resource — `cluster_arbiter._read_local_drbd_uuid()`; note `drbdadm current-uuid` does not exist in DRBD 9.x). Decrypt M's slot, read `marker` (M's last-known DRBD UUID).
    - **EXACT MATCH** between P's local UUID and `slot[M].marker` → P's local data is identical to M's last witness-published state → safe to take over.
    - Mismatch → P missed writes M did before dying. **Refuse to promote.** Log clearly, surface to operator. Manual `drbdadm invalidate` on P (or wait for M to come back) is the only way out.
-4. **Write own slot `tag.lms = 1`** with current local `(ts_writer, drbd_uuid)`.
-5. **Read it back from the NEXT witness reply.** Wait ~1.5 s per attempt (one netd send+receive round-trip), then decrypt own slot and verify `tag.lms == 1` AND `marker == local drbd_uuid`. If not (write packet lost) → retry. Refuse to promote after 3 attempts (≈ 4.5 s).
+4. **Write own slot `tag.claim = 1`** with current local `(ts_writer, drbd_uuid)`. (If the takeover lands the survivor with a node-majority — the witness wasn't actually pivotal — the next Leader tick's `ensure_witness_claim()` releases this again; it sticks only while the witness stays pivotal.)
+5. **Read it back from the NEXT witness reply.** Wait ~1.5 s per attempt (one netd send+receive round-trip), then decrypt own slot and verify `tag.claim == 1` AND `marker == local drbd_uuid`. If not (write packet lost) → retry. Refuse to promote after 3 attempts (≈ 4.5 s).
 6. **Promote, in order:**
    - `drbdadm primary cluster`
    - `mount $(drbdadm sh-dev cluster) /var/lib/bedrock/cluster`
@@ -113,12 +130,12 @@ When taking over from another node M, P:
    - start filer + s3.
 7. **Rqlite quorum returns** as soon as the arbiter rqlited joins the surviving per-node rqlited (P's own). Only then — outside this protocol — can `set_mgmt_master(self)` be written through rqlite. The witness is not consulted again until the next state change.
 
-Same protocol, abbreviated path, applies when the current master M itself loses peer-but-keeps-witness ("Scenario B" below): M is already at steps 6/7 done; it only needs steps 4+5 (flip own tag to lms, readback-verify).
+Same protocol, abbreviated path, applies when the current master M reaches an even split where the witness becomes pivotal for its quorum ("Scenario B" below): M is already at steps 6/7 done; it only needs steps 4+5 (set its own witness claim, readback-verify).
 
 ## Arbiter self-demote protocol
 A node currently arbiter-host self-demotes when its local election (mesh peer-liveness + witness reachability) concludes NoQuorum for `SELF_DEMOTE_MISSES = 9` consecutive election ticks (≈ 9 s — one tick before a survivor's `MASTER_LOSS_MISSES = 10`, so `.254` is released before any peer can take over), OR step 3 of takeover refuses with UUID mismatch on a fresh boot. The counter (`netd.noquorum_master_ticks`) also rides out the ~5 s daemon-startup window where neighbours=0 looks like NoQuorum, so a fresh restart never self-marks:
 1. Stop filer + s3 → `ip addr del 100.X.Y.254/32` (released first, at every N, so a follower with a leftover `.254` never answers on the VIP) → stop `bedrock-rqlited-arbiter` → unmount → `drbdadm secondary cluster`. (At N=1, only filer + s3 + `.254` come down; there's no DRBD/arbiter to stop.)
-2. Write own slot `tag.lms = 0`. This write requires the witness to be reachable. If the write fails (witness unreachable), the LMS bit stays set on the witness and the cluster is now in a stuck-LMS state — see INV-7. Retry on every subsequent election tick for as long as we are demoted-but-still-running. If we shut down or die before the write lands, operator intervention is required (see `docs/operator-overrides.md` "Clear stuck LMS"). Do not assume the slot will time out — it will not.
+2. Write own slot `tag.claim = 0`. This write requires the witness to be reachable. If the write fails (witness unreachable), the claim stays set on the witness and the cluster is now in a stuck-claim state — see INV-7. Retry on every subsequent election tick for as long as we are demoted-but-still-running. If we shut down or die before the write lands, operator intervention is required (see `docs/operator-overrides.md` "Clear stuck witness claim"). Do not assume the slot will time out — it will not. (Note: a master that simply regained a node-majority releases its claim via `ensure_witness_claim()` without demoting — this demote-path release is for the NoQuorum/handoff case.)
 
 Order matters: filer + s3 (which use the mount) come down first, then `.254` is released before this node could ever be seen as still hosting. INV-1 forbids `.254` on two nodes simultaneously even for a tick — and the demoting node releases it a full second before any survivor's `MASTER_LOSS_MISSES` promote fires.
 
@@ -139,14 +156,14 @@ At N≥2, even an eligible cold-booter holds off its FIRST promote for `COLD_BOO
 ### A — master loses peer AND witness ("isolated alone")
 - M's writes stop landing on witness. M's slot ages.
 - M's local election: 100 self of (100+100+1 = 201), majority 101 → NoQuorum → after the 9-tick (≈ 9 s) self-demote streak M demotes. M is now off; nothing running.
-- Survivor P sees mesh peer M gone, slot[M] stale (≥ 10 s), `tag.lms == 0`. P promotes at `MASTER_LOSS_MISSES = 10` (~10 s) — one tick after M has released `.254` — and runs the takeover protocol. UUID match (P was a healthy Secondary up to M's last write) → P promotes.
+- Survivor P sees mesh peer M gone, slot[M] stale (≥ 10 s), `claim == 0`. P promotes at `MASTER_LOSS_MISSES = 10` (~10 s) — one tick after M has released `.254` — and runs the takeover protocol. UUID match (P was a healthy Secondary up to M's last write) → P promotes.
 
-### B — master loses peer only, keeps witness ("last man standing")
-- M sees peer down via mesh. M runs steps 4+5 of takeover (it's already hosting): flip own slot `tag.lms = 1`, read back confirmed. Keeps hosting and refreshing each tick.
-- P sees mesh peer M gone but slot[M] fresh + `tag.lms == 1` → P stays follower (takeover step 2).
+### B — even split, witness pivotal ("witness-claim tiebreak"; at N=2 this is "master keeps witness, loses peer")
+- M reaches an even split where its node-votes alone fall short (e.g. N=2, M alone = 100 < majority 101). M runs steps 4+5 of takeover (it's already hosting): set its own `claim`, read back confirmed. Keeps hosting and refreshing each tick. When a node-majority returns, M releases the claim itself.
+- P sees mesh peer M gone but slot[M] fresh + `claim == 1` → P stays follower (takeover step 2).
 
 ### C — split with witness reachable from both sides ("symmetric")
-- Both try Scenario-B's flip-to-lms. The first one whose write lands AND is reflected in the OTHER side's next reply wins by being seen as fresh+lms. Loser's takeover step 2 trips on the winner's slot → loser stays follower.
+- Both try Scenario-B's claim. The first one whose write lands AND is reflected in the OTHER side's next reply wins by being seen as fresh+claim. Loser's takeover step 2 trips on the winner's slot → loser stays follower.
 - Race resolution = one round-trip; typically < 2 s.
 
 ### D — witness gone, peer alive
@@ -162,18 +179,19 @@ At N≥2, even an eligible cold-booter holds off its FIRST promote for `COLD_BOO
 ## Invariants
 - **INV-1** — at most one node holds `.254` at a time. Enforced by: takeover refuses on fresh-other-slot (step 2), refuses on UUID mismatch (step 3), requires own-write readback (step 5) before claiming `.254` (step 6); and the isolated master self-demotes (releases `.254`) at `SELF_DEMOTE_MISSES = 9`, one tick before a survivor promotes at `MASTER_LOSS_MISSES = 10`.
 - **INV-2** — each node writes only its own slot. The witness files the blob under the AEAD-verified envelope `n` (so a node can only overwrite its own key); the reader additionally drops any slot whose decrypted inner `n` ≠ the map key it arrived under.
-- **INV-3** — tag transitions are local-only. `lms` is set on this-node-decided-to-go-solo, cleared on this-node-self-demoted. Never copied from another slot.
+- **INV-3** — claim transitions are local-only, owned solely by the claiming node, and recomputed each Leader tick. `claim` is SET while the witness is pivotal for this node's quorum (`node_votes < majority`, an exact even split) and RELEASED by this node the moment a node-majority is (re)established (`ensure_witness_claim`), or on self-demote. Never copied from another slot, never set from a "I'm alone" heuristic, never auto-expired. (Predecessor bug: the old "set-when-alone / clear-only-on-self-demote" rule left a node that went solo once — e.g. the N=1 init window — holding a stale claim forever, which disabled mgmt-master auto-failover.)
 - **INV-4** — `ts_writer` from the writer is the freshness reference; reader uses its own clock for comparison. No witness clock involved.
-- **INV-5** — the takeover UUID comparison (step 3, against M's slot) is **exact equality**, never an ordering — any mismatch refuses. UUIDs carry no order. "Newer/older" exists only in the cold-boot self-slot check, and only as a local 7-day-history classification (`state.classify_arbiter_uuid`: superseded ⇒ refuse; current/unseen ⇒ allow), never as a numeric compare.
+- **INV-5** — the takeover UUID comparison (step 3, against M's slot) is **equality of the data generation**, never an ordering — any genuine mismatch refuses. UUIDs carry no order. "Newer/older" exists only in the cold-boot self-slot check, and only as a local 7-day-history classification (`state.classify_arbiter_uuid`: superseded ⇒ refuse; current/unseen ⇒ allow), never as a numeric compare.
+  - ⚠ **KNOWN BUG (open, 2026-06-05):** the comparison is currently a raw string `!=` on the full `data_gen_id` current-UUID, but DRBD encodes the **primary-role flag in bit 0** of that value — an ex-Primary publishes `…3` (bit0=1) while in-sync Secondaries hold `…2` (bit0=0). So a healthy, fully-synced Secondary (`ds:UpToDate`, `oos:0`) is wrongly refused with `DRBD divergence` even though the data generation is identical. The fix is to mask bit 0 (the DRBD primary flag) before comparing — `(int(local,16) & ~1) == (int(marker,16) & ~1)` — which does **not** weaken divergence detection (bit 0 is role, not generation). Observed live: this now blocks a true cross-node arbiter failover (it was previously masked by the claim-refuse firing first). Until fixed, a real master-death failover stalls at step 3 and needs `drbdadm invalidate`/operator action.
 - **INV-6** — the takeover decision uses ONLY the witness + local commands; no rqlite CONSENSUS call is on the critical path (rqlite is the service being recovered). The lone exception is a `level='none'` LOCAL replica read to identify the last master + cluster size — no quorum required, never a write.
-- **INV-7** — **`tag.lms = 1` never times out, and a missing slot is treated as worst-case.** The 10 s staleness rule and the 72 h witness-retention rule do not clear LMS; they only change interpretation. The only paths to a cluster state where a previously-set LMS no longer blocks takeover:
-  - (a) The slot owner is alive and successfully writes `tag.lms = 0` to the witness (requires both online simultaneously).
-  - (b) The operator decommissions the slot owner (`bedrock node leave …` / equivalent removes it from the rqlite `nodes` table — the cluster-wide source of truth). Surviving nodes then *ignore* any witness slot for that removed node-id because it is no longer a known cluster member. The witness still stores the slot until 72 h retention drops it, but nobody reads it.
+- **INV-7** — **a witness claim never times out, and a missing slot is treated as worst-case.** The 10 s staleness rule and the 72 h witness-retention rule do not clear a claim; they only change interpretation. The claiming node releases its OWN claim automatically when a node-majority returns (INV-3) — so in normal operation no claim is left stuck. A claim only *stays* stuck when its owner dies while genuinely still pivotal. The paths to a state where a stuck claim no longer blocks takeover:
+  - (a) The slot owner is alive and writes `tag.claim = 0` itself — either the automatic node-majority release (INV-3, no operator) or the demote-path release. Requires the owner online + witness reachable.
+  - (b) The operator decommissions the slot owner (`bedrock node leave …` removes it from the rqlite `nodes` table — the cluster-wide source of truth). Surviving nodes then *ignore* any witness slot for that removed node-id because it is no longer a known cluster member. The witness still stores the slot until 72 h retention drops it, but nobody reads it. **This is the only manual case** — needed when the owner died permanently while pivotal.
   - (c) The operator re-keys the cluster's witness identity (new `cluster_uuid` and/or new `cluster.key`). Old encrypted slot payloads can no longer be decrypted by any cluster member; the slot map re-populates from current members' heartbeats within a few seconds.
 
-  **Witness-loses-state case is NOT a clear.** If the witness reboots and comes back empty (or any individual slot is missing), readers must assume the worst case for that slot: the missing slot *might* have held `tag.lms = 1`. Until the slot is repopulated by a fresh heartbeat from the current cluster member it belongs to (and observed by the reader), the reader treats that slot as `lms = 1`-possible and refuses takeover. A slot belonging to a node that is in the rqlite `nodes` table but not currently writing remains "worst-case unknown" until operator intervention via (b) or (c).
+  **Witness-loses-state case is NOT a clear.** If the witness reboots and comes back empty (or any individual slot is missing), readers must assume the worst case for that slot: the missing slot *might* have held a claim. Until the slot is repopulated by a fresh heartbeat from the current cluster member it belongs to (and observed by the reader), the reader treats that slot as `claim`-possible and refuses takeover. A slot belonging to a node that is in the rqlite `nodes` table but not currently writing remains "worst-case unknown" until operator intervention via (b) or (c). (This is the all-members-validity rule: a witness counts only when it holds current valid entries for EVERY known member — which is also what closes the reboot-during-partition split-brain window.)
 
-  Reason: a node that died with LMS set may have written data after the last DRBD sync to its peer; allowing automatic peer takeover — including via "witness forgot" — would risk silent data loss. The safety-over-availability trade is intentional. Only the paranoid survive.
+  Reason: a node that died holding a claim was, by construction, relying on the witness's pivotal vote (an even split) and may have written data after the last DRBD sync to its peer; allowing automatic peer takeover — including via "witness forgot" — would risk silent data loss. The safety-over-availability trade is intentional. Only the paranoid survive.
 
 ## Why no witness clock (and why the writer's clock works)
 - A witness that generates timestamps must have an accurate clock. ESP32 + battery-backed RTC + drift handling on a small appliance is significant complexity for one job.
@@ -206,7 +224,7 @@ At N≥2, even an eligible cold-booter holds off its FIRST promote for `COLD_BOO
 ## Implementation
 - `installer/lib/witness.py` — passive K/V slots (`slots: dict[int, Slot]`); `set_own_slot(ws, *, marker, tag=0, kind=…)` writer, `read_slot(ws, node_id)` / `own_slot(ws)` readers against the latest reply; `is_valid` / `is_confirmed` / `count_valid_confirmed` vote predicates; AEAD-msgpack wire format on UDP 12321. Drops slots whose node_id isn't in `member_ids` (INV-7 path b).
 - `installer/lib/election.py` — `compute(...)` decides Leader/Follower/NoQuorum from mesh peer-liveness + acks + witness votes; weights `VOTES_PER_NODE = 100`, `VOTE_PER_WITNESS = 1`; sticky NoQuorum via `/run/bedrock-no-quorum`.
-- `installer/lib/cluster_arbiter.py` — `promote_to_arbiter_host()` runs `_run_takeover_protocol()` (steps 1–5) then the step-6 DRBD-primary + mount + `.254` + arbiter rqlite + filer; `mgmt_master` is written only AFTER hosting is confirmed (never on the critical path). `demote_arbiter_host()` reverses it and writes `tag.lms = 0` at the end. `ensure_lms_if_last_standing()` sets LMS on the Scenario-B last-man path.
+- `installer/lib/cluster_arbiter.py` — `promote_to_arbiter_host()` runs `_run_takeover_protocol()` (steps 1–5) then the step-6 DRBD-primary + mount + `.254` + arbiter rqlite + filer; `mgmt_master` is written only AFTER hosting is confirmed (never on the critical path). `demote_arbiter_host()` reverses it and writes `tag.claim = 0` at the end. `ensure_witness_claim(ws, node_has_majority=…)` sets the claim while the witness is pivotal and releases it when a node-majority returns (called each Leader tick by netd).
 - `installer/lib/netd.py` — the `_election_tick` that ships the witness heartbeat each second, runs `compute()`, drives promote/demote, and counts `noquorum_master_ticks` to `SELF_DEMOTE_MISSES`.
 - `testbed/bedrock_echo_stub.py` — Python BedRock Echo witness for the testbed: a pure encrypted K/V slot server, no claim/bless logic.
 

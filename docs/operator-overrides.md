@@ -7,7 +7,7 @@ split-brain. The design goal for each: make the override as safe as
 possible *without* re-introducing the automatic behavior the safe
 default deliberately omits.
 
-One override is built and shipped (stuck-LMS decommission, via the
+One override is built and shipped (stuck witness-claim decommission, via the
 existing `bedrock node leave` saga). The rest are design entries —
 the failure they address is real, but no CLI verb exists yet. Each is
 marked `Built` or `Design`.
@@ -16,7 +16,7 @@ marked `Built` or `Design`.
 
 | Override | Why it's needed | Status |
 |---|---|---|
-| Decommission stuck-LMS holder (`bedrock node leave <node>`) | Resolve INV-7 stuck-LMS so takeover can proceed | **Built** |
+| Decommission stuck witness-claim holder (`bedrock node leave <node>`) | Resolve INV-7 stuck claim (only when a pivotal holder died permanently) so takeover can proceed | **Built** |
 | Re-key witness identity (new `cluster_uuid` / `cluster.key`) | Clear stale witness slot state, incl. ESP32-reboot limbo | Design |
 | Seize master with stale data | Up-to-date peer is irrecoverable | Design |
 | Force `drbdadm invalidate` on a node | Resolve DRBD divergence (operator picks the winner) | Design |
@@ -65,14 +65,25 @@ entry is a design constraint on the unbuilt verb.
 
 ---
 
-## Override: Decommission stuck-LMS holder — **Built**
+## Override: Decommission stuck witness-claim holder — **Built**
 
-**When needed.** A node held `tag.lms = 1` on a witness slot and then
-died (or was partitioned away permanently) without ever writing
-`tag.lms = 0`. Per INV-7, that slot reads `lms = 1` forever from the
-cluster's point of view. The takeover protocol
-(`cluster-quorum-spec.md` step 2) refuses for every surviving peer
-until the cluster stops treating the dead node as a member.
+**When needed (and how rare it now is).** A node held `tag.claim = 1` on
+a witness slot — i.e. the witness was *pivotal for its quorum* (an exact
+even node-split) — and then died permanently without releasing it. Per
+INV-7 that slot reads `claim = 1` forever, and the takeover protocol
+(`cluster-quorum-spec.md` step 2) refuses for every surviving peer until
+the cluster stops treating the dead node as a member.
+
+**This is now the ONLY case that needs an operator.** The claim is
+otherwise set and released by the holder itself — set only while the
+witness is pivotal, released the instant a node-majority returns
+(`ensure_witness_claim`, INV-3). A master with a clean node-majority
+never holds a claim, so its death never needs this override. You only
+land here when a genuinely-pivotal node (e.g. one side of a 2–2 split, or
+a 2-node cluster's master) dies and cannot come back. (Before the
+2026-06-05 fix the claim was set far too eagerly — at the N=1 init window
+— and never released, so *every* master death hit this. That bug is
+gone.)
 
 **Why decommission is the right escape.** The slot-read logic ignores
 any witness slot for a node not in the rqlite `nodes` table.
@@ -81,29 +92,30 @@ any witness slot for a node not in the rqlite `nodes` table.
 `cluster_state.load_cluster()`), so a slot whose `node_id` is not a
 current member is dropped before it can count. Removing the dead node
 from membership — the routine `node leave` saga — therefore also
-removes the LMS-veto without ever touching the witness. The witness is
+removes the claim-veto without ever touching the witness. The witness is
 a passive last-write slot store with no expiry, so the dead node's
 encrypted slot stays there indefinitely; the cluster simply stops
 looking at it once that `node_id` leaves `ws.member_ids`.
 
-**Why there is no "clear LMS bit" verb.** Writing `tag.lms = 0` on the
+**Why there is no "clear claim bit" verb.** Writing `tag.claim = 0` on the
 dead node's behalf means impersonating it at the witness — either via
 a privileged cross-node write (INV-2 forbids cross-node slot writes)
 or via key material only the dead node holds. Neither is correct: the
-LMS bit is *evidence the dead node had set itself solo master*, and
-that evidence cannot be safely retracted on its behalf. The only safe
+claim is *evidence the dead node was relying on the witness's pivotal
+vote* (so it may have written data past the last DRBD sync), and that
+evidence cannot be safely retracted on its behalf. The only safe
 move is to stop counting the dead node as a member.
 
 **What the operator must verify before running this.** All of:
-- The LMS-holder is genuinely gone, not merely unreachable from one
+- The claim-holder is genuinely gone, not merely unreachable from one
   vantage point (hardware confirmed dead, scrapped, or fenced and
   never coming back).
-- Accepted risk: any data the dead LMS-holder wrote after the
+- Accepted risk: any data the dead claim-holder wrote after the
   cluster's last successful DRBD sync to it is lost. This is likely —
-  LMS was set precisely because the surviving peer was already gone
+  the claim was set precisely because the surviving peer was already gone
   when the dead node went solo.
 - A surviving node holds the DRBD `cluster` singleton resource in a
-  usable state (`UpToDate`, even if behind the lost LMS-holder's last
+  usable state (`UpToDate`, even if behind the lost claim-holder's last
   writes).
 
 **CLI.**
@@ -154,7 +166,7 @@ propagate_daemon_config ─→ stop_remote_services ─→ verify_membership_dro
 **The takeover unblock.** Once `rqlite_node_unregister` lands, every
 surviving node's next netd tick refreshes `ws.member_ids` from rqlite;
 the dead node's `node_id` is absent from the member set, so its stale
-`lms = 1` slot is dropped in `drain_replies` regardless of the tag.
+`claim = 1` slot is dropped in `drain_replies` regardless of the tag.
 Takeover can then proceed. This dependency is implemented in
 `witness.py:drain_replies` and plumbed via `member_ids` each tick.
 
@@ -166,7 +178,7 @@ Takeover can then proceed. This dependency is implemented in
 - The witness lost state (ESP32 reboot, fileshare corruption) and the
   cluster needs a deterministic clean start rather than worst-case
   limbo.
-- After a stuck-LMS decommission, the operator wants the witness to
+- After a stuck-claim decommission, the operator wants the witness to
   actually drop the old slot instead of relying on the membership
   filter to ignore it.
 - `cluster.key` is suspected compromised.
