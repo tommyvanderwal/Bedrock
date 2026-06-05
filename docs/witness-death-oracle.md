@@ -122,3 +122,39 @@ One quorate side (the incumbent's). The far side stands down. No contest, no rac
 - `witness.py` — `TAG_HOSTING = 0x02`, `Slot.hosting`.
 - `cluster_arbiter` — `ensure_witness_claim` publishes the complete tag each Leader tick: `HOSTING` while genuinely hosting (actuation-truth), `+ CLAIM` only when pivotal; `demote_arbiter_host` clears it (`tag=0`); takeover step 2 refuses iff the master slot is `FRESH ∧ HOSTING`, proceeds on `stale ∨ ¬HOSTING`; self-demote when `node_votes + reachable_witnesses < majority` (the election NoQuorum path).
 - **RCA note:** `HOSTING` is sticky — netd republishes `own_tag` every heartbeat, so a transient witness-read miss in `ensure_witness_claim` does NOT drop the flag; only an explicit demote (`tag=0`) clears it. So `HOSTING ⟹ actually hosting`, and a live host never falsely reads as non-hosting within the freshness window.
+
+---
+
+## Live test coverage (testbed sims, N=4 / W=1 → majority 201)
+
+The proven isolation (drop `br0` except the workstation + down mesh/DRBD NICs
+`enp2s0..enp5s0`, keep `enp1s0`/`br0` so SSH + witness survive) drives three
+scripts that together exercise every death-oracle branch:
+
+- **`testbed/test_death_oracle_partitions.sh`**
+  - *A — isolate a non-master* → it sees the master slot FRESH+HOSTING → **defers**
+    (no takeover, master keeps `.254`). Restore → rejoins, no steal.
+  - *B — isolate the master* → its slot goes STALE (it cannot refresh the witness)
+    → `master_witness_alive` flips false → the 3-node majority promotes (node-majority
+    bound), the isolated master self-demotes (`tag=0`, releases `.254`). Exactly one
+    `.254` holder throughout; the returning ex-master defers (no steal-back).
+- **`testbed/test_death_oracle_claim.sh`**
+  - *C — isolate TWO non-masters* → master keeps one follower = 200 votes, `deficit=1`
+    (pivotal: `0<1<50`) → master **CLAIMS** the witness (`hosting=1 claim=1`) → reaches
+    `201/201` → keeps `.254`; the two isolated singletons defer. On heal the master
+    **releases** the claim (`hosting=1 claim=0`) once node-majority returns.
+
+**Observed (benign):** during a claim the Echo stub (workstation, eventually-consistent)
+can log `witness claim set but readback not yet confirmed (witness slow/unreachable);
+netd will keep publishing`. The master counts its own claim optimistically and holds
+`201/201` while netd re-publishes each tick until the readback confirms — the "witness
+slow" graceful-degradation path, not a fault.
+
+**One live edge intentionally left to the math:** a true 2+2 split where the *far*
+pair is itself a 2-node pair (200 votes, also pivotal) and must defer purely on the
+master's FRESH+HOSTING bit — not on lack of node-majority. The defer-on-HOSTING half
+is covered by A, the pivotal-claim half by C, and the "even split is never two-sided-
+pivotal when the master is DOWN" half by `deficit ≥ 51` (unit test
+`test_even_survivor_split_is_never_pivotal`). A live 2+2-pair partition needs
+selective per-peer iptables (not blanket NIC-down) and is deferred as marginal
+confidence at real bricking risk.
