@@ -690,11 +690,18 @@ def _run_takeover_protocol() -> bool:
                   last_master_id)
         return False
     if not slot_m.is_stale():
-        log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
-                 "(claim=%s); cluster healthy elsewhere",
-                 last_master_id, slot_m.claim)
-        return False
-    if slot_m.claim:
+        # Master's slot is FRESH. Death-oracle: refuse ONLY if it also says
+        # HOSTING — i.e. the master is alive AND actually hosting (docs/
+        # witness-death-oracle.md). A fresh-but-NOT-hosting slot means the
+        # master relinquished/demoted while still alive → safe to take over.
+        if slot_m.hosting:
+            log.info("arbiter: takeover REFUSED — slot[%d] is fresh + HOSTING; "
+                     "master is alive and hosting, cluster healthy elsewhere",
+                     last_master_id)
+            return False
+        log.info("arbiter: slot[%d] fresh but NOT hosting (master relinquished); "
+                 "continuing", last_master_id)
+    elif slot_m.claim:
         log.error("arbiter: takeover REFUSED — slot[%d] is stale "
                   "but holds a witness claim. Previous master died while "
                   "the witness was pivotal for its quorum and never "
@@ -703,8 +710,9 @@ def _run_takeover_protocol() -> bool:
                   "before takeover can proceed (see docs/operator-overrides.md).",
                   last_master_id)
         return False
-    log.info("arbiter: slot[%d] stale and holds no witness claim; continuing",
-             last_master_id)
+    else:
+        log.info("arbiter: slot[%d] stale and holds no witness claim; continuing",
+                 last_master_id)
     # Step 3: our local DRBD current-UUID must equal the master's published
     # marker for the SAME data generation. Both are read role-bit-masked
     # (`_read_local_drbd_uuid` here; netd publishes the marker via the same
@@ -821,7 +829,13 @@ def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
     election result that put us in the Leader branch:
         100 * reachable_active_nodes(incl self) >= majority.
 
-    Idempotent. Returns True iff we changed the claim bit this call.
+    This also publishes the HOSTING bit (actuation-truth) every tick — it is the
+    death-oracle signal a far node reads to decide the master is alive
+    (docs/witness-death-oracle.md). HOSTING and CLAIM are INDEPENDENT: a master
+    with a node-majority publishes HOSTING without CLAIM; a pivotal master
+    publishes HOSTING|CLAIM; a node that isn't actually hosting publishes neither.
+
+    Idempotent. Returns True iff we changed the tag this call.
     """
     if ws is None:
         return False
@@ -836,47 +850,51 @@ def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
         return False
 
     # The witness must be valid + confirmed for us to read our own slot back.
-    # If it isn't, leave the claim bit untouched and retry next tick (we
-    # can't safely flip a bit we can't read).
+    # If it isn't, leave the tag untouched and retry next tick (we can't safely
+    # flip a bit we can't read).
     if not (_witness.is_valid(ws) and _witness.is_confirmed(ws)):
         return False
     own = _witness.own_slot(ws)
-    holding = own is not None and own.claim
+    cur_tag = own.tag if own is not None else 0
 
-    if node_has_majority:
-        # Node-majority — release any claim we hold. The release write goes
-        # out on netd's next heartbeat (own_tag); netd keeps republishing 0.
-        if not holding:
-            return False
-        marker = (_read_local_drbd_uuid() or "").encode("ascii")
-        log.info("arbiter: node-majority (re)established — releasing witness "
-                 "claim (was pivotal, no longer needed)")
-        _witness.set_own_slot(ws, marker=marker, tag=0)
-        return True
-
-    # Witness is pivotal. Must actually be hosting the arbiter before we
-    # claim (don't claim from a follower / mid-promote node).
+    # HOSTING is actuation-truth: are we genuinely the arbiter host RIGHT NOW?
     status = arbiter_status()
     drbd_present = _drbd_resource_exists()
     if drbd_present:
-        hosting = (status.get("service_active")
-                   and status.get("ip_present")
-                   and status.get("drbd_role") == "Primary")
+        hosting = bool(status.get("service_active")
+                       and status.get("ip_present")
+                       and status.get("drbd_role") == "Primary")
     else:
-        hosting = status.get("ip_present")
+        hosting = bool(status.get("ip_present"))
+
     if not hosting:
+        # We're in the Leader branch but not actually hosting yet (mid-promote)
+        # or we lost actuation — publish NO HOSTING/CLAIM so a far node never
+        # treats us as alive-and-hosting on stale truth. (demote clears it too.)
+        if cur_tag == 0:
+            return False
+        _witness.set_own_slot(
+            ws, marker=(_read_local_drbd_uuid() or "").encode("ascii"), tag=0)
+        return True
+
+    # We host. CLAIM only when the witness is pivotal (node-votes short).
+    want_claim = not node_has_majority
+    desired = _witness.TAG_HOSTING | (_witness.TAG_CLAIM if want_claim else 0)
+    if cur_tag == desired:
         return False
-    if holding:
-        return False  # already claimed; no flip needed
 
     local_uuid = _read_local_drbd_uuid()
     marker = local_uuid.encode("ascii") if local_uuid else b""
-    log.info("arbiter: witness pivotal (node-votes < majority) — claiming "
-             "witness vote (marker=%s)", local_uuid[:12] if local_uuid else "")
-    _witness.set_own_slot(ws, marker=marker, tag=_witness.TAG_CLAIM)
-    # Readback-confirm (the arbiter owns the bit; the witness must reflect
-    # it before a peer's takeover can see fresh+claim and defer). Best-effort
-    # — netd ships the new tag on its next HB.
+    adding_claim = want_claim and not (own is not None and own.claim)
+    log.info("arbiter: publishing witness tag hosting=1 claim=%d (marker=%s)",
+             1 if want_claim else 0, local_uuid[:12] if local_uuid else "")
+    _witness.set_own_slot(ws, marker=marker, tag=desired)
+    if not adding_claim:
+        # HOSTING-only or claim-release write — no readback barrier needed;
+        # netd republishes own_tag each heartbeat.
+        return True
+    # We just ADDED the claim — readback-confirm so a peer's takeover sees
+    # fresh+claim and defers. Best-effort; netd keeps publishing.
     for _ in range(3):
         time.sleep(1.5)
         back = _witness.own_slot(ws)

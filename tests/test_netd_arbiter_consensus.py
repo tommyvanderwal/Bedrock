@@ -349,45 +349,57 @@ def test_claim_set_when_pivotal_and_hosting(monkeypatch):
         sets["marker"], sets["tag"] = marker, tag
 
     monkeypatch.setattr(witness, "set_own_slot", fake_set)
-    # own_slot: first claim=0 (must set), then reflects claim=1.
+    # own_slot: first claim=0 (must set), then reflects HOSTING|CLAIM.
     seq = [None, witness.Slot(node_id=2, ts_writer_ms=int(time.time() * 1000),
-                              tag=witness.TAG_CLAIM, marker=b"gen1")]
+                              tag=witness.TAG_HOSTING | witness.TAG_CLAIM,
+                              marker=b"gen1")]
     monkeypatch.setattr(witness, "own_slot", lambda ws: seq.pop(0) if seq else seq[-1])
     monkeypatch.setattr(time, "sleep", lambda *_: None)
     assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=False) is True
-    assert sets["tag"] == witness.TAG_CLAIM
+    # A pivotal host publishes BOTH the HOSTING (death-oracle) and CLAIM bits.
+    assert sets["tag"] == witness.TAG_HOSTING | witness.TAG_CLAIM
     assert sets["marker"] == b"gen1"
 
 
 def test_claim_released_when_node_majority(monkeypatch):
-    # node_has_majority=True while holding a claim → release it (tag=0).
-    # THE FIX: a healthy master that regained a node-majority drops its own
-    # claim, so its slot reads claim=0 and a survivor's takeover proceeds.
+    # node_has_majority=True while hosting and holding a claim → release the
+    # CLAIM but KEEP HOSTING (tag=HOSTING). THE FIX: a healthy master that
+    # regained a node-majority drops its claim (so a survivor's takeover can
+    # proceed) yet still advertises it is hosting (the death-oracle).
     st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
+    monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)  # hosting via ip
+    monkeypatch.setattr(ca, "arbiter_status",
+                        lambda: {"ip_present": True, "service_active": False,
+                                 "drbd_role": "Unknown"})
     monkeypatch.setattr(witness, "is_valid", lambda ws: True)
     monkeypatch.setattr(witness, "is_confirmed", lambda ws: True)
     monkeypatch.setattr(ca, "_read_local_drbd_uuid", lambda: "gen1")
     monkeypatch.setattr(witness, "own_slot",
                         lambda ws: witness.Slot(node_id=2,
                             ts_writer_ms=int(time.time() * 1000),
-                            tag=witness.TAG_CLAIM, marker=b"gen1"))
+                            tag=witness.TAG_HOSTING | witness.TAG_CLAIM, marker=b"gen1"))
     sets = {}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda ws, *, marker, tag, **k: sets.__setitem__("tag", tag))
     assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=True) is True
-    assert sets["tag"] == 0  # claim released
+    assert sets["tag"] == witness.TAG_HOSTING  # claim released, hosting kept
 
 
-def test_claim_noop_when_majority_and_not_holding(monkeypatch):
-    # node_has_majority=True and no claim held → nothing to do.
+def test_claim_noop_when_majority_and_already_hosting_only(monkeypatch):
+    # node_has_majority=True, hosting, slot already HOSTING (no claim) → no-op.
     st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
+    monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)
+    monkeypatch.setattr(ca, "arbiter_status",
+                        lambda: {"ip_present": True, "service_active": False,
+                                 "drbd_role": "Unknown"})
     monkeypatch.setattr(witness, "is_valid", lambda ws: True)
     monkeypatch.setattr(witness, "is_confirmed", lambda ws: True)
     monkeypatch.setattr(witness, "own_slot",
                         lambda ws: witness.Slot(node_id=2,
-                            ts_writer_ms=int(time.time() * 1000), tag=0, marker=b"g"))
+                            ts_writer_ms=int(time.time() * 1000),
+                            tag=witness.TAG_HOSTING, marker=b"g"))
     called = {"set": False}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda *a, **k: called.__setitem__("set", True))
@@ -416,7 +428,7 @@ def test_claim_noop_when_not_hosting(monkeypatch):
 
 
 def test_claim_noop_when_already_claimed(monkeypatch):
-    # Pivotal, hosting, own claim=1 → no flip needed.
+    # Pivotal, hosting, own slot already HOSTING|CLAIM → no flip needed.
     st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
     monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)
@@ -428,9 +440,34 @@ def test_claim_noop_when_already_claimed(monkeypatch):
     monkeypatch.setattr(witness, "own_slot",
                         lambda ws: witness.Slot(node_id=2,
                             ts_writer_ms=int(time.time() * 1000),
-                            tag=witness.TAG_CLAIM, marker=b"gen1"))
+                            tag=witness.TAG_HOSTING | witness.TAG_CLAIM, marker=b"gen1"))
     called = {"set": False}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda *a, **k: called.__setitem__("set", True))
     assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=False) is False
     assert called["set"] is False
+
+
+# ── takeover step-2 death-oracle gate (HOSTING flag) ──
+
+def test_takeover_refused_when_master_fresh_and_hosting(takeover_env):
+    # Master slot FRESH + HOSTING → master is alive AND hosting → REFUSE.
+    takeover_env.setattr(witness, "read_slot",
+        lambda ws, nid: witness.Slot(node_id=1, ts_writer_ms=int(time.time() * 1000),
+            tag=witness.TAG_HOSTING, marker=b"abbf889778373632"))
+    assert ca._run_takeover_protocol() is False
+
+
+def test_takeover_proceeds_when_master_fresh_but_not_hosting(takeover_env):
+    # Master slot FRESH but NOT hosting (gracefully relinquished while alive) →
+    # step 2 does NOT refuse; with a matching UUID + readback it promotes.
+    takeover_env.setattr(witness, "read_slot",
+        lambda ws, nid: witness.Slot(node_id=1, ts_writer_ms=int(time.time() * 1000),
+            tag=0, marker=b"abbf889778373632"))          # fresh, hosting=0, claim=0
+    takeover_env.setattr(ca, "_read_local_drbd_uuid", lambda: "abbf889778373632")
+    takeover_env.setattr(witness, "set_own_slot", lambda ws, **k: None)
+    takeover_env.setattr(witness, "own_slot",
+        lambda ws: witness.Slot(node_id=2, ts_writer_ms=int(time.time() * 1000),
+            tag=witness.TAG_CLAIM, marker=b"abbf889778373632"))
+    takeover_env.setattr(time, "sleep", lambda *_: None)
+    assert ca._run_takeover_protocol() is True

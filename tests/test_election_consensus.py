@@ -682,3 +682,60 @@ def test_casting_not_credited_when_following_a_live_master():
     )
     assert r.outcome is election.Outcome.FOLLOWER
     assert r.my_votes == 200                    # 100 self + 100 reachable peer; no casting term
+
+
+# ── death-oracle + node-majority bound (docs/witness-death-oracle.md) ──
+
+def test_death_oracle_far_side_follows_witness_alive_master():
+    # Clean 2+2 split: A1, master B2 mesh-UNreachable but witness-fresh+HOSTING,
+    # I have only 2 reachable nodes (no node-majority) → FOLLOW (do not take over).
+    r = election.compute(
+        self_name="A1", self_loopback="100.64.0.1",
+        peer_liveness={"A3": True, "B2": False, "B4": False},
+        node_loopbacks={"A1": "100.64.0.1", "A3": "100.64.0.3",
+                        "B2": "100.64.0.2", "B4": "100.64.0.4"},
+        current_mgmt_master="B2", n_configured_witnesses=1, n_valid_witnesses=1,
+        master_witness_alive=True, no_quorum_marker_path=NO_MARKER)
+    assert r.outcome is election.Outcome.FOLLOWER
+
+
+def test_death_oracle_node_majority_overrides_takes_over():
+    # 1+3 split: A1 holds a node-majority (A1,A3,A4 = 300 >= 201) over a
+    # mesh-UNreachable but witness-alive master B2 → TAKE OVER (don't defer).
+    r = election.compute(
+        self_name="A1", self_loopback="100.64.0.1",
+        peer_liveness={"A3": True, "A4": True, "B2": False},
+        node_loopbacks={"A1": "100.64.0.1", "A3": "100.64.0.3",
+                        "A4": "100.64.0.4", "B2": "100.64.0.2"},
+        current_mgmt_master="B2", n_configured_witnesses=1, n_valid_witnesses=1,
+        peer_acks={"A3": True, "A4": True}, master_witness_alive=True,
+        no_quorum_marker_path=NO_MARKER)
+    assert r.outcome is election.Outcome.LEADER
+
+
+def test_death_oracle_steady_state_follows_mesh_reachable_master():
+    # N=2 steady state: master mesh-reachable → always follow, even though the
+    # follower's reachable set (2 nodes = 200) is a node-majority. The bound
+    # only diverts when the master is mesh-UNreachable.
+    r = election.compute(
+        self_name="sim-2", self_loopback="100.64.0.2",
+        peer_liveness={"sim-1": True}, node_loopbacks=_loops("sim-1", "sim-2"),
+        current_mgmt_master="sim-1", master_witness_alive=True,
+        no_quorum_marker_path=NO_MARKER)
+    assert r.outcome is election.Outcome.FOLLOWER
+
+
+def test_even_survivor_split_is_never_pivotal():
+    # Master DOWN (still in the denominator, no auto-shrink); survivors split
+    # evenly. The deficit is always >= 51 → outside the 0<deficit<50 pivotal
+    # band → both sides NoQuorum → no dual-takeover, no witness contest. This is
+    # why no witness-exclusivity machinery is needed (docs/witness-death-oracle.md).
+    VPN, VPW = election.VOTES_PER_NODE, election.VOTE_PER_WITNESS
+    for N in (3, 5, 7, 9, 11):          # odd N → even survivor split possible
+        side = (N - 1) // 2
+        node_votes = VPN * side
+        for W in range(0, 6):
+            total = VPN * N + VPW * W
+            majority = total // 2 + 1
+            deficit = majority - node_votes
+            assert deficit >= 51, (N, W, deficit, "even survivor split is pivotal!")

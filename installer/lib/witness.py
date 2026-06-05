@@ -65,6 +65,13 @@ NODE_ID_MAX         = 250
 # INV-3/INV-7.
 TAG_CLAIM  = 0x01
 TAG_LMS    = TAG_CLAIM  # deprecated alias for the old "last-man-standing" name
+# Bit 1 = HOSTING: "I am ACTUALLY the arbiter host right now" (actuation-truth —
+# DRBD-Primary on `cluster` + .254 bound + arbiter rqlite up). This is the
+# death-oracle signal: a far node treats the master as alive iff the master's
+# slot is FRESH and HOSTING, so a demoted-but-still-alive master (HOSTING=0)
+# never pins .254 by mere freshness. Set/cleared by the hosting node only.
+# See docs/witness-death-oracle.md.
+TAG_HOSTING = 0x02
 
 # Marker kinds.
 MARKER_KIND_DRBD_ARBITER_UUID = 1
@@ -85,6 +92,11 @@ class Slot:
     def claim(self) -> bool:
         """True iff this slot's owner is claiming the witness's pivotal vote."""
         return bool(self.tag & TAG_CLAIM)
+
+    @property
+    def hosting(self) -> bool:
+        """True iff this slot's owner is ACTUALLY the arbiter host (death-oracle)."""
+        return bool(self.tag & TAG_HOSTING)
 
     # Deprecated alias for the old "last-man-standing" name.
     @property

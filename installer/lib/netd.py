@@ -1476,6 +1476,24 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
     if current_master and current_master != d.my_node and not master_lost:
         peer_liveness[current_master] = True
 
+    # DEATH-ORACLE: is the current master's witness slot FRESH and HOSTING?
+    # (docs/witness-death-oracle.md). If so, the master is alive even when the
+    # mesh can't reach it (a clean partition), so we must NOT hide it from
+    # compute — the far side follows it instead of taking over.
+    master_witness_alive = False
+    if current_master and current_master != d.my_node:
+        _mlo = node_loopbacks.get(current_master, "")
+        try:
+            _moct = int(_mlo.rsplit(".", 1)[-1]) if _mlo else 0
+            _mslot = _witness.read_slot(ws, _moct) if _moct else None
+            master_witness_alive = bool(
+                _mslot and not _mslot.is_stale() and _mslot.hosting)
+        except (ValueError, AttributeError):
+            master_witness_alive = False
+    # The master is only HIDDEN from compute (so a survivor may promote) when the
+    # mesh missed it AND the witness confirms it is no longer hosting.
+    master_effectively_gone = master_lost and not master_witness_alive
+
     # 4. Decide. The election tallies node acks + valid witnesses; the
     # witness slot arbitration (UUID match, claim bit, readback) is
     # handled in cluster_arbiter.promote_to_arbiter_host() per the spec.
@@ -1484,13 +1502,15 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         self_loopback=d.my_loopback,
         peer_liveness=peer_liveness,
         node_loopbacks=node_loopbacks,
-        # Hide the master from compute() only once the 10-miss detector
-        # has fired — so a brief 1-2 tick straggle never demotes it.
-        current_mgmt_master=(None if master_lost else current_master),
+        # Hidden only when the 10-miss detector fired AND the witness says the
+        # master no longer hosts — so a witness-fresh+HOSTING master is followed,
+        # not taken over (the death-oracle), and a brief straggle never demotes.
+        current_mgmt_master=(None if master_effectively_gone else current_master),
         n_configured_witnesses=n_configured_witnesses,
         n_valid_witnesses=n_valid_witnesses,
         peer_acks=peer_acks,
         casting_vote_node=casting_vote_node,
+        master_witness_alive=master_witness_alive,
     )
 
     # 4b. Publish our own election-heartbeat fields for the next

@@ -87,6 +87,7 @@ def compute(
     n_valid_witnesses: int = 0,
     peer_acks: dict[str, bool] | None = None,
     casting_vote_node: str | None = None,
+    master_witness_alive: bool = False,
     no_quorum_marker_path: Path = NO_QUORUM_MARKER,
 ) -> Election:
     """One-shot election decision. See module docstring for semantics.
@@ -149,7 +150,13 @@ def compute(
     majority = total_votes // 2 + 1
     witness_votes = VOTE_PER_WITNESS * min(n_valid_witnesses, n_configured_witnesses)
 
-    master_is_alive = bool(current_mgmt_master and liveness.get(current_mgmt_master))
+    # DEATH-ORACLE: the master is alive if the mesh can reach it OR its witness
+    # slot is FRESH and HOSTING (master_witness_alive, computed by netd from the
+    # witness). So a clean mesh-only split does NOT make the far side think the
+    # master died — it follows it instead of taking over. See
+    # docs/witness-death-oracle.md.
+    master_is_alive = bool(current_mgmt_master and (
+        liveness.get(current_mgmt_master) or master_witness_alive))
 
     if current_mgmt_master == self_name:
         # Already master. Steady-state quorum check uses reachability:
@@ -179,9 +186,21 @@ def compute(
             reason="already master",
         )
 
-    if master_is_alive:
-        # A live master we are not — follow it. (Quorum to *unseat* a
-        # live master is never sought; that only happens once it's gone.)
+    # NODE-MAJORITY BOUND on deference (docs/witness-death-oracle.md rule 2):
+    # - If the master is MESH-reachable, we are in steady state → always follow.
+    # - If the master is alive only via the witness (mesh-unreachable — a
+    #   partition), defer ONLY when we lack a node-majority among the nodes we
+    #   CAN reach. If we hold a node-majority WITHOUT the master, the master is a
+    #   provable minority that will self-demote, so we fall through to takeover.
+    #   In a clean even split neither side has a node-majority, so we defer
+    #   (correct: nothing moves).
+    mesh_reachable_master = bool(
+        current_mgmt_master and liveness.get(current_mgmt_master))
+    i_have_node_majority = VOTES_PER_NODE * len(reachable) >= majority
+    if master_is_alive and (mesh_reachable_master or not i_have_node_majority):
+        # A live master we are not, and either we can reach it on the mesh or we
+        # can't outvote it on nodes alone — follow it. (Quorum to *unseat* a live
+        # master is never sought.)
         my_votes = VOTES_PER_NODE * len(reachable) + witness_votes
         return Election(
             outcome=Outcome.FOLLOWER, my_votes=my_votes,
