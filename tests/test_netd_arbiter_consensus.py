@@ -321,15 +321,15 @@ def test_takeover_first_promote_proceeds_when_no_peer_claims(monkeypatch):
 
 
 # ────────────────────────────────────────────────────────────────────
-#  H6 — ensure_lms_if_last_standing (LMS Scenario B)
+#  H6 — ensure_witness_claim (pivotal claim / auto-release; INV-3/INV-7)
 # ────────────────────────────────────────────────────────────────────
 
-def test_ensure_lms_sets_bit_when_alone_and_hosting(monkeypatch):
-    # Leader, hosting (N=1: ip_present), no reachable peer, witness
-    # valid+confirmed, own slot lms=0 → set LMS + readback confirms.
-    st = _state_with_peer_hb(2, {})  # no fresh peer
+def test_claim_set_when_pivotal_and_hosting(monkeypatch):
+    # Pivotal (node_has_majority=False), hosting, witness valid+confirmed,
+    # own claim=0 → set claim + readback confirms.
+    st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
-    monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)  # N=1
+    monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)  # N=1-style
     monkeypatch.setattr(ca, "arbiter_status",
                         lambda: {"ip_present": True, "service_active": False,
                                  "drbd_role": "Unknown"})
@@ -342,31 +342,61 @@ def test_ensure_lms_sets_bit_when_alone_and_hosting(monkeypatch):
         sets["marker"], sets["tag"] = marker, tag
 
     monkeypatch.setattr(witness, "set_own_slot", fake_set)
-    # own_slot: first None (lms=0 → must set), then reflects lms=1.
+    # own_slot: first claim=0 (must set), then reflects claim=1.
     seq = [None, witness.Slot(node_id=2, ts_writer_ms=int(time.time() * 1000),
-                              tag=witness.TAG_LMS, marker=b"gen1")]
+                              tag=witness.TAG_CLAIM, marker=b"gen1")]
     monkeypatch.setattr(witness, "own_slot", lambda ws: seq.pop(0) if seq else seq[-1])
     monkeypatch.setattr(time, "sleep", lambda *_: None)
-    assert ca.ensure_lms_if_last_standing(st.netd_ws) is True
-    assert sets["tag"] == witness.TAG_LMS
+    assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=False) is True
+    assert sets["tag"] == witness.TAG_CLAIM
     assert sets["marker"] == b"gen1"
 
 
-def test_ensure_lms_noop_when_peer_reachable(monkeypatch):
-    # A fresh peer heartbeat exists → we are NOT last-standing → never set LMS.
-    st = _state_with_peer_hb(2, {"sim-1": _claim_hb("sim-1")})
+def test_claim_released_when_node_majority(monkeypatch):
+    # node_has_majority=True while holding a claim → release it (tag=0).
+    # THE FIX: a healthy master that regained a node-majority drops its own
+    # claim, so its slot reads claim=0 and a survivor's takeover proceeds.
+    st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
+    monkeypatch.setattr(witness, "is_valid", lambda ws: True)
+    monkeypatch.setattr(witness, "is_confirmed", lambda ws: True)
+    monkeypatch.setattr(ca, "_read_local_drbd_uuid", lambda: "gen1")
+    monkeypatch.setattr(witness, "own_slot",
+                        lambda ws: witness.Slot(node_id=2,
+                            ts_writer_ms=int(time.time() * 1000),
+                            tag=witness.TAG_CLAIM, marker=b"gen1"))
+    sets = {}
+    monkeypatch.setattr(witness, "set_own_slot",
+                        lambda ws, *, marker, tag, **k: sets.__setitem__("tag", tag))
+    assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=True) is True
+    assert sets["tag"] == 0  # claim released
+
+
+def test_claim_noop_when_majority_and_not_holding(monkeypatch):
+    # node_has_majority=True and no claim held → nothing to do.
+    st = _state_with_peer_hb(2, {})
+    monkeypatch.setattr(ca, "SHARED_STATE", st)
+    monkeypatch.setattr(witness, "is_valid", lambda ws: True)
+    monkeypatch.setattr(witness, "is_confirmed", lambda ws: True)
+    monkeypatch.setattr(witness, "own_slot",
+                        lambda ws: witness.Slot(node_id=2,
+                            ts_writer_ms=int(time.time() * 1000), tag=0, marker=b"g"))
     called = {"set": False}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda *a, **k: called.__setitem__("set", True))
-    assert ca.ensure_lms_if_last_standing(st.netd_ws) is False
+    assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=True) is False
     assert called["set"] is False
 
 
-def test_ensure_lms_noop_when_not_hosting(monkeypatch):
-    # Alone but not actually hosting the arbiter → don't claim LMS.
+def test_claim_noop_when_not_hosting(monkeypatch):
+    # Pivotal but not actually hosting the arbiter → don't claim.
     st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
+    monkeypatch.setattr(witness, "is_valid", lambda ws: True)
+    monkeypatch.setattr(witness, "is_confirmed", lambda ws: True)
+    monkeypatch.setattr(witness, "own_slot",
+                        lambda ws: witness.Slot(node_id=2,
+                            ts_writer_ms=int(time.time() * 1000), tag=0, marker=b"g"))
     monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: True)
     monkeypatch.setattr(ca, "arbiter_status",
                         lambda: {"ip_present": False, "service_active": False,
@@ -374,12 +404,12 @@ def test_ensure_lms_noop_when_not_hosting(monkeypatch):
     called = {"set": False}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda *a, **k: called.__setitem__("set", True))
-    assert ca.ensure_lms_if_last_standing(st.netd_ws) is False
+    assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=False) is False
     assert called["set"] is False
 
 
-def test_ensure_lms_noop_when_already_lms(monkeypatch):
-    # Already last-standing (own slot lms=1) → no flip needed.
+def test_claim_noop_when_already_claimed(monkeypatch):
+    # Pivotal, hosting, own claim=1 → no flip needed.
     st = _state_with_peer_hb(2, {})
     monkeypatch.setattr(ca, "SHARED_STATE", st)
     monkeypatch.setattr(ca, "_drbd_resource_exists", lambda: False)
@@ -391,9 +421,9 @@ def test_ensure_lms_noop_when_already_lms(monkeypatch):
     monkeypatch.setattr(witness, "own_slot",
                         lambda ws: witness.Slot(node_id=2,
                             ts_writer_ms=int(time.time() * 1000),
-                            tag=witness.TAG_LMS, marker=b"gen1"))
+                            tag=witness.TAG_CLAIM, marker=b"gen1"))
     called = {"set": False}
     monkeypatch.setattr(witness, "set_own_slot",
                         lambda *a, **k: called.__setitem__("set", True))
-    assert ca.ensure_lms_if_last_standing(st.netd_ws) is False
+    assert ca.ensure_witness_claim(st.netd_ws, node_has_majority=False) is False
     assert called["set"] is False

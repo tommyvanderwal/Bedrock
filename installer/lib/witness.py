@@ -25,7 +25,7 @@ Slot plaintext:
     {
         n:         node_id,            # must match envelope's n
         ts_writer: u64 epoch_ms,       # writer's clock; reader uses own clock
-        tag:       u8 bitflag,         # bit 0 = lms; bits 1-7 reserved (=0)
+        tag:       u8 bitflag,         # bit 0 = witness-claim; bits 1-7 reserved (=0)
         marker:    bytes,              # most relevant generation marker
                                        # (drbd current-uuid for arbiter slot)
         kind:      u8,                 # 1 = drbd-arbiter-uuid (others reserved)
@@ -55,8 +55,16 @@ SLOT_STALE_MS       = 10_000   # master-slot-stale threshold (EXECUTION-PLAN
 NODE_ID_MIN         = 1
 NODE_ID_MAX         = 250
 
-# Tag bitflags. Bit 0 = lms; other bits reserved.
-TAG_LMS    = 0x01
+# Tag bitflags. Bit 0 = witness-claim; other bits reserved.
+# A set claim bit means "this node has claimed (reserved, SCSI-3-PR style)
+# the witness's tie-breaking vote because its node-votes alone fall short of
+# quorum". Set/released ONLY by the claiming node itself — set when the
+# witness is pivotal (an even node-split), released when node-majority is
+# restored. It never times out; a node that dies still holding a claim needs
+# an operator decommission to clear it. See docs/cluster-quorum-spec.md
+# INV-3/INV-7.
+TAG_CLAIM  = 0x01
+TAG_LMS    = TAG_CLAIM  # deprecated alias for the old "last-man-standing" name
 
 # Marker kinds.
 MARKER_KIND_DRBD_ARBITER_UUID = 1
@@ -74,8 +82,14 @@ class Slot:
     seen_at_monotonic: float = 0.0
 
     @property
+    def claim(self) -> bool:
+        """True iff this slot's owner is claiming the witness's pivotal vote."""
+        return bool(self.tag & TAG_CLAIM)
+
+    # Deprecated alias for the old "last-man-standing" name.
+    @property
     def lms(self) -> bool:
-        return bool(self.tag & TAG_LMS)
+        return self.claim
 
     def is_stale(self, now_local_ms: Optional[int] = None,
                  threshold_ms: int = SLOT_STALE_MS) -> bool:
@@ -137,7 +151,7 @@ class WitnessState:
     # (early boot, before drbd UUID is known).
     own_marker: bytes = b""
     own_kind: int = MARKER_KIND_DRBD_ARBITER_UUID
-    own_tag: int = 0   # bit 0 = lms
+    own_tag: int = 0   # bit 0 = witness-claim
 
     # Current active-node member set (node_ids), refreshed each netd
     # tick from rqlite's `nodes` table via cluster_state.load_cluster().
@@ -606,8 +620,8 @@ def set_own_slot(ws: WitnessState, *, marker: bytes,
 
     Caller responsibility: every 1 s, set `marker` to the current
     DRBD current-UUID of the `cluster` singleton resource and `tag` to
-    `TAG_LMS` if operating last-man-standing, else 0. heartbeat_all
-    picks these up on the next tick."""
+    `TAG_CLAIM` while claiming the witness's pivotal vote (an even node-
+    split), else 0. heartbeat_all picks these up on the next tick."""
     ws.own_marker = bytes(marker)
     ws.own_tag = int(tag) & 0xFF
     ws.own_kind = int(kind) & 0xFF

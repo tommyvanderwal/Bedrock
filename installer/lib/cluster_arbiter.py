@@ -665,41 +665,45 @@ def _run_takeover_protocol() -> bool:
                   last_master_id, n)
         return False
 
-    # Step 1+2: inspect M's slot. Per cluster-quorum-spec.md INV-7,
-    # tag.lms=1 NEVER times out. A stale slot with lms=1 means the
-    # previous master died without clearing its LMS — only the
-    # operator can clear it (see docs/operator-overrides.md).
+    # Step 1+2: inspect M's slot. Per cluster-quorum-spec.md INV-7, a
+    # witness claim NEVER times out. A stale slot with claim=1 means the
+    # previous master died WHILE the witness was still pivotal for its
+    # quorum and could not release its own claim — only an operator
+    # decommission can clear it (see docs/operator-overrides.md). A master
+    # that had a node-majority releases its claim itself, so its slot reads
+    # claim=0 here and takeover proceeds without operator action.
     slot_m = _witness.read_slot(ws, last_master_id)
     if slot_m is None:
         # INV-7 "missing slot = worst case assumed". A missing slot
         # for a still-known cluster member might mean the witness
         # rebooted and lost its map; we cannot rule out that the
-        # missing slot previously held tag.lms=1. Operator must
+        # missing slot previously held a claim. Operator must
         # decommission the node from the rqlite `nodes` table
         # (which makes us ignore it entirely) or re-key the
         # witness identity.
         log.error("arbiter: takeover REFUSED — last master "
                   "node_id=%d has no slot at witness. Per INV-7 a "
                   "missing slot is treated as worst-case (could have "
-                  "held lms=1). Operator must decommission this "
+                  "held a witness claim). Operator must decommission this "
                   "node from the rqlite `nodes` table, or re-key "
                   "the witness identity (see docs/operator-overrides.md).",
                   last_master_id)
         return False
     if not slot_m.is_stale():
         log.info("arbiter: takeover REFUSED — slot[%d] is fresh "
-                 "(tag.lms=%s); cluster healthy elsewhere",
-                 last_master_id, slot_m.lms)
+                 "(claim=%s); cluster healthy elsewhere",
+                 last_master_id, slot_m.claim)
         return False
-    if slot_m.lms:
+    if slot_m.claim:
         log.error("arbiter: takeover REFUSED — slot[%d] is stale "
-                  "but tag.lms=1. Previous master died without "
-                  "clearing LMS; LMS does not time out. Operator "
-                  "must clear via override before takeover can "
-                  "proceed (see docs/operator-overrides.md).",
+                  "but holds a witness claim. Previous master died while "
+                  "the witness was pivotal for its quorum and never "
+                  "released the claim; claims do not time out. Operator "
+                  "must decommission the dead node (`bedrock node leave`) "
+                  "before takeover can proceed (see docs/operator-overrides.md).",
                   last_master_id)
         return False
-    log.info("arbiter: slot[%d] stale and tag.lms=0; continuing",
+    log.info("arbiter: slot[%d] stale and holds no witness claim; continuing",
              last_master_id)
     # Step 3: local DRBD UUID must EQUAL slot.marker exactly.
     local_uuid_step3 = _read_local_drbd_uuid()
@@ -718,27 +722,31 @@ def _run_takeover_protocol() -> bool:
     log.info("arbiter: DRBD UUID match (%s); proceeding to claim",
              local_uuid_step3[:12])
 
-    # Step 4: go solo — set our own slot tag=lms. The arbiter OWNS the
-    # LMS bit: netd does not recompute own_tag, so this explicit set is
-    # authoritative and the step-5 readback can't be raced back to 0.
-    # netd's election tick (1 Hz) ships whatever tag we set here on its
-    # next heartbeat, and only refreshes own_marker — never the tag.
+    # Step 4: claim the witness as part of the takeover handshake — set our
+    # own slot tag=claim. The arbiter OWNS the claim bit: netd does not
+    # recompute own_tag, so this explicit set is authoritative and the
+    # step-5 readback can't be raced back to 0. netd's election tick (1 Hz)
+    # ships whatever tag we set here on its next heartbeat, and only
+    # refreshes own_marker — never the tag. If this takeover lands us with a
+    # node-majority (the witness wasn't actually pivotal), the next Leader
+    # tick's ensure_witness_claim() releases this claim again — it sticks
+    # only while the witness remains pivotal for our quorum.
     local_uuid = _read_local_drbd_uuid()
     marker_bytes = local_uuid.encode("ascii") if local_uuid else b""
-    _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_LMS)
+    _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_CLAIM)
 
     # Step 5: read it back. Wait up to 3 attempts × ~1.5 s = ~4.5 s.
     expected_marker = marker_bytes
     for attempt in range(1, 4):
         time.sleep(1.5)  # let netd send + receive at least one round-trip
         own = _witness.own_slot(ws)
-        if own is not None and own.lms and own.marker == expected_marker:
-            log.info("arbiter: own slot readback OK (attempt %d, tag.lms=1, "
+        if own is not None and own.claim and own.marker == expected_marker:
+            log.info("arbiter: own slot readback OK (attempt %d, claim=1, "
                      "marker=%s)", attempt, local_uuid[:12])
             return True
         log.warning("arbiter: own-slot readback attempt %d not yet "
-                    "reflecting lms+marker (have=%r)", attempt,
-                    own and (own.lms, own.marker[:12]))
+                    "reflecting claim+marker (have=%r)", attempt,
+                    own and (own.claim, own.marker[:12]))
     log.error("arbiter: takeover REFUSED — own-slot readback failed "
               "after 3 attempts; witness unreachable or losing writes")
     return False
@@ -781,20 +789,30 @@ def _peer_claims_master_now(ws) -> "str | None":
     return None
 
 
-def ensure_lms_if_last_standing(ws) -> bool:
-    """H6 (LMS Scenario B): when this node is the elected LEADER, is
-    hosting the arbiter, has NO reachable peer, and the witness is
-    valid+confirmed, claim last-man-standing by writing our own slot with
-    tag.lms=1 and read it back to confirm.
+def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
+    """Maintain THIS node's witness claim each Leader tick (H6 / INV-3,
+    INV-7). The claim is an exclusive reservation (SCSI-3-PR style) of the
+    witness's tie-breaking vote.
 
-    The arbiter OWNS the LMS bit: netd does not recompute own_tag per
-    tick, so this explicit set is authoritative. LMS is cleared only on
-    self-demote (demote_arbiter_host), never auto-cleared (INV-7).
-    Idempotent + cheap — set_own_slot just flips ws.own_tag;
-    when we already hold a reachable peer or aren't last-standing it's a
-    no-op. Returns True iff we (re)asserted LMS this call.
+    Set/release rule — owned solely by the claiming node, never auto-expires,
+    never copied from another slot:
+      * `node_has_majority` is False  → the witness is PIVOTAL (our node-votes
+        alone fall short of quorum; we only reach this branch as elected
+        LEADER, so node-votes + witness already crosses the line). CLAIM it.
+      * `node_has_majority` is True   → node-majority is (re)established; the
+        witness is no longer needed. RELEASE any claim we hold.
 
-    Called from netd's Leader branch each tick.
+    This is the auto-release the old `ensure_lms_if_last_standing` lacked: a
+    healthy master that grew back to a node-majority drops its claim itself,
+    so its slot reads claim=0 and a survivor's takeover proceeds WITHOUT an
+    operator override. Operator action (`bedrock node leave`) is needed ONLY
+    when the claiming node dies permanently and can't release its own claim.
+
+    `node_has_majority` is computed by the caller (netd) from the same
+    election result that put us in the Leader branch:
+        100 * reachable_active_nodes(incl self) >= majority.
+
+    Idempotent. Returns True iff we changed the claim bit this call.
     """
     if ws is None:
         return False
@@ -808,13 +826,27 @@ def ensure_lms_if_last_standing(ws) -> bool:
     except Exception:
         return False
 
-    # Already last-standing? If a peer's heartbeat is fresh we are NOT
-    # alone — never set LMS while a peer is up.
-    if _fresh_peer_hbs():
+    # The witness must be valid + confirmed for us to read our own slot back.
+    # If it isn't, leave the claim bit untouched and retry next tick (we
+    # can't safely flip a bit we can't read).
+    if not (_witness.is_valid(ws) and _witness.is_confirmed(ws)):
         return False
+    own = _witness.own_slot(ws)
+    holding = own is not None and own.claim
 
-    # Must actually be hosting the arbiter (don't claim LMS from a
-    # follower / mid-promote node).
+    if node_has_majority:
+        # Node-majority — release any claim we hold. The release write goes
+        # out on netd's next heartbeat (own_tag); netd keeps republishing 0.
+        if not holding:
+            return False
+        marker = (_read_local_drbd_uuid() or "").encode("ascii")
+        log.info("arbiter: node-majority (re)established — releasing witness "
+                 "claim (was pivotal, no longer needed)")
+        _witness.set_own_slot(ws, marker=marker, tag=0)
+        return True
+
+    # Witness is pivotal. Must actually be hosting the arbiter before we
+    # claim (don't claim from a follower / mid-promote node).
     status = arbiter_status()
     drbd_present = _drbd_resource_exists()
     if drbd_present:
@@ -825,31 +857,24 @@ def ensure_lms_if_last_standing(ws) -> bool:
         hosting = status.get("ip_present")
     if not hosting:
         return False
-
-    # Witness must be valid + confirmed for us to trust an LMS claim
-    # (we must be able to read our own slot back). If we already hold
-    # lms=1 there's nothing to do.
-    if not (_witness.is_valid(ws) and _witness.is_confirmed(ws)):
-        return False
-    own = _witness.own_slot(ws)
-    if own is not None and own.lms:
-        return False  # already last-standing; no flip needed
+    if holding:
+        return False  # already claimed; no flip needed
 
     local_uuid = _read_local_drbd_uuid()
     marker = local_uuid.encode("ascii") if local_uuid else b""
-    log.info("arbiter: last-standing — no reachable peer + witness "
-             "valid+confirmed; setting own LMS bit (marker=%s)",
-             local_uuid[:12] if local_uuid else "")
-    _witness.set_own_slot(ws, marker=marker, tag=_witness.TAG_LMS)
-    # Readback-confirm (the arbiter owns the bit; the witness must
-    # reflect it). Best-effort — netd ships the new tag on its next HB.
+    log.info("arbiter: witness pivotal (node-votes < majority) — claiming "
+             "witness vote (marker=%s)", local_uuid[:12] if local_uuid else "")
+    _witness.set_own_slot(ws, marker=marker, tag=_witness.TAG_CLAIM)
+    # Readback-confirm (the arbiter owns the bit; the witness must reflect
+    # it before a peer's takeover can see fresh+claim and defer). Best-effort
+    # — netd ships the new tag on its next HB.
     for _ in range(3):
         time.sleep(1.5)
         back = _witness.own_slot(ws)
-        if back is not None and back.lms and back.marker == marker:
-            log.info("arbiter: LMS readback confirmed")
+        if back is not None and back.claim and back.marker == marker:
+            log.info("arbiter: witness claim readback confirmed")
             return True
-    log.warning("arbiter: LMS set but readback not yet confirmed "
+    log.warning("arbiter: witness claim set but readback not yet confirmed "
                 "(witness slow/unreachable); netd will keep publishing")
     return True
 
@@ -1004,15 +1029,17 @@ def demote_arbiter_host() -> dict:
         _svc_stop(ARBITER_SVC)
         _umount()
         _drbd_secondary()
-    # Per cluster-quorum-spec.md INV-7: tag.lms=1 never times out.
-    # After self-demote we MUST clear our lms bit so a survivor's
-    # takeover protocol can proceed without operator intervention.
+    # Per cluster-quorum-spec.md INV-7: a witness claim never times out.
+    # After self-demote we MUST clear our claim bit so a survivor's
+    # takeover protocol can proceed without operator intervention. (This is
+    # the demote-path release; ensure_witness_claim() is the steady-state
+    # release when node-majority returns without a demote.)
     # The netd tick pushes the new tag via set_own_slot on its next
     # heartbeat. This write only succeeds when the witness is
     # reachable from us; if the witness is unreachable now, netd
     # will keep retrying on every subsequent tick as long as we
     # remain running. If we shut down or die before the write lands,
-    # the slot stays lms=1 and operator override is required to
+    # the slot stays claim=1 and operator decommission is required to
     # unstick the cluster (see docs/operator-overrides.md).
     if SHARED_STATE is not None and SHARED_STATE.netd_ws is not None:
         try:
@@ -1026,8 +1053,8 @@ def demote_arbiter_host() -> dict:
             marker = (_read_local_drbd_uuid() or "").encode("ascii")
             _witness.set_own_slot(ws, marker=marker, tag=0)
         except Exception as e:
-            log.warning("arbiter: post-demote slot clear failed: %s "
-                        "(LMS may stick if we shut down before retry)", e)
+            log.warning("arbiter: post-demote claim clear failed: %s "
+                        "(claim may stick if we shut down before retry)", e)
     return arbiter_status()
 
 

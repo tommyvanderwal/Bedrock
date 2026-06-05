@@ -1477,7 +1477,7 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         peer_liveness[current_master] = True
 
     # 4. Decide. The election tallies node acks + valid witnesses; the
-    # witness slot arbitration (UUID match, tag.lms, readback) is
+    # witness slot arbitration (UUID match, claim bit, readback) is
     # handled in cluster_arbiter.promote_to_arbiter_host() per the spec.
     result = _election.compute(
         self_name=d.my_node,
@@ -1617,12 +1617,18 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
             except ImportError:
                 from lib import cluster_arbiter as _ca  # type: ignore
             _ca.promote_to_arbiter_host()
-            # H6 (LMS Scenario B): an already-hosting master that has lost
-            # its peer but keeps the witness must SET its own LMS bit so a
-            # later peer takeover is properly guarded. The arbiter owns
-            # the bit (not netd's per-tick recompute); this is idempotent
-            # and only flips 0→1 when we're genuinely last-standing.
-            _ca.ensure_lms_if_last_standing(ws)
+            # H6: maintain our witness claim. node_has_majority is computed
+            # from the SAME election result that put us in the Leader branch:
+            # do our node-votes alone (100 per reachable active node, incl
+            # self) already meet majority? If yes, the witness is not pivotal
+            # → release any claim. If no, the witness is pivotal (we're Leader
+            # so node+witness crosses the line) → claim it. The arbiter owns
+            # the bit; this is idempotent and only flips on a real transition.
+            node_has_majority = (
+                _election.VOTES_PER_NODE * len(result.reachable_peers)
+                >= result.majority
+            )
+            _ca.ensure_witness_claim(ws, node_has_majority=node_has_majority)
         except Exception as e:
             sys.stderr.write(
                 f"bedrock-net: arbiter promote/lms tick failed: {e!r} "
@@ -1639,11 +1645,12 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         d.demoted_in_cycle = False
 
     # Publish our own witness slot MARKER every tick (the current DRBD
-    # generation), but NEVER flip the LMS tag from a steady-state
-    # heuristic (Q-01 / BAD-4). The LMS bit is an explicit local
-    # DECISION owned solely by cluster_arbiter: set on go-solo, cleared
-    # on self-demote. Recomputing it here every tick raced the takeover
-    # step-5 readback and could clear an LMS bit the protocol meant to
+    # generation), but NEVER flip the witness-claim tag from a steady-state
+    # heuristic (Q-01 / BAD-4). The claim bit is an explicit local
+    # DECISION owned solely by cluster_arbiter: set when the witness is
+    # pivotal, released when node-majority returns (ensure_witness_claim)
+    # or on self-demote. Recomputing it here every tick raced the takeover
+    # step-5 readback and could clear a claim the protocol meant to
     # hold. netd only refreshes the marker and leaves ws.own_tag exactly
     # as the arbiter last set it.
     try:
