@@ -3,23 +3,33 @@
 **Status:** IMPLEMENTED + VALIDATED end-to-end on the 4-node testbed (2026-06-06). Replaces the
 `ensure_drbd_write_permission` / `resume-io` approach (the spurious-UUID root cause — see
 `bug-reports-upstream/drbd-quorum-lost-primary-uuid-rotation/`). Code: `installer/lib/fence_verdict.py`
-(verdict bridge + handler), `installer/lib/netd.py` (`_election_tick` publishes the verdict),
-`installer/lib/tier_storage.py` (`fencing resource-only` + handler in the `cluster` .res),
-`installer/lib/cluster_arbiter.py` (deploys the handler, `drbdadm adjust`). Campaign:
+(endpoint-side `decide_fence`/`feed_down` + the HTTP-calling handler), `mgmt/app.py`
+(`POST /internal/fence-decision`), `installer/lib/netd.py` (`_election_tick` consumes the DRBD
+"peer down" evidence + publishes `fence_view`), `installer/lib/state_shared.py` (`drbd_down_peers`
++ `fence_view`), `installer/lib/tier_storage.py` (`fencing resource-only` + handler in the `cluster`
+.res), `installer/lib/cluster_arbiter.py` (deploys the handler, `drbdadm adjust`). Campaign:
 `testbed/drbd_uuid_bug/arbiter_campaign.py`.
 
-> **CRITICAL CORRECTION (2026-06-06): the verdict gate is TWO conditions, not "fresh+stable".**
-> The first implementation gated the handler on a *fresh + stable* verdict and **split-brained on the
-> very first isolate-the-Primary test**: DRBD detects a lost peer in ~3 s, but netd's membership is
-> gated by `DOWN_HYSTERESIS ≈ 10 s`, so at +3 s the file still said `leader` and was both fresh (netd
-> rewrote it ~1 s ago) and stable (leader for minutes) — yet wrong. The handler WON on that stale value
-> and the minority Primary minted a sibling. The fix (see "The verdict gate" below): netd now publishes
-> the **reachable set** (loopback octets it currently reaches, incl self) alongside the outcome, and the
-> handler acts only once the LOST peer is **absent from `reachable`** (proof netd has seen *this*
-> partition) **and** the (outcome, reachable) tuple is **stable** (no false-leader transient while the
-> set shrinks). Validated: isolate-Primary → loser LOSE(6) @~23 s, **no sibling mint**, winner
-> force-promotes (its fence-peer fires WIN on the promote path → outdates the old master → regains
-> quorum), heal clean (no split-brain, one master). See `lesson_fence_peer_stale_verdict` in memory.
+> **THE MODEL IS A SYNCHRONOUS CALL, NOT A FILE (2026-06-06, Tommy's correction).**
+> DRBD's external fencing is meant to be a synchronous *act* — claim the witness then and there on the
+> split — not a passive read of pre-computed state. The first two attempts used a `/run/.../fence-verdict.json`
+> file (netd's 1 Hz election outcome, materialised). Both were wrong for the same reason: the file is
+> *downstream of the very event it arbitrates*, so it lagged the partition (the loser's file still said
+> `leader` at +3 s → minority Primary won → split-brain, reproduced on the testbed), and a file can't
+> perform the **exclusive witness claim** that makes an even split safe (two stale files can both read
+> `leader`; one witness claim has exactly one winner).
+>
+> **Now:** `bedrock-fence-peer` POSTs to bedrock-d's `:8001` HTTP-loopback `/internal/fence-decision`.
+> bedrock-d feeds DRBD's **authoritative** per-peer "down" evidence into netd's election
+> (`shared_state.drbd_down_peers`) — DRBD detects a lost peer in ~3 s, mesh liveness only after
+> `DOWN_HYSTERESIS ≈ 10 s`, so this **collapses the detection lag**. netd forces those peers' liveness
+> False, converges the election on the real partition, and drives the **exclusive** witness claim
+> (`ensure_witness_claim`); it publishes the converged verdict to `shared_state.fence_view`.
+> `decide_fence()` waits for that view to (a) ACK the evidence and (b) be STABLE, then returns
+> win/lose → handler `exit 4`/`6`/`1`. The file + its two-gate polling are deleted.
+> Validated (single B): isolate-Primary → DRBD freezes @+3.4 s (safe, no writes), **LOSE(6) @+15 s**
+> (vs ~23 s for the file — the evidence-feed is faster), **no sibling mint** (gen unchanged), winner
+> promotes, heal clean (resync +30 s, no split-brain, one master). See `lesson_fence_peer_stale_verdict`.
 
 ## The idea (the heart of it)
 
@@ -116,32 +126,40 @@ This is the precise fix: the bug was the loser minting a **sibling** generation 
 Here the loser is **outdated**, which is *not* a sibling — outdated nodes yield cleanly. And there
 is no `resume-io` to mis-fire.
 
-## The verdict gate (two conditions — the part that took a testbed split-brain to get right)
+## The decision flow (synchronous call + DRBD-evidence-fed election)
 
 The handler asks "should I (a Primary that just lost peer P) continue or yield?" The authority is
-netd's election, but **netd detects the partition slower than DRBD does** (DRBD ~3 s on a cut peer;
-netd's reachable membership is gated by `DOWN_HYSTERESIS ≈ 10 s`). A handler that trusts a merely
-*recent* "leader" verdict acts on netd's *pre-partition* view and wins when it should lose. So netd
-publishes, every election tick, `{outcome, updated, stable_since, reachable, self_octet}` where
-`reachable` is the set of loopback last-octets it currently reaches (incl self), computed from the
-**same** `election.compute` result as `outcome` (they can never disagree). The handler maps
-`DRBD_PEER_NODE_ID → loopback octet` from the local `drbdadm dump cluster` (config-only, no netlink →
-safe inside a fence callout) and acts only when **all three** hold:
+netd's election + the **exclusive witness claim**, and both legitimately live in netd (it owns the
+witness socket and the global membership view). The handler does **not** do witness IO itself (that
+would race netd) and does **not** read a pre-computed file (stale — see the banner). Instead:
 
-1. **FRESH** — `updated` within `FRESH_S` (3 s). Else netd is wedged → leave IO frozen.
-2. **PEER-EXCLUDED** — the lost peer's octet is **not** in `reachable`. This is the load-bearing
-   gate: it proves netd has independently observed *this* partition, closing the DRBD-vs-netd
-   detection gap. Until then the handler waits.
-3. **CONVERGED** — the `(outcome, reachable)` tuple has been **stable ≥ `STABLE_S`** (3 s).
-   `stable_since` resets whenever *either* changes, so the reachable set shrinking step-by-step
-   during hysteresis settling (a brief `{self+2}=leader` on a node that is really isolated) never
-   decides — only the settled membership does.
+1. **Handler → endpoint.** `bedrock-fence-peer` maps `DRBD_PEER_NODE_ID → loopback octet` from the
+   local `drbdadm dump cluster` (config-only, no netlink → safe inside a fence callout) and POSTs
+   `{resource, peer_octet}` to `:8001 /internal/fence-decision` (loopback, no TLS). One blocking call.
+2. **Endpoint feeds DRBD's evidence into netd.** `feed_down()` records `peer_octet` in
+   `shared_state.drbd_down_peers`. On its next tick `_election_tick` forces that peer's `peer_liveness`
+   **False** (overriding mesh hysteresis — DRBD's detection is authoritative and ~7 s faster). This is
+   the key: DRBD's fast per-peer detection becomes an *input* to netd's global election, collapsing the
+   `DOWN_HYSTERESIS` lag. A peer with a probe fresher than `FENCE_PEER_FRESH_S` (3 s) is provably back
+   *now*, so its stale evidence is ignored + cleared (heal recognised immediately).
+3. **netd converges + claims.** The election recomputes on the real partition; on the Leader path
+   `ensure_witness_claim` drives the **exclusive** witness claim (the even-split tiebreak). netd
+   publishes `{outcome, down_acked, stable_since, updated, self_octet}` to `shared_state.fence_view`.
+4. **Endpoint waits for the converged verdict.** `decide_fence()` polls `fence_view` until it is
+   (a) **FRESH** (`updated` within 3 s — else netd wedged → freeze), (b) **ACKed** (`peer_octet ∈
+   down_acked` — netd's election has incorporated this loss), and (c) **STABLE** (`stable_since` held
+   ≥ `DECIDE_STABLE_S` — a simultaneously-isolated master's per-peer evidence arrives over a few ticks,
+   so wait for the membership to settle). Then `leader → win`, `follower|noquorum → lose`. Deadline
+   (`DECIDE_DEADLINE_S ≈ 18 s`) → `undecided`. Handler maps `win→exit 4`, `lose→exit 6`, `undecided→exit 1`.
 
-Then: `outcome == leader → exit 4` (win), else `→ exit 6` (lose). Up to a deadline (`STABLE_S+…`,
-~25 s), anything else → `exit 1` (freeze — DRBD's safe default). **Measured timing** (isolate the
-Primary): fence-peer fires +1.6 s, decides LOSE +23 s (≈ DRBD detect + ~10 s netd hysteresis + the
-stability window) — consistent with the ~10 s `MASTER_LOSS_MISSES` .254 failover cadence. "Instant
-does not exist in distributed systems": the handler **waits for agreement**, it does not race.
+Why the loser is fast and the winner is correct: a fully-isolated old master, once all its peers'
+down-evidence is in, is a clear sub-majority → `noquorum` → **LOSE** in ~seconds (no waiting on acks).
+The winning side promotes via `cluster_arbiter` (force-promote fires the fence on the *promote* path),
+and by then netd has already elected it Leader (acks propagated) → **WIN** → outdate the old master →
+regain quorum. **Measured (isolate the Primary):** DRBD freezes @+3.4 s (safe, no writes), endpoint
+returns **LOSE @+15 s** (vs ~23 s for the old file), no sibling mint, heal clean. "Instant does not
+exist in distributed systems" — the handler **waits for agreement** (the converged, claimed verdict),
+it does not race; but DRBD's evidence makes that agreement arrive faster.
 
 ## What bedrock-d implements
 
