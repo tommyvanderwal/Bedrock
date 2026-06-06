@@ -149,3 +149,53 @@ continue (legit mint); LOSE → stay frozen → never mint → yield via force-s
 no kernel patch, no spurious sibling-generation fork.** The only remaining engineering is the real
 `bedrock-fence-peer` handler that returns 4/6 from the witness verdict (exclusive — only one side may
 get WIN), and removing `ensure_drbd_write_permission`/`_drbd_resume_io`.
+
+---
+
+## Does this extend to VM disks? NO — different mechanism (dragon-hunt, code-verified, high confidence)
+
+**Verdict: do NOT extend the fence-peer / witness-CLAIM model to VM disks.** It is coupled to three
+substrate properties the VM tier deliberately lacks:
+1. The witness slot is **one-per-node, arbiter-only** (single `MARKER_KIND_DRBD_ARBITER_UUID`,
+   `installer/lib/witness.py:30,77`) — it cannot carry a per-VM win/lose verdict.
+2. fence-peer fires only on a node **already Primary with `fencing` set** (`drbd_receiver.c:10123`);
+   the VM-failover taker is a **Secondary** doing `disconnect`+`primary --force`
+   (`bedrock_d/orchestrator/vm_failover.py:485-497`), and VM `.res` has **no `fencing`**
+   (`bedrock_d/vm/drbd_config.py:108-115`) → `FP_DONT_CARE` → never fires.
+3. fence-peer exists *because the arbiter can't read the rqlite it's recovering*; VM disks **have**
+   rqlite (`_rqlite_quorate` + the `level=strong` UUID gate). Two intentionally-separate consistency
+   classes (`feedback_read_consistency_classes`).
+
+VM disks stay on the shipped availability-first model: `auto-promote no` + `allow-two-primaries no`
++ `after-sb-*` + `_rqlite_quorate` (liveness) + the **fail-loud** `get_recorded_uuid(level=strong)`
+gate + suspend(T+20)/takeover(T+35)/kill(T+5m).
+
+### Real dragons found — in the EXISTING VM-failover path (not the extension)
+- **D4 (serious):** hung-old-primary gap is **timing, not interlock**. Old primary suspends ~T+5-9s
+  (userspace marker), survivor force-promotes at T+35s; a hung-but-not-dead old primary
+  (`no_quorum_responder` `asyncio.wait_for(30s)` times out, logs, *continues*) keeps flushing while
+  the survivor promotes (peer-down = heartbeat-age, not death-confirmed) → concurrent writes →
+  divergence. The VM analogue of cluster R3, **without** the `suspend-io` kernel backstop.
+- **D5 (serious):** the takeover `level=strong` UUID read is **tautological** — `_takeover_one`
+  promotes → writes its own UUID → reads it back → compares to its own local UUID (no DRBD-mutating
+  call between); proves "my write committed", not "no peer raced a promote". The code's own
+  docstring (`bedrock_d/vm/failover.py:182-183`) admits it. Genuine on cold-start, blind on takeover.
+- **D3 (inherent):** no quorum → a minority VM Primary keeps writing + rotating UUID → sibling
+  generations → `after-sb` discard (data loss on the discarded side), not clean Outdated→SyncTarget.
+- **D8 (inherited):** the denominator-shrink split-brain (`lesson_node_drain_denominator_splitbrain`,
+  deferred) lets a minority pass `_rqlite_quorate` and reach the strong-read; fence-peer wouldn't fix
+  it (election bug) — the `#7` all-applied watermark is the fix.
+
+### Recommended VM-disk hardening (instead of fence-peer), priority order
+1. **Positive death-confirmed interlock before `drbdadm primary`** in `_takeover_one`: require the
+   home node provably down/suspended (witness `HOSTING=0` / stale slot — the death-oracle signal),
+   not merely heartbeat-silent. Userspace; closes D4/D5 — the one real gap fence-peer was meant to fill.
+2. **Reorder the strong-read to PRE-promote** (mirror arbiter step 3) so it catches a behind/raced disk.
+3. `migrate` UUID-record should **fail the saga** (not warn-continue) on unreadable post-promote UUID.
+4. (vipet/3-peer only, v1.x) `quorum majority` + `suspend-io` kernel backstop — needs a per-VM resume
+   authority that does not exist; never on cattle(1)/pet(2).
+5. Make the even-split VM-failover stall **operator-visible** (today a silent logged skip).
+
+**Sequencing:** the cluster-tier fence-peer handler is still STATUS=design (the real `bedrock-fence-peer`
+does not exist yet; `cluster_arbiter.py:1382` still calls the to-be-removed `_drbd_resume_io`). Land +
+validate the cluster-tier handler first, then revisit VM disks.
