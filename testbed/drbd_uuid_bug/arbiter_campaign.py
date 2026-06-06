@@ -229,15 +229,19 @@ def run_scenario(tag, iteration):
     print("  uuid-gen before: " + "  ".join(
         f"sim-{n}={gen_before[n]:#018x}" if gen_before[n] else f"sim-{n}=?" for n in NODES))
 
-    # arm timing capture + clear the kernel log on every node so the post-heal split-brain
-    # check sees ONLY this iteration's events (dmesg is a ring buffer shared across runs).
+    # clear the kernel log on every node so the post-heal split-brain check AND the dmesg
+    # transition-timing parse see ONLY this iteration (dmesg is a ring buffer across runs).
     for n in NODES:
         S(n, "dmesg -C 2>/dev/null; true")
-        start_events2(n, 95)
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     t_cut = time.time()
     partition(block, witness_block)
+    # M's seconds-since-boot at ~cut, to align its dmesg [monotonic] timestamps to t_cut.
+    try:
+        cut_uptime = float(S(M, "cut -d' ' -f1 /proc/uptime"))
+    except (ValueError, TypeError):
+        cut_uptime = None
     print(f"  \033[33mCUT at {time.strftime('%H:%M:%S', time.localtime(t_cut))}\033[0m")
 
     # observe ~60s: a full failover needs the loser to stand down (~23s) AND the winning
@@ -284,25 +288,23 @@ def run_scenario(tag, iteration):
         print(f"  \033[{'31' if mint else '32'}m  frozen sim-{frozen_node}: "
               f"gen {b:#018x} -> {a:#018x}  => {vmsg}\033[0m")
 
-    ev = fetch_events2(M)
-    def find_after(floor, needles, anyof=None):
-        for line in ev.splitlines():
-            pt = parse_ts(line)
-            if pt is None or pt < floor:
-                continue
-            if all(x in line for x in needles) and (anyof is None or any(x in line for x in anyof)):
-                return pt
+    # DRBD-side transition timing from M's dmesg (cleared at cut; [monotonic] timestamps
+    # aligned to cut_uptime). Reliable, no backgrounded stream to buffer/lose.
+    dm = S(M, "dmesg 2>/dev/null")
+    def dmesg_first(*needles):
+        for line in dm.splitlines():
+            m = re.match(r"\[\s*(\d+\.\d+)\]", line)
+            if m and all(x in line for x in needles):
+                return float(m.group(1))
         return None
-    # first connection-loss transition on M after the cut
-    t_peer_lost = find_after(t_cut, ["connection:"],
-                             ["Connecting", "NetworkFailure", "BrokenPipe", "Timeout",
-                              "Unconnected", "TearDown", "ProtocolError"])
-    t_qno = find_after(t_cut, ["quorum:no"])
-    t_qyes = find_after(t_qno or t_cut, ["quorum:yes"])     # regain must follow loss
-    t_sec = find_after(t_cut, ["resource", "role:Secondary"])  # M's own demote (force-secondary)
+    t_peer_lost = (dmesg_first("conn(", "Connected ->") or dmesg_first("Connection closed")
+                   or dmesg_first("PingAck did not arrive"))
+    t_qno = dmesg_first("quorum( yes -> no")
+    t_qyes = dmesg_first("quorum( no -> yes")              # regain (winner side / scenario A)
+    t_sec = dmesg_first("role( Primary -> Secondary")       # M's own demote (force-secondary)
 
     def d(t):
-        return None if not t else round(t - t_cut, 2)
+        return None if (t is None or cut_uptime is None) else round(t - cut_uptime, 2)
     timeline.update({
         "drbd_peer_lost_+s": d(t_peer_lost), "quorum_lost_+s": d(t_qno),
         "quorum_regain_+s": d(t_qyes), "old_primary_force_secondary_+s": d(t_sec),

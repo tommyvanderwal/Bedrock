@@ -161,17 +161,34 @@ does not exist in distributed systems": the handler **waits for agreement**, it 
    (conn-loss path → LOSE) and the new master (promote path → WIN).
 5. `bedrock-unfence-peer` clears any per-peer state on heal.
 
-### Known follow-up (found by the campaign, NOT a safety hole)
+### Known follow-up — the loser's clean demote (the gating bug for *clean* auto-failover)
+
+**Campaign result (2026-06-06):** the fence-peer arbitration is solid — **no spurious sibling mint
+in 9/9 partition iterations** (A×3 WIN, B×3 LOSE, C 2v2), correct LOSE(6)/WIN(4) every time, clear
+timing (cut → DRBD detect ~5–10 s → fence fires → WAIT for netd convergence → decide @~13–24 s →
+quorum regain / winner force-promote → heal). A **single** clean failover works end-to-end. But the
+**heal path** has a real, separate bug, root-caused precisely:
 
 The losing old master returns `exit 6` → `D_OUTDATED` → `on-suspended-primary-outdated
-force-secondary` should demote it. But the arbiter FS (`/var/lib/bedrock/cluster`) is **mounted** on
-it, and you cannot `umount` a *frozen* DRBD device (the final fsync blocks on suspended IO), so the
-force-secondary cannot complete while frozen → the loser lingers as a **frozen Primary**. This is
-**safe** (suspended → no writes → no mint; verified gen-unchanged), and on heal it resyncs from the
-new master cleanly (one master, no split-brain). But across *repeated* failovers the stale mount can
-accumulate and block a node's *next* promotion (`-12 Device is held open by mount`). Proper fix:
-bedrock-d must `umount` the arbiter FS as soon as it observes it has been outdated/force-secondaried
-(or lost the election), not rely on the frozen-device demote. Tracked in `lesson_fence_peer_stale_verdict`.
+force-secondary` *should* demote it. It can't: the node is **frozen** (`suspended:quorum`, IO to the
+DRBD device blocked by `quorum all`), and the arbiter FS + arbiter-rqlite hold the device **open** —
+`drbdadm secondary` / force-secondary refuse "`-12 Device is held open`", and you cannot drain a
+frozen device to umount it. So the loser **stays a frozen Primary**. On heal, when it reconnects to a
+*winning-side follower* (which already resynced to the new master's generation), DRBD sees 1-Primary
+(`after-sb-1pri`) / 2-Primary (`after-sb-2pri disconnect`) instead of the clean 0-Primary case its
+`after-sb-0pri discard-zero-changes` policy would auto-resolve → the pair goes **StandAlone**, which
+breaks `quorum all` for the whole non-master set → resync stalls. (Three fixes already landed that
+make this *recoverable* and stop it cascading: `/proc/mounts`-based mount detection + lazy-umount of
+the EIO zombie (f745d31), and clearing a stale mount in the promote path (5d89355).)
+
+**Data is never at risk** — the loser is frozen (no writes, gen verified unchanged), and recovery is
+mechanical (`umount -l` the loser + `drbdadm connect --discard-my-data` its StandAlone links → resync
+from the master). But auto-failover is not *clean* until the loser demotes deterministically. **Proper
+fix (next piece):** on observed loss/outdate, bedrock-d must FORCE-release the frozen device — kill
+the arbiter-rqlite + mount holders, `umount -l`, then `drbdsetup secondary --force` — so the demote
+completes to Secondary *before* heal, letting `after-sb-0pri` auto-resolve. This gates VM-disk fence
+arbitration (P3) too, since VM disks would inherit the same frozen-loser-demote path. Tracked in
+`lesson_fence_peer_stale_verdict` + `lesson_arbiter_eio_zombie_mount`.
 
 ## Validation results (testbed, STOCK/unpatched 9.3.2, 2026-06-06)
 
