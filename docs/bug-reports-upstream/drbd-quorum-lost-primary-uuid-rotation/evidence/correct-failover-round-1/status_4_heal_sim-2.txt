@@ -1,0 +1,8 @@
+Warning: Permanently added '192.168.2.27' (ED25519) to the list of known hosts.
+bugtest role:Secondary suspended:quorum
+  disk:Outdated quorum:no open:no
+  bedrock-305eec role:Primary
+    peer-disk:Outdated
+  bedrock-853bdf connection:StandAlone
+  bedrock-9fa125 connection:StandAlone
+

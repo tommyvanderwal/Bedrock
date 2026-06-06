@@ -1,0 +1,9 @@
+C (pre-partition current-UUID on sim-1) = F128E5228BC28FF4
+F128E5228BC28FF4
+F128E5228BC28FF4
+L (post-partition current-UUID on sim-1) = F128E5228BC28FF4
+F128E5228BC28FF4
+F128E5228BC28FF4
+ROTATED (L != C) = NO
+dmesg 'new current UUID' on sim-1 during partition: 0
+Warning: Permanently added '192.168.2.30' (ED25519) to the list of known hosts.

@@ -1,0 +1,14 @@
+[Sat Jun  6 13:16:59 2026] drbd bugtest: susp-io( no -> quorum )
+[Sat Jun  6 13:16:59 2026] drbd bugtest/0 drbd25: quorum( yes -> no )
+[Sat Jun  6 13:16:59 2026] drbd bugtest/0 drbd25 bedrock-9fa125: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 13:16:59 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-9fa125: helper command: /sbin/drbdadm fence-peer
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-853bdf: helper command: /sbin/drbdadm fence-peer
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-9fa125: helper command: /sbin/drbdadm fence-peer exit code 6 (0x600)
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-9fa125: fence-peer helper returned 6 (peer is active)
+[Sat Jun  6 13:16:59 2026] drbd bugtest: State change failed: Refusing to be Outdated while Connected (-6)
+[Sat Jun  6 13:16:59 2026] drbd bugtest/0 drbd25: Failed: disk( UpToDate -> Outdated ) [outdate-async]
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-853bdf: helper command: /sbin/drbdadm fence-peer exit code 6 (0x600)
+[Sat Jun  6 13:16:59 2026] drbd bugtest bedrock-853bdf: fence-peer helper returned 6 (peer is active)
+[Sat Jun  6 13:16:59 2026] drbd bugtest: State change failed: Refusing to be Outdated while Connected (-6)
+[Sat Jun  6 13:16:59 2026] drbd bugtest/0 drbd25: Failed: disk( UpToDate -> Outdated ) [outdate-async]

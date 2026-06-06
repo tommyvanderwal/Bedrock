@@ -1,0 +1,2 @@
+13:16:59.253 FENCE-PEER res=bugtest peer=3 cstate=NetworkFailure u2d=0x00000003 verdict=lose
+13:16:59.258 FENCE-PEER res=bugtest peer=2 cstate=NetworkFailure u2d=0x00000003 verdict=lose

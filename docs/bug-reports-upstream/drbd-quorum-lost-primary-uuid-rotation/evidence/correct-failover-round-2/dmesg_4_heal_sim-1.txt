@@ -1,0 +1,12 @@
+Warning: Permanently added '192.168.2.30' (ED25519) to the list of known hosts.
+[Sat Jun  6 00:48:54 2026] drbd bugtest/0 drbd25 bedrock-9fa125: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 00:48:54 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 00:49:13 2026] drbd bugtest bedrock-9fa125: Feature flags enabled on protocol level: 0x1ff TRIM THIN_RESYNC WRITE_SAME WRITE_ZEROES RESYNC_DAGTAG
+[Sat Jun  6 00:49:13 2026] drbd bugtest bedrock-853bdf: Feature flags enabled on protocol level: 0x1ff TRIM THIN_RESYNC WRITE_SAME WRITE_ZEROES RESYNC_DAGTAG
+[Sat Jun  6 00:49:13 2026] drbd bugtest/0 drbd25: disk( UpToDate -> Outdated ) [connect-failed]
+[Sat Jun  6 00:49:13 2026] drbd bugtest bedrock-853bdf: conn( Disconnecting -> StandAlone ) [disconnected]
+[Sat Jun  6 00:49:13 2026] drbd bugtest bedrock-9fa125: conn( Disconnecting -> StandAlone ) [disconnected]
+[Sat Jun  6 00:49:14 2026] drbd bugtest: State change failed: Need access to UpToDate data (-2)
+[Sat Jun  6 00:49:14 2026] drbd bugtest/0 drbd25 bedrock-56f13b: Failed: pdsk( UpToDate -> Outdated ) [peer-state]
+[Sat Jun  6 00:49:14 2026] drbd bugtest/0 drbd25 bedrock-56f13b: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 00:49:14 2026] drbd bugtest bedrock-56f13b: conn( Disconnecting -> StandAlone ) [disconnected]

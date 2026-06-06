@@ -1,0 +1,2 @@
+[Sat Jun  6 01:26:53 2026] drbd bugtest: susp-io( no -> quorum )
+[Sat Jun  6 01:26:53 2026] drbd bugtest/0 drbd25: quorum( yes -> no )

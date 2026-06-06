@@ -13,6 +13,39 @@ live next to the code as `<module>.md` files.
 
 ---
 
+## L-DRBD — A frozen quorum-lost Primary that keeps a peer rotates its UUID (DRBD-internal)
+**2026-06-06** · [full lesson](drbd-uuid-quorum-foundations.md) · study: `docs/.drbd-study-raw.txt`
+
+**What we thought:** with `quorum all; on-no-quorum suspend-io`, a Primary that
+loses quorum freezes and keeps its current-UUID; the rotation we saw must be
+caused by bedrock-d's demote (graceful rqlite stop flushing → local IO).
+
+**What we found (kernel-source + live dmesg, zero assumptions):** the rotation is
+**DRBD-internal**, not bedrock-d. When the Primary loses *some* peers but keeps one,
+DRBD runs a two-phase-commit state change with the surviving peer, and an
+**unguarded** UUID-bump path (`drbd_state.c:4466`, the `susp_uuid` false→true edge in
+`w_after_state_change`) mints a new current-UUID **even though IO is frozen and
+nothing was written** — bypassing the `!PRIMARY_LOST_QUORUM` guard that the write and
+disconnect routes correctly carry. Losing *all* peers at once has no 2PC partner, so
+it does **not** rotate (case A). The rotated UUID is a *sibling* of the new master's
+generation → false split-brain on heal → full resync/`--discard-my-data` instead of
+incremental. No drbd.conf knob prevents it; durable fix is a kernel patch. Data is
+still safe (freeze ⇒ no divergent writes) — this is a heal-efficiency/automation gap,
+not data loss. Also corrected two over-strong first-pass claims via verification: the
+bump runs **async on the worker thread** (not synchronously in `finish_state_change`),
+and `on-suspended-primary-outdated=force-secondary` fires **after** the rotation.
+
+**What we changed:** wrote `docs/drbd-uuid-quorum-foundations.md` as the ground-truth
+foundation doc (arbiter + all VM disks, same setup). **Design (Tommy, final):**
+**quorum=ALL always** — no write without every replica present; on any loss DRBD
+freezes and **waits**; it must **never** self-mint a UUID; the only UUID generation is
+when **bedrock-d** explicitly says "continue writing" on the side it chooses
+(`drbdadm primary --force` mints it via `drbd_state.c:3131`, + `resume-io`). The
+**required** piece to make DRBD honor that: patch the `4295`/`4466` leak to add the
+`!PRIMARY_LOST_QUORUM` guard (Bedrock bundles drbd9x, so we can ship the patch; also
+report upstream). NOT quorum=majority (a detour I proposed and Tommy rejected). Must
+be validated on the 4-node testbed with `quorum all`.
+
 ## L1 — DRBD `--max-peers=7` must be set at metadata creation time
 **2026-04-30** · [scenario](scenarios/storage-tiers-1to4-2026-04-30.md)
 

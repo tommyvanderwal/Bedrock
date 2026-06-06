@@ -1,0 +1,7 @@
+bugtest role:Primary
+  disk:UpToDate open:no
+  bedrock-56f13b role:Secondary
+    peer-disk:UpToDate
+  bedrock-853bdf connection:Connecting
+  bedrock-9fa125 connection:Connecting
+

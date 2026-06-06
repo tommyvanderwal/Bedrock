@@ -1,0 +1,13 @@
+Warning: Permanently added '192.168.2.29' (ED25519) to the list of known hosts.
+[Sat Jun  6 00:49:46 2026] drbd bugtest/0 drbd25: disk( UpToDate -> Consistent ) quorum( yes -> no )
+[Sat Jun  6 00:49:46 2026] drbd bugtest/0 drbd25 bedrock-305eec: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 00:49:47 2026] drbd bugtest/0 drbd25 bedrock-56f13b: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 00:49:47 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( UpToDate -> Consistent ) [peer-state]
+[Sat Jun  6 00:49:47 2026] drbd bugtest bedrock-853bdf: No reconciliation resync even though 'bedrock-305eec' disappeared. (o=0)
+[Sat Jun  6 00:49:47 2026] drbd bugtest/0 drbd25: disk( Consistent -> UpToDate ) [lost-peer]
+[Sat Jun  6 00:49:47 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( Consistent -> UpToDate ) [peer-state]
+[Sat Jun  6 00:50:06 2026] drbd bugtest bedrock-305eec: Feature flags enabled on protocol level: 0x1ff TRIM THIN_RESYNC WRITE_SAME WRITE_ZEROES RESYNC_DAGTAG
+[Sat Jun  6 00:50:06 2026] drbd bugtest bedrock-305eec: conn( Disconnecting -> StandAlone ) [disconnected]
+[Sat Jun  6 00:50:06 2026] drbd bugtest bedrock-56f13b: Feature flags enabled on protocol level: 0x1ff TRIM THIN_RESYNC WRITE_SAME WRITE_ZEROES RESYNC_DAGTAG
+[Sat Jun  6 00:50:06 2026] drbd bugtest bedrock-56f13b: conn( Disconnecting -> StandAlone ) [disconnected]
+[Sat Jun  6 00:50:09 2026] drbd bugtest/0 drbd25: Failed: disk( UpToDate -> Outdated ) [far-away]

@@ -1,0 +1,8 @@
+Warning: Permanently added '192.168.2.30' (ED25519) to the list of known hosts.
+bugtest role:Primary suspended:quorum
+  disk:UpToDate quorum:no open:no blocked:upper
+  bedrock-56f13b role:Secondary
+    peer-disk:UpToDate
+  bedrock-853bdf connection:Connecting
+  bedrock-9fa125 connection:Connecting
+

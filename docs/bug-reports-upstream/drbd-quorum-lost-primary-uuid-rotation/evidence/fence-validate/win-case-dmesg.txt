@@ -1,0 +1,14 @@
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25 bedrock-9fa125: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( UpToDate -> DUnknown ) repl( Established -> Off )
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-853bdf: helper command: /sbin/drbdadm fence-peer
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-9fa125: helper command: /sbin/drbdadm fence-peer
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-853bdf: helper command: /sbin/drbdadm fence-peer exit code 4 (0x400)
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-853bdf: fence-peer helper returned 4 (peer was fenced)
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25 bedrock-853bdf: pdsk( DUnknown -> Outdated ) [outdate-async]
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-9fa125: helper command: /sbin/drbdadm fence-peer exit code 4 (0x400)
+[Sat Jun  6 13:17:44 2026] drbd bugtest bedrock-9fa125: fence-peer helper returned 4 (peer was fenced)
+[Sat Jun  6 13:17:44 2026] drbd bugtest: susp-io( quorum -> uuid ) [outdate-async]
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25: quorum( no -> yes ) [outdate-async]
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25 bedrock-9fa125: pdsk( DUnknown -> Outdated ) [outdate-async]
+[Sat Jun  6 13:17:44 2026] drbd bugtest/0 drbd25: new current UUID: 412D65B2C9673E49 weak: FFFFFFFFFFFFFFFC
+[Sat Jun  6 13:17:44 2026] drbd bugtest: susp-io( uuid -> no ) [susp-uuid]

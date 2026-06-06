@@ -1,0 +1,9 @@
+bugtest role:Secondary
+  disk:UpToDate open:no
+  bedrock-56f13b role:Secondary
+    peer-disk:UpToDate
+  bedrock-853bdf role:Secondary
+    peer-disk:UpToDate
+  bedrock-9fa125 role:Secondary
+    peer-disk:UpToDate
+
