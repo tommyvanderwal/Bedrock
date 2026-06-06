@@ -947,6 +947,38 @@ async def internal_cdc(request: Request):
     return {"ok": True}
 
 
+# ── DRBD fence-peer arbitration (synchronous, loopback-only) ─────────
+
+class FenceDecisionRequest(BaseModel):
+    resource: str
+    peer_octet: int
+
+
+@app.post("/internal/fence-decision")
+def internal_fence_decision(req: FenceDecisionRequest, request: Request):
+    """Synchronous DRBD fence-peer arbitration. `bedrock-fence-peer` (spawned by DRBD on a
+    Primary peer-loss) POSTs here; we feed DRBD's AUTHORITATIVE per-peer "down" evidence into
+    netd's election (collapsing the ~10 s mesh-hysteresis lag), let netd converge + drive the
+    EXCLUSIVE witness claim, and return the verdict (win/lose/undecided -> exit 4/6/1). This
+    replaces the racy /run/bedrock/fence-verdict.json file. SYNC handler (def, not async): it
+    runs in FastAPI's threadpool, so the up-to-~18 s block never stalls the asyncio event loop.
+    See lib/fence_verdict.py + docs/drbd-fence-peer-arbiter-design.md."""
+    ch = request.client.host if request.client else ""
+    if ch not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "fence-decision endpoint is loopback-only")
+    state = getattr(request.app.state, "bedrock", None)
+    if state is None:
+        return {"verdict": "undecided", "detail": "no shared state"}
+    try:
+        from lib import fence_verdict as _fv
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import fence_verdict as _fv  # type: ignore
+    verdict = _fv.decide_fence(state, req.peer_octet)
+    return {"verdict": verdict, "resource": req.resource, "peer_octet": req.peer_octet}
+
+
 # ── Operator login ──────────────────────────────────────────────────
 
 class LoginReq(BaseModel):

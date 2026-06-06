@@ -1,145 +1,120 @@
-"""Fence-peer verdict bridge — the replacement for ensure_drbd_write_permission/resume-io.
+"""Fence-peer verdict bridge — SYNCHRONOUS witness-claim model (replaces the verdict file).
 
-THE MODEL (docs/drbd-fence-peer-arbiter-design.md). DRBD's fence-peer handler is the
-synchronous "a Primary lost a peer — external arbiter, may I continue?" callout. On the
-arbiter `cluster` resource (quorum all + on-no-quorum suspend-io + fencing resource-only),
-when the Primary loses a peer DRBD spawns `bedrock-fence-peer` and *acts on its exit code*:
-  exit 4 (P_OUTDATED) -> outdate the lost peer  => WE WIN, regain quorum, continue
-  exit 6 (P_PRIMARY)  -> outdate myself         => WE LOSE, yield (stays frozen, never mints)
-  exit 1 (broken)     -> "leave IO frozen"      => UNDECIDED, fail safe
+THE MODEL (docs/drbd-fence-peer-arbiter-design.md). A DRBD fence-peer callout is a
+synchronous ACT, not a file lookup. On peer loss DRBD spawns `bedrock-fence-peer` (the
+Primary frozen, DRBD waiting for the exit code). The handler POSTs to bedrock-d's
+:8001 HTTP-loopback `/internal/fence-decision {resource, peer_octet}`. bedrock-d then:
 
-The verdict is the SAME election netd already computes (election.compute -> leader/follower/
-noquorum). The danger is acting on a verdict that is STALE — written by netd before netd
-itself had detected the partition. DRBD detects a lost peer FAST (~3-6 s); netd's membership
-is gated by DOWN_HYSTERESIS (~10 s). So at +3 s the file still says "leader" and is both
-"fresh" (netd rewrote it ~1 s ago) and "stable" (leader for minutes) — yet WRONG. A naive
-fresh+stable gate WINS on that stale value and a minority Primary mints a sibling -> split-brain.
-(Empirically reproduced on the testbed, 2026-06-06.)
+  1. Feeds DRBD's AUTHORITATIVE "peer down" evidence into netd's election
+     (shared_state.drbd_down_peers) — DRBD detects a lost peer in ~3-6 s, mesh liveness
+     only after DOWN_HYSTERESIS (~10 s), so this collapses the detection lag.
+  2. Lets netd converge the election on the real partition AND drive the EXCLUSIVE witness
+     claim (ensure_witness_claim) — the claim is what makes an even split safe (only one
+     side reserves the witness vote; two stale files could both read "leader" -> split-brain).
+  3. Returns the converged verdict; handler -> exit 4 (WIN, outdate peer, continue) /
+     6 (LOSE, outdate self, yield) / 1 (undecided, freeze — DRBD's safe default).
 
-THE FIX — two gates that together prove netd has SEEN this partition and CONVERGED on it:
-  netd records, each election tick: {outcome, updated, stable_since, reachable, self_octet}
-  where `reachable` = the loopback last-octets netd currently reaches (INCLUDING self), and
-  `stable_since` resets whenever the (outcome, reachable) tuple changes — not just the outcome.
+Why a call and not a file (Tommy's correction): the file was netd's 1 Hz election outcome
+materialised — downstream of the very event it arbitrates, so it lagged the partition (the
+loser's file still said "leader" at +3 s -> minority Primary won -> split-brain, reproduced
+on the testbed). And it could not perform the exclusive witness CLAIM, which must happen
+*then and there* on the split. The call feeds DRBD's fast detection in and waits for the
+real, evidence-accelerated arbitration. This is how DRBD's external fencing is meant to be
+used (a synchronous actuating callout), like crm-fence-peer.
 
-  The handler, for the lost peer P (mapped to its loopback octet via the local DRBD config),
-  returns a decision ONLY when:
-    (a) FRESH       — updated within FRESH_S            (else netd wedged -> freeze)
-    (b) P-EXCLUDED  — P's octet is NOT in `reachable`   (else netd has not yet seen THIS
-                      partition -> wait; this is what closes the DRBD-vs-netd detection gap)
-    (c) CONVERGED   — (outcome,reachable) stable >= STABLE_S (else the reachable set is still
-                      shrinking through a transient -> a brief {self+2}=leader during a full
-                      isolation must NOT decide WIN -> wait)
-  then: outcome 'leader' -> win(4); else -> lose(6).  Anything else, up to a deadline -> freeze(1).
-
-This module is the netd-side `record()` + the canonical `decide()` (also inlined, dependency-
-free, into HANDLER_SCRIPT so the handler DRBD spawns needs no bedrock imports). stdlib only.
+This module is the endpoint-side `feed_down()` + `decide_fence()` (called by mgmt's
+/internal/fence-decision) and the self-contained HANDLER_SCRIPT DRBD spawns. stdlib only.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import time
-from pathlib import Path
 
-VERDICT_FILE = Path("/run/bedrock/fence-verdict.json")
-
-# netd ticks the election ~1 Hz; >FRESH_S stale means netd is wedged -> fail safe (freeze).
+# The endpoint waits this long for netd to converge before giving up -> 'undecided' (freeze).
+# Must be < the handler's HTTP timeout, which must be < DRBD's (unbounded) handler wait.
+DECIDE_DEADLINE_S = 18.0
+# netd's published (outcome, down_acked) must hold this long before we trust it: a
+# simultaneously-isolated master's per-peer down-evidence arrives over a few election ticks,
+# so we wait for the membership to settle (a transient must not decide). ~3 election ticks.
+DECIDE_STABLE_S = 2.5
+POLL_S = 0.4
+# fence_view is stale (netd wedged) if older than this -> fail safe (freeze).
 FRESH_S = 3.0
-# Convergence guard: the (outcome, reachable) tuple must hold this long before we act, so a
-# reachable set shrinking step-by-step during DOWN_HYSTERESIS settling (a transient
-# {self+2}=leader on a node that is really isolated) never decides. Short because the
-# P-excluded gate already covers the DRBD-vs-netd detection lag. Validated on the testbed.
-STABLE_S = 3.0
-
-# netd-side stability tracking (module state, lives in the netd process).
-_last_key: tuple | None = None
-_stable_since: float = 0.0
 
 
-def record(outcome: str, *, reachable_octets=None, self_octet=None,
-           now: float | None = None) -> None:
-    """Called by netd each election tick with the current outcome + the set of loopback
-    octets netd currently reaches (incl self). Resets stability when EITHER the outcome OR
-    the reachable set changes, then atomically writes VERDICT_FILE. Never raises."""
-    global _last_key, _stable_since
-    if not outcome:
+def feed_down(shared_state, peer_octet, *, now: float | None = None) -> None:
+    """Record DRBD's authoritative 'peer <octet> is down' evidence for netd's election
+    (shared_state.drbd_down_peers, monotonic ts). netd forces that peer's liveness False
+    and expires the evidence. Best-effort; never raises."""
+    if shared_state is None or peer_octet is None:
         return
-    now = time.time() if now is None else now
-    reach = sorted({o for o in (reachable_octets or ()) if o is not None})
-    key = (outcome, tuple(reach))
-    if key != _last_key:
-        _last_key = key
-        _stable_since = now
+    now = time.monotonic() if now is None else now
     try:
-        VERDICT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = VERDICT_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "outcome": outcome, "updated": now, "stable_since": _stable_since,
-            "reachable": reach, "self_octet": self_octet,
-        }))
-        os.replace(tmp, VERDICT_FILE)
-    except OSError:
+        with shared_state.netd_lock:
+            shared_state.drbd_down_peers[int(peer_octet)] = now
+    except (OSError, ValueError, TypeError):
         pass
 
 
-def decide(peer_octet, *, now: float | None = None, fresh_s: float = FRESH_S,
-           stable_s: float = STABLE_S, path: Path = VERDICT_FILE) -> str:
-    """Canonical verdict from the recorded file for a lost peer whose loopback octet is
-    `peer_octet`. Returns 'win' | 'lose' | 'undecided'.
+def decide_fence(shared_state, peer_octet, *, deadline_s: float = DECIDE_DEADLINE_S,
+                 stable_s: float = DECIDE_STABLE_S, poll_s: float = POLL_S) -> str:
+    """Synchronous fence decision for an arbiter Primary that lost `peer_octet`.
 
-    win       = peer excluded + converged + outcome 'leader'
-    lose      = peer excluded + converged + outcome 'noquorum'/'follower'
-    undecided = stale OR peer still reachable (netd hasn't seen this partition) OR not yet
-                converged OR peer unresolved -> caller leaves IO frozen (DRBD's safe default).
-    """
-    now = time.time() if now is None else now
-    try:
-        v = json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+    Feeds the down-evidence, then waits for netd's published `fence_view` to (a) be FRESH
+    (netd ticking), (b) ACK the evidence (peer_octet in down_acked — netd's election has
+    incorporated this loss), and (c) be STABLE (the converged partition view), then maps the
+    outcome -> 'win' (leader) | 'lose' (follower/noquorum) | 'undecided' (deadline -> freeze).
+    The exclusive witness claim is driven by netd's ensure_witness_claim, so a stable
+    'leader' here already means the claim is confirmed if the split was witness-pivotal."""
+    if shared_state is None or peer_octet is None:
         return "undecided"
-    if now - float(v.get("updated", 0)) > fresh_s:
-        return "undecided"                              # netd not ticking -> fail safe
-    reach = v.get("reachable")
-    if not isinstance(reach, list) or peer_octet is None:
-        return "undecided"                              # no membership / unresolved peer -> freeze
-    if peer_octet in reach:
-        return "undecided"                              # netd still sees the peer -> hasn't seen the cut
-    if now - float(v.get("stable_since", now)) < stable_s:
-        return "undecided"                              # reachable set still converging -> wait
-    o = (v.get("outcome") or "").lower()
-    if o == "leader":
-        return "win"
-    if o in ("noquorum", "follower"):
-        return "lose"
-    return "undecided"
+    try:
+        peer_octet = int(peer_octet)
+    except (ValueError, TypeError):
+        return "undecided"
+    feed_down(shared_state, peer_octet)
+    deadline = time.monotonic() + deadline_s
+    while True:
+        now = time.monotonic()
+        feed_down(shared_state, peer_octet, now=now)   # keep evidence alive across the wait
+        try:
+            with shared_state.netd_lock:
+                v = dict(shared_state.fence_view or {})
+        except (OSError, RuntimeError):
+            v = {}
+        outcome = (v.get("outcome") or "").lower()
+        fresh = (now - float(v.get("updated", 0.0))) <= FRESH_S
+        acked = peer_octet in (v.get("down_acked") or [])
+        stable = (now - float(v.get("stable_since", now))) >= stable_s
+        if fresh and acked and stable and outcome:
+            if outcome == "leader":
+                return "win"
+            if outcome in ("follower", "noquorum"):
+                return "lose"
+        if now >= deadline:
+            return "undecided"
+        time.sleep(poll_s)
 
 
-# The handler DRBD spawns. Self-contained (no bedrock imports): it maps the lost peer's
-# DRBD node-id -> loopback octet from the local DRBD config, then applies the same
-# fresh + peer-excluded + converged gate as decide(), polling until convergence or a deadline.
+# The handler DRBD spawns. Self-contained (no bedrock imports): maps the lost peer's DRBD
+# node-id -> loopback octet from the local drbd config, then makes ONE blocking HTTP call to
+# bedrock-d's loopback fence-decision endpoint. Any error/timeout -> exit 1 (freeze, safe).
 HANDLER_SCRIPT = r'''#!/usr/bin/env python3
-"""bedrock-fence-peer — DRBD fence-peer handler for the arbiter `cluster` resource.
+"""bedrock-fence-peer — DRBD fence-peer handler (synchronous witness-claim model).
 
-DRBD spawns this when the arbiter Primary loses a peer (fencing resource-only). It returns the
-bedrock-d election verdict as a fence exit code, but ONLY once netd has itself SEEN this same
-partition and converged on it — never on a verdict that merely predates the cut:
-  4 = peer outdated (WIN, continue)   6 = outdate self (LOSE, yield)   1 = undecided (freeze)
-
-Gate (see lib/fence_verdict.py): netd publishes {outcome, updated, stable_since, reachable}
-where `reachable` = loopback octets netd currently reaches (incl self). We act only when
-(a) fresh, (b) the LOST peer's octet is ABSENT from `reachable` (proof netd saw this partition —
-closes the ~7 s gap between DRBD's fast peer-loss detection and netd's hysteresis), and
-(c) (outcome,reachable) stable >= STABLE_S (a converging transient must not decide). Else poll
-to a deadline, then freeze. The peer node-id -> octet map comes from the LOCAL drbd config
-(drbdadm dump: config-only, no kernel/netlink -> safe to call inside a fence callout).
+DRBD spawns this when the arbiter Primary loses a peer (fencing resource-only). It POSTs to
+bedrock-d's :8001 HTTP-loopback /internal/fence-decision, which feeds DRBD's authoritative
+peer-loss into netd's election, lets netd converge + drive the exclusive witness claim, and
+returns the verdict:  4 = WIN (outdate peer, continue)  6 = LOSE (outdate self, yield)
+1 = undecided (leave IO frozen). Self-contained (no bedrock imports): maps peer node-id ->
+loopback octet from the local drbd config (drbdadm dump = config-only, no kernel/netlink ->
+safe inside a fence callout), then one blocking HTTP call. Any error/timeout -> exit 1.
 """
-import json, os, re, subprocess, sys, time, syslog
-from pathlib import Path
+import json, os, re, subprocess, sys, syslog, urllib.request
 
-VERDICT_FILE = Path("/run/bedrock/fence-verdict.json")
 ARBITER_RES = "cluster"
-FRESH_S, STABLE_S, POLL_S, DEADLINE_S = 3.0, 3.0, 0.5, 25.0
+ENDPOINT = "http://127.0.0.1:8001/internal/fence-decision"
+HTTP_TIMEOUT_S = 25.0
 
 res = os.environ.get("DRBD_RESOURCE", "?")
 peer_id = os.environ.get("DRBD_PEER_NODE_ID", "?")
@@ -148,8 +123,8 @@ syslog.openlog("bedrock-fence-peer")
 
 def peer_octet_for(node_id):
     """Map a DRBD peer node-id -> its loopback last-octet via the LOCAL drbd config.
-    Each `on <host> { node-id N; address ipv4 100.83.252.X:port; }` (the on-block address
-    is the loopback; it precedes the connection sections). Static, no rqlite."""
+    Each `on <host> { node-id N; address ipv4 100.83.252.X:port; }` (on-block address is
+    the loopback; it precedes the connection sections). Static, no rqlite, no netlink."""
     try:
         out = subprocess.run(["drbdadm", "dump", ARBITER_RES],
                              capture_output=True, text=True, timeout=10).stdout
@@ -169,49 +144,39 @@ def peer_octet_for(node_id):
     return None
 
 
-def decide(now, peer_octet):
-    try:
-        v = json.loads(VERDICT_FILE.read_text())
-    except (OSError, ValueError):
-        return "undecided"
-    if now - float(v.get("updated", 0)) > FRESH_S:
-        return "undecided"
-    reach = v.get("reachable")
-    if not isinstance(reach, list) or peer_octet is None:
-        return "undecided"
-    if peer_octet in reach:
-        return "undecided"                  # netd hasn't seen THIS partition yet
-    if now - float(v.get("stable_since", now)) < STABLE_S:
-        return "undecided"                  # reachable set still converging
-    o = (v.get("outcome") or "").lower()
-    if o == "leader":
-        return "win"
-    if o in ("noquorum", "follower"):
-        return "lose"
-    return "undecided"
-
-
+# Only the arbiter resource is wired to this handler; refuse anything else -> leave frozen.
+# (VM-disk fence arbitration via rqlite ownership is a separate handler — see P3.)
 if res != ARBITER_RES:
     syslog.syslog(syslog.LOG_ERR, "fence-peer on unexpected res=%s peer=%s -> exit 1" % (res, peer_id))
     sys.exit(1)
 
-peer_octet = peer_octet_for(peer_id)
-syslog.syslog("fence-peer res=%s peer=%s (octet=%s): deciding" % (res, peer_id, peer_octet))
-deadline = time.time() + DEADLINE_S
-while True:
-    now = time.time()
-    d = decide(now, peer_octet)
-    if d == "win":
-        syslog.syslog("fence-peer res=%s peer=%s -> WIN (exit 4, outdate peer)" % (res, peer_id))
-        sys.exit(4)
-    if d == "lose":
-        syslog.syslog("fence-peer res=%s peer=%s -> LOSE (exit 6, outdate self)" % (res, peer_id))
-        sys.exit(6)
-    if now >= deadline:
-        syslog.syslog(syslog.LOG_WARNING,
-                      "fence-peer res=%s peer=%s -> UNDECIDED (exit 1, leave IO frozen)" % (res, peer_id))
-        sys.exit(1)
-    time.sleep(POLL_S)
+octet = peer_octet_for(peer_id)
+if octet is None:
+    syslog.syslog(syslog.LOG_ERR,
+                  "fence-peer res=%s peer=%s: cannot map node-id -> octet -> exit 1" % (res, peer_id))
+    sys.exit(1)
+
+syslog.syslog("fence-peer res=%s peer=%s (octet=%s): asking bedrock-d" % (res, peer_id, octet))
+body = json.dumps({"resource": res, "peer_octet": octet}).encode()
+req = urllib.request.Request(ENDPOINT, data=body,
+                             headers={"Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
+        verdict = (json.loads(r.read().decode()).get("verdict") or "").lower()
+except Exception as e:
+    syslog.syslog(syslog.LOG_WARNING,
+                  "fence-peer res=%s peer=%s: call failed (%r) -> exit 1 (freeze)" % (res, peer_id, e))
+    sys.exit(1)
+
+if verdict == "win":
+    syslog.syslog("fence-peer res=%s peer=%s -> WIN (exit 4, outdate peer)" % (res, peer_id))
+    sys.exit(4)
+if verdict == "lose":
+    syslog.syslog("fence-peer res=%s peer=%s -> LOSE (exit 6, outdate self)" % (res, peer_id))
+    sys.exit(6)
+syslog.syslog(syslog.LOG_WARNING,
+              "fence-peer res=%s peer=%s -> %s (exit 1, freeze)" % (res, peer_id, verdict or "undecided"))
+sys.exit(1)
 '''
 
 
@@ -220,6 +185,8 @@ HANDLER_PATH = "/usr/local/lib/bedrock/bedrock-fence-peer"
 
 def deploy_handler(path: str = HANDLER_PATH) -> None:
     """Write the self-contained handler script + make it executable. Idempotent."""
+    import os
+    from pathlib import Path
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     if not (p.exists() and p.read_text() == HANDLER_SCRIPT):

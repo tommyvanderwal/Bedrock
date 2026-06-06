@@ -97,7 +97,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import msgpack
 
@@ -164,6 +164,15 @@ UP_HYSTERESIS_S   = 5.0          # link must be up this long before LINK_UP
 # the MASTER_LOSS_MISSES heartbeat counter above.
 DOWN_HYSTERESIS_S = 10.0         # silent this long before LINK_DOWN
 QUALITY_REFRESH_S = 60.0         # LINK_QUALITY rate limit when stable
+
+# DRBD fence evidence (the /internal/fence-decision endpoint feeds DRBD's fast
+# per-peer "peer down" detection into the election so it converges before mesh
+# hysteresis would). Evidence older than DRBD_DOWN_TTL_S is dropped (>= hysteresis
+# so it hands off cleanly to mesh down-detection). A peer with a probe fresher than
+# FENCE_PEER_FRESH_S is provably back NOW (not hysteresis-stale) -> its stale
+# down-evidence is ignored + cleared so heal is recognised immediately.
+DRBD_DOWN_TTL_S = 15.0
+FENCE_PEER_FRESH_S = 3.0
 
 # Rate-limit (monotonic) for the "Echo answering with an unconfigured echo_id"
 # warning — a likely echo_id != witness_id misconfiguration.
@@ -778,6 +787,10 @@ class Daemon:
     cdp_socks: dict  = field(default_factory=dict)
     mndp_sock: Optional[socket.socket] = None
     switch_neighbors: dict = field(default_factory=dict)
+    # Back-reference to the unified BedrockState (set in run_daemon when running
+    # inside bedrock-d). Lets _election_tick read DRBD fence "peer down" evidence
+    # and publish the live fence verdict. None in standalone netd.
+    shared_state: Optional[Any] = None
     # Stop flag for clean shutdown.
     stopped: bool = False
 
@@ -1494,6 +1507,42 @@ def _election_tick(d, ws, _witness, _election, _fence_verdict, prev_outcome):
     # mesh missed it AND the witness confirms it is no longer hosting.
     master_effectively_gone = master_lost and not master_witness_alive
 
+    # 3c. DRBD fence evidence — collapse the detection lag. DRBD detects a lost peer in
+    # ~3-6 s; mesh liveness (peer_liveness above) only drops a peer after DOWN_HYSTERESIS_S
+    # (~10 s). The /internal/fence-decision endpoint records DRBD's AUTHORITATIVE per-peer
+    # "down" octets in shared_state.drbd_down_peers; force those peers' liveness False here
+    # so the election (and the witness claim it drives) converges on the real partition in
+    # seconds. A peer with a FRESH probe (<= FENCE_PEER_FRESH_S) is provably back NOW, so its
+    # stale evidence is ignored + cleared (heal recognised immediately). _drbd_down_octets is
+    # the set actually applied — published in `down_acked` so the endpoint knows it landed.
+    _ss = getattr(d, "shared_state", None)
+    _drbd_down_octets: set = set()
+    if _ss is not None:
+        _now_m = time.monotonic()
+        _now_t = time.time()
+        _fresh_names = {n.peer_node for n in d.neighbours.values()
+                        if n.peer_node and (_now_t - getattr(n, "last_seen", 0.0)) <= FENCE_PEER_FRESH_S}
+        _fresh_octets = set()
+        for _nm in _fresh_names:
+            _lb = node_loopbacks.get(_nm, "")
+            try:
+                _fresh_octets.add(int(str(_lb).rsplit(".", 1)[-1]))
+            except (ValueError, AttributeError):
+                pass
+        with _ss.netd_lock:
+            _dd = _ss.drbd_down_peers
+            for _o, _ts in list(_dd.items()):
+                if (_now_m - _ts) > DRBD_DOWN_TTL_S or _o in _fresh_octets:
+                    del _dd[_o]              # expired, or peer provably back -> drop evidence
+            _drbd_down_octets = set(_dd.keys())
+        if _drbd_down_octets:
+            for _nm, _lb in node_loopbacks.items():
+                try:
+                    if int(str(_lb).rsplit(".", 1)[-1]) in _drbd_down_octets:
+                        peer_liveness[_nm] = False
+                except (ValueError, AttributeError):
+                    pass
+
     # 4. Decide. The election tallies node acks + valid witnesses; the
     # witness slot arbitration (UUID match, claim bit, readback) is
     # handled in cluster_arbiter.promote_to_arbiter_host() per the spec.
@@ -1513,27 +1562,37 @@ def _election_tick(d, ws, _witness, _election, _fence_verdict, prev_outcome):
         master_witness_alive=master_witness_alive,
     )
 
-    # 4a. Publish the fence-peer verdict (replaces resume-io). The bedrock-fence-peer
-    # handler gates on the LOST peer being ABSENT from `reachable` (proof netd has SEEN
-    # this partition — not merely that it wrote the file recently; DRBD detects a lost peer
-    # ~7 s before netd's hysteresis does) plus (outcome,reachable) stability. We publish the
-    # set of loopback octets we currently reach (incl self) from the SAME `result` so the
-    # outcome and the membership it was computed over can never disagree. See
-    # lib/fence_verdict.py + docs/drbd-fence-peer-arbiter-design.md.
-    try:
-        def _oct(ip):
-            try:
-                return int(str(ip).rsplit(".", 1)[-1])
-            except (ValueError, AttributeError):
-                return None
-        _self_oct = _oct(d.my_loopback)
-        _reach = {_self_oct}
-        for _p in result.reachable_peers:
-            _reach.add(_oct(node_loopbacks.get(_p, "")))
-        _fence_verdict.record(result.outcome.value,
-                              reachable_octets=_reach, self_octet=_self_oct)
-    except Exception as _e:  # never let the verdict bridge break the election tick
-        sys.stderr.write(f"bedrock-net: fence-verdict record error: {_e!r}\n")
+    # 4a. Publish the live fence verdict to shared state (in-memory; REPLACES the
+    # /run/bedrock/fence-verdict.json file). The /internal/fence-decision endpoint reads
+    # this synchronously on a DRBD fence callout. `down_acked` = the DRBD-reported-down
+    # octets this election incorporated (so the endpoint knows its evidence landed);
+    # `stable_since` resets when (outcome, down_acked) changes so the endpoint waits for
+    # convergence before answering. The witness CLAIM that makes an even split safe is
+    # driven by ensure_witness_claim on the Leader path below — evidence-accelerated, so
+    # `outcome==leader` already means "claim confirmed if pivotal". See lib/fence_verdict.py.
+    if _ss is not None:
+        try:
+            _self_oct = int(str(d.my_loopback).rsplit(".", 1)[-1]) if d.my_loopback else 0
+        except (ValueError, AttributeError):
+            _self_oct = 0
+        _now_mono = time.monotonic()
+        _down_sorted = sorted(_drbd_down_octets)
+        _key = (result.outcome.value, tuple(_down_sorted))
+        try:
+            with _ss.netd_lock:
+                _prev = _ss.fence_view or {}
+                _stable = (_prev.get("stable_since", _now_mono)
+                           if _prev.get("key") == _key else _now_mono)
+                _ss.fence_view = {
+                    "outcome": result.outcome.value,
+                    "down_acked": _down_sorted,
+                    "self_octet": _self_oct,
+                    "updated": _now_mono,
+                    "stable_since": _stable,
+                    "key": _key,
+                }
+        except Exception as _e:  # never let the verdict bridge break the election tick
+            sys.stderr.write(f"bedrock-net: fence_view publish error: {_e!r}\n")
 
     # 4b. Publish our own election-heartbeat fields for the next
     # hb_send_round so peers see our stance.
@@ -1947,6 +2006,9 @@ def run_daemon(shared_state=None):
             shared_state.self_node_name = my_node
             shared_state.self_loopback_ip = my_loopback
             shared_state.cluster_uuid = cluster_uuid
+        # Back-reference so _election_tick can read the DRBD fence "peer down"
+        # evidence + publish the live fence verdict (replaces the verdict file).
+        d.shared_state = shared_state
 
     d.recv_sock = open_recv_socket()
     d.recv_sock.settimeout(0.05)

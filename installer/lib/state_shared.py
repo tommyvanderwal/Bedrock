@@ -73,6 +73,23 @@ class BedrockState:
     # netd only refreshes own_marker each tick (Q-01/BAD-4).
     netd_ws: Optional[Any] = None
 
+    # ── DRBD fence-peer coordination (replaces /run/bedrock/fence-verdict.json) ──
+    # DRBD detects a lost peer FAST (~3-6 s); netd's mesh liveness is gated by
+    # DOWN_HYSTERESIS (~10 s). On a fence callout the /internal/fence-decision
+    # endpoint feeds DRBD's AUTHORITATIVE per-peer "down" evidence here; netd's
+    # election forces those peers' liveness False, collapsing the detection lag so
+    # the arbitration (incl. the exclusive witness claim driven by netd) converges
+    # in ~seconds instead of ~13 s. Keyed by loopback octet -> monotonic ts;
+    # netd expires entries (DRBD_DOWN_TTL_S) so a healed peer is re-counted.
+    # Written by the endpoint, read+expired by netd — both under netd_lock.
+    drbd_down_peers: dict = field(default_factory=dict)
+    # netd publishes the live fence verdict each election tick (in-memory, no file):
+    #   {outcome: str, down_acked: list[int octet], stable_since: float(mono),
+    #    updated: float(mono), self_octet: int}
+    # Read by the fence-decision endpoint under netd_lock. `stable_since` resets
+    # when (outcome, down_acked) changes so the endpoint can wait for convergence.
+    fence_view: dict = field(default_factory=dict)
+
     # ── orchestrator-owned state (rqlite_subscriber etc.) ─────────
     # Live snapshot of cluster state, projected from rqlite by the
     # subscriber task. FastAPI handlers read this directly.

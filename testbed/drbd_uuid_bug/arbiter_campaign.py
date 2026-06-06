@@ -157,7 +157,7 @@ def parse_fence(n, since_epoch):
         if not m:
             continue
         ts = float(m.group(1))
-        if "deciding" in line and fire is None:
+        if ("deciding" in line or "asking bedrock-d" in line) and fire is None:
             fire = ts
         for kw, c in (("-> WIN", 4), ("-> LOSE", 6), ("-> UNDECIDED", 1)):
             if kw in line and decision is None:
