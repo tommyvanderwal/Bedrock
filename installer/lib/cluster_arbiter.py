@@ -220,6 +220,20 @@ def _drbd_promote() -> None:
     rc, _, err = _run(["drbdadm", "primary", TIER_RESOURCE], timeout=30)
     if rc == 0:
         return
+    # A stale arbiter mount blocks promotion ("-12 Device is held open by mount"): a prior
+    # master demoted but its frozen/EIO mount couldn't be umounted at the time. A node that is
+    # PROMOTING is (about to be) the host but is currently Secondary, and a Secondary must NOT
+    # be mounted — so a held-open-by-mount here is ALWAYS a stale mount. The demote branch of
+    # converge (which umounts) never runs for a should-host node, so the promote path must
+    # self-heal it: lazy-detach + retry. (See _umount / the EIO-zombie-mount lesson.) Without
+    # this, a node that was master a few failovers ago can never re-promote -> winner-promote
+    # stalls -> the cluster ends a failover with NO master.
+    if "held open" in err.lower() or "open_cnt" in err.lower():
+        log.warning("arbiter: promote blocked by stale arbiter mount; clearing + retrying")
+        _umount()
+        rc, _, err = _run(["drbdadm", "primary", TIER_RESOURCE], timeout=30)
+        if rc == 0:
+            return
     # Two cases need --force, and in BOTH the cluster election + witness are
     # the single source of authority for who owns the data — if they say we are
     # master (we only get here from a Leader outcome), we are:
