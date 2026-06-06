@@ -387,17 +387,27 @@ def ensure_arbiter_drbd_up() -> None:
 def _is_mounted(path: Path) -> bool:
     """True iff `path` itself is a mount point (not just on a mounted FS).
 
-    findmnt -T <path> returns the containing filesystem, which for a
-    not-yet-mounted /var/lib/bedrock/cluster returns the root mount
-    ("/" on xfs) — so _is_mounted would return True even though
-    the DRBD device isn't mounted there. That made promote_to_arbiter_host
-    skip the mount step and the filer happily wrote leveldb3 to the
-    root FS, which is invisible to peers and disappears at failover.
-
-    Use `mountpoint -q` (or equivalently findmnt without -T) which
-    returns 0 ONLY if the path is a true mount point."""
-    rc, _, _ = _run(["mountpoint", "-q", str(path)])
-    return rc == 0
+    Reads /proc/self/mounts directly and matches the EXACT mountpoint — NO stat() of the
+    path. Two requirements this satisfies:
+      * Don't false-positive on the root FS: `findmnt -T` returns the containing filesystem
+        ("/" for an unmounted /var/lib/bedrock/cluster), which once made promote skip the
+        mount and the filer wrote leveldb to the root FS (invisible to peers). Matching the
+        exact mountpoint string avoids that.
+      * SEE an EIO "zombie" mount: when DRBD demotes the device to Secondary (e.g. the
+        outdated loser becomes SyncTarget on heal) while the XFS is still mounted, every I/O
+        to that mount returns EIO. `mountpoint -q` stat()s the path → EIO → it falsely reports
+        "not mounted", so converge never cleans the zombie and the held-open device blocks the
+        next promote (`-12 Device is held open`). The mount TABLE needs no I/O to the FS."""
+    target = str(path)
+    try:
+        with open("/proc/self/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == target:
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 def _mount() -> None:
@@ -421,7 +431,15 @@ def _umount() -> None:
     if not _is_mounted(MOUNT_POINT):
         return
     log.info("arbiter: umount %s", MOUNT_POINT)
-    _run(["umount", str(MOUNT_POINT)], timeout=20)
+    rc, _, err = _run(["umount", str(MOUNT_POINT)], timeout=20)
+    if rc != 0 and _is_mounted(MOUNT_POINT):
+        # A DRBD device demoted to Secondary under a live mount leaves an EIO "zombie": a
+        # normal umount can't sync/stat it. Lazy-detach frees the device (the next promote
+        # needs it) and the FS refs drain asynchronously. This is the cleanup path for the
+        # outdated loser after a failover heal (the force-secondary couldn't umount frozen).
+        log.warning("arbiter: umount %s failed (%s); lazy-detaching (-l)",
+                    MOUNT_POINT, err.strip())
+        _run(["umount", "-l", str(MOUNT_POINT)], timeout=20)
 
 
 # ─────────────────────────────────────────────────────────────────────
