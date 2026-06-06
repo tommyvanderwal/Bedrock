@@ -1162,7 +1162,7 @@ def _parse_echo_addr(addr):
     return (host, port)
 
 
-def _election_tick(d, ws, _witness, _election, prev_outcome):
+def _election_tick(d, ws, _witness, _election, _fence_verdict, prev_outcome):
     """One election tick. Side-effects:
       - heartbeats / re-discovers the witness
       - on Leader outcome: DRIVES cluster_arbiter.promote_to_arbiter_host()
@@ -1512,6 +1512,28 @@ def _election_tick(d, ws, _witness, _election, prev_outcome):
         casting_vote_node=casting_vote_node,
         master_witness_alive=master_witness_alive,
     )
+
+    # 4a. Publish the fence-peer verdict (replaces resume-io). The bedrock-fence-peer
+    # handler gates on the LOST peer being ABSENT from `reachable` (proof netd has SEEN
+    # this partition — not merely that it wrote the file recently; DRBD detects a lost peer
+    # ~7 s before netd's hysteresis does) plus (outcome,reachable) stability. We publish the
+    # set of loopback octets we currently reach (incl self) from the SAME `result` so the
+    # outcome and the membership it was computed over can never disagree. See
+    # lib/fence_verdict.py + docs/drbd-fence-peer-arbiter-design.md.
+    try:
+        def _oct(ip):
+            try:
+                return int(str(ip).rsplit(".", 1)[-1])
+            except (ValueError, AttributeError):
+                return None
+        _self_oct = _oct(d.my_loopback)
+        _reach = {_self_oct}
+        for _p in result.reachable_peers:
+            _reach.add(_oct(node_loopbacks.get(_p, "")))
+        _fence_verdict.record(result.outcome.value,
+                              reachable_octets=_reach, self_octet=_self_oct)
+    except Exception as _e:  # never let the verdict bridge break the election tick
+        sys.stderr.write(f"bedrock-net: fence-verdict record error: {_e!r}\n")
 
     # 4b. Publish our own election-heartbeat fields for the next
     # hb_send_round so peers see our stance.
@@ -2061,16 +2083,12 @@ def run_daemon(shared_state=None):
             hb_drain(d)
             # ── Election + witness tick ────────────────────────────
             if now - last_election_at >= ELECTION_INTERVAL_S:
+                # _election_tick records the fence-peer verdict itself (it has the
+                # reachable-membership the outcome was computed over — see 4a there).
                 last_election_outcome = _election_tick(
-                    d, ws, _witness, _election, last_election_outcome)
+                    d, ws, _witness, _election, _fence_verdict, last_election_outcome)
                 hb_send_round(d, now)
                 last_election_at = now
-                # Record the fresh outcome for the DRBD fence-peer handler
-                # (the bedrock-fence-peer arbiter callout reads it with a
-                # freshness + stability gate). Replaces resume-io. Independent
-                # of shared_state so the handler works even pre-dashboard.
-                if last_election_outcome:
-                    _fence_verdict.record(last_election_outcome)
                 # Publish outcome onto shared state for the dashboard
                 # + orchestrator (saves them re-reading /run files).
                 if shared_state is not None and last_election_outcome:

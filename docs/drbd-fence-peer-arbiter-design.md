@@ -1,9 +1,25 @@
 # DRBD fence-peer as the bedrock-d arbiter interface — design + code-path reasoning
 
-**Status:** design, code-verified against DRBD 9.3.2 (`/tmp/drbdsrc`, HEAD `a46cbd9`). To be
-validated on the 4-node testbed before implementing in bedrock-d. Supersedes the
-`ensure_drbd_write_permission` / `resume-io` approach (which was the spurious-UUID root cause —
-see `bug-reports-upstream/drbd-quorum-lost-primary-uuid-rotation/`).
+**Status:** IMPLEMENTED + VALIDATED end-to-end on the 4-node testbed (2026-06-06). Replaces the
+`ensure_drbd_write_permission` / `resume-io` approach (the spurious-UUID root cause — see
+`bug-reports-upstream/drbd-quorum-lost-primary-uuid-rotation/`). Code: `installer/lib/fence_verdict.py`
+(verdict bridge + handler), `installer/lib/netd.py` (`_election_tick` publishes the verdict),
+`installer/lib/tier_storage.py` (`fencing resource-only` + handler in the `cluster` .res),
+`installer/lib/cluster_arbiter.py` (deploys the handler, `drbdadm adjust`). Campaign:
+`testbed/drbd_uuid_bug/arbiter_campaign.py`.
+
+> **CRITICAL CORRECTION (2026-06-06): the verdict gate is TWO conditions, not "fresh+stable".**
+> The first implementation gated the handler on a *fresh + stable* verdict and **split-brained on the
+> very first isolate-the-Primary test**: DRBD detects a lost peer in ~3 s, but netd's membership is
+> gated by `DOWN_HYSTERESIS ≈ 10 s`, so at +3 s the file still said `leader` and was both fresh (netd
+> rewrote it ~1 s ago) and stable (leader for minutes) — yet wrong. The handler WON on that stale value
+> and the minority Primary minted a sibling. The fix (see "The verdict gate" below): netd now publishes
+> the **reachable set** (loopback octets it currently reaches, incl self) alongside the outcome, and the
+> handler acts only once the LOST peer is **absent from `reachable`** (proof netd has seen *this*
+> partition) **and** the (outcome, reachable) tuple is **stable** (no false-leader transient while the
+> set shrinks). Validated: isolate-Primary → loser LOSE(6) @~23 s, **no sibling mint**, winner
+> force-promotes (its fence-peer fires WIN on the promote path → outdates the old master → regains
+> quorum), heal clean (no split-brain, one master). See `lesson_fence_peer_stale_verdict` in memory.
 
 ## The idea (the heart of it)
 
@@ -100,6 +116,33 @@ This is the precise fix: the bug was the loser minting a **sibling** generation 
 Here the loser is **outdated**, which is *not* a sibling — outdated nodes yield cleanly. And there
 is no `resume-io` to mis-fire.
 
+## The verdict gate (two conditions — the part that took a testbed split-brain to get right)
+
+The handler asks "should I (a Primary that just lost peer P) continue or yield?" The authority is
+netd's election, but **netd detects the partition slower than DRBD does** (DRBD ~3 s on a cut peer;
+netd's reachable membership is gated by `DOWN_HYSTERESIS ≈ 10 s`). A handler that trusts a merely
+*recent* "leader" verdict acts on netd's *pre-partition* view and wins when it should lose. So netd
+publishes, every election tick, `{outcome, updated, stable_since, reachable, self_octet}` where
+`reachable` is the set of loopback last-octets it currently reaches (incl self), computed from the
+**same** `election.compute` result as `outcome` (they can never disagree). The handler maps
+`DRBD_PEER_NODE_ID → loopback octet` from the local `drbdadm dump cluster` (config-only, no netlink →
+safe inside a fence callout) and acts only when **all three** hold:
+
+1. **FRESH** — `updated` within `FRESH_S` (3 s). Else netd is wedged → leave IO frozen.
+2. **PEER-EXCLUDED** — the lost peer's octet is **not** in `reachable`. This is the load-bearing
+   gate: it proves netd has independently observed *this* partition, closing the DRBD-vs-netd
+   detection gap. Until then the handler waits.
+3. **CONVERGED** — the `(outcome, reachable)` tuple has been **stable ≥ `STABLE_S`** (3 s).
+   `stable_since` resets whenever *either* changes, so the reachable set shrinking step-by-step
+   during hysteresis settling (a brief `{self+2}=leader` on a node that is really isolated) never
+   decides — only the settled membership does.
+
+Then: `outcome == leader → exit 4` (win), else `→ exit 6` (lose). Up to a deadline (`STABLE_S+…`,
+~25 s), anything else → `exit 1` (freeze — DRBD's safe default). **Measured timing** (isolate the
+Primary): fence-peer fires +1.6 s, decides LOSE +23 s (≈ DRBD detect + ~10 s netd hysteresis + the
+stability window) — consistent with the ~10 s `MASTER_LOSS_MISSES` .254 failover cadence. "Instant
+does not exist in distributed systems": the handler **waits for agreement**, it does not race.
+
 ## What bedrock-d implements
 
 1. `.res`: add `fencing resource-only` + the two handlers (above). Keep `quorum all`,
@@ -112,7 +155,23 @@ is no `resume-io` to mis-fire.
 3. **Delete** `ensure_drbd_write_permission` / `_drbd_resume_io` — no longer the mechanism.
 4. Keep `_drbd_promote` (`drbdadm primary --force`) for electing a **new** master on a
    Secondary-only winning side; it outdates absent peers → regains quorum the same way.
+   **Confirmed in DRBD source** (`drbd_nl.c:1177,1213`, the `drbd_set_role` path): promoting a node
+   with `D_UNKNOWN` peers under `fencing` calls `conn_try_outdate_peer` → our handler → WIN(4) →
+   outdate the isolated old master → quorum returns. So the fence-peer serves BOTH the old master
+   (conn-loss path → LOSE) and the new master (promote path → WIN).
 5. `bedrock-unfence-peer` clears any per-peer state on heal.
+
+### Known follow-up (found by the campaign, NOT a safety hole)
+
+The losing old master returns `exit 6` → `D_OUTDATED` → `on-suspended-primary-outdated
+force-secondary` should demote it. But the arbiter FS (`/var/lib/bedrock/cluster`) is **mounted** on
+it, and you cannot `umount` a *frozen* DRBD device (the final fsync blocks on suspended IO), so the
+force-secondary cannot complete while frozen → the loser lingers as a **frozen Primary**. This is
+**safe** (suspended → no writes → no mint; verified gen-unchanged), and on heal it resyncs from the
+new master cleanly (one master, no split-brain). But across *repeated* failovers the stale mount can
+accumulate and block a node's *next* promotion (`-12 Device is held open by mount`). Proper fix:
+bedrock-d must `umount` the arbiter FS as soon as it observes it has been outdated/force-secondaried
+(or lost the election), not rely on the frozen-device demote. Tracked in `lesson_fence_peer_stale_verdict`.
 
 ## Validation results (testbed, STOCK/unpatched 9.3.2, 2026-06-06)
 

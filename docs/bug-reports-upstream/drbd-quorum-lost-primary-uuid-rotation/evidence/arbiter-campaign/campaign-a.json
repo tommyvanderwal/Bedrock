@@ -1,0 +1,54 @@
+[
+  {
+    "tag": "A",
+    "iter": 1,
+    "desc": "isolate Secondary sim-1; Primary sim-3 should WIN (exit 4)",
+    "master": 3,
+    "expect": "win",
+    "frozen_node": null,
+    "gen_before": {
+      "1": "0x3fd7444c1e64a10a",
+      "2": "0x3fd7444c1e64a10a",
+      "3": "0x3fd7444c1e64a10a",
+      "4": "0x3fd7444c1e64a10a"
+    },
+    "gen_after_cut": {
+      "1": "0x3fd7444c1e64a10a",
+      "2": "0xd6ce18cba0ec067e",
+      "3": "0xd6ce18cba0ec067e",
+      "4": "0xd6ce18cba0ec067e"
+    },
+    "gen_after_heal": {
+      "1": "0xd6ce18cba0ec067e",
+      "2": "0xd6ce18cba0ec067e",
+      "3": "0xd6ce18cba0ec067e",
+      "4": "0xd6ce18cba0ec067e"
+    },
+    "gen_during_samples": {},
+    "frozen_minted_sibling": null,
+    "timeline": {
+      "cut": 1780765151.4515326,
+      "fence_decisions": {
+        "sim-1": null
+      },
+      "drbd_peer_lost_+s": null,
+      "quorum_lost_+s": null,
+      "quorum_regain_+s": null,
+      "old_primary_force_secondary_+s": null
+    },
+    "n254_after_cut": [
+      "sim-3"
+    ],
+    "roles_after_cut": {
+      "sim-1": "Secondary",
+      "sim-2": "Secondary",
+      "sim-3": "Primary",
+      "sim-4": "Secondary"
+    },
+    "resync_done_s": 15.3,
+    "split_brain": false,
+    "n254_after_heal": 1,
+    "passed": true,
+    "reasons": []
+  }
+]

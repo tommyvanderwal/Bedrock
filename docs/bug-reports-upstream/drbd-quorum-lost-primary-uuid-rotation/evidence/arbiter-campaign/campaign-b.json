@@ -1,0 +1,94 @@
+[
+  {
+    "tag": "B",
+    "iter": 1,
+    "desc": "isolate Primary sim-2 (minority, no witness); should LOSE (exit 6), freeze, no mint",
+    "master": 2,
+    "expect": "lose",
+    "frozen_node": 2,
+    "gen_before": {
+      "1": "0x46412a688162e0a6",
+      "2": "0x46412a688162e0a6",
+      "3": "0x46412a688162e0a6",
+      "4": "0x46412a688162e0a6"
+    },
+    "gen_after_cut": {
+      "1": "0xa0c0184cbd625b02",
+      "2": "0x46412a688162e0a6",
+      "3": "0xa0c0184cbd625b02",
+      "4": "0xa0c0184cbd625b02"
+    },
+    "gen_after_heal": {
+      "1": "0xa0c0184cbd625b02",
+      "2": "0xa0c0184cbd625b02",
+      "3": "0xa0c0184cbd625b02",
+      "4": "0xa0c0184cbd625b02"
+    },
+    "gen_during_samples": {
+      "2.5": "0x46412a688162e0a6",
+      "4.5": "0x46412a688162e0a6",
+      "6.6": "0x46412a688162e0a6",
+      "8.6": "0x46412a688162e0a6",
+      "10.7": "0x46412a688162e0a6",
+      "12.7": "0x46412a688162e0a6",
+      "14.8": "0x46412a688162e0a6",
+      "16.8": "0x46412a688162e0a6",
+      "18.8": "0x46412a688162e0a6",
+      "20.9": "0x46412a688162e0a6",
+      "22.9": "0x46412a688162e0a6",
+      "25.0": "0x46412a688162e0a6",
+      "27.0": "0x46412a688162e0a6",
+      "29.0": "0x46412a688162e0a6",
+      "31.1": "0x46412a688162e0a6",
+      "33.1": "0x46412a688162e0a6",
+      "35.2": "0x46412a688162e0a6",
+      "37.2": "0x46412a688162e0a6",
+      "39.3": "0x46412a688162e0a6",
+      "41.3": "0x46412a688162e0a6",
+      "43.3": "0x46412a688162e0a6",
+      "45.4": "0x46412a688162e0a6",
+      "47.4": "0x46412a688162e0a6",
+      "49.5": "0x46412a688162e0a6",
+      "51.5": "0x46412a688162e0a6",
+      "53.6": "0x46412a688162e0a6",
+      "55.6": "0x46412a688162e0a6",
+      "57.6": "0x46412a688162e0a6",
+      "59.7": "0x46412a688162e0a6",
+      "61.7": "0x46412a688162e0a6"
+    },
+    "frozen_minted_sibling": false,
+    "timeline": {
+      "cut": 1780767452.0147674,
+      "fence": {
+        "sim-1": null,
+        "sim-2": {
+          "fire_+s": 1.6,
+          "decision_+s": 23.63,
+          "exit": 6,
+          "verdict": "LOSE"
+        },
+        "sim-3": null,
+        "sim-4": null
+      },
+      "drbd_peer_lost_+s": null,
+      "quorum_lost_+s": null,
+      "quorum_regain_+s": null,
+      "old_primary_force_secondary_+s": null
+    },
+    "n254_after_cut": [
+      "sim-1"
+    ],
+    "roles_after_cut": {
+      "sim-1": "Primary",
+      "sim-2": "Primary",
+      "sim-3": "Secondary",
+      "sim-4": "Secondary"
+    },
+    "resync_done_s": 30.4,
+    "split_brain": false,
+    "n254_after_heal": 1,
+    "passed": true,
+    "reasons": [],
+    "notes": []
+  }
+]
