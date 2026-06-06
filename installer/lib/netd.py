@@ -1957,12 +1957,13 @@ def run_daemon(shared_state=None):
     # (split-brain prevention), which is the correct behaviour.
     try:
         from . import witness as _witness, election as _election
-        from . import witness_file as _witness_file
+        from . import witness_file as _witness_file, fence_verdict as _fence_verdict
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import witness as _witness, election as _election  # type: ignore
         from lib import witness_file as _witness_file  # type: ignore
+        from lib import fence_verdict as _fence_verdict  # type: ignore
     # node_id is the last octet of our /32 loopback (1-250 per
     # cluster-quorum-spec.md). Always present in N>=1 once state.json
     # has been initialised by mgmt_install/agent_install.
@@ -2064,6 +2065,12 @@ def run_daemon(shared_state=None):
                     d, ws, _witness, _election, last_election_outcome)
                 hb_send_round(d, now)
                 last_election_at = now
+                # Record the fresh outcome for the DRBD fence-peer handler
+                # (the bedrock-fence-peer arbiter callout reads it with a
+                # freshness + stability gate). Replaces resume-io. Independent
+                # of shared_state so the handler works even pre-dashboard.
+                if last_election_outcome:
+                    _fence_verdict.record(last_election_outcome)
                 # Publish outcome onto shared state for the dashboard
                 # + orchestrator (saves them re-reading /run files).
                 if shared_state is not None and last_election_outcome:

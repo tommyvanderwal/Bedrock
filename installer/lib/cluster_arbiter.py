@@ -220,16 +220,21 @@ def _drbd_promote() -> None:
     rc, _, err = _run(["drbdadm", "primary", TIER_RESOURCE], timeout=30)
     if rc == 0:
         return
-    # Failover case: the previous primary is unreachable (we got here
-    # via cluster election → set_mgmt_master → converge), so DRBD's
-    # "Need access to UpToDate data" check refuses without --force.
-    # The election (lib/election.py) + witness DRBD-UUID blessing
-    # (lib/witness.py) are the single source of authority for who
-    # owns the data — if they say we're master, we are. --force here
-    # is correct.
-    if "uptodate" in err.lower() or "need access" in err.lower():
-        log.warning("arbiter: drbdadm primary refused (peer unreachable); "
-                    "retrying with --force per election authority")
+    # Two cases need --force, and in BOTH the cluster election + witness are
+    # the single source of authority for who owns the data — if they say we are
+    # master (we only get here from a Leader outcome), we are:
+    #   * "Need access to UpToDate data" — the previous primary is unreachable.
+    #   * "No quorum" — with `quorum all`, DRBD refuses `primary` on a side that
+    #     lacks FULL replica quorum. But a witness-pivotal / minority takeover
+    #     is exactly that: bedrock-d's election (all nodes + witness) blessed us
+    #     even though DRBD's local replica count is short. --force is the
+    #     "bedrock-d says keep going" promote signal; the losing side is frozen
+    #     (quorum all) so it cannot be writing, so forcing primary here is safe.
+    el = err.lower()
+    if "uptodate" in el or "need access" in el or "quorum" in el:
+        log.warning("arbiter: drbdadm primary refused (%s); retrying with "
+                    "--force per election authority",
+                    "no quorum" if "quorum" in el else "peer unreachable")
         rc, _, err = _run(
             ["drbdadm", "--", "--force", "primary", TIER_RESOURCE],
             timeout=30,
@@ -242,6 +247,136 @@ def _drbd_promote() -> None:
 def _drbd_secondary() -> None:
     log.info("arbiter: drbdadm secondary %s", TIER_RESOURCE)
     _run(["drbdadm", "secondary", TIER_RESOURCE], timeout=30)
+
+
+# One-shot guard: pin the DRBD safety resource-options once per daemon lifetime
+# (the kernel keeps them until the resource goes down).
+_DRBD_SAFETY_DONE = False
+
+
+def _enforce_drbd_safety_options() -> None:
+    """Pin the load-bearing DRBD resource-options on the live arbiter resource.
+
+    DRBD ships dangerous defaults for a quorum-critical singleton:
+      * ``auto-promote yes`` — self-promotes to Primary the moment the device
+        is opened. We forbid it (``auto-promote no``): the election + witness
+        are the SOLE promote authority, and only bedrock-d's ``drbdadm primary``
+        ever promotes. With self-promote off, two nodes can never both be
+        Primary → 2-primary split-brain impossible by construction.
+      * ``quorum off`` — a Primary keeps writing (and rotates its current-UUID)
+        even in a minority. We set ``quorum all`` + ``on-no-quorum suspend-io``
+        so a Primary that loses ANY peer FREEZES instantly (no writes, no UUID
+        rotation) — DRBD must stop the moment it loses a node, not wait for
+        bedrock-d to notice (by then the UUID has advanced and IOPs crossed the
+        line = split brain). On peer loss DRBD calls the fence-peer handler
+        (``bedrock-fence-peer``), which returns bedrock-d's fresh+stable election
+        verdict — outdate the peer (continue) or outdate self (yield). This
+        function also deploys that handler + applies ``fencing resource-only``.
+      * ``on-suspended-primary-outdated force-secondary`` — a returning frozen
+        Primary that reconnects to a newer-generation Primary auto-demotes
+        (backstop; bedrock-d's self-demote is the primary clean path).
+
+    The rendered .res declares all of these (fresh installs); this live-sets
+    them on clusters that predate the change. Idempotent, forks at most once per
+    daemon start. The core trio is set together; the (newer) outdated-handling
+    is best-effort so an older drbd-utils that rejects the flag still gets the
+    rest."""
+    global _DRBD_SAFETY_DONE
+    if _DRBD_SAFETY_DONE:
+        return
+    # Deploy the fence-peer handler FIRST — DRBD must be able to run it before
+    # fencing is active (a missing handler -> drbdadm error -> DRBD leaves IO
+    # frozen: safe, but not what we want). Idempotent.
+    try:
+        from . import fence_verdict as _fv
+    except ImportError:
+        from lib import fence_verdict as _fv  # type: ignore
+    try:
+        _fv.deploy_handler()
+    except OSError as e:
+        log.warning("arbiter: fence-peer handler deploy failed: %s", e)
+    rc, _, _ = _run(["drbdsetup", "resource-options", TIER_RESOURCE,
+                     "--auto-promote=no", "--quorum=all",
+                     "--on-no-quorum=suspend-io"])
+    if rc != 0:
+        return  # retry next tick; don't latch a partial apply
+    # Best-effort (drbd-utils >= 9.1.7); harmless if unsupported.
+    _run(["drbdsetup", "resource-options", TIER_RESOURCE,
+          "--on-suspended-primary-outdated=force-secondary"])
+    # Apply `fencing resource-only` + the fence-peer handler from the (updated)
+    # .res live — for clusters that predate the change; a no-op on fresh installs
+    # already up from the new .res. THIS is what makes DRBD call bedrock-fence-peer
+    # on peer loss instead of the removed resume-io path.
+    _run(["drbdadm", "adjust", TIER_RESOURCE])
+    _DRBD_SAFETY_DONE = True
+
+
+def _drbd_suspended_quorum() -> bool:
+    """True iff the arbiter resource currently has IO suspended because it lost
+    DRBD quorum (``suspended:quorum`` in drbdsetup status)."""
+    rc, out, _ = _run(["drbdsetup", "status", TIER_RESOURCE])
+    return rc == 0 and "suspended:quorum" in (out or "")
+
+
+# (REMOVED) _drbd_resume_io / ensure_drbd_write_permission — the resume-io path
+# was the spurious-UUID ROOT CAUSE: it fired every converge tick on a STALE,
+# unconfirmed cached election outcome, and `drbdadm resume-io` on a quorum-lost
+# armed Primary made DRBD mint a new current-UUID (zero writes) -> false
+# split-brain on heal. Replaced by the native fence-peer arbiter callout: on
+# losing a peer DRBD calls `bedrock-fence-peer`, which returns bedrock-d's
+# FRESH + STABLE election verdict (fence_verdict.py) as exit 4 (outdate peer ->
+# regain quorum -> continue) / 6 (outdate self -> yield) / 1 (leave IO frozen).
+# See docs/drbd-fence-peer-arbiter-design.md + bug-reports-upstream/.
+
+
+def _drbd_up() -> bool:
+    """``drbdadm up`` the arbiter resource (attach + connect as Secondary).
+
+    The arbiter DRBD is deliberately NOT systemd-auto-started (install.sh
+    disables drbd.service) so a promote never races a half-configured resource
+    at boot — bedrock-d owns the decision and calls this once it holds the tier.
+    Bringing it up needs no quorum and no Primary: peers connect and resync on
+    UUID lineage as Secondary. Idempotent: returns True if already up."""
+    rc, _, err = _run(["drbdadm", "up", TIER_RESOURCE], timeout=30)
+    e = (err or "").lower()
+    if rc == 0 or "already" in e or "exists" in e:
+        return True
+    log.warning("arbiter: drbdadm up %s failed: %s", TIER_RESOURCE, err.strip())
+    return False
+
+
+def ensure_arbiter_drbd_up() -> None:
+    """Quorum-aware boot / self-heal for the arbiter (cluster-tier) DRBD.
+
+    Runs on EVERY node that holds the arbiter tier (the cluster-drbd-ready
+    marker) — followers included — so the master's writes replicate and a
+    failover target always holds an UpToDate copy. Brings the resource up as
+    Secondary if it's down (cold boot, crash) and pins auto-promote=no. The
+    elected master separately promotes to Primary in promote_to_arbiter_host().
+    Idempotent + cheap once up.
+
+    R5 / degraded recovery: with auto-promote=no the only StandAlone we could
+    ever see is a genuine 2-primary divergence — which the election/witness make
+    impossible by construction. So if one is ever observed we FAIL LOUD and
+    leave the data untouched for an operator (never silently discard); the
+    normal path is just up→Secondary→resync."""
+    if not _drbd_resource_exists():
+        return  # N=1 / not in the arbiter tier yet — nothing to up
+    if _drbd_role() == "Unknown":
+        log.info("arbiter: cluster DRBD is down — bringing it up as Secondary "
+                 "(quorum-aware boot/self-heal)")
+        if not _drbd_up():
+            return
+    _enforce_drbd_safety_options()
+    # Surface a StandAlone connection loudly. It should be unreachable under
+    # auto-promote=no + the election authority; if it happens, data has
+    # genuinely diverged and only an operator (or a future fenced resolver)
+    # should choose a survivor — we do NOT auto-discard.
+    rc, out, _ = _run(["drbdadm", "cstate", TIER_RESOURCE])
+    if rc == 0 and "StandAlone" in (out or ""):
+        log.error("arbiter: cluster DRBD is StandAlone (split-brain) — NOT "
+                  "auto-resolving; manual recovery required. cstate=%r",
+                  (out or "").strip())
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -436,6 +571,12 @@ def promote_to_arbiter_host() -> dict:
         # Steps 6: hardware/software state changes — assert the
         # DRBD-primary + mount + .254 trio.
         log.info("arbiter: promoting (N=%d, cluster DRBD present)", n)
+        # On a cold boot / post-crash the resource is down (systemd does not
+        # auto-start it); `drbdadm primary` on a down resource fails "Unknown
+        # resource". Bring it up (Secondary) + pin auto-promote=no first.
+        # Idempotent no-op when already up.
+        _drbd_up()
+        _enforce_drbd_safety_options()
         _drbd_promote()
         _mount()
         ARBITER_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1038,12 +1179,20 @@ def _read_local_drbd_uuid(resource: str = TIER_RESOURCE) -> str:
         # debugfs present but unparseable → defer; do NOT use stale dump-md.
         return ""
     except FileNotFoundError:
-        pass  # resource detached (N=1): dump-md current-uuid is authoritative
+        # debugfs absent. If this IS the arbiter tier resource and it is
+        # configured-but-down (marker present, cold boot before
+        # ensure_arbiter_drbd_up has attached it), dump-md only spams
+        # `drbdmeta ... dump-md exit-255` on every election tick and tells us
+        # nothing live → defer; the up reconcile attaches it within seconds.
+        if resource == TIER_RESOURCE and _drbd_resource_exists():
+            return ""
+        # else: genuinely detached / scratch — on-disk current-uuid IS live.
     except OSError:
         return ""  # transient read error on an attached resource → defer
     try:
         out = subprocess.check_output(
-            ["drbdadm", "dump-md", resource], timeout=3
+            ["drbdadm", "dump-md", resource], timeout=3,
+            stderr=subprocess.DEVNULL,   # don't leak drbdmeta errors to journal
         )
         for line in out.decode().splitlines():
             s = line.strip()
@@ -1093,8 +1242,22 @@ def demote_arbiter_host() -> dict:
     _ip_del()
     if drbd_present:
         _svc_stop(ARBITER_SVC)
-        _umount()
-        _drbd_secondary()
+        if _drbd_suspended_quorum():
+            # DRBD froze this node on quorum loss (it lost a peer). We step DOWN
+            # at the bedrock-d level (services stopped + .254 released above) but
+            # we must NOT resume-io to umount/secondary — resuming would let the
+            # minority write, the very thing the freeze prevents. Leave DRBD
+            # frozen on its old UUID; it resolves on reconnect via
+            # on-suspended-primary-outdated=force-secondary (sees the newer-
+            # generation master → demotes + resyncs). No minority write, ever.
+            log.info("arbiter: DRBD frozen (quorum lost) — stepping down at the "
+                     "bedrock-d level; leaving DRBD frozen on its old UUID until "
+                     "it reconnects to the blessed master")
+        else:
+            # Graceful demote while still quorate (e.g. role handover): the
+            # device isn't frozen, so umount + secondary cleanly.
+            _umount()
+            _drbd_secondary()
     # Per cluster-quorum-spec.md INV-7: a witness claim never times out.
     # After self-demote we MUST clear our claim bit so a survivor's
     # takeover protocol can proceed without operator intervention. (This is
@@ -1197,6 +1360,20 @@ def converge() -> dict:
         .254 is bound (so a follower with leftover state from a prior
         role is reliably cleaned up).
     """
+    # Quorum-aware boot / self-heal: ensure the arbiter DRBD is up (Secondary)
+    # on every node that holds the tier — followers included — so the master's
+    # writes replicate and a failover target stays UpToDate. Runs before the
+    # hosting decision so a would-be master finds the resource already attached
+    # when it promotes. Idempotent + cheap once up.
+    ensure_arbiter_drbd_up()
+
+    # NOTE: write-permission is NO LONGER driven from converge. On peer loss DRBD
+    # itself calls the fence-peer handler (bedrock-fence-peer), which asks
+    # bedrock-d the fresh+stable election verdict and outdates the peer (continue)
+    # or itself (yield). The removed ensure_drbd_write_permission/resume-io was
+    # the spurious-UUID root cause. _enforce_drbd_safety_options() deploys the
+    # handler + applies `fencing resource-only`.
+
     should_host = i_should_host_arbiter()
     status = arbiter_status()
     drbd_present = _drbd_resource_exists()

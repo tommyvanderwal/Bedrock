@@ -992,7 +992,27 @@ def render_drbd_res(resource: str, minor: int,
     body = (
         f'resource {resource} {{\n'
         f'  protocol C;\n'
-        f'  options {{ on-no-quorum suspend-io; }}\n'
+        # Quorum-gated writes — the load-bearing split-brain prevention.
+        #  * quorum all + on-no-quorum suspend-io: a Primary that loses ANY peer
+        #    FREEZES all IO instantly and, crucially, does NOT rotate its
+        #    current-UUID. DRBD must stop the moment it loses a node — it can't
+        #    wait for bedrock-d to notice the split, because by then the UUID
+        #    has already advanced and IOPs have crossed the line (= split
+        #    brain). DRBD stays "dumb": replicate, and stop on any loss. Only
+        #    bedrock-d's election re-enables writes (`drbdadm resume-io`), and
+        #    only on the partition bedrock-d blesses (the side that still holds
+        #    quorum across ALL cluster nodes + witness — which DRBD's local
+        #    replica view cannot judge). bedrock-d only ever RESUMES; it never
+        #    suspends (too late). The losing side never gets the signal → stays
+        #    frozen → steps down.
+        #  * on-suspended-primary-outdated force-secondary: a returning frozen
+        #    Primary that reconnects to a newer-generation Primary auto-demotes.
+        #  * auto-promote no — DRBD must NEVER pick Primary itself; only
+        #    bedrock-d's election-gated `drbdadm primary` promotes. Two nodes
+        #    can never both self-promote, so 2-primary split-brain is impossible
+        #    by construction.
+        f'  options {{ quorum all; on-no-quorum suspend-io; '
+        f'on-suspended-primary-outdated force-secondary; auto-promote no; }}\n'
         # rs-discard-granularity + discard-zeroes-if-aligned let DRBD
         # pass TRIM/discard down through to the thin LV (SG-06), so a
         # `fstrim` on the mounted FS reclaims pool blocks on every peer.
@@ -1001,7 +1021,14 @@ def render_drbd_res(resource: str, minor: int,
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
-        f'after-sb-2pri disconnect; }}\n'
+        f'after-sb-2pri disconnect; '
+        f'fencing resource-only; }}\n'
+        # fence-peer = bedrock-d's arbiter callout (REPLACES resume-io): on
+        # losing a peer the Primary asks bedrock-d "may I continue?". The
+        # handler returns the fresh+stable election verdict as exit 4 (outdate
+        # peer -> regain quorum -> continue) / 6 (outdate self -> yield) / 1
+        # (leave IO frozen). docs/drbd-fence-peer-arbiter-design.md.
+        f'  handlers {{ fence-peer "/usr/local/lib/bedrock/bedrock-fence-peer"; }}\n'
         f'\n' +
         ''.join(on_blocks) +
         '\n' +
@@ -1209,13 +1236,37 @@ def render_drbd_res_mesh(resource: str, minor: int,
     body = (
         f'resource {resource} {{\n'
         f'  protocol C;\n'
-        f'  options {{ on-no-quorum suspend-io; }}\n'
+        # Quorum-gated writes — the load-bearing split-brain prevention.
+        #  * quorum all + on-no-quorum suspend-io: a Primary that loses ANY peer
+        #    FREEZES all IO instantly and, crucially, does NOT rotate its
+        #    current-UUID. DRBD must stop the moment it loses a node — it can't
+        #    wait for bedrock-d to notice the split, because by then the UUID
+        #    has already advanced and IOPs have crossed the line (= split
+        #    brain). DRBD stays "dumb": replicate, and stop on any loss. Only
+        #    bedrock-d's election re-enables writes (`drbdadm resume-io`), and
+        #    only on the partition bedrock-d blesses (the side that still holds
+        #    quorum across ALL cluster nodes + witness — which DRBD's local
+        #    replica view cannot judge). bedrock-d only ever RESUMES; it never
+        #    suspends (too late). The losing side never gets the signal → stays
+        #    frozen → steps down.
+        #  * on-suspended-primary-outdated force-secondary: a returning frozen
+        #    Primary that reconnects to a newer-generation Primary auto-demotes.
+        #  * auto-promote no — DRBD must NEVER pick Primary itself; only
+        #    bedrock-d's election-gated `drbdadm primary` promotes. Two nodes
+        #    can never both self-promote, so 2-primary split-brain is impossible
+        #    by construction.
+        f'  options {{ quorum all; on-no-quorum suspend-io; '
+        f'on-suspended-primary-outdated force-secondary; auto-promote no; }}\n'
         f'  disk    {{ c-plan-ahead 0; c-min-rate 0; resync-rate 100M; '
         f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
         f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
-        f'after-sb-2pri disconnect; }}\n'
+        f'after-sb-2pri disconnect; '
+        f'fencing resource-only; }}\n'
+        # fence-peer = bedrock-d's arbiter callout (REPLACES resume-io); see
+        # render_drbd_res + docs/drbd-fence-peer-arbiter-design.md.
+        f'  handlers {{ fence-peer "/usr/local/lib/bedrock/bedrock-fence-peer"; }}\n'
         f'\n' +
         ''.join(on_blocks) +
         '\n' +
