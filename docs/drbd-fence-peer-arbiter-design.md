@@ -179,13 +179,21 @@ it does not race; but DRBD's evidence makes that agreement arrive faster.
    (conn-loss path → LOSE) and the new master (promote path → WIN).
 5. `bedrock-unfence-peer` clears any per-peer state on heal.
 
-### Known follow-up — the loser's clean demote (the gating bug for *clean* auto-failover)
+### The loser's clean demote — RESOLVED (force-release, 2026-06-07)
 
-**Campaign result (2026-06-06):** the fence-peer arbitration is solid — **no spurious sibling mint
-in 9/9 partition iterations** (A×3 WIN, B×3 LOSE, C 2v2), correct LOSE(6)/WIN(4) every time, clear
-timing (cut → DRBD detect ~5–10 s → fence fires → WAIT for netd convergence → decide @~13–24 s →
-quorum regain / winner force-promote → heal). A **single** clean failover works end-to-end. But the
-**heal path** has a real, separate bug, root-caused precisely:
+**Status: FIXED + validated.** The realistic test — fail, wait for FULL reconvergence, only then fail
+again (NOT failover-during-convergence, which is a different/unrealistic scenario) — passes **B×3 = 3/3**:
+each failover force-demotes the loser, the winner promotes, heal resyncs clean (~10–15 s), one master
+persists, and between failovers the cluster fully reconverges (every loser returns to a clean,
+promote-able Secondary within the ~1 min + resync budget). Plus the fence arbitration itself: no
+spurious sibling mint in *every* partition iteration, correct LOSE(6)/WIN(4).
+
+**The fix** (`_force_release_drbd`, commit `e34690c`): on observed loss the frozen branch of
+`demote_arbiter_host` HARD-releases — `drbdsetup secondary --force=yes` (demotes a frozen Primary in
+~12 ms, EIOing held IO, **never** resume-io), then SIGKILLs the mount holders BY SERVICE NAME
+(rqlited-arbiter + weed-filer + weed-s3 — **never** `fuser -m`, which on an EIO zombie falls back to
+`/` and kills the box), then `umount -l`. The loser is Secondary before heal → reconnects 0-pri →
+`after-sb-0pri discard-zero-changes` auto-resolves. The original root cause, for the record:
 
 The losing old master returns `exit 6` → `D_OUTDATED` → `on-suspended-primary-outdated
 force-secondary` *should* demote it. It can't: the node is **frozen** (`suspended:quorum`, IO to the

@@ -1,0 +1,249 @@
+[
+  {
+    "tag": "A",
+    "iter": 1,
+    "desc": "isolate Secondary sim-2; Primary sim-1 should WIN (exit 4)",
+    "master": 1,
+    "expect": "win",
+    "frozen_node": null,
+    "gen_before": {
+      "1": "0xc7aa274720579366",
+      "2": "0xc7aa274720579366",
+      "3": "0xc7aa274720579366",
+      "4": "0xc7aa274720579366"
+    },
+    "gen_after_cut": {
+      "1": "0x3744db4d338c8cb2",
+      "2": "0xc7aa274720579366",
+      "3": "0x3744db4d338c8cb2",
+      "4": "0x3744db4d338c8cb2"
+    },
+    "gen_after_heal": {
+      "1": "0x3744db4d338c8cb2",
+      "2": "0x3744db4d338c8cb2",
+      "3": "0x3744db4d338c8cb2",
+      "4": "0x3744db4d338c8cb2"
+    },
+    "gen_during_samples": {},
+    "frozen_minted_sibling": null,
+    "timeline": {
+      "cut": 1780782311.1985404,
+      "fence": {
+        "sim-1": {
+          "fire_+s": 5.37,
+          "decision_+s": 9.0,
+          "exit": 4,
+          "verdict": "WIN"
+        },
+        "sim-2": null,
+        "sim-3": null,
+        "sim-4": null
+      },
+      "drbd_peer_lost_+s": 5.84,
+      "quorum_lost_+s": 5.84,
+      "quorum_regain_+s": 9.58,
+      "old_primary_force_secondary_+s": null
+    },
+    "n254_after_cut": [
+      "sim-1"
+    ],
+    "roles_after_cut": {
+      "sim-1": "Primary",
+      "sim-2": "Secondary",
+      "sim-3": "Secondary",
+      "sim-4": "Secondary"
+    },
+    "resync_done_s": 20.3,
+    "split_brain": false,
+    "n254_after_heal": 1,
+    "passed": true,
+    "reasons": [],
+    "notes": []
+  },
+  {
+    "tag": "B",
+    "iter": 1,
+    "desc": "isolate Primary sim-1 (minority, no witness); should LOSE (exit 6), freeze, no mint",
+    "master": 1,
+    "expect": "lose",
+    "frozen_node": 1,
+    "gen_before": {
+      "1": "0x3744db4d338c8cb2",
+      "2": "0x3744db4d338c8cb2",
+      "3": "0x3744db4d338c8cb2",
+      "4": "0x3744db4d338c8cb2"
+    },
+    "gen_after_cut": {
+      "1": "0x3744db4d338c8cb2",
+      "2": "0x03a0dbbe7200144a",
+      "3": "0x03a0dbbe7200144a",
+      "4": "0x03a0dbbe7200144a"
+    },
+    "gen_after_heal": {
+      "1": "0x03a0dbbe7200144a",
+      "2": "0x03a0dbbe7200144a",
+      "3": "0x03a0dbbe7200144a",
+      "4": "0x03a0dbbe7200144a"
+    },
+    "gen_during_samples": {
+      "2.6": "0x3744db4d338c8cb2",
+      "4.6": "0x3744db4d338c8cb2",
+      "6.7": "0x3744db4d338c8cb2",
+      "8.7": "0x3744db4d338c8cb2",
+      "10.7": "0x3744db4d338c8cb2",
+      "12.8": "0x3744db4d338c8cb2",
+      "14.8": "0x3744db4d338c8cb2",
+      "16.8": "0x3744db4d338c8cb2",
+      "18.9": "0x3744db4d338c8cb2",
+      "20.9": "0x3744db4d338c8cb2",
+      "23.0": "0x3744db4d338c8cb2",
+      "25.0": "0x3744db4d338c8cb2",
+      "27.0": "0x3744db4d338c8cb2",
+      "29.1": "0x3744db4d338c8cb2",
+      "31.1": "0x3744db4d338c8cb2",
+      "33.2": "0x3744db4d338c8cb2",
+      "35.2": "0x3744db4d338c8cb2",
+      "37.3": "0x3744db4d338c8cb2",
+      "39.3": "0x3744db4d338c8cb2",
+      "41.3": "0x3744db4d338c8cb2",
+      "43.4": "0x3744db4d338c8cb2",
+      "45.4": "0x3744db4d338c8cb2",
+      "47.5": "0x3744db4d338c8cb2",
+      "49.5": "0x3744db4d338c8cb2",
+      "51.5": "0x3744db4d338c8cb2",
+      "53.6": "0x3744db4d338c8cb2",
+      "55.6": "0x3744db4d338c8cb2",
+      "57.7": "0x3744db4d338c8cb2",
+      "59.7": "0x3744db4d338c8cb2",
+      "61.8": "0x3744db4d338c8cb2"
+    },
+    "frozen_minted_sibling": false,
+    "timeline": {
+      "cut": 1780782397.5260818,
+      "fence": {
+        "sim-1": {
+          "fire_+s": 9.2,
+          "decision_+s": 23.02,
+          "exit": 6,
+          "verdict": "LOSE"
+        },
+        "sim-2": null,
+        "sim-3": null,
+        "sim-4": null
+      },
+      "drbd_peer_lost_+s": 9.62,
+      "quorum_lost_+s": 9.62,
+      "quorum_regain_+s": null,
+      "old_primary_force_secondary_+s": null
+    },
+    "n254_after_cut": [
+      "sim-2"
+    ],
+    "roles_after_cut": {
+      "sim-1": "Primary",
+      "sim-2": "Primary",
+      "sim-3": "Secondary",
+      "sim-4": "Secondary"
+    },
+    "resync_done_s": 91.5,
+    "split_brain": false,
+    "n254_after_heal": 1,
+    "passed": true,
+    "reasons": [],
+    "notes": []
+  },
+  {
+    "tag": "C",
+    "iter": 1,
+    "desc": "2v2: lose=[2, 1] (no witness) vs win=[3, 4]+witness; Primary sim-2 should LOSE, freeze, no mint",
+    "master": 2,
+    "expect": "lose",
+    "frozen_node": 2,
+    "gen_before": {
+      "1": "0x03a0dbbe7200144a",
+      "2": "0x03a0dbbe7200144a",
+      "3": "0x03a0dbbe7200144a",
+      "4": "0x03a0dbbe7200144a"
+    },
+    "gen_after_cut": {
+      "1": "0x03a0dbbe7200144a",
+      "2": "0x03a0dbbe7200144a",
+      "3": "0x6ba02913501d23c8",
+      "4": "0x6ba02913501d23c8"
+    },
+    "gen_after_heal": {
+      "1": "0x6ba02913501d23c8",
+      "2": "0x03a0dbbe7200144a",
+      "3": "0x6ba02913501d23c8",
+      "4": "0x6ba02913501d23c8"
+    },
+    "gen_during_samples": {
+      "2.6": "0x03a0dbbe7200144a",
+      "4.6": "0x03a0dbbe7200144a",
+      "6.7": "0x03a0dbbe7200144a",
+      "8.7": "0x03a0dbbe7200144a",
+      "10.8": "0x03a0dbbe7200144a",
+      "12.8": "0x03a0dbbe7200144a",
+      "14.8": "0x03a0dbbe7200144a",
+      "16.9": "0x03a0dbbe7200144a",
+      "18.9": "0x03a0dbbe7200144a",
+      "21.0": "0x03a0dbbe7200144a",
+      "23.0": "0x03a0dbbe7200144a",
+      "25.0": "0x03a0dbbe7200144a",
+      "27.1": "0x03a0dbbe7200144a",
+      "29.1": "0x03a0dbbe7200144a",
+      "31.2": "0x03a0dbbe7200144a",
+      "33.2": "0x03a0dbbe7200144a",
+      "35.3": "0x03a0dbbe7200144a",
+      "37.3": "0x03a0dbbe7200144a",
+      "39.3": "0x03a0dbbe7200144a",
+      "41.4": "0x03a0dbbe7200144a",
+      "43.4": "0x03a0dbbe7200144a",
+      "45.4": "0x03a0dbbe7200144a",
+      "47.5": "0x03a0dbbe7200144a",
+      "49.5": "0x03a0dbbe7200144a",
+      "51.6": "0x03a0dbbe7200144a",
+      "53.6": "0x03a0dbbe7200144a",
+      "55.7": "0x03a0dbbe7200144a",
+      "57.7": "0x03a0dbbe7200144a",
+      "59.7": "0x03a0dbbe7200144a",
+      "61.8": "0x03a0dbbe7200144a"
+    },
+    "frozen_minted_sibling": false,
+    "timeline": {
+      "cut": 1780782556.4941604,
+      "fence": {
+        "sim-1": null,
+        "sim-2": {
+          "fire_+s": 7.82,
+          "decision_+s": 19.1,
+          "exit": 6,
+          "verdict": "LOSE"
+        },
+        "sim-3": null,
+        "sim-4": null
+      },
+      "drbd_peer_lost_+s": 7.91,
+      "quorum_lost_+s": 7.91,
+      "quorum_regain_+s": null,
+      "old_primary_force_secondary_+s": null
+    },
+    "n254_after_cut": [
+      "sim-3"
+    ],
+    "roles_after_cut": {
+      "sim-1": "Secondary",
+      "sim-2": "Primary",
+      "sim-3": "Primary",
+      "sim-4": "Secondary"
+    },
+    "resync_done_s": null,
+    "split_brain": false,
+    "n254_after_heal": 1,
+    "passed": false,
+    "reasons": [
+      "resync did not complete within window"
+    ],
+    "notes": []
+  }
+]

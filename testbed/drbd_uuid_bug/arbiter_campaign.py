@@ -165,15 +165,32 @@ def parse_fence(n, since_epoch):
     return fire, decision, code
 
 # ---- health gate ------------------------------------------------------------
-def wait_healthy(timeout=120):
+def wait_healthy(timeout=150, settle_checks=3):
+    """FULLY-RECONVERGED gate (realistic budget per Tommy: ~1 min + resync). Requires, held
+    STABLE for `settle_checks` consecutive polls:
+      * exactly ONE master (.254 holder),
+      * every node's 3 peers UpToDate (resync done everywhere),
+      * ONLY that master has the arbiter mounted — a node that was force-released as a loser
+        must be back to a CLEAN, promote-able Secondary (no stale mount) before the next
+        failover. (The weak old gate let the next failover start before the prior loser had
+        fully recovered -> the winner-can't-promote false failure.)
+    Returns False if the cluster can't reach this within the budget — i.e. a force-released
+    node left PERSISTENT damage, which is a real bug (not a timing artifact)."""
     t0 = time.time()
+    good = 0
     while time.time() - t0 < timeout:
-        n254 = sum(1 for n in NODES if has254(n))
+        n254 = [n for n in NODES if has254(n)]
         ups = {n: S(n, f"drbdsetup status {RES} 2>/dev/null | grep -cE 'peer-disk:UpToDate'")
                for n in NODES}
+        mnt = {n: S(n, "grep -c ' /var/lib/bedrock/cluster ' /proc/self/mounts") for n in NODES}
         upok = all(ups[n] == "3" for n in NODES)
-        if n254 == 1 and upok:
-            return True
+        mounted = [n for n in NODES if mnt.get(n) == "1"]
+        if len(n254) == 1 and upok and mounted == n254:
+            good += 1
+            if good >= settle_checks:
+                return True
+        else:
+            good = 0
         time.sleep(4)
     return False
 
