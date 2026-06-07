@@ -1018,7 +1018,11 @@ def render_drbd_res(resource: str, minor: int,
         # `fstrim` on the mounted FS reclaims pool blocks on every peer.
         f'  disk    {{ c-plan-ahead 0; c-min-rate 0; resync-rate 100M; '
         f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
-        f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
+        # ping-int 5: keepalive on an IDLE link, so a silent peer loss is seen in
+        # ping-int(5) + ping-timeout(~0.5) ≈ 5.5 s — under the timeout(6 s) active-IO path, so
+        # ANY connection loss is noticed by DRBD in ≤6 s, consistently. Well inside a guest's
+        # ~30 s disk timeout (6 s detect + ~24 s to fail over + resume writes). Bedrock default.
+        f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; ping-int 5; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
         f'after-sb-2pri disconnect; '
@@ -1259,7 +1263,11 @@ def render_drbd_res_mesh(resource: str, minor: int,
         f'on-suspended-primary-outdated force-secondary; auto-promote no; }}\n'
         f'  disk    {{ c-plan-ahead 0; c-min-rate 0; resync-rate 100M; '
         f'rs-discard-granularity 65536; discard-zeroes-if-aligned yes; }}\n'
-        f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; '
+        # ping-int 5: keepalive on an IDLE link, so a silent peer loss is seen in
+        # ping-int(5) + ping-timeout(~0.5) ≈ 5.5 s — under the timeout(6 s) active-IO path, so
+        # ANY connection loss is noticed by DRBD in ≤6 s, consistently. Well inside a guest's
+        # ~30 s disk timeout (6 s detect + ~24 s to fail over + resume writes). Bedrock default.
+        f'  net     {{ max-buffers 8000; sndbuf-size 0; rcvbuf-size 0; ping-int 5; '
         f'after-sb-0pri discard-zero-changes; '
         f'after-sb-1pri discard-secondary; '
         f'after-sb-2pri disconnect; '
@@ -1423,7 +1431,11 @@ def promote_local_to_drbd_master(resource: str, peers: list[dict]) -> None:
     already_configured = (rc_chk.returncode == 0 and
                           "no resources" not in (rc_chk.stderr or "").lower())
     if not already_configured:
-        run(f"drbdadm create-md {resource} --force --max-peers=7")
+        # --bitmap-block-size=1048576 (1 MiB vs 4 KiB PAGE_SIZE default): coarser dirty-bitmap
+        # = far less RAM per resource (1 bit per 1 MiB, not per 4 KiB) for a coarser resync
+        # (a small write dirties a 1 MiB region); we have the bandwidth. Set at metadata-create
+        # time (NOT live-adjustable) -> applies to every resource Bedrock makes. Bedrock default.
+        run(f"drbdadm create-md {resource} --force --max-peers=7 --bitmap-block-size=1048576")
         run(f"drbdadm up {resource}")
     # drbdadm up on an already-up resource fails with "Minor or
     # volume exists already" (rc=10). Skip when status confirms the
@@ -1492,7 +1504,12 @@ def join_drbd_peer(resource: str, peers: list[dict]) -> None:
     write_drbd_resource(resource, peers)
     # create-md can fail if metadata already exists from a previous
     # attempt; --force overwrites. Either succeeds.
-    run(f"drbdadm create-md {resource} --force --max-peers=7")
+    # --bitmap-block-size=1048576 (1 MiB vs the 4 KiB PAGE_SIZE default): coarser dirty-bitmap
+    # = far less RAM per resource (one bit per 1 MiB instead of per 4 KiB) at the cost of a
+    # coarser resync (a small write dirties a 1 MiB region); we have the resync bandwidth.
+    # Set at metadata-create time (NOT live-adjustable), so it applies to every resource Bedrock
+    # creates from now on. Bedrock default for all DRBD uses.
+    run(f"drbdadm create-md {resource} --force --max-peers=7 --bitmap-block-size=1048576")
     # drbdadm up: if already up, swallow the "exists already" error.
     r = subprocess.run(
         f"drbdadm up {resource}",
