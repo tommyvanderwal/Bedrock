@@ -1274,13 +1274,15 @@ def _force_release_drbd() -> None:
     else:
         log.error("arbiter: force-release could not demote to Secondary: %s", (err or "").strip())
     # Now the device is a (read-only) Secondary, so these no longer block on a frozen Primary.
-    # Kill EVERY holder of the arbiter mount BY SERVICE NAME — the arbiter rqlite AND the
-    # SeaweedFS filer (singleton) + s3 both keep data on this mount, and if the filer survives
-    # it holds the device open ("-12 held open") and blocks this node's NEXT promote.
+    # Kill the arbiter mount's holders BY SERVICE NAME — the arbiter rqlite and the SeaweedFS
+    # FILER (the cluster singleton; its leveldb lives on this mount). NOT weed-s3: that is a
+    # PER-NODE gateway (bound 0.0.0.0:8333, no data on the arbiter mount) and must keep running
+    # through a failover — SIGKILLing it here used to take out this node's own S3 endpoint.
+    # If the filer survives it holds the device open ("-12 held open") and blocks the next promote.
     # ☠️ NEVER `fuser -k -m <mount>` here: on an EIO zombie mount fuser stats the path, gets
     # EIO, falls back to the containing mount '/', and -k SIGKILLs the whole box (sshd + init).
     # SIGKILL (not stop) so a flush can't hang; lazy umount (no fsync) after.
-    for _svc in (ARBITER_SVC, "bedrock-weed-filer.service", "bedrock-weed-s3.service"):
+    for _svc in (ARBITER_SVC, "bedrock-weed-filer.service"):
         _run(["systemctl", "kill", "--signal=SIGKILL", _svc], timeout=8)
     _run(["umount", "-l", str(MOUNT_POINT)], timeout=10)
 

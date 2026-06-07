@@ -406,30 +406,30 @@ def is_filer_active() -> bool:
 
 def promote_to_filer_host() -> None:
     """Called by cluster_arbiter.promote_to_arbiter_host() after the
-    cluster-singleton volume is mounted. Starts filer + s3 gateway on
-    this node. Idempotent."""
-    log.info("seaweedfs: starting filer + s3 on this node")
+    cluster-singleton volume is mounted. Starts ONLY the filer (the
+    cluster singleton on .254). The weed-s3 gateway is a PER-NODE service
+    (runs on every node, bound 0.0.0.0:8333, started/restarted by
+    promote_to_master_volume_host) — it is NOT tied to the arbiter role and
+    must NOT be touched here. Idempotent."""
+    log.info("seaweedfs: starting filer on this node")
     # Clear any stuck start-rate-limit from a previous failed start
     # attempt (env file race during install, mount-not-ready, etc.).
     # stderr silenced — `reset-failed` on a not-yet-loaded unit
     # complains, but the failure mode is harmless.
     subprocess.run(
-        ["systemctl", "reset-failed",
-         "bedrock-weed-filer.service",
-         "bedrock-weed-s3.service"],
+        ["systemctl", "reset-failed", "bedrock-weed-filer.service"],
         check=False, timeout=10,
         stderr=subprocess.DEVNULL,
     )
     _systemctl("start", "bedrock-weed-filer.service")
-    _systemctl("start", "bedrock-weed-s3.service")
 
 
 def demote_filer_host() -> None:
-    """Called by cluster_arbiter.demote_arbiter_host() before
-    unmounting the cluster-singleton volume. Stops filer + s3.
-    Idempotent."""
-    log.info("seaweedfs: stopping filer + s3 on this node")
-    _systemctl("stop", "bedrock-weed-s3.service")
+    """Called by cluster_arbiter.demote_arbiter_host() before unmounting the
+    cluster-singleton volume. Stops ONLY the filer (the singleton). The
+    weed-s3 gateway is PER-NODE and stays running through a failover — stopping
+    it here used to kill the demoting node's own S3 gateway. Idempotent."""
+    log.info("seaweedfs: stopping filer on this node")
     _systemctl("stop", "bedrock-weed-filer.service")
 
 
