@@ -1237,6 +1237,54 @@ def _read_local_drbd_uuid(resource: str = TIER_RESOURCE) -> str:
     return ""
 
 
+def _force_release_drbd() -> None:
+    """HARD-release a FROZEN arbiter device (suspended:quorum). No clean shutdown is possible.
+
+    The device has IO suspended (it lost DRBD quorum), so a graceful `systemctl stop` of the
+    arbiter rqlite flushes-and-blocks, and a normal `umount` fsyncs-and-blocks — both hang
+    forever on the suspended device. And we must NEVER `resume-io` to unstick them: resuming
+    would let the minority write, the exact spurious-UUID bug the freeze prevents. So we KILL:
+
+      1. SIGKILL the arbiter rqlite + every other process holding the mount. Their dirty pages
+         are DROPPED at the kernel level when the process dies — never flushed — so the minority
+         STILL never writes. (Tommy's call: the arbiter must be killed, no clean shutdown.)
+      2. `umount -l` (lazy): detaches the mount from the namespace without touching the frozen
+         FS, releasing the device's open count.
+      3. `drbdadm secondary`: with open_cnt==0 the device demotes + discards the frozen writes.
+         The outdated loser then reconnects as a 0-pri Secondary so after-sb-0pri
+         discard-zero-changes auto-resolves the heal (no StandAlone tangle). DRBD's
+         on-suspended-primary-outdated=force-secondary would also fire once the mount is freed;
+         the explicit call is a deterministic backstop.
+    """
+    log.warning("arbiter: DRBD frozen (quorum lost) — HARD-releasing (force Secondary, then "
+                "kill holders). No clean shutdown; never resume-io.")
+    # DEMOTE FIRST — this is the one operation that must be fast. `drbdsetup secondary
+    # --force=yes` demotes a frozen (suspended:quorum) Primary INSTANTLY (~0 s, verified on the
+    # testbed) even with the mount + arbiter-rqlite still attached: it EIOs any held/pending IO
+    # and forces the role to Secondary. The pending writes are discarded — the loser is the
+    # outdated minority, they'd be lost anyway, and crucially this is NOT resume-io (nothing is
+    # flushed to the minority). Doing this FIRST is the whole fix: the old order did fuser +
+    # umount first, which BLOCK ~tens of seconds on the frozen FS, so the demote landed after
+    # the heal and the loser reconnected as a Primary -> 1pri/2pri -> StandAlone/resync-stall.
+    rc, _, err = _run(["drbdsetup", "secondary", TIER_RESOURCE, "--force=yes"], timeout=20)
+    if rc != 0:                              # older drbdsetup without --force, or transient
+        rc, _, err = _run(["drbdadm", "secondary", TIER_RESOURCE], timeout=15)
+    if rc == 0:
+        log.info("arbiter: force-release demoted to Secondary — heal will resync clean")
+    else:
+        log.error("arbiter: force-release could not demote to Secondary: %s", (err or "").strip())
+    # Now the device is a (read-only) Secondary, so these no longer block on a frozen Primary.
+    # Kill EVERY holder of the arbiter mount BY SERVICE NAME — the arbiter rqlite AND the
+    # SeaweedFS filer (singleton) + s3 both keep data on this mount, and if the filer survives
+    # it holds the device open ("-12 held open") and blocks this node's NEXT promote.
+    # ☠️ NEVER `fuser -k -m <mount>` here: on an EIO zombie mount fuser stats the path, gets
+    # EIO, falls back to the containing mount '/', and -k SIGKILLs the whole box (sshd + init).
+    # SIGKILL (not stop) so a flush can't hang; lazy umount (no fsync) after.
+    for _svc in (ARBITER_SVC, "bedrock-weed-filer.service", "bedrock-weed-s3.service"):
+        _run(["systemctl", "kill", "--signal=SIGKILL", _svc], timeout=8)
+    _run(["umount", "-l", str(MOUNT_POINT)], timeout=10)
+
+
 def demote_arbiter_host() -> dict:
     """Stop hosting the singleton services. Reverse of promote.
 
@@ -1255,39 +1303,35 @@ def demote_arbiter_host() -> dict:
     """
     log.info("arbiter: demoting this node (was singleton host)")
     drbd_present = _drbd_resource_exists()
-    # SeaweedFS S3 + filer first — they use the mount, must stop
-    # before umount. Also valid at N=1; they just stop.
-    try:
-        try:
-            from . import seaweedfs
-        except ImportError:
-            import sys
-            sys.path.insert(0, "/usr/local/lib/bedrock")
-            from lib import seaweedfs  # type: ignore
-        seaweedfs.demote_filer_host()
-    except Exception as e:
-        log.warning("arbiter: SeaweedFS filer demote failed: %s", e)
-    # Release the .254 VIP at every cluster size. promote_to_arbiter_host
-    # binds it in both the N=1 and the N>=2 paths, so demote must
-    # release it in both too — otherwise a follower with a stale .254
-    # from a previous role briefly answers on the cluster VIP.
+    frozen = drbd_present and _drbd_suspended_quorum()
+    # Release the .254 VIP at every cluster size + state (cheap, no IO — safe even when frozen).
+    # promote binds it in both N=1 and N>=2, so demote must release it in both — otherwise a
+    # follower with a stale .254 from a prior role briefly answers on the cluster VIP.
     _ip_del()
-    if drbd_present:
-        _svc_stop(ARBITER_SVC)
-        if _drbd_suspended_quorum():
-            # DRBD froze this node on quorum loss (it lost a peer). We step DOWN
-            # at the bedrock-d level (services stopped + .254 released above) but
-            # we must NOT resume-io to umount/secondary — resuming would let the
-            # minority write, the very thing the freeze prevents. Leave DRBD
-            # frozen on its old UUID; it resolves on reconnect via
-            # on-suspended-primary-outdated=force-secondary (sees the newer-
-            # generation master → demotes + resyncs). No minority write, ever.
-            log.info("arbiter: DRBD frozen (quorum lost) — stepping down at the "
-                     "bedrock-d level; leaving DRBD frozen on its old UUID until "
-                     "it reconnects to the blessed master")
-        else:
-            # Graceful demote while still quorate (e.g. role handover): the
-            # device isn't frozen, so umount + secondary cleanly.
+    if frozen:
+        # DRBD froze this node on quorum loss (suspended:quorum). A clean shutdown is IMPOSSIBLE
+        # — a graceful filer/rqlite stop flushes and a normal umount fsyncs, both blocking
+        # forever on the suspended device — and we must never resume-io (minority-write = the
+        # spurious-UUID bug). So HARD-KILL the holders + force the device Secondary, discarding
+        # the frozen writes at the kernel level. The outdated loser then reconnects as a 0-pri
+        # Secondary and after-sb-0pri discard-zero-changes auto-resolves the heal. This is the
+        # fix for the StandAlone/resync-stall tangle (the old code left the device frozen here).
+        _force_release_drbd()
+    else:
+        # Not frozen (graceful role handover, or N=1): clean stop is safe. SeaweedFS S3 + filer
+        # first — they use the mount, must stop before umount.
+        try:
+            try:
+                from . import seaweedfs
+            except ImportError:
+                import sys
+                sys.path.insert(0, "/usr/local/lib/bedrock")
+                from lib import seaweedfs  # type: ignore
+            seaweedfs.demote_filer_host()
+        except Exception as e:
+            log.warning("arbiter: SeaweedFS filer demote failed: %s", e)
+        if drbd_present:
+            _svc_stop(ARBITER_SVC)
             _umount()
             _drbd_secondary()
     # Per cluster-quorum-spec.md INV-7: a witness claim never times out.
