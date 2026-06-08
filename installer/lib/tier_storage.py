@@ -1314,6 +1314,24 @@ def regen_drbd_configs_from_snapshot(snapshot: dict) -> bool:
             "loopback_ip": n.get("loopback_ip", ""),
         })
 
+    # Arbiter DRBD caps at SINGLETON_MAX_REPLICAS (3): beyond 3-way, `quorum all` makes every
+    # arbiter write wait on too many replicas -> latency. The lowest-octet 3 (== the Raft-3
+    # voter set / seaweedfs._master_set) host it; a 4th+ node joins the CLUSTER but the arbiter
+    # DRBD does NOT expand onto it. write_drbd_resource() caps the non-mesh path; this mesh
+    # render path (used at N>=3) must cap too — otherwise the singleton goes N-way.
+    peers = cap_singleton_peers(peers)
+    # If THIS node fell OUTSIDE the capped 3-set (a lower-octet node joined and pushed us out,
+    # or a legacy >3-way arbiter), it must not host the singleton — don't render a self-less
+    # .res (drbdadm adjust would fail). A fresh node outside the set never created the .res
+    # (join_as_secondary's self-survives-cap guard), so this only fires for a former member
+    # being demoted out; the lowest-octet 3 re-render 3-way and drop this node's connection.
+    try:
+        _self_lo = (load_state() or {}).get("loopback_ip", "")
+    except Exception:
+        _self_lo = ""
+    if _self_lo and not any(p.get("loopback_ip") == _self_lo for p in peers):
+        return False
+
     DRBD_MODES = {"drbd", "drbd-3way"}
     resource = CLUSTER_RESOURCE
     minor = CLUSTER_MINOR
