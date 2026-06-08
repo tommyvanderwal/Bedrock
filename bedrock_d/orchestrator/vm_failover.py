@@ -737,25 +737,34 @@ def _vm_name_from_res(res: str) -> str:
     return m.group(1) if m else ""
 
 
-def _local_frozen_primary_vm_resources() -> list[str]:
-    """Names of local vm-* DRBD resources that are FROZEN Primaries — role:Primary AND
-    suspended (susp_fen). The freeze is the discriminator: an active winner / taking-over
-    Primary is NEVER suspended once its fence verdict lands, so this only ever surfaces the
-    minority loser whose fence-peer got 'undecided' (it could not reach rqlite to self-outdate)
-    and stayed frozen. `drbdsetup status` omits the suspended field entirely when not frozen."""
+def _vm_resource_states() -> dict:
+    """Parse `drbdsetup status` ONCE -> {res: {role, suspended, standalone}} for local vm-*
+    resources. `suspended` (susp_fen) is the fence-loser discriminator — `drbdsetup status`
+    omits the field entirely when not frozen, and an active winner/taking-over Primary is
+    suspended only transiently. `standalone` is true when any peer connection is StandAlone
+    (a winner the takeover left disconnected, to be reconnected once the peer returns)."""
     try:
         txt = subprocess.run(["drbdsetup", "status"], capture_output=True, text=True,
                              timeout=15).stdout
     except (OSError, subprocess.SubprocessError):
-        return []
-    out = []
+        return {}
+    states: dict = {}
+    cur = None
     for line in txt.splitlines():
-        if not line or line[:1].isspace():
-            continue   # only top-level resource headers start at column 0
-        m = re.match(r"(\S+)\s+role:(\w+)", line)
-        if m and m.group(1).startswith("vm-") and m.group(2) == "Primary" and "suspended:" in line:
-            out.append(m.group(1))
-    return out
+        if not line.strip():
+            continue
+        if not line[:1].isspace():                 # top-level resource header (column 0)
+            m = re.match(r"(\S+)\s+role:(\w+)", line)
+            if m and m.group(1).startswith("vm-"):
+                cur = m.group(1)
+                states[cur] = {"role": m.group(2),
+                               "suspended": "suspended:" in line,
+                               "standalone": False}
+            else:
+                cur = None
+        elif cur is not None and "connection:StandAlone" in line:
+            states[cur]["standalone"] = True
+    return states
 
 
 def _strong_vms_host(vm_name: str) -> Optional[str]:
@@ -803,18 +812,28 @@ def _heal_lost_frozen_primary(res: str, vm_name: str) -> None:
         log.warning("vm_failover: heal %s — force-released, resyncing from the winner", res)
 
 
-async def reconcile_lost_frozen_primaries_task():
-    """Every TICK_S: heal any local vm-* DRBD that is a FROZEN Primary the cluster no longer
-    owns — the quorum-lost loser of a VM fence (isolated in the minority, its fence-peer got
-    'undecided' and it could never self-outdate, so it stayed frozen). On quorum return we
-    force-release it + resync from the winner (the #34 heal, for VM disks).
+async def reconcile_vm_fence_heal_task():
+    """Every TICK_S: drive a VM-disk fence aftermath back to a clean replicated pair. Two roles,
+    both keyed off a single `drbdsetup status` parse + a strong vms.host read:
 
-    Gate: role==Primary AND suspended AND strong-read vms.host != me, STABLE for
-    HEAL_LOST_FROZEN_STABLE_S. The stability window is what makes this safe mid-takeover: a
-    node that is WINNING / taking over is suspended only for the ~1-3 s its fence verdict takes
-    (and its vms.host catches up right after), far under the window — so we never force-secondary
-    a node that is legitimately becoming Primary; only a persistently-frozen loser matches."""
-    log.info("vm_failover: reconcile_lost_frozen_primaries_task started "
+      LOSER  — a FROZEN (susp_fen) Primary the cluster no longer owns (the quorum-lost minority
+        node whose fence-peer got 'undecided' and could never self-outdate, so it stayed
+        frozen). Once the condition holds STABLE for HEAL_LOST_FROZEN_STABLE_S we force-release
+        it + rejoin (the #34 heal, for VM disks). The stability window is what makes this safe
+        mid-takeover: a node that is WINNING is suspended only for the ~1-3 s its fence verdict
+        takes (then resumes + vms.host catches up), far under the window — so we never
+        force-secondary a node that is legitimately becoming Primary.
+
+      WINNER — a StandAlone Primary I OWN (vms.host == me). A takeover leaves the winner
+        StandAlone (it disconnected the dead inbound peer); nothing else reconnects it, so the
+        demoted loser would sit at Connecting forever. Reconnect it (drbdadm connect) to
+        re-establish replication. Idempotent; an absent peer just stays Connecting; two
+        Primaries can't merge (after-sb-2pri disconnect), so retrying is safe.
+
+    Both reads are level='strong' — they also prove we're back in quorum (they raise in the
+    minority). In steady state every resource is Connected + unsuspended, so neither branch
+    fires and no strong reads happen."""
+    log.info("vm_failover: reconcile_vm_fence_heal_task started "
              "(heal-stable threshold = %.0fs)", HEAL_LOST_FROZEN_STABLE_S)
     me = ""
     first_seen: dict[str, float] = {}   # res -> monotonic ts the (frozen, host!=me) cond began
@@ -825,31 +844,42 @@ async def reconcile_lost_frozen_primaries_task():
                 me = _self_node_name()
                 if not me:
                     continue
-            frozen = set(_local_frozen_primary_vm_resources())
-            # forget resources that are no longer frozen-lost (resumed / demoted / healed)
+            states = _vm_resource_states()
+            # forget resources no longer in the frozen-Primary condition (resumed/demoted/healed)
             for r in list(first_seen):
-                if r not in frozen:
+                st = states.get(r)
+                if not st or not (st["role"] == "Primary" and st["suspended"]):
                     first_seen.pop(r, None)
             now = time.monotonic()
-            for res in frozen:
+            for res, st in states.items():
                 vm_name = _vm_name_from_res(res)
                 if not vm_name:
                     continue
-                try:
-                    host = _strong_vms_host(vm_name)   # strong -> proves we're back in quorum
-                except Exception:
-                    first_seen.pop(res, None)           # still minority -> can't heal yet
-                    continue
-                if host is None or host == me:
-                    first_seen.pop(res, None)           # unknown VM, or I AM the host -> leave it
-                    continue
-                # confirmed lost: hold the condition stable before the destructive heal
-                t0 = first_seen.setdefault(res, now)
-                if now - t0 >= HEAL_LOST_FROZEN_STABLE_S:
-                    _heal_lost_frozen_primary(res, vm_name)
-                    first_seen.pop(res, None)
+                if st["role"] == "Primary" and st["suspended"]:
+                    # LOSER candidate
+                    try:
+                        host = _strong_vms_host(vm_name)   # strong -> proves we're back in quorum
+                    except Exception:
+                        first_seen.pop(res, None)           # still minority -> can't heal yet
+                        continue
+                    if host is None or host == me:
+                        first_seen.pop(res, None)           # unknown VM, or I AM the host -> leave
+                        continue
+                    t0 = first_seen.setdefault(res, now)
+                    if now - t0 >= HEAL_LOST_FROZEN_STABLE_S:
+                        _heal_lost_frozen_primary(res, vm_name)
+                        first_seen.pop(res, None)
+                elif st["role"] == "Primary" and st["standalone"]:
+                    # WINNER candidate — reconnect to restore replication to the returning peer
+                    try:
+                        host = _strong_vms_host(vm_name)
+                    except Exception:
+                        continue
+                    if host == me:
+                        subprocess.run(["drbdadm", "connect", res],
+                                       capture_output=True, timeout=15)
         except Exception as e:
-            log.warning("vm_failover: reconcile-lost-frozen tick: %s", e)
+            log.warning("vm_failover: vm-fence heal tick: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -866,5 +896,5 @@ def start_failover_tasks() -> list:
         asyncio.create_task(suspend_on_no_quorum_task()),
         asyncio.create_task(takeover_after_peer_down_task()),
         asyncio.create_task(kill_suspended_after_5min_task()),
-        asyncio.create_task(reconcile_lost_frozen_primaries_task()),
+        asyncio.create_task(reconcile_vm_fence_heal_task()),
     ]
