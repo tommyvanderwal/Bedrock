@@ -28,7 +28,18 @@ This module is the endpoint-side `feed_down()` + `decide_fence()` (called by mgm
 
 from __future__ import annotations
 
+import re
 import time
+
+# The cluster-singleton DRBD resource — the ONLY resource arbitrated via netd's election +
+# witness claim (decide_fence). Everything else (vm-*) is arbitrated via rqlite ownership
+# (decide_vm_fence). At module scope so mgmt's endpoint can branch on it.
+ARBITER_RES = "cluster"
+
+# A per-VM DRBD resource is named `vm-<vm_name>-disk<N>` (bedrock_d/vm/create.py). The vm_name
+# is everything between the `vm-` prefix and the FINAL `-disk<digits>` (greedy middle so a
+# vm_name that itself contains `-disk` still splits at the last one).
+_VM_RES_RE = re.compile(r"^vm-(.+)-disk\d+$")
 
 # The endpoint waits this long for netd to converge before giving up -> 'undecided' (freeze).
 # Must be < the handler's HTTP timeout, which must be < DRBD's (unbounded) handler wait.
@@ -96,19 +107,102 @@ def decide_fence(shared_state, peer_octet, *, deadline_s: float = DECIDE_DEADLIN
         time.sleep(poll_s)
 
 
+def vm_name_for_resource(resource: str) -> str | None:
+    """`vm-<name>-disk<N>` -> `<name>`; None for anything that isn't a per-VM disk."""
+    m = _VM_RES_RE.match(resource or "")
+    return m.group(1) if m else None
+
+
+def _self_node_name() -> str:
+    """This node's name from /etc/bedrock/state.json ("" on any error)."""
+    try:
+        import json
+        from pathlib import Path
+        return (json.loads(Path("/etc/bedrock/state.json").read_text()) or {}).get("node_name") or ""
+    except Exception:
+        return ""
+
+
+def decide_vm_fence(resource: str, peer_node: str | None = None, *,
+                    my_node: str | None = None) -> str:
+    """Synchronous fence decision for a per-VM DRBD disk whose replication link to
+    `peer_node` just dropped (this node is the frozen/promoting Primary).
+
+    The authority is rqlite, NOT netd's election: a per-VM disk has no witness of its own, so
+    "which side is in the cluster majority" is exactly "which DRBD peer can still satisfy a
+    level='strong' read". Mirrors is_safe_to_start_vm / _vms_on_dead_peer so the DRBD-level
+    gate and the orchestrator's takeover can never disagree about who runs the VM:
+
+      * strong-read vms.host + failover_order. A node in the MINORITY partition cannot confirm
+        the Raft leader -> the read RAISES -> 'undecided' (DRBD stays frozen, the safe default;
+        the orchestrator suspends the VM and fails it over to the majority side). NO local
+        fallback — a stale local replica could read an old host and split-brain.
+      * host == me  -> 'win' (blessed home AND, since the strong read succeeded, in the
+        majority -> outdate the lost peer, resume).
+      * host == peer_node AND I'm next in failover_order after it -> 'win'. This is the
+        sanctioned takeover: the fence-peer fires DURING takeover_after_peer_down_task's
+        `drbdadm primary`, BEFORE it writes vms.host=me, so we recognise the successor by the
+        lost-host identity + the predetermined order (peers_after_dead), exactly as the
+        takeover task does. Without this the takeover would read the dead host, LOSE, and
+        outdate itself — breaking every failover.
+      * otherwise -> 'lose' (a stale Primary the cluster says no longer owns this VM -> yield).
+    """
+    vm_name = vm_name_for_resource(resource)
+    if not vm_name:
+        return "undecided"
+    me = my_node or _self_node_name()
+    if not me:
+        return "undecided"
+    try:
+        from lib import rqlite_client
+        from bedrock_d.vm.failover import peers_after_dead
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import rqlite_client  # type: ignore
+        from bedrock_d.vm.failover import peers_after_dead  # type: ignore
+    # STRONG read — fails loud in the minority partition (no leader confirmation), which IS the
+    # "am I in the cluster majority?" gate. See the read-consistency-classes memory: a
+    # DRBD-takeover decision is strict-leader, never flexible/local-fallback.
+    try:
+        with rqlite_client.RqliteClient() as rc:
+            row = rc.query_one(
+                "SELECT host, failover_order FROM vms WHERE vm_name = ?",
+                params=[vm_name], level="strong",
+            )
+    except Exception:
+        return "undecided"          # minority / rqlite unreachable -> freeze (safe)
+    if row is None:
+        return "undecided"          # unknown VM -> don't guess, stay frozen
+    host = row.get("host") or ""
+    if host == me:
+        return "win"
+    if peer_node and host == peer_node:
+        import json
+        try:
+            order = json.loads(row.get("failover_order") or "[]")
+        except (TypeError, ValueError):
+            order = []
+        if peers_after_dead(order, me, host):
+            return "win"            # sanctioned takeover from the lost host
+    return "lose"
+
+
 # The handler DRBD spawns. Self-contained (no bedrock imports): maps the lost peer's DRBD
 # node-id -> loopback octet from the local drbd config, then makes ONE blocking HTTP call to
 # bedrock-d's loopback fence-decision endpoint. Any error/timeout -> exit 1 (freeze, safe).
 HANDLER_SCRIPT = r'''#!/usr/bin/env python3
-"""bedrock-fence-peer — DRBD fence-peer handler (synchronous witness-claim model).
+"""bedrock-fence-peer — DRBD fence-peer handler (synchronous decision model).
 
-DRBD spawns this when the arbiter Primary loses a peer (fencing resource-only). It POSTs to
-bedrock-d's :8001 HTTP-loopback /internal/fence-decision, which feeds DRBD's authoritative
-peer-loss into netd's election, lets netd converge + drive the exclusive witness claim, and
-returns the verdict:  4 = WIN (outdate peer, continue)  6 = LOSE (outdate self, yield)
-1 = undecided (leave IO frozen). Self-contained (no bedrock imports): maps peer node-id ->
-loopback octet from the local drbd config (drbdadm dump = config-only, no kernel/netlink ->
-safe inside a fence callout), then one blocking HTTP call. Any error/timeout -> exit 1.
+DRBD spawns this on a Primary peer-loss (fencing resource-only for the `cluster` singleton,
+resource-and-stonith for per-VM disks) and waits, IO frozen, for the exit code. It POSTs to
+bedrock-d's :8001 HTTP-loopback /internal/fence-decision, which arbitrates by resource class:
+  * `cluster`  -> netd's election + the exclusive witness claim (peer mapped to loopback octet)
+  * `vm-*`     -> rqlite ownership (peer mapped to node_name, compared with vms.host)
+and returns the verdict:  4 = WIN (outdate peer, continue)  6 = LOSE (outdate self, yield)
+1 = undecided (leave IO frozen). Self-contained (no bedrock imports): maps the peer node-id
+from the local drbd config (drbdadm dump = config-only, no kernel/netlink -> safe inside a
+fence callout), then one blocking HTTP call. Any error/timeout -> exit 1 (freeze, safe).
 """
 import json, os, re, subprocess, sys, syslog, urllib.request
 
@@ -121,17 +215,24 @@ peer_id = os.environ.get("DRBD_PEER_NODE_ID", "?")
 syslog.openlog("bedrock-fence-peer")
 
 
-def peer_octet_for(node_id):
-    """Map a DRBD peer node-id -> its loopback last-octet via the LOCAL drbd config.
-    Each `on <host> { node-id N; address ipv4 100.83.252.X:port; }` (on-block address is
-    the loopback; it precedes the connection sections). Static, no rqlite, no netlink."""
+def _dump(resource):
+    """`drbdadm dump <resource>` stdout (config-only, no kernel/netlink -> safe inside a
+    fence callout); "" on any error. Normalised so each on-block carries both `node-id N`
+    and its own `address ipv4 <loopback>:port`."""
     try:
-        out = subprocess.run(["drbdadm", "dump", ARBITER_RES],
-                             capture_output=True, text=True, timeout=10).stdout
+        return subprocess.run(["drbdadm", "dump", resource],
+                              capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
+        return ""
+
+
+def peer_octet_for(node_id, dump):
+    """Map a DRBD peer node-id -> its loopback last-octet from the on-block address
+    (`on <host> { node-id N; ... address ipv4 100.83.252.X:port; }`). The on-block address
+    follows its node-id and precedes the connection sections, so the node-id->address pairing
+    is unambiguous."""
     pending = None
-    for line in out.splitlines():
+    for line in dump.splitlines():
         m = re.search(r"node-id\s+(\d+)", line)
         if m:
             pending = m.group(1)
@@ -144,20 +245,46 @@ def peer_octet_for(node_id):
     return None
 
 
-# Only the arbiter resource is wired to this handler; refuse anything else -> leave frozen.
-# (VM-disk fence arbitration via rqlite ownership is a separate handler — see P3.)
-if res != ARBITER_RES:
+def peer_name_for(node_id, dump):
+    """Map a DRBD peer node-id -> its node_name from the on-block header
+    (`on <node_name> { node-id N; ... }`). Used by the per-VM path so bedrock-d can compare
+    the lost peer against vms.host. node-id appears ONLY in on-blocks, so the open `on` name
+    is the owner."""
+    pending = None
+    for line in dump.splitlines():
+        m = re.match(r"\s*on\s+(\S+)\s*\{", line)
+        if m:
+            pending = m.group(1)
+            continue
+        m = re.search(r"node-id\s+(\d+)", line)
+        if m and pending is not None and m.group(1) == str(node_id):
+            return pending
+    return None
+
+
+# Route by resource class. The `cluster` singleton -> netd-election arbitration (peer octet);
+# a per-VM disk (`vm-*`) -> rqlite-ownership arbitration (peer node_name). Anything else is
+# not wired to a decision -> leave IO frozen (safe).
+if res == ARBITER_RES:
+    octet = peer_octet_for(peer_id, _dump(res))
+    if octet is None:
+        syslog.syslog(syslog.LOG_ERR,
+                      "fence-peer res=%s peer=%s: cannot map node-id -> octet -> exit 1" % (res, peer_id))
+        sys.exit(1)
+    payload = {"resource": res, "peer_octet": octet}
+    syslog.syslog("fence-peer res=%s peer=%s (octet=%s): asking bedrock-d" % (res, peer_id, octet))
+elif res.startswith("vm-"):
+    # peer_node lets bedrock-d recognise the sanctioned takeover (vms.host still == the lost
+    # host). "" still decides the steady-state host==me case; the takeover case then freezes
+    # (safe) rather than mis-promoting.
+    peer_name = peer_name_for(peer_id, _dump(res)) or ""
+    payload = {"resource": res, "peer_node": peer_name}
+    syslog.syslog("fence-peer res=%s peer=%s (node=%s): asking bedrock-d" % (res, peer_id, peer_name or "?"))
+else:
     syslog.syslog(syslog.LOG_ERR, "fence-peer on unexpected res=%s peer=%s -> exit 1" % (res, peer_id))
     sys.exit(1)
 
-octet = peer_octet_for(peer_id)
-if octet is None:
-    syslog.syslog(syslog.LOG_ERR,
-                  "fence-peer res=%s peer=%s: cannot map node-id -> octet -> exit 1" % (res, peer_id))
-    sys.exit(1)
-
-syslog.syslog("fence-peer res=%s peer=%s (octet=%s): asking bedrock-d" % (res, peer_id, octet))
-body = json.dumps({"resource": res, "peer_octet": octet}).encode()
+body = json.dumps(payload).encode()
 req = urllib.request.Request(ENDPOINT, data=body,
                              headers={"Content-Type": "application/json"}, method="POST")
 try:

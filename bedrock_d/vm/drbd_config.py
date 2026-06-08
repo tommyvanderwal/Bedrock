@@ -96,13 +96,44 @@ def render(resource: str, *, minor: int, peers: list[Peer],
     return (
         f"resource {resource} {{\n"
         f"    protocol C;\n"
+        # auto-promote no — DRBD must NEVER pick Primary itself. Its default is
+        # `yes`, which silently promotes a node the moment /dev/drbdN is opened
+        # (a mount, qemu opening the disk, even a udev/blkid probe). That is the
+        # systemic cause of dual-Primary: one node bedrock-d-promotes while
+        # another self-promotes on a device open during a failover/migration
+        # race. allow-two-primaries=no only blocks that WHILE CONNECTED — across
+        # a partition both sides could still self-promote. With auto-promote off,
+        # only bedrock-d's orchestrated `drbdadm primary` (vm_failover / migrate,
+        # rqlite-gated) ever promotes, so two Primaries can't arise.
+        # on-suspended-primary-outdated force-secondary — a returning frozen
+        # (susp_fen) Primary that the surviving side OUTDATED while it was gone
+        # auto-demotes to Secondary on reconnect, so the taken-over VM disk
+        # resyncs from the new home instead of dead-locking dual-Primary. Mirrors
+        # the cluster singleton; the #34 heal lesson applies to VM disks too.
+        f"    options {{ auto-promote no; on-suspended-primary-outdated force-secondary; }}\n"
         f"    disk {{ on-io-error detach; }}\n"
+        # fencing resource-and-stonith — on ANY replication-link loss DRBD
+        # SUSPENDS all IO (susp_fen) AND calls the fence-peer handler, then waits
+        # for its exit code before resuming. A 2-/3-way VM disk has no quorum
+        # tiebreaker of its own, so per Tommy it must ALWAYS freeze and let
+        # bedrock-d (rqlite-majority + the VM's blessed home) decide which side
+        # keeps it — never DRBD auto-deciding. The handler maps the resource to
+        # an rqlite-ownership verdict (decide_vm_fence): win (exit 4, outdate
+        # peer, resume) / lose (6, yield) / undecided (1, stay frozen — the
+        # minority case, since a minority node's strong rqlite read fails).
+        # ping-int 5 — notice a dead link in <=6 s (Tommy: Windows guests error
+        # at the 30 s disk-timeout, active-IO DRBD timeout is 6 s, so ~24 s to
+        # fail over). 5 s + 1 MiB bitmap are the Bedrock defaults for ALL DRBD.
+        # See docs/drbd-fence-peer-arbiter-design.md.
         f"    net {{\n"
         f"        allow-two-primaries no;\n"
         f"        after-sb-0pri discard-zero-changes;\n"
         f"        after-sb-1pri discard-secondary;\n"
         f"        after-sb-2pri disconnect;\n"
+        f"        fencing resource-and-stonith;\n"
+        f"        ping-int 5;\n"
         f"    }}\n"
+        f'    handlers {{ fence-peer "/usr/local/lib/bedrock/bedrock-fence-peer"; }}\n'
         + "\n".join(on_blocks) + "\n\n"
         + "\n".join(conn_blocks) + "\n"
         f"}}\n"

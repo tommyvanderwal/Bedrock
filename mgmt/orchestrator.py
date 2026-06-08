@@ -541,11 +541,27 @@ async def _start_local_services():
     vms = cluster.get("vms", {}) or {}
     self_name = _self_node_name()
 
-    # The `cluster` singleton (arbiter rqlite + filer/s3 + .254 VIP +
-    # its DRBD primary/mount) is owned by cluster_arbiter.converge(),
-    # driven from the rqlite subscriber + converge_retry. Per-VM DRBD
-    # resources are ours to bring up: at boot nothing has run `drbdadm
-    # up` yet (the units are disabled — quorum-aware boot), so
+    # The `cluster` singleton (arbiter rqlite + filer/s3 + .254 VIP + its
+    # DRBD primary/mount) is owned by cluster_arbiter; the elected master
+    # promotes it to Primary in converge(). But the arbiter DRBD must first be
+    # brought UP (as Secondary) on EVERY node that holds the tier — it is
+    # deliberately NOT systemd-auto-started (quorum-aware boot), so nothing else
+    # attaches it after a reboot. Without this the master would run Primary with
+    # no connected secondaries (writes unprotected) and a follower would have no
+    # UpToDate copy to fail over to. Eager here (don't wait for the 5s converge
+    # tick, and close the cold-boot drbdmeta-spam window); idempotent.
+    try:
+        try:
+            from lib import cluster_arbiter as _ca
+        except ImportError:                       # source-tree layout
+            from installer.lib import cluster_arbiter as _ca  # type: ignore
+        await asyncio.to_thread(_ca.ensure_arbiter_drbd_up)
+    except Exception as e:
+        log.warning("services: arbiter DRBD up failed "
+                    "(converge_retry will retry): %s", e)
+
+    # Per-VM DRBD resources are ours to bring up: at boot nothing has run
+    # `drbdadm up` yet (the units are disabled — quorum-aware boot), so
     # /dev/drbdN won't exist until we do it here, and libvirtd would
     # fail to open the VM's backing device.
     ours = [n for n, vm in vms.items()
@@ -1436,6 +1452,22 @@ def start_all():
     # call_soon_threadsafe — asyncio.get_event_loop() raises in a worker
     # thread, which is what silently killed the reactor_diff.
     _MAIN_LOOP = asyncio.get_running_loop()
+    # Deploy the DRBD fence-peer handler on EVERY node — not just arbiter hosts.
+    # Per-VM disks (fencing resource-and-stonith) reference it from their .res and
+    # can run on ANY node, including one OUTSIDE the 3-node arbiter set whose
+    # arbiter path (cluster_arbiter._enforce_drbd_safety_options) never fires. A
+    # missing handler -> DRBD leaves IO frozen on peer loss (safe but stuck).
+    # Idempotent; the arbiter path also deploys it. See lib/fence_verdict.py.
+    try:
+        try:
+            from lib import fence_verdict as _fv
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/usr/local/lib/bedrock")
+            from lib import fence_verdict as _fv  # type: ignore
+        _fv.deploy_handler()
+    except Exception as e:
+        log.warning("orchestrator: fence-peer handler deploy failed: %s", e)
     # All wrapped in supervise() so a crash is LOUD (CRITICAL + traceback)
     # instead of a silently-vanished task. Loops restart-with-backoff;
     # the two one-shots (boot_orchestrator, saga_resume) log-critical and

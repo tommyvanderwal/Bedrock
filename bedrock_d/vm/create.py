@@ -196,9 +196,16 @@ class VmCreate:
 
     @step("drbd_create_md")
     def step_create_md(self, ctx):
-        """drbdadm create-md --max-peers=7 on every peer, per disk.
-        Idempotent — if metadata already exists drbdadm exits non-
-        zero, which we tolerate (later steps catch real problems)."""
+        """drbdadm create-md --max-peers=7 --bitmap-block-size=1048576 on
+        every peer, per disk. Idempotent — if metadata already exists drbdadm
+        exits non-zero, which we tolerate (later steps catch real problems).
+
+        bitmap-block-size 1 MiB (vs the 4 KiB default) is the Bedrock default
+        for ALL DRBD (Tommy): DRBD keeps the dirty bitmap resident in RAM, so a
+        256× coarser bitmap is 256× less memory + on-disk meta (a 500 GB
+        7-peer disk drops from ~109 MB to ~440 KB) — we have bandwidth to
+        spare for the slightly larger resync granularity. Baked at create-md
+        (not live-adjustable), so it must be set here at VM-create time."""
         if not ctx["is_replicated"]:
             return
         for host in _peer_hosts(ctx["peers"]):
@@ -206,6 +213,7 @@ class VmCreate:
                 _lvm._run_on(
                     host,
                     f"drbdadm create-md --force --max-peers=7 "
+                    f"--bitmap-block-size=1048576 "
                     f"{d['resource']} 2>&1 | tail -2",
                     check=False)
 

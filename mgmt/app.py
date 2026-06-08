@@ -951,32 +951,47 @@ async def internal_cdc(request: Request):
 
 class FenceDecisionRequest(BaseModel):
     resource: str
-    peer_octet: int
+    # Cluster-singleton path: the lost peer's loopback last-octet (fed into netd's
+    # election). Per-VM path leaves it -1 and uses peer_node instead.
+    peer_octet: int = -1
+    # Per-VM path: the lost peer's node_name (to recognise the sanctioned takeover
+    # when vms.host still points at the lost host). Empty on the cluster path.
+    peer_node: str = ""
 
 
 @app.post("/internal/fence-decision")
 def internal_fence_decision(req: FenceDecisionRequest, request: Request):
     """Synchronous DRBD fence-peer arbitration. `bedrock-fence-peer` (spawned by DRBD on a
-    Primary peer-loss) POSTs here; we feed DRBD's AUTHORITATIVE per-peer "down" evidence into
-    netd's election (collapsing the ~10 s mesh-hysteresis lag), let netd converge + drive the
-    EXCLUSIVE witness claim, and return the verdict (win/lose/undecided -> exit 4/6/1). This
-    replaces the racy /run/bedrock/fence-verdict.json file. SYNC handler (def, not async): it
-    runs in FastAPI's threadpool, so the up-to-~18 s block never stalls the asyncio event loop.
-    See lib/fence_verdict.py + docs/drbd-fence-peer-arbiter-design.md."""
+    Primary peer-loss) POSTs here. SYNC handler (def, not async): it runs in FastAPI's
+    threadpool, so the up-to-~18 s block never stalls the asyncio event loop. Two resource
+    classes, two authorities (see lib/fence_verdict.py + docs/drbd-fence-peer-arbiter-design.md):
+
+      * the `cluster` singleton -> decide_fence(): feed DRBD's AUTHORITATIVE per-peer "down"
+        evidence into netd's election (collapsing the ~10 s mesh-hysteresis lag), let netd
+        converge + drive the EXCLUSIVE witness claim, return the verdict. (Replaces the racy
+        /run/bedrock/fence-verdict.json file.)
+      * a per-VM disk (`vm-*`) -> decide_vm_fence(): a per-VM DRBD has no witness of its own,
+        so the authority is a level='strong' rqlite read of vms.host (which doubles as the
+        'am I in the cluster majority?' gate — it fails in the minority) + failover_order.
+
+    Both map win/lose/undecided -> handler exit 4/6/1."""
     ch = request.client.host if request.client else ""
     if ch not in ("127.0.0.1", "::1"):
         raise HTTPException(403, "fence-decision endpoint is loopback-only")
-    state = getattr(request.app.state, "bedrock", None)
-    if state is None:
-        return {"verdict": "undecided", "detail": "no shared state"}
     try:
         from lib import fence_verdict as _fv
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, "/usr/local/lib/bedrock")
         from lib import fence_verdict as _fv  # type: ignore
-    verdict = _fv.decide_fence(state, req.peer_octet)
-    return {"verdict": verdict, "resource": req.resource, "peer_octet": req.peer_octet}
+    if req.resource == _fv.ARBITER_RES:
+        state = getattr(request.app.state, "bedrock", None)
+        if state is None:
+            return {"verdict": "undecided", "detail": "no shared state"}
+        verdict = _fv.decide_fence(state, req.peer_octet)
+    else:
+        verdict = _fv.decide_vm_fence(req.resource, req.peer_node or None)
+    return {"verdict": verdict, "resource": req.resource}
 
 
 # ── Operator login ──────────────────────────────────────────────────
