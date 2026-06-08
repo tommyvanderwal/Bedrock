@@ -254,50 +254,78 @@ get WIN), and removing `ensure_drbd_write_permission`/`_drbd_resume_io`.
 
 ---
 
-## Does this extend to VM disks? NO — different mechanism (dragon-hunt, code-verified, high confidence)
+## Extending to VM disks — SHIPPED (P3, 2026-06-08): same hook, rqlite-ownership decision
 
-**Verdict: do NOT extend the fence-peer / witness-CLAIM model to VM disks.** It is coupled to three
-substrate properties the VM tier deliberately lacks:
-1. The witness slot is **one-per-node, arbiter-only** (single `MARKER_KIND_DRBD_ARBITER_UUID`,
-   `installer/lib/witness.py:30,77`) — it cannot carry a per-VM win/lose verdict.
-2. fence-peer fires only on a node **already Primary with `fencing` set** (`drbd_receiver.c:10123`);
-   the VM-failover taker is a **Secondary** doing `disconnect`+`primary --force`
-   (`bedrock_d/orchestrator/vm_failover.py:485-497`), and VM `.res` has **no `fencing`**
-   (`bedrock_d/vm/drbd_config.py:108-115`) → `FP_DONT_CARE` → never fires.
-3. fence-peer exists *because the arbiter can't read the rqlite it's recovering*; VM disks **have**
-   rqlite (`_rqlite_quorate` + the `level=strong` UUID gate). Two intentionally-separate consistency
-   classes (`feedback_read_consistency_classes`).
+> **Reversal of the earlier "NO" verdict.** An earlier draft argued against extending fence-peer to
+> VM disks because the *witness-CLAIM* decision is arbiter-only. That objection dissolves once you
+> separate the **hook** (DRBD's `fence-peer` callout) from the **decision authority**: the cluster
+> singleton decides via netd-election + witness CLAIM; a per-VM disk decides via a **`level=strong`
+> rqlite read of `vms.host`**. Same synchronous-callout hook, different authority. Tommy's call:
+> *"a 2-way and a 3-way DRBD should always freeze and wait for bedrock-D to decide which side is in
+> the Bedrock majority"* — a per-VM disk has no quorum tiebreaker of its own, so it must never
+> self-decide. This section documents what shipped.
 
-VM disks stay on the shipped availability-first model: `auto-promote no` + `allow-two-primaries no`
-+ `after-sb-*` + `_rqlite_quorate` (liveness) + the **fail-loud** `get_recorded_uuid(level=strong)`
-gate + suspend(T+20)/takeover(T+35)/kill(T+5m).
+### Config (per-VM `vm-<name>-disk<N>`, `bedrock_d/vm/drbd_config.py`)
+- `fencing resource-and-stonith` — on **any** replication-link loss DRBD **suspends ALL IO**
+  (`susp_fen`) and calls the handler, blocking until its exit. This is the always-freeze. (The
+  cluster singleton uses `resource-only`; VM disks need the stronger `-and-stonith` because they
+  have no `quorum`/witness backstop, so the freeze itself must come from fencing.)
+- `handlers { fence-peer bedrock-fence-peer; }` — the same self-contained handler, which now routes
+  by resource class: `cluster` → octet/netd path; `vm-*` → node_name/rqlite path.
+- `options on-suspended-primary-outdated force-secondary` + `ping-int 5` + create-md
+  `--bitmap-block-size=1048576` (the Bedrock DRBD defaults, now on VM disks too).
 
-### Real dragons found — in the EXISTING VM-failover path (not the extension)
-- **D4 (serious):** hung-old-primary gap is **timing, not interlock**. Old primary suspends ~T+5-9s
-  (userspace marker), survivor force-promotes at T+35s; a hung-but-not-dead old primary
-  (`no_quorum_responder` `asyncio.wait_for(30s)` times out, logs, *continues*) keeps flushing while
-  the survivor promotes (peer-down = heartbeat-age, not death-confirmed) → concurrent writes →
-  divergence. The VM analogue of cluster R3, **without** the `suspend-io` kernel backstop.
-- **D5 (serious):** the takeover `level=strong` UUID read is **tautological** — `_takeover_one`
-  promotes → writes its own UUID → reads it back → compares to its own local UUID (no DRBD-mutating
-  call between); proves "my write committed", not "no peer raced a promote". The code's own
-  docstring (`bedrock_d/vm/failover.py:182-183`) admits it. Genuine on cold-start, blind on takeover.
-- **D3 (inherent):** no quorum → a minority VM Primary keeps writing + rotating UUID → sibling
-  generations → `after-sb` discard (data loss on the discarded side), not clean Outdated→SyncTarget.
-- **D8 (inherited):** the denominator-shrink split-brain (`lesson_node_drain_denominator_splitbrain`,
-  deferred) lets a minority pass `_rqlite_quorate` and reach the strong-read; fence-peer wouldn't fix
-  it (election bug) — the `#7` all-applied watermark is the fix.
+### Decision (`fence_verdict.decide_vm_fence`, endpoint-side)
+`level=strong` read of `vms.host` + `failover_order` for the VM. The strong read **doubles as the
+"am I in the cluster majority?" gate** — it RAISES in the minority partition (no leader to confirm),
+which maps to `undecided` → DRBD stays frozen (the safe default). Then:
+- `host == me` → **win** (blessed home, in majority → outdate peer, resume).
+- `host == lost_peer` AND I'm next in `failover_order` → **win** (the *sanctioned takeover*: the
+  callout fires *during* `takeover_after_peer_down_task`'s `drbdadm primary`, **before** it writes
+  `vms.host = me` at the last saga step, so we recognise the successor by the lost-host identity +
+  the predetermined order — `peers_after_dead`, the same authority the takeover itself uses).
+- else → **lose**. Mirrors `is_safe_to_start_vm` / `_vms_on_dead_peer` so the DRBD-level gate and the
+  orchestrator can never disagree about who runs the VM.
 
-### Recommended VM-disk hardening (instead of fence-peer), priority order
-1. **Positive death-confirmed interlock before `drbdadm primary`** in `_takeover_one`: require the
-   home node provably down/suspended (witness `HOSTING=0` / stale slot — the death-oracle signal),
-   not merely heartbeat-silent. Userspace; closes D4/D5 — the one real gap fence-peer was meant to fill.
-2. **Reorder the strong-read to PRE-promote** (mirror arbiter step 3) so it catches a behind/raced disk.
-3. `migrate` UUID-record should **fail the saga** (not warn-continue) on unreadable post-promote UUID.
-4. (vipet/3-peer only, v1.x) `quorum majority` + `suspend-io` kernel backstop — needs a per-VM resume
-   authority that does not exist; never on cattle(1)/pet(2).
-5. Make the even-split VM-failover stall **operator-visible** (today a silent logged skip).
+This is the intended separation of the two read-consistency classes (`feedback_read_consistency_classes`):
+the VM fence decision is **strict-leader, no local fallback** (a stale local replica could read an old
+host → split-brain).
 
-**Sequencing:** the cluster-tier fence-peer handler is still STATUS=design (the real `bedrock-fence-peer`
-does not exist yet; `cluster_arbiter.py:1382` still calls the to-be-removed `_drbd_resume_io`). Land +
-validate the cluster-tier handler first, then revisit VM disks.
+### Heal — the loser's clean recovery (`reconcile_vm_fence_heal_task`, the #34 analogue for VM disks)
+A frozen minority loser cannot self-resolve: isolated, its fence-peer got `undecided`, so it never
+self-outdated; on reconnect it is a frozen Primary the winner can't merge with (`after-sb-2pri
+disconnect`). On quorum return the 4th vm_failover task drives it back to a clean pair, both moves
+idempotent off one `drbdsetup status` parse:
+1. **Reconnect any StandAlone `vm-*`** (`drbdadm connect`) — the takeover leaves the WINNER StandAlone
+   (it disconnected the dead inbound peer), and a just-demoted loser can land StandAlone when its
+   first handshake aborts (`-27`). Reconnecting the winner triggers DRBD's own *"remote has more
+   recent data → force secondary"* on the frozen loser (clean, because no-mint = the loser's UUID is
+   a strict ancestor); reconnecting the demoted Secondary completes the resync. Non-destructive.
+2. **Backstop force-release** a frozen Primary the cluster no longer owns (`vms.host != me`, stable
+   12 s) via `drbdsetup secondary --force=yes` — for the case nothing reconnected it so the native
+   force-secondary never fired. The 12 s window keeps this off a node that is only transiently
+   suspended because it is *winning* a fence (resolves in ~1-3 s).
+
+### What this fixes (the earlier "dragons" D3/D4/D5)
+- **D3 / D4** (minority/hung old Primary keeps writing while the survivor promotes → divergence): the
+  `resource-and-stonith` freeze stops the minority's writes at the DRBD-detection moment (~3-6 s with
+  `ping-int 5`), long before the T+35 s takeover. Empirically: **no split-brain, no-mint** across runs.
+- **D5** (tautological takeover strong-read): `decide_vm_fence` adds an **independent** strong-read
+  gate at the actual promote (`vms.host`/`failover_order`), not just the self-confirming UUID read.
+- **D8** (denominator-shrink split-brain, `lesson_node_drain_denominator_splitbrain`): still an
+  *election* bug the fence-peer can't fix — the `#7` all-applied watermark remains the fix.
+
+### Validation (testbed, stock DRBD 9.x, 2026-06-08 — `testbed/drbd_uuid_bug/vm_fence_campaign.py`)
+Realistic gate (full reconverge between scenarios), pet VM (2-way):
+- **W** (isolate the replica): host **WINS**, VM never stops, single Primary throughout; the winner
+  legitimately mints a new UUID (drives the replica's resync); clean reconverge. **PASS**.
+- **F** (isolate the host): froze at **T+2.9 s**, successor fence-peer **WIN** at T+7.5 s during its
+  `drbdadm primary`, VM running on the successor at **T+28 s**; isolated host is Primary-**but-frozen**
+  (exactly one live Primary → **no split-brain**); frozen loser's UUID **never rotated** (no-mint);
+  on heal the loser auto-demotes + resyncs to UpToDate/UpToDate with no manual action. **PASS**.
+
+### Still open / deferred
+- `migrate` live failed on a libvirt `qemu+ssh` **host-key verification** error (testbed migration SSH
+  known_hosts not seeded) — orthogonal to P3; note for the migrate path.
+- `migrate.py` post-promote UUID-record should **fail the saga** (not warn-continue) on unreadable UUID.
+- vipet/3-peer even-split VM-failover stall should be made **operator-visible** (today a silent skip).
