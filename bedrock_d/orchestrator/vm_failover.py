@@ -55,6 +55,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -86,7 +87,17 @@ KILL_AFTER_QUORUM_LOSS_S   = 5 * 60  # kill 5 min after QUORUM LOSS (not after
                                      # turned off after 5 minutes; from ~20 s it
                                      # gets suspended first."
 
-TICK_S = 5.0     # all three tasks run on this cadence
+TICK_S = 5.0     # all four tasks run on this cadence
+
+# A local frozen (susp_fen) Primary the cluster no longer owns must persist this long before
+# we force-release it (reconcile_lost_frozen_primaries_task). It is LONGER than a winning /
+# taking-over node's brief susp_fen window — a VM fence verdict is a fast level='strong' read
+# (~1-3 s) that resumes the winner immediately — so only a PERSISTENTLY frozen loser (the
+# minority node whose fence-peer got 'undecided' and could never self-outdate) ever matches.
+HEAL_LOST_FROZEN_STABLE_S = 12.0
+
+# vm-<name>-disk<N> -> <name> (same convention as bedrock_d/vm/create.py + fence_verdict).
+_VM_RES_RE = re.compile(r"^vm-(.+)-disk\d+$")
 
 # Freshness window for the _rqlite_quorate isolation gate (a Go duration string
 # passed to rqlite's level='none'+freshness read). Comfortably above rqlite's
@@ -717,12 +728,137 @@ async def kill_suspended_after_5min_task():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# ④ reconcile_lost_frozen_primaries — the #34 heal, for VM disks
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _vm_name_from_res(res: str) -> str:
+    m = _VM_RES_RE.match(res or "")
+    return m.group(1) if m else ""
+
+
+def _local_frozen_primary_vm_resources() -> list[str]:
+    """Names of local vm-* DRBD resources that are FROZEN Primaries — role:Primary AND
+    suspended (susp_fen). The freeze is the discriminator: an active winner / taking-over
+    Primary is NEVER suspended once its fence verdict lands, so this only ever surfaces the
+    minority loser whose fence-peer got 'undecided' (it could not reach rqlite to self-outdate)
+    and stayed frozen. `drbdsetup status` omits the suspended field entirely when not frozen."""
+    try:
+        txt = subprocess.run(["drbdsetup", "status"], capture_output=True, text=True,
+                             timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for line in txt.splitlines():
+        if not line or line[:1].isspace():
+            continue   # only top-level resource headers start at column 0
+        m = re.match(r"(\S+)\s+role:(\w+)", line)
+        if m and m.group(1).startswith("vm-") and m.group(2) == "Primary" and "suspended:" in line:
+            out.append(m.group(1))
+    return out
+
+
+def _strong_vms_host(vm_name: str) -> Optional[str]:
+    """rqlite vms.host for vm_name (level='strong'). RAISES in the minority partition (no
+    leader confirmation) — so a successful read also proves we are back in quorum."""
+    try:
+        from lib import rqlite_client
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, "/usr/local/lib/bedrock")
+        from lib import rqlite_client  # type: ignore
+    with rqlite_client.RqliteClient() as rc:
+        row = rc.query_one("SELECT host FROM vms WHERE vm_name = ?",
+                           params=[vm_name], level="strong")
+    if row is None:
+        return None
+    return row.get("host") or None
+
+
+def _heal_lost_frozen_primary(res: str, vm_name: str) -> None:
+    """Force-release a frozen Primary the cluster no longer owns + resync from the winner.
+    The VM-disk equivalent of cluster_arbiter._force_release_drbd (#34): a quorum-lost frozen
+    Primary cannot demote on its own (it is not self-outdated, so on-suspended-primary-outdated
+    never fires; and it cannot reconnect — two Primaries -> after-sb-2pri disconnect)."""
+    log.warning("vm_failover: HEALING lost frozen Primary %s (VM %r) — the cluster host is "
+                "elsewhere; force-release + resync from the winner", res, vm_name)
+    # 1. Force-demote: EIO the frozen IO (discards the minority's un-replicated writes — they
+    #    cannot survive without split-brain). This also unblocks the stuck qemu (its IO errors
+    #    out), so the stale local VM copy exits.
+    subprocess.run(["drbdsetup", "secondary", res, "--force=yes"],
+                   capture_output=True, timeout=20)
+    # 2. Best-effort cleanup of the (now dying) stale local VM + its suspended-record entry.
+    subprocess.run(["virsh", "destroy", vm_name], capture_output=True, timeout=20)
+    drop_suspended([vm_name])
+    # 3. Reconnect discarding OUR data -> resync from the winner. disconnect first to clear the
+    #    net-config; --discard-my-data is safe because rqlite says we are definitively the loser
+    #    (only the loser runs this heal — the winner has vms.host == me and skips it).
+    subprocess.run(["drbdadm", "disconnect", res], capture_output=True, timeout=15)
+    rc = subprocess.run(["drbdadm", "connect", "--discard-my-data", res],
+                       capture_output=True, timeout=15)
+    if rc.returncode != 0:
+        log.warning("vm_failover: heal %s connect --discard-my-data rc=%d stderr=%s",
+                    res, rc.returncode, rc.stderr.decode(errors='replace')[:200])
+    else:
+        log.warning("vm_failover: heal %s — force-released, resyncing from the winner", res)
+
+
+async def reconcile_lost_frozen_primaries_task():
+    """Every TICK_S: heal any local vm-* DRBD that is a FROZEN Primary the cluster no longer
+    owns — the quorum-lost loser of a VM fence (isolated in the minority, its fence-peer got
+    'undecided' and it could never self-outdate, so it stayed frozen). On quorum return we
+    force-release it + resync from the winner (the #34 heal, for VM disks).
+
+    Gate: role==Primary AND suspended AND strong-read vms.host != me, STABLE for
+    HEAL_LOST_FROZEN_STABLE_S. The stability window is what makes this safe mid-takeover: a
+    node that is WINNING / taking over is suspended only for the ~1-3 s its fence verdict takes
+    (and its vms.host catches up right after), far under the window — so we never force-secondary
+    a node that is legitimately becoming Primary; only a persistently-frozen loser matches."""
+    log.info("vm_failover: reconcile_lost_frozen_primaries_task started "
+             "(heal-stable threshold = %.0fs)", HEAL_LOST_FROZEN_STABLE_S)
+    me = ""
+    first_seen: dict[str, float] = {}   # res -> monotonic ts the (frozen, host!=me) cond began
+    while True:
+        await asyncio.sleep(TICK_S)
+        try:
+            if not me:
+                me = _self_node_name()
+                if not me:
+                    continue
+            frozen = set(_local_frozen_primary_vm_resources())
+            # forget resources that are no longer frozen-lost (resumed / demoted / healed)
+            for r in list(first_seen):
+                if r not in frozen:
+                    first_seen.pop(r, None)
+            now = time.monotonic()
+            for res in frozen:
+                vm_name = _vm_name_from_res(res)
+                if not vm_name:
+                    continue
+                try:
+                    host = _strong_vms_host(vm_name)   # strong -> proves we're back in quorum
+                except Exception:
+                    first_seen.pop(res, None)           # still minority -> can't heal yet
+                    continue
+                if host is None or host == me:
+                    first_seen.pop(res, None)           # unknown VM, or I AM the host -> leave it
+                    continue
+                # confirmed lost: hold the condition stable before the destructive heal
+                t0 = first_seen.setdefault(res, now)
+                if now - t0 >= HEAL_LOST_FROZEN_STABLE_S:
+                    _heal_lost_frozen_primary(res, vm_name)
+                    first_seen.pop(res, None)
+        except Exception as e:
+            log.warning("vm_failover: reconcile-lost-frozen tick: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Public entry point — called from mgmt/orchestrator.start_all
 # ─────────────────────────────────────────────────────────────────────
 
 
 def start_failover_tasks() -> list:
-    """Spawn the three failover tasks on the current asyncio loop.
+    """Spawn the four failover tasks on the current asyncio loop.
     Returns the task handles (caller doesn't have to keep them; the
     loop owns them). Idempotent at the loop-task level via the
     orchestrator's _TASKS_STARTED guard."""
@@ -730,4 +866,5 @@ def start_failover_tasks() -> list:
         asyncio.create_task(suspend_on_no_quorum_task()),
         asyncio.create_task(takeover_after_peer_down_task()),
         asyncio.create_task(kill_suspended_after_5min_task()),
+        asyncio.create_task(reconcile_lost_frozen_primaries_task()),
     ]
