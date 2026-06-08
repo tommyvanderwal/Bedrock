@@ -785,54 +785,45 @@ def _strong_vms_host(vm_name: str) -> Optional[str]:
 
 
 def _heal_lost_frozen_primary(res: str, vm_name: str) -> None:
-    """Force-release a frozen Primary the cluster no longer owns + resync from the winner.
-    The VM-disk equivalent of cluster_arbiter._force_release_drbd (#34): a quorum-lost frozen
-    Primary cannot demote on its own (it is not self-outdated, so on-suspended-primary-outdated
-    never fires; and it cannot reconnect — two Primaries -> after-sb-2pri disconnect)."""
-    log.warning("vm_failover: HEALING lost frozen Primary %s (VM %r) — the cluster host is "
-                "elsewhere; force-release + resync from the winner", res, vm_name)
-    # 1. Force-demote: EIO the frozen IO (discards the minority's un-replicated writes — they
-    #    cannot survive without split-brain). This also unblocks the stuck qemu (its IO errors
-    #    out), so the stale local VM copy exits.
+    """Force-demote a frozen Primary the cluster no longer owns — the BACKSTOP for when DRBD's
+    own 'remote has more recent data -> force secondary' did not fire (it fires when something
+    reconnects the frozen node; this covers the case nothing did). drbdsetup secondary --force
+    EIOs the frozen IO — discarding the minority's un-replicated writes, which cannot survive
+    without split-brain — and unblocks the stuck qemu so the stale local VM copy exits.
+
+    Reconnect + resync is deliberately left to the StandAlone branch of the heal loop: after
+    the demote the node is a StandAlone Secondary, drbdadm connect re-establishes it, and DRBD's
+    UUID ancestry picks the sync direction — clean, because the frozen loser never minted a
+    sibling UUID (no-mint), so its current-UUID is a strict ancestor of the winner's."""
+    log.warning("vm_failover: force-releasing lost frozen Primary %s (VM %r) — the cluster "
+                "host is elsewhere", res, vm_name)
     subprocess.run(["drbdsetup", "secondary", res, "--force=yes"],
                    capture_output=True, timeout=20)
-    # 2. Best-effort cleanup of the (now dying) stale local VM + its suspended-record entry.
     subprocess.run(["virsh", "destroy", vm_name], capture_output=True, timeout=20)
     drop_suspended([vm_name])
-    # 3. Reconnect discarding OUR data -> resync from the winner. disconnect first to clear the
-    #    net-config; --discard-my-data is safe because rqlite says we are definitively the loser
-    #    (only the loser runs this heal — the winner has vms.host == me and skips it).
-    subprocess.run(["drbdadm", "disconnect", res], capture_output=True, timeout=15)
-    rc = subprocess.run(["drbdadm", "connect", "--discard-my-data", res],
-                       capture_output=True, timeout=15)
-    if rc.returncode != 0:
-        log.warning("vm_failover: heal %s connect --discard-my-data rc=%d stderr=%s",
-                    res, rc.returncode, rc.stderr.decode(errors='replace')[:200])
-    else:
-        log.warning("vm_failover: heal %s — force-released, resyncing from the winner", res)
 
 
 async def reconcile_vm_fence_heal_task():
-    """Every TICK_S: drive a VM-disk fence aftermath back to a clean replicated pair. Two roles,
-    both keyed off a single `drbdsetup status` parse + a strong vms.host read:
+    """Every TICK_S: drive a VM-disk fence aftermath back to a clean replicated pair via two
+    independent, idempotent moves keyed off one `drbdsetup status` parse:
 
-      LOSER  — a FROZEN (susp_fen) Primary the cluster no longer owns (the quorum-lost minority
-        node whose fence-peer got 'undecided' and could never self-outdate, so it stayed
-        frozen). Once the condition holds STABLE for HEAL_LOST_FROZEN_STABLE_S we force-release
-        it + rejoin (the #34 heal, for VM disks). The stability window is what makes this safe
-        mid-takeover: a node that is WINNING is suspended only for the ~1-3 s its fence verdict
-        takes (then resumes + vms.host catches up), far under the window — so we never
-        force-secondary a node that is legitimately becoming Primary.
+      (1) RECONNECT any StandAlone vm-* resource. A takeover leaves the WINNER StandAlone (it
+          disconnected the dead inbound peer); a just-demoted LOSER can also land StandAlone when
+          its first reconnect handshake aborts (-27) as DRBD forces it Secondary. drbdadm connect
+          re-establishes both — DRBD's UUID ancestry picks the sync direction (clean, no-mint).
+          Non-destructive + idempotent: an absent peer just stays Connecting; two Primaries can't
+          merge (after-sb-2pri disconnect); and reconnecting a still-frozen Primary loser nudges
+          DRBD into its own 'remote newer -> force secondary'. No quorum gate needed — a reconnect
+          during a live partition is a harmless no-op (peer unreachable).
 
-      WINNER — a StandAlone Primary I OWN (vms.host == me). A takeover leaves the winner
-        StandAlone (it disconnected the dead inbound peer); nothing else reconnects it, so the
-        demoted loser would sit at Connecting forever. Reconnect it (drbdadm connect) to
-        re-establish replication. Idempotent; an absent peer just stays Connecting; two
-        Primaries can't merge (after-sb-2pri disconnect), so retrying is safe.
+      (2) BACKSTOP force-release a FROZEN (susp_fen) Primary the cluster no longer owns, if it is
+          STILL frozen after HEAL_LOST_FROZEN_STABLE_S — i.e. DRBD's native force-secondary never
+          fired because nothing reconnected it. The strong vms.host read gives the authoritative
+          owner AND proves we're back in quorum (it raises in the minority); the stability window
+          keeps this off a node that is only transiently suspended because it is WINNING a fence
+          right now (that resolves in ~1-3s, far under the window).
 
-    Both reads are level='strong' — they also prove we're back in quorum (they raise in the
-    minority). In steady state every resource is Connected + unsuspended, so neither branch
-    fires and no strong reads happen."""
+    In steady state every resource is Connected + unsuspended, so neither move fires."""
     log.info("vm_failover: reconcile_vm_fence_heal_task started "
              "(heal-stable threshold = %.0fs)", HEAL_LOST_FROZEN_STABLE_S)
     me = ""
@@ -845,8 +836,7 @@ async def reconcile_vm_fence_heal_task():
                 if not me:
                     continue
             states = _vm_resource_states()
-            # forget resources no longer in the frozen-Primary condition (resumed/demoted/healed)
-            for r in list(first_seen):
+            for r in list(first_seen):     # forget resources no longer a frozen Primary
                 st = states.get(r)
                 if not st or not (st["role"] == "Primary" and st["suspended"]):
                     first_seen.pop(r, None)
@@ -855,8 +845,12 @@ async def reconcile_vm_fence_heal_task():
                 vm_name = _vm_name_from_res(res)
                 if not vm_name:
                     continue
+                # (1) reconnect any disconnected resource — winner or demoted loser
+                if st["standalone"]:
+                    subprocess.run(["drbdadm", "connect", res],
+                                   capture_output=True, timeout=15)
+                # (2) backstop-demote a frozen Primary the cluster no longer owns
                 if st["role"] == "Primary" and st["suspended"]:
-                    # LOSER candidate
                     try:
                         host = _strong_vms_host(vm_name)   # strong -> proves we're back in quorum
                     except Exception:
@@ -869,15 +863,8 @@ async def reconcile_vm_fence_heal_task():
                     if now - t0 >= HEAL_LOST_FROZEN_STABLE_S:
                         _heal_lost_frozen_primary(res, vm_name)
                         first_seen.pop(res, None)
-                elif st["role"] == "Primary" and st["standalone"]:
-                    # WINNER candidate — reconnect to restore replication to the returning peer
-                    try:
-                        host = _strong_vms_host(vm_name)
-                    except Exception:
-                        continue
-                    if host == me:
-                        subprocess.run(["drbdadm", "connect", res],
-                                       capture_output=True, timeout=15)
+                else:
+                    first_seen.pop(res, None)
         except Exception as e:
             log.warning("vm_failover: vm-fence heal tick: %s", e)
 

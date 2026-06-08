@@ -234,8 +234,8 @@ def scenario_F():
     for _ in range(40):
         r = vrole(host); cs = cstate(host); ds = dstate(host)
         if r == "Secondary":
-            print(f"    \033[32mloser sim-{host} auto-demoted to Secondary at +{now()-t_heal:.0f}s "
-                  f"(cstate={cs} dstate={ds}) — on-suspended-primary-outdated worked\033[0m")
+            print(f"    \033[32mloser sim-{host} demoted to Secondary at +{now()-t_heal:.0f}s "
+                  f"(cstate={cs} dstate={ds}) — heal force-release / DRBD native\033[0m")
             loser_demoted = True
             break
         time.sleep(3)
