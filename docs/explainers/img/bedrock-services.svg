@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="12.5">
+  <rect width="900" height="520" fill="#ffffff"/>
+  <text x="450" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#111">Arbiter service lifecycle — what bedrock-d actually does to the boxes</text>
+  <text x="450" y="46" text-anchor="middle" font-size="11" fill="#777">the arbiter "services" = bedrock-rqlited-arbiter + bedrock-weed-filer, the .254 VIP, the mgmt-master role — all riding the one `cluster` DRBD mount</text>
+
+  <!-- LOSER column -->
+  <rect x="40" y="70" width="400" height="420" rx="10" fill="#fdf3f3" stroke="#f1c4c4"/>
+  <text x="240" y="96" text-anchor="middle" font-size="14" font-weight="700" fill="#b91c1c">LOSER — demote_arbiter_host() → _force_release_drbd()</text>
+  <text x="240" y="114" text-anchor="middle" font-size="11" fill="#9b2c2c">verdict LOSE, and the device is frozen → nothing can be stopped cleanly</text>
+
+  <g font-size="12">
+    <rect x="60" y="132" width="360" height="50" rx="6" fill="#fbe3e3"/>
+    <text x="74" y="151" font-weight="700" fill="#7f1212">1 · drbdsetup secondary --force=yes   (~0 s)</text>
+    <text x="74" y="169" fill="#7f1212">EIO the held writes, force role → Secondary. DEMOTE FIRST — the one op that must be fast.</text>
+
+    <rect x="60" y="192" width="360" height="64" rx="6" fill="#fbe3e3"/>
+    <text x="74" y="211" font-weight="700" fill="#7f1212">2 · SIGKILL the holders (by service name)</text>
+    <text x="74" y="229" fill="#7f1212">bedrock-rqlited-arbiter + bedrock-weed-filer.</text>
+    <text x="74" y="246" fill="#7f1212">dirty pages DROPPED by the kernel on death → minority STILL never writes.</text>
+
+    <rect x="60" y="266" width="360" height="46" rx="6" fill="#fbe3e3"/>
+    <text x="74" y="285" font-weight="700" fill="#7f1212">3 · umount -l   (lazy)</text>
+    <text x="74" y="303" fill="#7f1212">detach the mount without touching the frozen FS → open count drops to 0.</text>
+
+    <rect x="60" y="322" width="360" height="60" rx="6" fill="#f6d4d4"/>
+    <text x="74" y="341" font-weight="700" fill="#7f1212">NEVER: systemctl stop · umount · resume-io</text>
+    <text x="74" y="359" fill="#7f1212">all three block forever on a frozen FS, and resume-io would let the</text>
+    <text x="74" y="376" fill="#7f1212">minority write — re-opening the exact bug the freeze prevents.</text>
+
+    <rect x="60" y="392" width="360" height="44" rx="6" fill="#e6f4ea" stroke="#bfe3c4"/>
+    <text x="74" y="411" font-weight="700" fill="#15803d">4 · reconnect as Secondary → resync from winner</text>
+    <text x="74" y="428" fill="#15803d">after-sb-0pri discard-zero-changes → UpToDate. Done.</text>
+  </g>
+
+  <!-- WINNER column -->
+  <rect x="460" y="70" width="400" height="420" rx="10" fill="#f1faf3" stroke="#bfe3c4"/>
+  <text x="660" y="96" text-anchor="middle" font-size="14" font-weight="700" fill="#15803d">WINNER — promote_arbiter_host()</text>
+  <text x="660" y="114" text-anchor="middle" font-size="11" fill="#1a7f37">verdict WIN (or it already held the role and never lost it)</text>
+
+  <g font-size="12">
+    <rect x="480" y="132" width="360" height="46" rx="6" fill="#e6f4ea"/>
+    <text x="494" y="151" font-weight="700" fill="#0f5224">1 · drbdadm primary cluster</text>
+    <text x="494" y="169" fill="#15803d">already-UpToDate, peer Outdated → instant; no resync needed to serve.</text>
+
+    <rect x="480" y="188" width="360" height="46" rx="6" fill="#e6f4ea"/>
+    <text x="494" y="207" font-weight="700" fill="#0f5224">2 · mount /var/lib/bedrock/cluster</text>
+    <text x="494" y="225" fill="#15803d">the rqlite data dir + filer state ride this one DRBD volume.</text>
+
+    <rect x="480" y="244" width="360" height="46" rx="6" fill="#e6f4ea"/>
+    <text x="494" y="263" font-weight="700" fill="#0f5224">3 · bring up the .254 cluster VIP (/32)</text>
+    <text x="494" y="281" fill="#15803d">advertised via the path-vector route layer; clients follow it.</text>
+
+    <rect x="480" y="300" width="360" height="46" rx="6" fill="#e6f4ea"/>
+    <text x="494" y="319" font-weight="700" fill="#0f5224">4 · start bedrock-rqlited-arbiter + bedrock-weed-filer</text>
+    <text x="494" y="337" fill="#15803d">on the data that was already replicated to this node.</text>
+
+    <rect x="480" y="356" width="360" height="46" rx="6" fill="#e6f4ea"/>
+    <text x="494" y="375" font-weight="700" fill="#0f5224">5 · assume the mgmt-master role</text>
+    <text x="494" y="393" fill="#15803d">serves the control plane; CA, dashboards, sagas follow the mount.</text>
+
+    <rect x="480" y="412" width="360" height="60" rx="6" fill="#d7efdb" stroke="#a9dbb0"/>
+    <text x="494" y="431" font-weight="700" fill="#0f5224">often: nothing moved at all</text>
+    <text x="494" y="449" fill="#15803d">if the old master was the winner (e.g. it lost only a Secondary),</text>
+    <text x="494" y="466" fill="#15803d">it just exit-4-resumes and keeps every service. No transfer.</text>
+  </g>
+</svg>

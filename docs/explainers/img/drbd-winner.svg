@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 640" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="12.5">
+  <rect width="480" height="640" fill="#ffffff"/>
+  <text x="240" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#15803d">DRBD on the WINNER (majority Primary)</text>
+  <text x="240" y="46" text-anchor="middle" font-size="11" fill="#777">same start, same freeze — opposite verdict</text>
+
+  <line x1="60" y1="60" x2="60" y2="600" stroke="#a8d8b0" stroke-width="2"/>
+
+  <g>
+    <circle cx="60" cy="78" r="5" fill="#16a34a"/>
+    <text x="78" y="74" font-weight="600" fill="#15803d">Connected · Primary · UpToDate</text>
+    <text x="78" y="90" fill="#666">writing happily; replicating to peers</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="124" r="5" fill="#b91c1c"/>
+    <text x="78" y="120" font-weight="700" fill="#b91c1c">t = 0   partition</text>
+    <text x="78" y="136" fill="#666">same event — the winner can't tell yet that it is the winner</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="178" r="5" fill="#d97706"/>
+    <text x="78" y="166" font-weight="600" fill="#b45309">DRBD notices — same cost as the loser</text>
+    <text x="78" y="182" fill="#444">&lt; 1 s (RST) · ≈ 5.5 s (idle) · 6 s (active I/O)</text>
+  </g>
+
+  <g>
+    <rect x="48" y="206" width="384" height="40" rx="6" fill="#fef6ec" stroke="#f3d9b5"/>
+    <text x="60" y="224" font-weight="700" fill="#92500e">I/O SUSPENDED — frozen too (briefly)</text>
+    <text x="60" y="240" fill="#92500e">`quorum all` means the winner ALSO loses quorum-all → it freezes, then asks</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="278" r="5" fill="#7c3aed"/>
+    <text x="78" y="274" font-weight="600" fill="#6d28d9">fence-peer callout (resource-only)</text>
+    <text x="78" y="290" fill="#444">DRBD spawns `bedrock-fence-peer`, then BLOCKS on its exit code</text>
+  </g>
+
+  <g>
+    <rect x="48" y="308" width="384" height="44" rx="6" fill="#eef6f0" stroke="#bfe3c4"/>
+    <text x="60" y="326" fill="#15803d">bedrock-d: netd says I am Leader (+ exclusive witness claim if even) →</text>
+    <text x="60" y="342" font-weight="600" fill="#15803d">verdict = WIN  →  handler exit 4</text>
+  </g>
+
+  <g>
+    <rect x="48" y="368" width="384" height="58" rx="6" fill="#eef6f0" stroke="#bfe3c4"/>
+    <text x="60" y="386" font-weight="700" fill="#0f5224">exit 4 = "peer is Outdated"</text>
+    <text x="60" y="402" fill="#15803d">DRBD marks the peer Outdated → quorum is satisfied again →</text>
+    <text x="60" y="418" font-weight="600" fill="#0f5224">I/O RESUMES · the arbiter keeps serving</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="452" r="5" fill="#16a34a"/>
+    <text x="78" y="448" font-weight="600" fill="#15803d">Primary · UpToDate · sole writer</text>
+    <text x="78" y="464" fill="#444">a NEW current-UUID is minted here — this is correct:</text>
+    <text x="78" y="480" fill="#444">it records "I diverged from the outdated peer" so the resync knows the delta</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="520" r="5" fill="#2563eb"/>
+    <text x="78" y="516" font-weight="600" fill="#1d4ed8">heal: peer returns as Outdated</text>
+    <text x="78" y="532" fill="#444">winner is SyncSource; UUID ancestry is clean (loser never minted)</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="572" r="5" fill="#16a34a"/>
+    <text x="78" y="568" font-weight="600" fill="#15803d">Connected · UpToDate/UpToDate</text>
+    <text x="78" y="584" fill="#444">replicated pair restored; no operator action</text>
+  </g>
+</svg>

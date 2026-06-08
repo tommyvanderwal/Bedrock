@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 640" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="12.5">
+  <rect width="480" height="640" fill="#ffffff"/>
+  <text x="240" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#b91c1c">DRBD on the LOSER (minority Primary)</text>
+  <text x="240" y="46" text-anchor="middle" font-size="11" fill="#777">time flows downward — each step has a cost</text>
+
+  <!-- spine -->
+  <line x1="60" y1="60" x2="60" y2="600" stroke="#e0a0a0" stroke-width="2"/>
+
+  <!-- helper: dot + label blocks -->
+  <g>
+    <circle cx="60" cy="78" r="5" fill="#16a34a"/>
+    <text x="78" y="74" font-weight="600" fill="#15803d">Connected · Primary · UpToDate</text>
+    <text x="78" y="90" fill="#666">writing happily; replicating to peers</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="124" r="5" fill="#b91c1c"/>
+    <text x="78" y="120" font-weight="700" fill="#b91c1c">t = 0   partition</text>
+    <text x="78" y="136" fill="#666">the replication link goes silent</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="178" r="5" fill="#d97706"/>
+    <text x="78" y="166" font-weight="600" fill="#b45309">DRBD notices — NOT instant</text>
+    <text x="78" y="182" fill="#444">clean RST (peer crash/close): &lt; 1 s</text>
+    <text x="78" y="198" fill="#444">silent idle link: ping-int 5 s + ping-timeout 0.5 s ≈ 5.5 s</text>
+    <text x="78" y="214" fill="#444">writes in flight: timeout 6 s</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="252" r="5" fill="#dc2626"/>
+    <text x="78" y="248" font-weight="600" fill="#b91c1c">conn → Connecting · quorum LOST</text>
+    <text x="78" y="264" fill="#444">`quorum all` + `on-no-quorum suspend-io`</text>
+  </g>
+
+  <g>
+    <rect x="48" y="286" width="384" height="40" rx="6" fill="#fdecec" stroke="#f1c4c4"/>
+    <text x="60" y="304" font-weight="700" fill="#7f1212">I/O SUSPENDED — frozen</text>
+    <text x="60" y="320" fill="#7f1212">suspended:quorum · no write reaches the disk · this is the anti-split-brain</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="356" r="5" fill="#7c3aed"/>
+    <text x="78" y="352" font-weight="600" fill="#6d28d9">fence-peer callout (resource-only)</text>
+    <text x="78" y="368" fill="#444">DRBD spawns `bedrock-fence-peer`, then BLOCKS on its exit code</text>
+  </g>
+
+  <g>
+    <rect x="48" y="386" width="384" height="40" rx="6" fill="#f3f0fb" stroke="#d9cef5"/>
+    <text x="60" y="404" fill="#6d28d9">bedrock-d: my `level=strong` read can't reach a leader →</text>
+    <text x="60" y="420" font-weight="600" fill="#6d28d9">verdict = LOSE / UNDECIDED  →  handler exit 6 / 1</text>
+  </g>
+
+  <g>
+    <rect x="48" y="442" width="384" height="44" rx="6" fill="#fdecec" stroke="#f1c4c4"/>
+    <text x="60" y="460" font-weight="700" fill="#7f1212">stays FROZEN Primary · UUID UNCHANGED</text>
+    <text x="60" y="476" fill="#7f1212">no new-current-UUID is minted — the spurious-UUID bug never happens</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="516" r="5" fill="#dc2626"/>
+    <text x="78" y="506" font-weight="600" fill="#b91c1c">bedrock-d HARD-releases (can't stop cleanly)</text>
+    <text x="78" y="522" fill="#444">SIGKILL holders → dirty pages DROPPED (never flushed)</text>
+    <text x="78" y="538" fill="#444">`umount -l` → `drbdsetup secondary --force` (~0 s)</text>
+  </g>
+
+  <g>
+    <circle cx="60" cy="576" r="5" fill="#16a34a"/>
+    <text x="78" y="572" font-weight="600" fill="#15803d">Secondary · Outdated → reconnect → SyncTarget</text>
+    <text x="78" y="588" fill="#444">after-sb-0pri discard-zero-changes → UpToDate, clean</text>
+  </g>
+</svg>

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="13">
+  <rect width="960" height="470" fill="#ffffff"/>
+  <text x="480" y="30" text-anchor="middle" font-size="19" font-weight="700" fill="#111">Arbiter failover — the whole thing at a glance</text>
+  <text x="480" y="50" text-anchor="middle" font-size="12" fill="#666">One partition, two sides. "Instantly" does not exist — every arrow below has a cost in seconds.</text>
+
+  <!-- time axis -->
+  <line x1="70" y1="90" x2="890" y2="90" stroke="#bbb" stroke-width="1"/>
+  <text x="70" y="80" font-size="11" fill="#888">t=0  partition</text>
+  <text x="890" y="80" text-anchor="end" font-size="11" fill="#888">time →</text>
+  <g fill="#888" font-size="10" text-anchor="middle">
+    <line x1="70"  y1="86" x2="70"  y2="94" stroke="#bbb"/>
+    <line x1="270" y1="86" x2="270" y2="94" stroke="#bbb"/><text x="270" y="106">~5.5 s</text>
+    <line x1="470" y1="86" x2="470" y2="94" stroke="#bbb"/><text x="470" y="106">~9 s</text>
+    <line x1="690" y1="86" x2="690" y2="94" stroke="#bbb"/><text x="690" y="106">~15 s</text>
+    <line x1="890" y1="86" x2="890" y2="94" stroke="#bbb"/>
+  </g>
+
+  <!-- WINNER lane -->
+  <rect x="70" y="130" width="820" height="120" rx="8" fill="#f1faf2" stroke="#bfe3c4"/>
+  <text x="84" y="152" font-weight="700" fill="#1a7f37">WINNER side  (majority partition)</text>
+  <rect x="84" y="165" width="150" height="22" rx="4" fill="#d7efdb"/><text x="90" y="180" fill="#1a7f37">DRBD detects peer gone</text>
+  <rect x="244" y="165" width="150" height="22" rx="4" fill="#d7efdb"/><text x="250" y="180" fill="#1a7f37">IO suspends (frozen)</text>
+  <rect x="404" y="165" width="170" height="22" rx="4" fill="#cdeed2"/><text x="410" y="180" fill="#1a7f37">fence-peer → bedrock-d</text>
+  <rect x="404" y="192" width="320" height="22" rx="4" fill="#bfe3c4"/><text x="410" y="207" fill="#13632b">netd: I am Leader + witness CLAIM → verdict WIN</text>
+  <rect x="584" y="165" width="180" height="22" rx="4" fill="#a9dbb0"/><text x="590" y="180" fill="#0f5224" font-weight="600">exit 4: outdate peer, RESUME</text>
+  <rect x="734" y="219" width="156" height="22" rx="4" fill="#8fcf99"/><text x="740" y="234" fill="#0f5224" font-weight="600">arbiter services keep running</text>
+
+  <!-- LOSER lane -->
+  <rect x="70" y="270" width="820" height="150" rx="8" fill="#fdf2f2" stroke="#f1c4c4"/>
+  <text x="84" y="292" font-weight="700" fill="#b91c1c">LOSER side  (minority partition)</text>
+  <rect x="84" y="305" width="150" height="22" rx="4" fill="#f8dada"/><text x="90" y="320" fill="#b91c1c">DRBD detects peer gone</text>
+  <rect x="244" y="305" width="150" height="22" rx="4" fill="#f8dada"/><text x="250" y="320" fill="#b91c1c">quorum lost → IO frozen</text>
+  <rect x="404" y="305" width="170" height="22" rx="4" fill="#f6cccc"/><text x="410" y="320" fill="#b91c1c">fence-peer → bedrock-d</text>
+  <rect x="404" y="332" width="200" height="22" rx="4" fill="#f1c4c4"/><text x="410" y="347" fill="#8f1414">strong read FAILS (no quorum)</text>
+  <rect x="584" y="305" width="150" height="22" rx="4" fill="#eba8a8"/><text x="590" y="320" fill="#7f1212" font-weight="600">exit 6/1: stay FROZEN</text>
+  <rect x="640" y="360" width="250" height="22" rx="4" fill="#e08c8c"/><text x="646" y="375" fill="#5e0d0d" font-weight="600">bedrock-d HARD-release: kill rqlited+filer</text>
+  <rect x="640" y="388" width="250" height="22" rx="4" fill="#d97676"/><text x="646" y="403" fill="#5e0d0d" font-weight="600">force-secondary → reconnect → resync</text>
+  <text x="84" y="378" fill="#b91c1c" font-size="11">never resume-io —</text>
+  <text x="84" y="392" fill="#b91c1c" font-size="11">dirty pages are</text>
+  <text x="84" y="406" fill="#b91c1c" font-size="11">DROPPED, not flushed</text>
+
+  <!-- divider -->
+  <line x1="404" y1="125" x2="404" y2="425" stroke="#cbd5e1" stroke-dasharray="4 4"/>
+  <text x="404" y="445" text-anchor="middle" font-size="11" fill="#64748b">↑ the single decision point: bedrock-d (netd election + exclusive witness claim) tells each side win / lose</text>
+</svg>

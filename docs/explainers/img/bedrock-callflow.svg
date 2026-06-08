@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 540" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="12.5">
+  <rect width="900" height="540" fill="#ffffff"/>
+  <text x="450" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#111">How bedrock-d turns "a peer vanished" into win / lose</text>
+  <text x="450" y="46" text-anchor="middle" font-size="11" fill="#777">synchronous: DRBD is frozen and waiting the entire time</text>
+
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#475569"/></marker>
+  </defs>
+
+  <!-- 1 DRBD -->
+  <rect x="40" y="80" width="180" height="58" rx="8" fill="#fdecec" stroke="#e0a0a0"/>
+  <text x="130" y="104" text-anchor="middle" font-weight="700" fill="#b91c1c">DRBD (kernel)</text>
+  <text x="130" y="122" text-anchor="middle" fill="#7f1212" font-size="11">frozen Primary · fence-peer</text>
+
+  <!-- 2 handler -->
+  <rect x="40" y="190" width="180" height="62" rx="8" fill="#f3f0fb" stroke="#cbb9f0"/>
+  <text x="130" y="214" text-anchor="middle" font-weight="700" fill="#6d28d9">bedrock-fence-peer</text>
+  <text x="130" y="231" text-anchor="middle" fill="#6d28d9" font-size="11">map node-id → octet</text>
+  <text x="130" y="246" text-anchor="middle" fill="#6d28d9" font-size="11">POST 127.0.0.1:8001</text>
+
+  <!-- 3 endpoint -->
+  <rect x="300" y="190" width="200" height="62" rx="8" fill="#eef4fb" stroke="#a9c9ef"/>
+  <text x="400" y="214" text-anchor="middle" font-weight="700" fill="#1d4ed8">/internal/fence-decision</text>
+  <text x="400" y="231" text-anchor="middle" fill="#1d4ed8" font-size="11">feed drbd_down_peers[octet]</text>
+  <text x="400" y="246" text-anchor="middle" fill="#1d4ed8" font-size="11">then decide_fence() polls</text>
+
+  <!-- 4 netd election -->
+  <rect x="300" y="300" width="200" height="86" rx="8" fill="#eef6f0" stroke="#bfe3c4"/>
+  <text x="400" y="322" text-anchor="middle" font-weight="700" fill="#15803d">netd election tick (1 Hz)</text>
+  <text x="400" y="340" text-anchor="middle" fill="#15803d" font-size="11">force that peer liveness = False</text>
+  <text x="400" y="356" text-anchor="middle" fill="#15803d" font-size="11">→ collapses the 10 s hysteresis</text>
+  <text x="400" y="372" text-anchor="middle" fill="#15803d" font-size="11">recompute votes (100 / node)</text>
+
+  <!-- 5 witness claim -->
+  <rect x="560" y="300" width="200" height="86" rx="8" fill="#fff7ed" stroke="#f3cf9a"/>
+  <text x="660" y="322" text-anchor="middle" font-weight="700" fill="#b45309">exclusive witness CLAIM</text>
+  <text x="660" y="340" text-anchor="middle" fill="#92500e" font-size="11">only if the split is EVEN</text>
+  <text x="660" y="356" text-anchor="middle" fill="#92500e" font-size="11">(witness is pivotal)</text>
+  <text x="660" y="372" text-anchor="middle" fill="#92500e" font-size="11">one side reserves the vote</text>
+
+  <!-- 6 fence_view -->
+  <rect x="300" y="430" width="200" height="70" rx="8" fill="#eef6f0" stroke="#bfe3c4"/>
+  <text x="400" y="452" text-anchor="middle" font-weight="700" fill="#15803d">publish fence_view</text>
+  <text x="400" y="470" text-anchor="middle" fill="#15803d" font-size="11">{outcome, down_acked,</text>
+  <text x="400" y="485" text-anchor="middle" fill="#15803d" font-size="11">stable_since, updated}</text>
+
+  <!-- 7 verdict -->
+  <rect x="560" y="190" width="300" height="62" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="710" y="212" text-anchor="middle" font-weight="700" fill="#334155">decide_fence returns when fence_view is</text>
+  <text x="710" y="229" text-anchor="middle" fill="#475569" font-size="11">FRESH (≤3 s) · ACKED (octet in down_acked)</text>
+  <text x="710" y="244" text-anchor="middle" fill="#475569" font-size="11">· STABLE (≥2.5 s)   → win / lose / undecided</text>
+
+  <!-- arrows -->
+  <line x1="130" y1="138" x2="130" y2="188" stroke="#475569" marker-end="url(#ar)"/>
+  <text x="138" y="166" fill="#475569" font-size="10">spawn, block</text>
+  <line x1="220" y1="221" x2="298" y2="221" stroke="#475569" marker-end="url(#ar)"/>
+  <line x1="400" y1="252" x2="400" y2="298" stroke="#475569" marker-end="url(#ar)"/>
+  <line x1="500" y1="343" x2="558" y2="343" stroke="#475569" marker-end="url(#ar)"/>
+  <line x1="400" y1="386" x2="400" y2="428" stroke="#475569" marker-end="url(#ar)"/>
+  <path d="M500,455 C540,455 540,235 558,225" fill="none" stroke="#475569" marker-end="url(#ar)"/>
+  <text x="548" y="350" fill="#475569" font-size="10">poll 0.4 s</text>
+  <!-- verdict back to handler -->
+  <path d="M620,252 C620,420 250,420 200,255" fill="none" stroke="#1a7f37" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+  <text x="430" y="412" fill="#1a7f37" font-size="10" font-weight="600">verdict → exit 4 / 6 / 1 → DRBD unblocks</text>
+
+  <text x="40" y="524" fill="#94a3b8" font-size="10.5">Deadline: decide_fence gives up at 18 s → "undecided" (freeze, the safe default). Handler HTTP timeout 25 s; DRBD's wait is unbounded.</text>
+</svg>

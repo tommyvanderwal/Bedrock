@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="12">
+  <rect width="920" height="520" fill="#ffffff"/>
+  <text x="460" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#111">Time budget — winner resumes / loser is decided</text>
+  <text x="460" y="46" text-anchor="middle" font-size="11" fill="#777">scale: 1 s = 40 px. Every band is a real, named cost. "Instant" never appears.</text>
+
+  <!-- axis: 0..20s -->
+  <line x1="120" y1="70" x2="120" y2="470" stroke="#cbd5e1"/>
+  <g stroke="#eef2f7" stroke-width="1">
+    <line x1="200" y1="70" x2="200" y2="470"/><line x1="280" y1="70" x2="280" y2="470"/>
+    <line x1="360" y1="70" x2="360" y2="470"/><line x1="440" y1="70" x2="440" y2="470"/>
+    <line x1="520" y1="70" x2="520" y2="470"/><line x1="600" y1="70" x2="600" y2="470"/>
+    <line x1="680" y1="70" x2="680" y2="470"/><line x1="760" y1="70" x2="760" y2="470"/>
+    <line x1="840" y1="70" x2="840" y2="470"/>
+  </g>
+  <g fill="#94a3b8" font-size="10" text-anchor="middle">
+    <text x="120" y="62">0 s</text><text x="200" y="62">2</text><text x="280" y="62">4</text>
+    <text x="360" y="62">6</text><text x="440" y="62">8</text><text x="520" y="62">10</text>
+    <text x="600" y="62">12</text><text x="680" y="62">14</text><text x="760" y="62">16</text><text x="840" y="62">18</text>
+  </g>
+
+  <!-- BEST CASE row (clean RST) -->
+  <text x="12" y="104" font-weight="700" fill="#15803d">BEST</text>
+  <text x="12" y="120" fill="#64748b" font-size="10">clean RST</text>
+  <!-- detection 0.1s -->
+  <rect x="120" y="90" width="6" height="34" fill="#f59e0b"/>
+  <!-- fence-peer + http 0.3s -->
+  <rect x="126" y="90" width="12" height="34" fill="#a78bfa"/>
+  <!-- election tick <=1s -->
+  <rect x="138" y="90" width="40" height="34" fill="#34d399"/>
+  <!-- stable 2.5s -->
+  <rect x="178" y="90" width="100" height="34" fill="#10b981"/>
+  <!-- resume -->
+  <rect x="278" y="90" width="6" height="34" fill="#059669"/>
+  <line x1="284" y1="84" x2="284" y2="130" stroke="#065f46" stroke-width="2"/>
+  <text x="292" y="112" fill="#065f46" font-weight="700" font-size="11">winner RESUMED ≈ 4 s</text>
+
+  <!-- WORST CASE row (silent idle) -->
+  <text x="12" y="184" font-weight="700" fill="#b45309">WORST</text>
+  <text x="12" y="200" fill="#64748b" font-size="10">silent idle</text>
+  <text x="12" y="213" fill="#64748b" font-size="10">link</text>
+  <!-- detection 5.5s -->
+  <rect x="120" y="170" width="220" height="34" fill="#f59e0b"/>
+  <text x="230" y="191" text-anchor="middle" fill="#7c4a02" font-size="10">DRBD detect 5.5 s</text>
+  <!-- fence-peer+http 0.3 -->
+  <rect x="340" y="170" width="12" height="34" fill="#a78bfa"/>
+  <!-- election converge ~3.5s (evidence over a few ticks) -->
+  <rect x="352" y="170" width="140" height="34" fill="#34d399"/>
+  <text x="422" y="191" text-anchor="middle" fill="#065f46" font-size="10">converge ~3.5 s</text>
+  <!-- stable 2.5 -->
+  <rect x="492" y="170" width="100" height="34" fill="#10b981"/>
+  <text x="542" y="191" text-anchor="middle" fill="#065f46" font-size="10">stable 2.5</text>
+  <rect x="592" y="170" width="6" height="34" fill="#059669"/>
+  <line x1="598" y1="164" x2="598" y2="210" stroke="#065f46" stroke-width="2"/>
+  <text x="606" y="192" fill="#065f46" font-weight="700" font-size="11">resumed ≈ 9–12 s</text>
+
+  <!-- deadline -->
+  <line x1="840" y1="76" x2="840" y2="300" stroke="#dc2626" stroke-dasharray="5 4"/>
+  <text x="836" y="318" text-anchor="end" fill="#dc2626" font-size="11" font-weight="600">hard ceiling: decide_fence deadline 18 s → "undecided" = freeze</text>
+
+  <!-- LOSER row -->
+  <text x="12" y="264" font-weight="700" fill="#b91c1c">LOSER</text>
+  <rect x="120" y="250" width="472" height="34" fill="#fca5a5"/>
+  <text x="356" y="271" text-anchor="middle" fill="#7f1212" font-size="10.5">FROZEN — no writes — the whole time the decision runs</text>
+  <rect x="592" y="250" width="10" height="34" fill="#b91c1c"/>
+  <text x="608" y="271" fill="#7f1212" font-size="11" font-weight="600">verdict LOSE → force-release (demote ~0 s)</text>
+
+  <!-- legend -->
+  <g font-size="11">
+    <rect x="120" y="350" width="14" height="14" fill="#f59e0b"/><text x="140" y="362" fill="#444">DRBD detection (RST &lt;1s · idle 5.5s · active-IO 6s)</text>
+    <rect x="120" y="372" width="14" height="14" fill="#a78bfa"/><text x="140" y="384" fill="#444">fence-peer spawn + loopback HTTP (~0.3 s)</text>
+    <rect x="120" y="394" width="14" height="14" fill="#34d399"/><text x="140" y="406" fill="#444">netd election converges (DRBD evidence collapses the 10 s hysteresis)</text>
+    <rect x="120" y="416" width="14" height="14" fill="#10b981"/><text x="140" y="428" fill="#444">stability hold (DECIDE_STABLE_S = 2.5 s) — a transient must not decide</text>
+    <rect x="540" y="372" width="14" height="14" fill="#fca5a5"/><text x="560" y="384" fill="#444">loser frozen (safe — nobody writes)</text>
+  </g>
+
+  <text x="120" y="466" fill="#94a3b8" font-size="10.5">Context: a Windows guest's disk timeout is ~30 s; active-IO DRBD timeout is 6 s — so even the worst case leaves &gt;18 s of headroom before a guest errors. The arbiter itself has no guest, so its only "deadline" is how long the control plane is briefly read-only.</text>
+</svg>
