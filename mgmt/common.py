@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import paramiko
+from fastapi import HTTPException
 
 import sys as _sys
 _sys.path.insert(0, "/usr/local/lib/bedrock")
@@ -798,3 +799,159 @@ def get_last_state() -> dict:
 def set_last_state(state: dict) -> None:
     global _last_state
     _last_state = state
+# ── ISO / image inventory (shared: imports + vm-create iso list) ─────
+
+
+
+
+
+
+def load_inventory() -> dict:
+    if VM_INVENTORY_FILE.exists():
+        try: return json.loads(VM_INVENTORY_FILE.read_text())
+        except Exception: return {}
+    return {}
+
+
+
+
+
+
+def save_inventory(inv: dict):
+    VM_INVENTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    VM_INVENTORY_FILE.write_text(json.dumps(inv, indent=2))
+# ── Import job directory (shared: imports router + _vm_create_from_import) ──
+
+
+
+
+
+
+def _import_dir(job_id: str) -> Path:
+    # Strict job-id form to prevent traversal
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", job_id):
+        raise HTTPException(400, "invalid id")
+    return IMPORT_ROOT / job_id
+# ── Import job meta writer (shared: imports router + _vm_create_from_import) ──
+
+
+
+
+
+
+def _write_import_meta(d: Path, meta: dict):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+# ── shared VM/import helpers + roots (used by common + multiple routers) ──
+
+
+
+
+# routes_iso registration needs the push_log callable, so it runs after
+# `def push_log(...)` further down (see "── routes_iso ──").
+
+
+# ── Import library (VMware/Hyper-V/qcow2 → Bedrock) ──────────────────────
+
+IMPORT_ROOT = Path("/opt/bedrock/imports")
+
+
+
+
+# ── Settings helpers ────────────────────────────────────────────────────────
+
+def _vm_host(vm_name: str) -> tuple:
+    """Return (running_on_name, host, resource_name) for a VM that exists."""
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm: raise HTTPException(404, f"Unknown VM: {vm_name}")
+    running = vm.get("running_on") or (vm.get("defined_on") or [None])[0]
+    if not running: raise HTTPException(503, "VM has no known node")
+    nodes_cfg = get_nodes()
+    return running, nodes_cfg[running]["host"], vm.get("drbd_resource", "")
+
+
+
+
+def _vm_get_settings(vm_name: str) -> dict:
+    running, host, resource = _vm_host(vm_name)
+    xml = ssh_cmd(host, f"virsh dumpxml {vm_name}")
+    info = _parse_dominfo(xml)
+    # disk size from the data disk (first <disk device='disk'>)
+    data_disk = next((d for d in info["disks"] if d["device"] == "disk"), None)
+    disk_bytes = 0
+    if data_disk and data_disk["source"]:
+        try:
+            disk_bytes = int(ssh_cmd(host, f"blockdev --getsize64 {data_disk['source']}"))
+        except Exception: pass
+    # Current CDROM inserted (if any). The USER's ISO slot is whichever SATA
+    # CDROM is NOT virtio-win.iso.
+    cdrom_slot, cdrom_iso = None, None
+    for d in info["disks"]:
+        if d["device"] == "cdrom":
+            fname = d["source"].rsplit("/", 1)[-1] if d["source"] else ""
+            if fname != "virtio-win.iso":
+                cdrom_slot = d["target"]
+                cdrom_iso = fname or None
+                break
+    # Priority from inventory
+    inv = load_inventory()
+    priority = (inv.get(vm_name) or {}).get("priority", "normal")
+    # Get cpu_shares live
+    try:
+        out = ssh_cmd(host, f"virsh schedinfo {vm_name} 2>/dev/null | awk '/cpu_shares/{{print $3}}'")
+        cpu_shares = int(out.strip()) if out.strip() else None
+    except Exception:
+        cpu_shares = None
+    return {
+        "name": vm_name,
+        "host": host,
+        "vcpus": info["vcpus"],
+        "ram_mb": info["ram_kib"] // 1024,
+        "disk_gb": disk_bytes // (1024**3),
+        "disk_path": data_disk["source"] if data_disk else "",
+        "disk_target": data_disk["target"] if data_disk else "",
+        "drbd_resource": resource,
+        "cdrom_slot": cdrom_slot,
+        "cdrom_iso": cdrom_iso,
+        "priority": priority,
+        "cpu_shares": cpu_shares,
+    }
+# ── data-gathering sub-helpers + cache paths (used by build_*/_vm_get_settings) ──
+
+
+
+
+# ── Physical topology rollup ────────────────────────────────────────────────
+
+PHYSICAL_TOPOLOGY_CACHE = Path("/run/bedrock/physical_topology.json")
+
+
+VM_INVENTORY_FILE = Path("/etc/bedrock/vm_inventory.json")
+
+
+
+
+def _parse_dominfo(xml: str) -> dict:
+    """Pull vcpus, ram, cdrom target+source, disk target+source from VM XML."""
+    import re as _re
+    m_vcpu = _re.search(r"<vcpu[^>]*>(\d+)</vcpu>", xml)
+    m_mem = _re.search(r"<memory[^>]*unit=['\"]KiB['\"][^>]*>(\d+)</memory>", xml) or \
+            _re.search(r"<memory[^>]*>(\d+)</memory>", xml)
+    disks = []
+    for m in _re.finditer(r"<disk\b([^>]*)>(.*?)</disk>", xml, _re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        device = _re.search(r"device=['\"]([^'\"]+)['\"]", attrs)
+        device = device.group(1) if device else "disk"
+        src = _re.search(r"<source\s+(?:file|dev)=['\"]([^'\"]+)['\"]", body)
+        tgt = _re.search(r"<target\s+dev=['\"]([^'\"]+)['\"]\s+bus=['\"]([^'\"]+)['\"]", body)
+        if tgt:
+            disks.append({
+                "device": device, "target": tgt.group(1), "bus": tgt.group(2),
+                "source": src.group(1) if src else "",
+            })
+    return {
+        "vcpus": int(m_vcpu.group(1)) if m_vcpu else 0,
+        "ram_kib": int(m_mem.group(1)) if m_mem else 0,
+        "disks": disks,
+    }

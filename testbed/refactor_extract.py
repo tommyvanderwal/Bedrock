@@ -16,7 +16,7 @@ import argparse
 import ast
 import sys
 
-APP = "mgmt/app.py"
+APP = "mgmt/app.py"  # default source
 
 
 def find_spans(src, names):
@@ -51,10 +51,12 @@ def main():
     ap.add_argument("--header", required=True)
     ap.add_argument("--names", required=True)
     ap.add_argument("--router", action="store_true")
+    ap.add_argument("--src", default=APP)
     a = ap.parse_args()
     names = [n.strip() for n in a.names.split(",") if n.strip()]
 
-    src = open(APP).read()
+    SRC = a.src
+    src = open(SRC).read()
     spans, lines = find_spans(src, names)
     missing = [n for n in names if n not in spans]
     if missing:
@@ -76,7 +78,7 @@ def main():
     # remove from app.py (reverse line order so offsets stay valid)
     for nm, (s, e) in sorted(spans.items(), key=lambda kv: kv[1][0], reverse=True):
         del lines[s - 1:e]
-    open(APP, "w").write("\n".join(lines))
+    open(SRC, "w").write("\n".join(lines))
 
     print(f"moved {len(names)} blocks → {a.dest}: {[n for n,_ in ordered]}")
 

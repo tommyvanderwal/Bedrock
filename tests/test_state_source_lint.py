@@ -52,6 +52,7 @@ ALLOWED = {
     # inherit app.py's direct bedrock_state use (operator/observability writes).
     "mgmt/routers/auth.py",
     "mgmt/routers/observability.py",
+    "mgmt/routers/join.py",
     "mgmt/orchestrator.py",
     "mgmt/backup.py",
     "mgmt/victoria.py",

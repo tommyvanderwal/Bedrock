@@ -11,9 +11,7 @@ def api_cron_preview(expr: str, n: int = 5):
     """Return the next N fire times for a cron expression (UTC ISO).
     Used by the dashboard's schedule-input field for live preview as
     the operator types. Pure parser — no I/O."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent))
-    import cron as _cron
+    from mgmt import cron as _cron
     try:
         return {"cron_expr": expr, "next_fires_utc": _cron.next_n(expr, n=max(1, min(n, 20)))}
     except _cron.CronError as e:

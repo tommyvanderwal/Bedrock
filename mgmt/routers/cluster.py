@@ -1,5 +1,8 @@
 """Cluster + node + topology read endpoints (the dashboard's main views)."""
 from __future__ import annotations
+import json
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 from common import (load_cluster, get_nodes, build_cluster_state,
                     build_physical_topology, get_witness_status, get_last_state)
