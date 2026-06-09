@@ -22,7 +22,7 @@ router = APIRouter(tags=["imports"])
 
 
 def _vm_create_from_import(*a, **k):
-    from app import _vm_create_from_import as _impl
+    from routers.vms import _vm_create_from_import as _impl
     return _impl(*a, **k)
 
 

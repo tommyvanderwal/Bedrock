@@ -955,3 +955,198 @@ def _parse_dominfo(xml: str) -> dict:
         "ram_kib": int(m_mem.group(1)) if m_mem else 0,
         "disks": disks,
     }
+# ── secret distribution + VM power ops (shared across backup/storage/witnesses/vms + handle_rpc) ──
+
+
+
+
+def _import_backup_module():
+    """Lazy-import mgmt/backup.py — keeps app.py importable when the
+    module is missing (e.g. during partial install) and matches the
+    lazy-import pattern used elsewhere for lib modules."""
+    import backup as _b
+    return _b
+
+
+
+
+def _write_local_secret(path: str, content: str, mode: int = 0o600):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.parent.chmod(0o700)
+    p.write_text(content)
+    p.chmod(mode)
+
+
+
+
+def _write_remote_secret(host: str, path: str, content: str,
+                         mode: int = 0o600, timeout: int = 15):
+    """Push a secret file via paramiko SFTP. Atomic-replace via tmp +
+    POSIX rename. Caller passes already-rendered content (env file or
+    raw key).
+
+    Why posix_rename: plain `sftp.rename()` maps to SSH_FXP_RENAME
+    which (per the SFTP spec) refuses to overwrite an existing target.
+    `posix_rename` maps to OpenSSH's `posix-rename@openssh.com`
+    extension and behaves like POSIX `rename(2)` — atomic replace.
+    Without this, every secret update past the first one fails with a
+    nondescript "Failure" from the server."""
+    c = _ssh_connect(host)
+    try:
+        parent = str(Path(path).parent)
+        # exec_command is async-fire-and-forget; wait for the channel
+        # to close so the directory definitely exists before SFTP open.
+        _, so, _ = c.exec_command(f"mkdir -p -m 700 {parent}", timeout=timeout)
+        so.channel.recv_exit_status()
+
+        sftp = c.open_sftp()
+        tmp = f"{path}.tmp.bedrock"
+        with sftp.open(tmp, "wb") as f:
+            f.write(content.encode())
+        sftp.chmod(tmp, mode)
+        sftp.posix_rename(tmp, path)
+        sftp.close()
+    finally:
+        c.close()
+
+
+
+
+def _propagate_secret(rel_path: str, content: str, mode: int = 0o600):
+    """Write a secret to `rel_path` on every node (including this one).
+    Returns (ok_nodes, failed_nodes) so the caller can surface partial
+    failure to the UI."""
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []  # (node_name, reason)
+    self_host = _self_host()
+    for name, node in get_nodes().items():
+        host = node.get("host")
+        if not host:
+            continue
+        try:
+            if host == self_host:
+                _write_local_secret(rel_path, content, mode)
+            else:
+                _write_remote_secret(host, rel_path, content, mode)
+            ok.append(name)
+        except Exception as e:
+            failed.append((name, str(e)))
+            push_log(f"backup: propagate {rel_path} → {name} ({host}) "
+                     f"failed: {e}",
+                     node="mgmt", app="bedrock-mgmt", level="warn")
+    return ok, failed
+
+
+
+
+def _self_host() -> str:
+    """Best-effort detection of this node's IP/hostname so we don't
+    SSH-loop to ourselves (some sshd configs reject that)."""
+    try:
+        from lib import state as _state
+        s = _state.load() if hasattr(_state, "load") else {}
+        nodes = get_nodes()
+        n = nodes.get(s.get("node_name", ""))
+        if n and n.get("host"):
+            return n["host"]
+    except Exception:
+        pass
+    return ""
+
+
+
+
+def _render_s3_creds_env(access_key: str, secret_key: str) -> str:
+    """Bash-sourceable env file. Variable names match what kopia's S3
+    backend reads from the environment (KOPIA_S3_ACCESS_KEY, etc.)."""
+    import shlex as _sh
+    return (
+        "# bedrock-managed; do not edit by hand. mode 0600.\n"
+        f"export KOPIA_S3_ACCESS_KEY={_sh.quote(access_key)}\n"
+        f"export KOPIA_S3_SECRET_KEY={_sh.quote(secret_key)}\n"
+        # AWS_* mirrors so other tools that read the file work too
+        f"export AWS_ACCESS_KEY_ID={_sh.quote(access_key)}\n"
+        f"export AWS_SECRET_ACCESS_KEY={_sh.quote(secret_key)}\n"
+    )
+
+
+
+
+# ── VM action implementations ──────────────────────────────────────────────
+
+def _vm_start(vm_name: str) -> dict:
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm: raise HTTPException(404, f"Unknown VM: {vm_name}")
+    if vm["state"] == "running": raise HTTPException(400, "Already running")
+    resource = vm.get("drbd_resource", "")
+    nodes_cfg = get_nodes()
+
+    target = None
+    # Prefer node where DRBD is already Primary
+    if resource:
+        for nname, cfg in nodes_cfg.items():
+            if state["nodes"][nname]["online"]:
+                drbd = parse_drbd_status(state["nodes"][nname]["drbd_raw"])
+                if resource in drbd and drbd[resource]["role"] == "Primary":
+                    target = nname; break
+    # Fallback: any defined node that's online
+    if not target:
+        for nname in vm.get("defined_on", []):
+            if nname in state["nodes"] and state["nodes"][nname]["online"]:
+                target = nname; break
+    if not target:
+        raise HTTPException(503, "No online node with this VM defined")
+
+    # Promote DRBD if needed (cattle VMs have no DRBD)
+    if resource:
+        ssh_cmd_rc(nodes_cfg[target]["host"], f"drbdadm primary {resource}")
+
+    out, rc = ssh_cmd_rc(nodes_cfg[target]["host"], f"virsh start {vm_name}")
+    if rc != 0:
+        # The exact virsh/qemu error is the most useful thing to keep — record it
+        # as a per-VM event so it's findable later (the baseline lifecycle event
+        # never fires here because the state didn't change).
+        _events.emit("vm_error", f"VM {vm_name} start FAILED on {target}: {out}",
+                     vm=vm_name, node=target, level="error", op="start", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator started {vm_name} on {target}",
+                 vm=vm_name, node=target, reason="operator", op="start")
+    return {"status": "started", "node": target}
+
+
+
+
+def _vm_shutdown(vm_name: str) -> dict:
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
+    nodes_cfg = get_nodes()
+    on = vm["running_on"]
+    out, rc = ssh_cmd_rc(nodes_cfg[on]["host"], f"virsh shutdown {vm_name}")
+    if rc != 0:
+        _events.emit("vm_error", f"VM {vm_name} shutdown FAILED on {on}: {out}",
+                     vm=vm_name, node=on, level="error", op="shutdown", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator shutdown {vm_name} on {on}",
+                 vm=vm_name, node=on, reason="operator", op="shutdown")
+    return {"status": "shutdown sent"}
+
+
+
+
+def _vm_poweroff(vm_name: str) -> dict:
+    state = build_cluster_state()
+    vm = state["vms"].get(vm_name)
+    if not vm or vm["state"] != "running": raise HTTPException(400, "Not running")
+    nodes_cfg = get_nodes()
+    on = vm["running_on"]
+    out, rc = ssh_cmd_rc(nodes_cfg[on]["host"], f"virsh destroy {vm_name}")
+    if rc != 0:
+        _events.emit("vm_error", f"VM {vm_name} poweroff FAILED on {on}: {out}",
+                     vm=vm_name, node=on, level="error", op="poweroff", error=out)
+        raise HTTPException(500, f"Failed: {out}")
+    _events.emit("vm_lifecycle", f"operator powered off {vm_name} on {on}",
+                 vm=vm_name, node=on, reason="operator", op="poweroff")
+    return {"status": "powered off"}
