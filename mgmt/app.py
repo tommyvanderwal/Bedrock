@@ -34,86 +34,13 @@ from lib import bedrock_state as _bs           # noqa: E402
 from lib import rqlite_client as _rqlite       # noqa: E402
 from lib import cluster_state as _cluster_state  # noqa: E402
 from lib import event_log as _events            # noqa: E402
+from dependencies import (  # noqa: E402
+    require_peer, require_operator, require_operator_or_peer,
+)
 
 
-async def require_peer(request: Request) -> str:
-    """FastAPI dep — accepts requests signed by a known cluster node.
-    Returns the verified node name. Raises 401 on any failure."""
-    body = await request.body()
-
-    def _lookup(node_name: str):
-        cluster = load_cluster()
-        n = (cluster.get("nodes") or {}).get(node_name) or {}
-        pk_hex = (n.get("bedrock_pubkey") or "").strip()
-        if not pk_hex:
-            return None
-        try:
-            return bytes.fromhex(pk_hex)
-        except ValueError:
-            return None
-
-    authz = request.headers.get("authorization", "")
-    try:
-        return _peer_auth.verify(authz, request.method,
-                                 request.url.path
-                                 + (("?" + request.url.query) if request.url.query else ""),
-                                 body, _lookup)
-    except ValueError as e:
-        raise HTTPException(401, f"peer auth failed: {e}")
-
-
-async def require_operator(request: Request) -> str:
-    """FastAPI dep — accepts requests with a valid `Authorization: Bearer
-    <token>` operator session token. Returns the username on success.
-    Raises 401 on any failure. Loopback (the trusted local CLI on :8001)
-    is exempt — local root is already privileged; see _auth_middleware."""
-    _ch = request.client.host if request.client else ""
-    if _ch in ("127.0.0.1", "::1"):
-        return "local"
-    authz = request.headers.get("authorization", "")
-    if not authz.startswith("Bearer "):
-        raise HTTPException(401, "missing Bearer token")
-    try:
-        payload = _op_auth.verify_token(authz[7:].strip())
-    except ValueError as e:
-        raise HTTPException(401, f"operator auth failed: {e}")
-    return payload.get("sub", "")
-
-
-async def require_operator_or_peer(request: Request) -> str:
-    """Accepts EITHER a peer Ed25519 signature OR an operator Bearer
-    token. Returns `op:<user>` or `peer:<node>` so handlers know which.
-    Use for endpoints that legitimately need both call sites (e.g. an
-    operator clicks "transfer mgmt" in the dashboard AND the receiving
-    node's mgmt service finishes the handoff by calling back)."""
-    authz = request.headers.get("authorization", "")
-    if authz.startswith("Bearer "):
-        try:
-            payload = _op_auth.verify_token(authz[7:].strip())
-            return f"op:{payload.get('sub', '')}"
-        except ValueError as e:
-            raise HTTPException(401, f"operator auth failed: {e}")
-    if authz.startswith(_peer_auth.SCHEME + " "):
-        body = await request.body()
-
-        def _lookup(node_name: str):
-            cluster = load_cluster()
-            n = (cluster.get("nodes") or {}).get(node_name) or {}
-            pk_hex = (n.get("bedrock_pubkey") or "").strip()
-            try:
-                return bytes.fromhex(pk_hex) if pk_hex else None
-            except ValueError:
-                return None
-
-        try:
-            who = _peer_auth.verify(
-                authz, request.method,
-                request.url.path + (("?" + request.url.query) if request.url.query else ""),
-                body, _lookup)
-            return f"peer:{who}"
-        except ValueError as e:
-            raise HTTPException(401, f"peer auth failed: {e}")
-    raise HTTPException(401, "missing operator or peer credentials")
+# require_peer / require_operator / require_operator_or_peer now live in
+# dependencies.py (imported above) so the routers share one implementation.
 
 # (The /api/peer-test smoke endpoint is registered after `app = FastAPI()`,
 # search for it below.)
