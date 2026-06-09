@@ -42,9 +42,9 @@ ALLOWED = {
     # leader read IS the majority gate) and cannot route through a cached
     # bedrock_d.state facade. See docs/explainers/02-bedrock-perspective.md.
     "lib/fence_verdict.py",
-    # mgmt is a peer of bedrock_d at the moment; treat as legacy
-    # until Stage 8 splits it.
-    "mgmt/app.py",
+    # mgmt is a peer of bedrock_d at the moment; treat as legacy until Stage 8
+    # splits it. (app.py itself dropped off this list in the router refactor —
+    # it no longer talks to rqlite at all.)
     # the shared cluster-data infra extracted from app.py during the router split;
     # build_cluster_state / get_node_info read rqlite directly, same as app.py did.
     "mgmt/common.py",

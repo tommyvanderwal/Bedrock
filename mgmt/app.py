@@ -1,60 +1,46 @@
 #!/usr/bin/env python3
-"""Bedrock cluster management dashboard — FastAPI backend with WebSocket hub."""
+"""Bedrock cluster management dashboard — FastAPI entry module.
+
+This file owns only the app-level wiring (FastAPI bigger-applications layout):
+  * the ``app`` object + inclusion of the domain routers (mgmt/routers/*)
+  * the auth middleware (operator Bearer / peer Ed25519 / loopback)
+  * the ``/ws`` WebSocket hub + the state push loop behind it
+  * the startup hook (shared-state seed + orchestrator boot)
+  * static mounts (Svelte build, noVNC) + the SPA fallback
+  * ``serve_main()`` — the uvicorn listeners (called by bedrock-d)
+
+Everything else lives elsewhere: API routes in ``routers/``, shared infra
+(SSH pool, cluster gathering, push_log, VM power ops) in ``common.py``,
+cross-cutting auth deps in ``dependencies.py``.
+"""
 
 import asyncio
 import json
 import logging
-import re
-import shutil
-import subprocess
 import threading
-import time
+from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
-import paramiko
-import urllib.request
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 from ws import hub
-from tasks import registry as task_registry, Task
+from tasks import registry as task_registry
 
-# Peer-auth + operator-auth + join-handshake — these modules live in the
-# bedrock lib tree (installer-deployed) rather than mgmt's own source
-# dir so installers and mgmt share the same code.
-import sys as _sys_peerauth
-_sys_peerauth.path.insert(0, "/usr/local/lib/bedrock")
+# The bedrock lib tree (installer-deployed) — shared with bedrock_d + the CLI.
+import sys as _sys_libpath
+_sys_libpath.path.insert(0, "/usr/local/lib/bedrock")
 from lib import peer_auth as _peer_auth        # noqa: E402
 from lib import operator_auth as _op_auth      # noqa: E402
-from lib import join_handshake as _join_hs     # noqa: E402
-from lib import bedrock_state as _bs           # noqa: E402
-from lib import rqlite_client as _rqlite       # noqa: E402
-from lib import cluster_state as _cluster_state  # noqa: E402
-from lib import event_log as _events            # noqa: E402
-from dependencies import (  # noqa: E402
-    require_peer, require_operator, require_operator_or_peer,
-)
+from dependencies import require_operator      # noqa: E402
 from common import (  # noqa: E402
-    load_cluster, save_cluster, write_scrape_config, get_nodes,
-    ssh_cmd, ssh_cmd_rc, _ssh_connect, _ssh_pool_drop,
-    get_node_info, parse_drbd_status, get_witness_status,
-    get_vm_drbd_resource, get_vm_disks, get_vm_vnc_port,
-    build_cluster_state, build_physical_topology, _mgmt_node_name, push_log,
-    load_inventory, save_inventory, _import_dir, _write_import_meta,
-    _vm_host, _vm_get_settings, _vm_start, _vm_shutdown, _vm_poweroff,
-    _import_backup_module,
+    load_cluster, write_scrape_config, get_nodes, ssh_cmd_rc,
+    build_cluster_state, get_vm_vnc_port, push_log,
+    _vm_start, _vm_shutdown, _vm_poweroff,
 )
 import common as _common  # noqa: E402
-
-
-# require_peer / require_operator / require_operator_or_peer now live in
-# dependencies.py (imported above) so the routers share one implementation.
-
-# (The /api/peer-test smoke endpoint is registered after `app = FastAPI()`,
-# search for it below.)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("bedrock")
@@ -65,67 +51,28 @@ log = logging.getLogger("bedrock")
 for _noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# ── Config ──────────────────────────────────────────────────────────────────
 
-CLUSTER_FILE = Path("/etc/bedrock/cluster.json")
-import os as _os
-
-# ── SSH helpers ─────────────────────────────────────────────────────────────
-#
-# Connection pool: paramiko `SSHClient` per host, reused across calls.
-# Without this, every `ssh_cmd` opened a fresh TCP+kex+auth — at N=4
-# nodes × every-3-second probe loop × 4 mgmt processes (master + 3
-# followers) sshd's pre-auth queue filled up and dropped connections
-# with "exceeded LoginGraceTime" penalty, manifesting as nodes
-# flapping between Online/Offline on the dashboard. Caching reuses
-# a single Transport per peer + opens new channels on demand, which
-# is what paramiko is designed for.
-import threading as _threading
-
-
-# ── FastAPI app ─────────────────────────────────────────────────────────────
+# ── FastAPI app + routers ───────────────────────────────────────────────────
 
 app = FastAPI(title="Bedrock Cluster Manager")
 
-from routers import internal as _r_internal  # noqa: E402
-app.include_router(_r_internal.router)
-from routers import auth as _r_auth  # noqa: E402
-app.include_router(_r_auth.router)
-from routers import tasks as _r_tasks  # noqa: E402
-app.include_router(_r_tasks.router)
-from routers import cron as _r_cron  # noqa: E402
-app.include_router(_r_cron.router)
-from routers import observability as _r_observability  # noqa: E402
-app.include_router(_r_observability.router)
-from routers import cluster as _r_cluster  # noqa: E402
-app.include_router(_r_cluster.router)
-from routers import exports as _r_exports  # noqa: E402
-app.include_router(_r_exports.router)
-from routers import join as _r_join  # noqa: E402
-app.include_router(_r_join.router)
-from routers import imports as _r_imports  # noqa: E402
-app.include_router(_r_imports.router)
-from routers import witnesses as _r_witnesses  # noqa: E402
-app.include_router(_r_witnesses.router)
-from routers import storage as _r_storage  # noqa: E402
-app.include_router(_r_storage.router)
-from routers import backup as _r_backup  # noqa: E402
-app.include_router(_r_backup.router)
-from routers import vm_backup as _r_vm_backup  # noqa: E402
-app.include_router(_r_vm_backup.router)
-from routers import vms as _r_vms  # noqa: E402
-app.include_router(_r_vms.router)
+# All API routes live in mgmt/routers/* — one module per resource domain,
+# each exposing ``router = APIRouter(...)``. Inclusion order is match order.
+for _name in (
+    "internal", "auth", "tasks", "cron", "observability", "cluster",
+    "exports", "join", "imports", "witnesses", "storage", "backup",
+    "vm_backup", "vms",
+):
+    app.include_router(import_module(f"routers.{_name}").router)
 
 
-# ── Auth middleware ─────────────────────────────────────────────────
+# ── Auth middleware ─────────────────────────────────────────────────────────
 # Every /api/* request must carry either:
 #   - operator Bearer token (issued by /api/login), OR
 #   - peer Ed25519 signature (`Authorization: Bedrock-Ed25519 ...`)
 # Public-path allow-list covers discovery, login, the join handshake
 # (joiner doesn't yet have credentials), and the static dashboard
 # assets (the browser fetches HTML/JS/CSS before login).
-
-from fastapi.responses import JSONResponse as _JSONResponse  # noqa: E402
 
 _PUBLIC_PREFIXES = (
     "/_app/", "/favicon", "/static/", "/assets/",
@@ -173,7 +120,7 @@ async def _auth_middleware(request: Request, call_next):
             _op_auth.verify_token(authz[7:].strip())
             return await call_next(request)
         except ValueError as e:
-            return _JSONResponse({"detail": f"operator auth: {e}"}, status_code=401)
+            return JSONResponse({"detail": f"operator auth: {e}"}, status_code=401)
 
     if authz.startswith(_peer_auth.SCHEME + " "):
         body = await request.body()
@@ -199,24 +146,15 @@ async def _auth_middleware(request: Request, call_next):
                 body, _lookup)
             return await call_next(request)
         except ValueError as e:
-            return _JSONResponse({"detail": f"peer auth: {e}"}, status_code=401)
+            return JSONResponse({"detail": f"peer auth: {e}"}, status_code=401)
 
-    return _JSONResponse({"detail": "authentication required"}, status_code=401)
+    return JSONResponse({"detail": "authentication required"}, status_code=401)
 
 
-# In-memory cache of master's X25519 private halves, keyed by request_id.
-# When operator approves, we look up the private key here, do ECDH +
-# AEAD, then drop the private key. Lost on mgmt restart — joiners that
-# polled before approval and saw their request go stale need to retry,
-# which is correct UX for a security-critical handshake.
-_MASTER_EPH_PRIV: dict[str, "X25519PrivateKey"] = {}   # noqa: F821
-
-# ── WebSocket endpoint ──────────────────────────────────────────────────────
-
-# Last-known cluster state. The state push loop fills it; /ws and /api/cluster
-# serve from here instantly so the dashboard never waits on fresh SSH probes.
-# _last_state WS cache now lives in common.py (shared with the cluster router)
-
+# ── WebSocket endpoint + state push loop ────────────────────────────────────
+# Last-known cluster state lives in common.py (`get/set_last_state`), shared
+# with the cluster router, so /ws and /api/cluster serve from the same cache
+# and the dashboard never waits on fresh SSH probes.
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -250,6 +188,7 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         hub.disconnect(ws)
 
+
 async def handle_rpc(method: str, params: dict) -> dict:
     loop = asyncio.get_event_loop()
     if method == "vm.start":
@@ -265,7 +204,6 @@ async def handle_rpc(method: str, params: dict) -> dict:
                 params["name"], MigrateRequest(target_node=params.get("target_node"))))
     raise ValueError(f"Unknown method: {method}")
 
-# ── Background task: push cluster state every 3 seconds ────────────────────
 
 async def _gather_and_push():
     """One expensive cluster gather (per-node SSH fanout) → cache → broadcast."""
@@ -289,6 +227,9 @@ async def state_push_loop():
         except Exception as e:
             log.error("State push error: %s", e)
         await asyncio.sleep(3)
+
+
+# ── Startup hook ────────────────────────────────────────────────────────────
 
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _STARTUP_DONE: bool = False
@@ -352,35 +293,23 @@ async def startup():
     orchestrator.start_all()
 
 
-class NodeRegister(BaseModel):
-    name: str
-    host: str
-    role: str = "compute"
-    pubkey: Optional[str] = None          # SSH ed25519 — paramiko mesh
-    bedrock_pubkey: Optional[str] = None  # Ed25519 identity — inter-node API auth
+# ── Legacy register_routes splits (pre-router modules) ──────────────────────
+# These predate the routers/ layout: each module exposes register_routes(app,
+# **deps) instead of an APIRouter. Folding them into routers/ is a follow-up.
 
-
-# ── Metrics API (queries VictoriaMetrics) ───────────────────────────────────
-
-from victoria import query_range, query_instant, query_logs
-from victoria import push_log as _vl_push_log
-
-# Metrics + logs read endpoints live in mgmt/routes_obs.py.
-from routes_obs import register_routes as _register_obs_routes
+# Metrics + logs read endpoints (queries VictoriaMetrics / VictoriaLogs).
+from routes_obs import register_routes as _register_obs_routes  # noqa: E402
 _register_obs_routes(app)
 
 # Generic saga submission API — POST /api/operations + the read-side.
 # This is the surface the CLI (and any external automation) uses to submit
 # vm_create / destroy / grow / migrate / cluster_init / node_join /
 # node_leave sagas.
-from routes_operations import register_routes as _register_operations_routes
+from routes_operations import register_routes as _register_operations_routes  # noqa: E402
 _register_operations_routes(app, require_operator=require_operator)
 
-
-# ── Supportability checks ─────────────────────────────────────────────────
-# Endpoint lives in mgmt/routes_support.py. Pure read-only diagnostic;
-# see that file for the per-check details.
-from routes_support import register_routes as _register_support_routes
+# Supportability checks — pure read-only diagnostics.
+from routes_support import register_routes as _register_support_routes  # noqa: E402
 _register_support_routes(
     app,
     load_cluster=load_cluster,
@@ -388,10 +317,8 @@ _register_support_routes(
     ssh_cmd_rc=ssh_cmd_rc,
 )
 
-
-# ── Console redirect + VNC WebSocket → raw-TCP proxy ───────────────────────
-# Implementation lives in mgmt/routes_console.py.
-from routes_console import register_routes as _register_console_routes
+# Console redirect + VNC WebSocket → raw-TCP proxy.
+from routes_console import register_routes as _register_console_routes  # noqa: E402
 _register_console_routes(
     app,
     build_cluster_state=build_cluster_state,
@@ -399,13 +326,12 @@ _register_console_routes(
     get_vm_vnc_port=get_vm_vnc_port,
 )
 
-# ── routes_iso (deferred from earlier — needs push_log) ──────────────────
-from routes_iso import register_routes as _register_iso_routes
+# ISO upload/list/delete.
+from routes_iso import register_routes as _register_iso_routes  # noqa: E402
 _register_iso_routes(app, push_log=push_log)
 
 
-# ── Static files (Svelte build + noVNC) ────────────────────────────────────
-from fastapi.responses import FileResponse
+# ── Static files (Svelte build + noVNC) ─────────────────────────────────────
 
 novnc_dir = Path(__file__).parent / "novnc"
 if novnc_dir.exists():
@@ -413,7 +339,6 @@ if novnc_dir.exists():
 
 ui_build = Path(__file__).parent / "ui" / "build"
 
-# Serve static assets from Svelte build
 if ui_build.exists():
     # Mount _app directory for JS/CSS bundles
     app_dir = ui_build / "_app"
@@ -429,6 +354,7 @@ if ui_build.exists():
             return FileResponse(str(file_path))
         # Otherwise serve index.html (SPA routing)
         return FileResponse(str(ui_build / "index.html"))
+
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
@@ -464,13 +390,12 @@ def serve_main():
     bind a dedicated bootstrap port (8444) clear of the whole map.
     (finding T-05.)
     """
-    import threading
     import uvicorn
     cert = Path("/etc/bedrock/tls/cert.pem")
     key  = Path("/etc/bedrock/tls/key.pem")
     # Always bind 127.0.0.1:8001 — the local CLI dials this regardless
     # of cert state. Running in a daemon thread so the main thread can
-    # bring up the LAN listener (8443 with cert, 8080 without).
+    # bring up the LAN listener (8443 with cert, 8444 without).
     threading.Thread(
         target=lambda: uvicorn.run(app, host="127.0.0.1", port=8001,
                                    log_level="warning"),
