@@ -21,7 +21,7 @@ from common import (load_cluster, push_log, ssh_cmd, ssh_cmd_rc, get_nodes, buil
                     build_physical_topology, get_vm_disks, get_vm_drbd_resource, get_vm_vnc_port,
                     _vm_start, _vm_shutdown, _vm_poweroff, _vm_host, _vm_get_settings,
                     _propagate_secret, _import_dir, _write_import_meta, IMPORT_ROOT,
-                    _mgmt_node_name, load_inventory, save_inventory)
+                    _mgmt_node_name, load_inventory, save_inventory, ISO_DIR)
 from tasks import registry as task_registry, Task
 
 import sys as _sys
@@ -1372,15 +1372,6 @@ def _vm_create_from_import(meta: dict, req, task: Optional[Task] = None) -> dict
 
 
 
-# ── ISO library ─────────────────────────────────────────────────────────────
-# The three endpoints (list / upload / delete) live in mgmt/routes_iso.py.
-# The ISO_DIR constant + VM inventory helpers stay here because the VM
-# creation paths in app.py import them.
-
-# Cluster-wide SeaweedFS FUSE mount — identical on every node, so
-# `--cdrom {ISO_DIR}/<name>.iso` works from anywhere. See routes_iso.py
-# for the upload path that writes here.
-ISO_DIR = Path("/mnt/bedrock/iso")
 
 
 

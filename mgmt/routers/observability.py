@@ -1,10 +1,14 @@
-"""Operator action: promote/swap a metrics or logs backend (heavier DI than the read-only
-routes in routes_obs.py)."""
+"""Observability domain: the operator's promote/swap-a-backend action, plus the
+read-only metrics + logs endpoints (thin pre-canned queries over VictoriaMetrics
+and VictoriaLogs for the dashboard — no state, no auth gates beyond the global
+middleware)."""
 from __future__ import annotations
+import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from dependencies import require_operator
 from common import load_cluster, ssh_cmd, ssh_cmd_rc, push_log
+from victoria import query_range, query_logs
 import sys as _sys
 _sys.path.insert(0, "/usr/local/lib/bedrock")
 from lib import bedrock_state as _bs           # noqa: E402
@@ -140,3 +144,87 @@ def observability_promote(req: ObsPromote, user: str = Depends(require_operator)
         "logs_backends":    new_logs,
         "seed_report":      seed_report,
     }
+
+
+# ─── Metrics (VictoriaMetrics) ────────────────────────────────
+
+@router.get("/api/metrics/nodes")
+def api_metrics_nodes(hours: int = 1, step: str = "30s"):
+    """CPU and memory for all nodes over time."""
+    end = int(time.time())
+    start = end - hours * 3600
+    return {
+        "cpu": query_range(
+            '100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100',
+            start, end, step),
+        "mem": query_range(
+            '(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100',
+            start, end, step),
+        "net_rx": query_range(
+            'rate(node_network_receive_bytes_total{device="br0"}[1m])',
+            start, end, step),
+        "net_tx": query_range(
+            'rate(node_network_transmit_bytes_total{device="br0"}[1m])',
+            start, end, step),
+    }
+
+
+@router.get("/api/metrics/vms")
+def api_metrics_vms(hours: int = 1, step: str = "30s"):
+    """Per-VM CPU and disk IOPS over time."""
+    end = int(time.time())
+    start = end - hours * 3600
+    return {
+        "cpu": query_range(
+            'rate(bedrock_vm_cpu_time_ns[1m]) / 1e9 * 100',
+            start, end, step),
+        "disk_rd_iops": query_range(
+            'rate(bedrock_vm_disk_read_reqs{disk="0"}[1m])',
+            start, end, step),
+        "disk_wr_iops": query_range(
+            'rate(bedrock_vm_disk_write_reqs{disk="0"}[1m])',
+            start, end, step),
+        "disk_wr_lat": query_range(
+            'rate(bedrock_vm_disk_write_time_ns{disk="0"}[1m]) / rate(bedrock_vm_disk_write_reqs{disk="0"}[1m]) / 1e6',
+            start, end, step),
+    }
+
+
+@router.get("/api/metrics/drbd")
+def api_metrics_drbd(hours: int = 1, step: str = "30s"):
+    """DRBD replication metrics."""
+    end = int(time.time())
+    start = end - hours * 3600
+    return {
+        "sent": query_range('rate(bedrock_drbd_sent_kb[1m])',
+                            start, end, step),
+        "received": query_range('rate(bedrock_drbd_received_kb[1m])',
+                                start, end, step),
+        "out_of_sync": query_range('bedrock_drbd_out_of_sync_kb',
+                                   start, end, step),
+    }
+
+
+# ─── Logs (VictoriaLogs) ──────────────────────────────────────
+
+@router.get("/api/logs")
+def api_logs(query: str = "*", limit: int = 50, hours: int = 1):
+    end = int(time.time())
+    start = end - hours * 3600
+    return query_logs(query, limit=limit, start=start, end=end)
+
+
+@router.get("/api/logs/node/{node_name}")
+def api_logs_node(node_name: str, limit: int = 50, hours: int = 1):
+    end = int(time.time())
+    start = end - hours * 3600
+    return query_logs(f'hostname:"{node_name}"',
+                      limit=limit, start=start, end=end)
+
+
+@router.get("/api/logs/vm/{vm_name}")
+def api_logs_vm(vm_name: str, limit: int = 50, hours: int = 1):
+    end = int(time.time())
+    start = end - hours * 3600
+    return query_logs(f'"{vm_name}"',
+                      limit=limit, start=start, end=end)

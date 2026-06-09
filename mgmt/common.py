@@ -847,8 +847,10 @@ def _write_import_meta(d: Path, meta: dict):
 
 
 
-# routes_iso registration needs the push_log callable, so it runs after
-# `def push_log(...)` further down (see "── routes_iso ──").
+# Cluster-wide SeaweedFS FUSE mount — identical on every node, so
+# `--cdrom {ISO_DIR}/<name>.iso` works from anywhere (the upload path in
+# routers/isos.py writes here; the create path in routers/vms.py reads it).
+ISO_DIR = Path("/mnt/bedrock/iso")
 
 
 # ── Import library (VMware/Hyper-V/qcow2 → Bedrock) ──────────────────────

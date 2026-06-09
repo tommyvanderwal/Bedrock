@@ -34,10 +34,8 @@ import sys as _sys_libpath
 _sys_libpath.path.insert(0, "/usr/local/lib/bedrock")
 from lib import peer_auth as _peer_auth        # noqa: E402
 from lib import operator_auth as _op_auth      # noqa: E402
-from dependencies import require_operator      # noqa: E402
 from common import (  # noqa: E402
-    load_cluster, write_scrape_config, get_nodes, ssh_cmd_rc,
-    build_cluster_state, get_vm_vnc_port, push_log,
+    load_cluster, write_scrape_config, build_cluster_state,
     _vm_start, _vm_shutdown, _vm_poweroff,
 )
 import common as _common  # noqa: E402
@@ -61,7 +59,7 @@ app = FastAPI(title="Bedrock Cluster Manager")
 for _name in (
     "internal", "auth", "tasks", "cron", "observability", "cluster",
     "exports", "join", "imports", "witnesses", "storage", "backup",
-    "vm_backup", "vms",
+    "vm_backup", "vms", "operations", "support", "console", "isos",
 ):
     app.include_router(import_module(f"routers.{_name}").router)
 
@@ -291,44 +289,6 @@ async def startup():
     else:
         import orchestrator
     orchestrator.start_all()
-
-
-# ── Legacy register_routes splits (pre-router modules) ──────────────────────
-# These predate the routers/ layout: each module exposes register_routes(app,
-# **deps) instead of an APIRouter. Folding them into routers/ is a follow-up.
-
-# Metrics + logs read endpoints (queries VictoriaMetrics / VictoriaLogs).
-from routes_obs import register_routes as _register_obs_routes  # noqa: E402
-_register_obs_routes(app)
-
-# Generic saga submission API — POST /api/operations + the read-side.
-# This is the surface the CLI (and any external automation) uses to submit
-# vm_create / destroy / grow / migrate / cluster_init / node_join /
-# node_leave sagas.
-from routes_operations import register_routes as _register_operations_routes  # noqa: E402
-_register_operations_routes(app, require_operator=require_operator)
-
-# Supportability checks — pure read-only diagnostics.
-from routes_support import register_routes as _register_support_routes  # noqa: E402
-_register_support_routes(
-    app,
-    load_cluster=load_cluster,
-    get_nodes=get_nodes,
-    ssh_cmd_rc=ssh_cmd_rc,
-)
-
-# Console redirect + VNC WebSocket → raw-TCP proxy.
-from routes_console import register_routes as _register_console_routes  # noqa: E402
-_register_console_routes(
-    app,
-    build_cluster_state=build_cluster_state,
-    get_nodes=get_nodes,
-    get_vm_vnc_port=get_vm_vnc_port,
-)
-
-# ISO upload/list/delete.
-from routes_iso import register_routes as _register_iso_routes  # noqa: E402
-_register_iso_routes(app, push_log=push_log)
 
 
 # ── Static files (Svelte build + noVNC) ─────────────────────────────────────
