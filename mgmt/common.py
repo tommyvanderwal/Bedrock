@@ -782,3 +782,19 @@ def push_log(msg: str, node: str = "mgmt", app: str = "bedrock-mgmt",
         except Exception:
             pass
     _vl_push_log(msg, node=node, app=app, level=level)
+
+
+# ── Shared WS cluster-state cache ────────────────────────────────────
+# The state-push loop (app.py) rebinds this every few seconds; /ws and the cluster router
+# serve from it instantly so the dashboard never waits on fresh SSH probes. Lives here (a
+# leaf module) so both the loop and the router reach the SAME current value via the accessors.
+_last_state: dict = {"nodes": {}, "vms": {}, "witness": {"nodes": {}}}
+
+
+def get_last_state() -> dict:
+    return _last_state
+
+
+def set_last_state(state: dict) -> None:
+    global _last_state
+    _last_state = state

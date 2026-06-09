@@ -48,6 +48,10 @@ ALLOWED = {
     # the shared cluster-data infra extracted from app.py during the router split;
     # build_cluster_state / get_node_info read rqlite directly, same as app.py did.
     "mgmt/common.py",
+    # API routers carved out of app.py during the bigger-applications split; they
+    # inherit app.py's direct bedrock_state use (operator/observability writes).
+    "mgmt/routers/auth.py",
+    "mgmt/routers/observability.py",
     "mgmt/orchestrator.py",
     "mgmt/backup.py",
     "mgmt/victoria.py",

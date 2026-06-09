@@ -91,6 +91,16 @@ app = FastAPI(title="Bedrock Cluster Manager")
 
 from routers import internal as _r_internal  # noqa: E402
 app.include_router(_r_internal.router)
+from routers import auth as _r_auth  # noqa: E402
+app.include_router(_r_auth.router)
+from routers import tasks as _r_tasks  # noqa: E402
+app.include_router(_r_tasks.router)
+from routers import cron as _r_cron  # noqa: E402
+app.include_router(_r_cron.router)
+from routers import observability as _r_observability  # noqa: E402
+app.include_router(_r_observability.router)
+from routers import cluster as _r_cluster  # noqa: E402
+app.include_router(_r_cluster.router)
 
 
 # ── Auth middleware ─────────────────────────────────────────────────
@@ -178,135 +188,6 @@ async def _auth_middleware(request: Request, call_next):
             return _JSONResponse({"detail": f"peer auth: {e}"}, status_code=401)
 
     return _JSONResponse({"detail": "authentication required"}, status_code=401)
-
-
-# Smoke endpoint for the Ed25519 framework. Returns the caller's verified
-# node name. Used by tests + operators wanting to confirm that inter-node
-# signing is wired up correctly.
-@app.get("/api/peer-test")
-def peer_test(node: str = Depends(require_peer)):
-    return {"verified_caller": node}
-
-
-# Internal loopback endpoints (CDC + DRBD fence-decision) live in routers/internal.py
-
-
-# ── Operator login ──────────────────────────────────────────────────
-
-class LoginReq(BaseModel):
-    username: str
-    password: str
-
-
-# Per-IP leaky-bucket rate limiter so a brute-forcer can't fill the
-# event loop with PBKDF2 work. 5 fails/min/IP; resets on success.
-_LOGIN_BUCKET: dict[str, list[float]] = {}
-_LOGIN_MAX = 5
-_LOGIN_WINDOW_S = 60
-
-
-def _login_throttle(ip: str) -> bool:
-    """Returns True if the request should be rejected."""
-    import time as _t
-    now = _t.time()
-    bucket = [t for t in _LOGIN_BUCKET.get(ip, []) if now - t < _LOGIN_WINDOW_S]
-    _LOGIN_BUCKET[ip] = bucket
-    return len(bucket) >= _LOGIN_MAX
-
-
-def _login_record_fail(ip: str) -> None:
-    import time as _t
-    _LOGIN_BUCKET.setdefault(ip, []).append(_t.time())
-
-
-@app.post("/api/login")
-def login(req: LoginReq, request: Request):
-    ip = request.client.host if request.client else "?"
-    if _login_throttle(ip):
-        raise HTTPException(429, "too many failed logins, try again in a minute")
-    ops = (load_cluster().get("operators") or {})
-    op = ops.get(req.username) or {}
-    if not _op_auth.verify_password(req.password, op.get("salt", ""), op.get("hash", "")):
-        _login_record_fail(ip)
-        # Constant-ish response time: PBKDF2 already ran for ~150ms regardless
-        # of whether the user exists. Don't differentiate "no such user" vs
-        # "wrong password" in the response.
-        raise HTTPException(401, "invalid credentials")
-    token, exp = _op_auth.mint_token(req.username)
-    push_log(f"operator {req.username!r} logged in from {ip}",
-             node="mgmt", app="bedrock-mgmt", level="info")
-    return {"token": token, "exp": exp, "user": req.username}
-
-
-@app.get("/api/whoami")
-def whoami(user: str = Depends(require_operator)):
-    return {"user": user}
-
-
-# ── Operator management (passwd / list / remove) ───────────────────
-
-class OperatorSet(BaseModel):
-    username: str
-    password: str
-
-
-@app.get("/api/operators")
-def list_operators(user: str = Depends(require_operator)):
-    """Return the list of operator usernames. Hashes are NOT exposed —
-    they live write-only in the replicated `operators` cluster state."""
-    ops = (load_cluster().get("operators") or {})
-    return {"operators": sorted(ops.keys())}
-
-
-@app.post("/api/operators/set")
-def set_operator(req: OperatorSet, user: str = Depends(require_operator)):
-    """Upsert an operator credential. `bedrock operator passwd <user>`
-    uses this — the same endpoint adds a new operator OR changes an
-    existing one's password (the rqlite write is upsert-shaped). Operator
-    must already be authenticated; we don't require the OLD password
-    because the Bearer token already proves authority.
-    """
-    if not req.username or not req.password:
-        raise HTTPException(400, "username and password required")
-    if len(req.password) < 4:
-        raise HTTPException(400, "password too short (min 4 chars for now)")
-    salt, phash = _op_auth.hash_password(req.password)
-    try:
-        _bs.operator_set(
-            username=req.username, salt=salt, password_hash=phash)
-    except Exception as e:
-        raise HTTPException(503, f"could not set operator: {e}")
-    push_log(f"operator {user!r} set password for {req.username!r}",
-             node="mgmt", app="bedrock-mgmt", level="info")
-    return {"username": req.username, "status": "set"}
-
-
-class OperatorRemove(BaseModel):
-    username: str
-
-
-@app.post("/api/operators/remove")
-def remove_operator(req: OperatorRemove, user: str = Depends(require_operator)):
-    """Delete an operator. Refuses to remove the last operator — that
-    would lock the cluster's dashboard. Also refuses to remove
-    yourself (operator must be removed by a different operator, so
-    accidental lockout requires two mistakes)."""
-    ops = (load_cluster().get("operators") or {})
-    if req.username not in ops:
-        raise HTTPException(404, f"no such operator: {req.username!r}")
-    if req.username == user:
-        raise HTTPException(400, "refusing to remove yourself; "
-                                  "ask another operator")
-    if len(ops) <= 1:
-        raise HTTPException(400, "refusing to remove the last operator "
-                                  "(cluster would lock out)")
-    try:
-        _bs.operator_remove(username=req.username)
-    except Exception as e:
-        raise HTTPException(503, f"could not remove operator: {e}")
-    push_log(f"operator {user!r} removed {req.username!r}",
-             node="mgmt", app="bedrock-mgmt", level="warn")
-    return {"username": req.username, "status": "removed"}
 
 
 # ── Join handshake ──────────────────────────────────────────────────
@@ -660,133 +541,6 @@ class JoinReject(BaseModel):
     reason: str = ""
 
 
-# ── Observability backend management (operator CLI) ─────────────────
-
-class ObsPromote(BaseModel):
-    new_node: str
-    replace: str = ""
-    kind: str = "both"   # "both", "metrics", or "logs"
-
-
-@app.post("/api/observability/backends")
-def observability_promote(req: ObsPromote, user: str = Depends(require_operator)):
-    """Add or swap a backend in `obs_backends`. Runs the vmbackup-
-    vmrestore seed BEFORE flipping the snapshot so the new backend
-    isn't visible until it's caught up. Synchronous — operator CLI
-    waits on this call."""
-    cluster = load_cluster()
-    nodes = (cluster.get("nodes") or {})
-    if req.new_node not in nodes:
-        raise HTTPException(400, f"unknown node {req.new_node!r}")
-    obs = (cluster.get("obs_backends") or {})
-    metrics_bk = list(obs.get("metrics") or [])
-    logs_bk    = list(obs.get("logs") or [])
-    do_metrics = req.kind in ("both", "metrics")
-    do_logs    = req.kind in ("both", "logs")
-
-    def _slot(curr: list[str]) -> tuple[list[str], str]:
-        """Compute the post-promote list + source for seeding. Returns
-        (new_list, source_host_or_'')."""
-        if req.new_node in curr:
-            return curr, ""   # nothing to do — already a backend
-        if len(curr) < 2:
-            # Free slot available; just append.
-            return curr + [req.new_node], (nodes.get(curr[0], {}).get("host", "") if curr else "")
-        # Both slots full → must replace.
-        if not req.replace:
-            raise HTTPException(400, "both backend slots full; pass --replace")
-        if req.replace not in curr:
-            raise HTTPException(400, f"--replace {req.replace!r} not in current backend list {curr}")
-        # Seed from the OTHER existing backend (the one we're keeping).
-        keep = [b for b in curr if b != req.replace][0]
-        return [n if n != req.replace else req.new_node for n in curr], \
-               nodes.get(keep, {}).get("host", "")
-
-    new_metrics, src_metrics = (_slot(metrics_bk) if do_metrics else (metrics_bk, ""))
-    new_logs,    src_logs    = (_slot(logs_bk)    if do_logs    else (logs_bk, ""))
-
-    target_host = nodes[req.new_node].get("host", "")
-    if not target_host:
-        raise HTTPException(503, f"{req.new_node!r} has no host address")
-
-    # === Phase 1: flip the snapshot FIRST. ===
-    # This puts the new node into the agent target list everywhere.
-    # Every node's vmagent + vlagent reconfigures and starts dual-
-    # writing to the new target — which isn't accepting yet, so writes
-    # accumulate in the agent disk queue. The new node's reactor sees
-    # itself in `obs_backends` but `_can_start_vm_backend` returns
-    # False (data dir empty + not solo backend), so bedrock-vm stays
-    # stopped. bedrock-vl starts (VL has no seed path).
-    try:
-        _bs.obs_backends_set(metrics=new_metrics, logs=new_logs)
-    except Exception as e:
-        raise HTTPException(503, f"could not set obs backends: {e}")
-
-    # Give agents a moment to fold the entry + reconfigure. Two seconds
-    # is enough on the testbed; the orchestrator subscriber polls fast.
-    # If we skipped this and went straight to seed, agents would still
-    # be configured for the OLD target list and writes between snapshot
-    # and start would land only on the source — exactly the gap this
-    # reorder eliminates.
-    import time as _t
-    _t.sleep(2)
-
-    # === Phase 2: seed the new node's data dir. ===
-    # During this window: agents are buffering for the new target;
-    # source backend is still serving reads. vmbackup snapshots the
-    # source at this instant, ships, vmrestores into the target's data
-    # dir. The seed is "frozen in time" from this snapshot moment.
-    seed_report = {}
-    try:
-        from lib import observability as _obs
-
-        def _runner(host: str, cmd: str, timeout: int = 60):
-            return ssh_cmd_rc(host, cmd, timeout=timeout)
-
-        # `force=True` whenever we're replacing an existing backend.
-        # The new node might have stale data from a previous tenancy
-        # as a backend; without force, seed_backend's "data dir is
-        # not empty, skip" guard would leave that stale data in
-        # place. For a free-slot promote (cluster expansion 1→2),
-        # the empty-data-dir check is the right safety net.
-        _force = bool(req.replace)
-        if do_metrics and src_metrics and req.new_node not in metrics_bk:
-            rep = _obs.seed_backend(src_metrics, target_host, _runner, None,
-                                    force=_force)
-            seed_report["metrics"] = rep.get("metrics", "?")
-        if do_logs and src_logs and req.new_node not in logs_bk:
-            if src_logs != src_metrics or not do_metrics:
-                rep = _obs.seed_backend(src_logs, target_host, _runner, None,
-                                        force=_force)
-            seed_report["logs"] = rep.get("logs", "?")
-    except Exception as e:
-        push_log(f"obs.seed_backend warning: {e}",
-                 node="mgmt", app="bedrock-mgmt", level="warn")
-
-    # === Phase 3: start the backend daemon on the new node. ===
-    # Reactor's seed gate keeps bedrock-vm stopped until the data dir
-    # is populated. We just populated it via vmrestore, so SSH in and
-    # start it explicitly. Once it's up, agents drain their disk-queue
-    # buffers (writes that accumulated during phases 1+2) into the new
-    # backend — convergence with zero data gap.
-    if do_metrics and req.new_node in new_metrics and target_host:
-        try:
-            ssh_cmd(target_host, "systemctl start bedrock-vm.service", timeout=20)
-        except Exception as e:
-            push_log(f"could not start bedrock-vm on {req.new_node}: {e}",
-                     node="mgmt", app="bedrock-mgmt", level="warn")
-
-    _replace_disp = req.replace or "-"
-    push_log(f"operator {user!r} promoted {req.new_node!r} "
-             f"(replace={_replace_disp}, kind={req.kind})",
-             node="mgmt", app="bedrock-mgmt", level="info")
-    return {
-        "metrics_backends": new_metrics,
-        "logs_backends":    new_logs,
-        "seed_report":      seed_report,
-    }
-
-
 @app.post("/api/join/reject")
 def join_reject(req: JoinReject, user: str = Depends(require_operator)):
     cluster = load_cluster()
@@ -809,7 +563,7 @@ def join_reject(req: JoinReject, user: str = Depends(require_operator)):
 
 # Last-known cluster state. The state push loop fills it; /ws and /api/cluster
 # serve from here instantly so the dashboard never waits on fresh SSH probes.
-_last_state: dict = {"nodes": {}, "vms": {}, "witness": {"nodes": {}}}
+# _last_state WS cache now lives in common.py (shared with the cluster router)
 
 
 @app.websocket("/ws")
@@ -824,7 +578,7 @@ async def websocket_endpoint(ws: WebSocket):
         return
     await hub.connect(ws)
     # Push cached state immediately so the UI renders before the next refresh.
-    await hub.send_to(ws, "cluster", _last_state)
+    await hub.send_to(ws, "cluster", _common.get_last_state())
     # The push loop only probes WHILE a client is connected, so the cache may be
     # stale after an idle period. Kick a fresh gather now (off the handler) so
     # this client sees current state promptly; the loop keeps it fresh after.
@@ -862,10 +616,9 @@ async def handle_rpc(method: str, params: dict) -> dict:
 
 async def _gather_and_push():
     """One expensive cluster gather (per-node SSH fanout) → cache → broadcast."""
-    global _last_state
     loop = asyncio.get_event_loop()
     state = await loop.run_in_executor(None, build_cluster_state)
-    _last_state = state
+    _common.set_last_state(state)
     await hub.broadcast("cluster", state)
 
 
@@ -891,7 +644,7 @@ _STARTUP_LOCK = threading.Lock()
 
 @app.on_event("startup")
 async def startup():
-    global _last_state, _main_loop, _STARTUP_DONE
+    global _main_loop, _STARTUP_DONE
     # Under bedrock-d we run TWO uvicorn instances (8443 HTTPS + 8001
     # loopback) in SEPARATE threads, each with its own event loop —
     # both call this hook on the same `app`. Without a real lock the
@@ -907,7 +660,7 @@ async def startup():
     _common.set_main_loop(_main_loop)
     # Seed from cluster state so the sidebar shows host names instantly.
     cfg = load_cluster()
-    _last_state = {
+    _common.set_last_state({
         "nodes": {n: {"name": n, "host": c.get("host", ""), "online": False,
                       "kernel": "", "uptime_since": "", "load": "",
                       "mem_total_mb": 0, "mem_used_mb": 0,
@@ -920,7 +673,7 @@ async def startup():
         "topology": {"switches": {}, "links": [], "node_count": 0,
                      "switch_count": 0, "link_count": 0,
                      "computed_at": 0.0},
-    }
+    })
     task_registry().wire(_main_loop, hub.broadcast)
     asyncio.create_task(state_push_loop())
     write_scrape_config(cfg)
@@ -944,59 +697,6 @@ async def startup():
     else:
         import orchestrator
     orchestrator.start_all()
-
-# ── REST API (for curl/scripting) ──────────────────────────────────────────
-
-@app.get("/api/cluster")
-def api_cluster():
-    # Serve cached state. Fresh data lands every 3s via the push loop.
-    return _last_state
-
-
-@app.get("/api/topology")
-def api_topology():
-    """Physical topology rollup — switches and routers each cluster
-    NIC sees, grouped by device_key (MAC). Computed every 3 s by the
-    state push loop from each node's /run/bedrock/switch_neighbors.json.
-    Not consensus state — purely a derived view for the dashboard."""
-    return _last_state.get("topology", {"switches": {}, "links": [],
-                                          "node_count": 0, "switch_count": 0,
-                                          "link_count": 0,
-                                          "computed_at": 0.0})
-
-
-@app.get("/api/tasks")
-def api_tasks():
-    """Active + recently-finished tasks. Clients use WS 'task' channel for
-    live updates; this endpoint is the snapshot on fresh page load."""
-    return task_registry().list()
-
-
-@app.get("/api/tasks/{task_id}")
-def api_task_get(task_id: str):
-    t = task_registry().get(task_id)
-    if not t:
-        raise HTTPException(404, "task not found (finished and aged out, or never existed)")
-    from tasks import _serialize
-    return _serialize(t)
-
-
-@app.get("/cluster-info")
-def cluster_info():
-    """Discovery endpoint — lets `bedrock join` find this cluster."""
-    state_file = Path("/etc/bedrock/state.json")
-    cluster = load_cluster()
-    info = {
-        "cluster_name": cluster.get("cluster_name", "bedrock"),
-        "cluster_uuid": cluster.get("cluster_uuid", "unknown"),
-        "nodes": list(cluster.get("nodes", {}).keys()),
-    }
-    if state_file.exists():
-        s = json.loads(state_file.read_text())
-        info["cluster_uuid"] = s.get("cluster_uuid", info["cluster_uuid"])
-        info["mgmt_url"] = s.get("mgmt_url", "")
-        info["witness_host"] = s.get("witness_host", "")
-    return info
 
 
 class NodeRegister(BaseModel):
@@ -1038,18 +738,6 @@ def _append_authorized_key(pubkey: str, target_host: Optional[str] = None):
 def _read_local_pubkey() -> str:
     p = Path("/root/.ssh/id_ed25519.pub")
     return p.read_text().strip() if p.exists() else ""
-
-
-# Node registration goes through the join-handshake flow
-# (`POST /api/join/request` → operator approval → `POST /api/join/approve`):
-# SSH-pubkey fan-out, loopback-IP allocation, and node_register+node_loopback
-# logging, with cluster.key shipped AEAD-sealed under an ECDH session key
-# (see lib/join_handshake.py) rather than in plaintext.
-
-
-@app.get("/api/nodes")
-def list_nodes():
-    return load_cluster().get("nodes", {})
 
 
 # ── ISO library ─────────────────────────────────────────────────────────────
@@ -3202,20 +2890,6 @@ def api_vm_backup_schedule_remove(vm_name: str, reason: str = ""):
     except Exception as e:
         raise HTTPException(500, f"rqlite write failed: {e}")
     return {"status": "ok", "revision": rev, "vm": vm_name}
-
-
-@app.get("/api/cron/preview")
-def api_cron_preview(expr: str, n: int = 5):
-    """Return the next N fire times for a cron expression (UTC ISO).
-    Used by the dashboard's schedule-input field for live preview as
-    the operator types. Pure parser — no I/O."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent))
-    import cron as _cron
-    try:
-        return {"cron_expr": expr, "next_fires_utc": _cron.next_n(expr, n=max(1, min(n, 20)))}
-    except _cron.CronError as e:
-        raise HTTPException(400, f"invalid cron expression: {e}")
 
 
 @app.delete("/api/vms/{vm_name}/backups/{kopia_snapshot_id}")
