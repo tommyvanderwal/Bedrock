@@ -116,7 +116,7 @@ class ReplicaRepair:
 
     def _repair_singleton(self, ctx):
         try:
-            from installer.lib import tier_storage as _ts
+            from lib import tier_storage as _ts
         except ImportError:
             sys.path.insert(0, "/usr/local/lib/bedrock")
             from lib import tier_storage as _ts  # type: ignore

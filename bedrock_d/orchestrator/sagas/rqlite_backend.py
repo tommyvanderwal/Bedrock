@@ -1,13 +1,13 @@
 """RqliteSagaBackend — production storage adapter for the saga executor.
 
-Wraps ``installer/lib/rqlite_client.RqliteClient`` to satisfy the
+Wraps ``lib/rqlite_client.RqliteClient`` to satisfy the
 ``SagaBackend`` protocol declared in ``executor.py``. All SQL
 statements use parameterised execute/query — no string interpolation
 of user-supplied values.
 
 # Schema this depends on
 
-``installer/lib/bedrock_schema.sql`` defines ``operations`` +
+``lib/bedrock_schema.sql`` defines ``operations`` +
 ``operation_steps`` (see the SQL file's "Sagas" section). The
 schema must be applied before this backend is used.
 """
@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# The RqliteClient lives in installer/lib; this adapter is the only
+# The RqliteClient lives in lib; this adapter is the only
 # place that imports it, so the executor itself stays decoupled.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "installer"))
 from lib import rqlite_client  # noqa: E402

@@ -73,7 +73,7 @@ Concretely this file holds:
     so we never fight ourselves).
 
 DRBD config regen on path-table change lives in
-`installer/lib/tier_storage.py::regen_drbd_configs_from_snapshot`,
+`lib/tier_storage.py::regen_drbd_configs_from_snapshot`,
 called by mgmt/orchestrator.py's subscriber. Not in this file.
 
 Style: pure stdlib + msgpack. No external deps beyond what

@@ -2,5 +2,5 @@
 
 See docs/codebase-rewrite-plan.md for the target shape. This package
 is being built incrementally; until the migration completes, the
-legacy installer/lib + mgmt packages continue to exist alongside.
+legacy lib + mgmt packages continue to exist alongside.
 """

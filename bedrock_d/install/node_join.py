@@ -27,9 +27,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Path-shim for the still-legacy installer/lib helpers we delegate
+# Path-shim for the repo-root lib/ helpers we delegate
 # into. Stage 7 of the rewrite plan moves these under bedrock_d/.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "installer"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bedrock_d.orchestrator.sagas import (  # noqa: E402
     FileSagaBackend, SagaExecutor, SagaState, saga, step,

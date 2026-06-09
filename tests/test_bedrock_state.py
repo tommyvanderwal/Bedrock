@@ -1,4 +1,4 @@
-"""Unit tests for installer/lib/bedrock_state.py.
+"""Unit tests for lib/bedrock_state.py.
 
 Mocks the rqlite_client so the tests run without a live rqlite —
 asserts on the SQL each helper emits and the parameters it binds.

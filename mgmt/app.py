@@ -1846,7 +1846,7 @@ def _read_local_pubkey() -> str:
 # (`POST /api/join/request` → operator approval → `POST /api/join/approve`):
 # SSH-pubkey fan-out, loopback-IP allocation, and node_register+node_loopback
 # logging, with cluster.key shipped AEAD-sealed under an ECDH session key
-# (see installer/lib/join_handshake.py) rather than in plaintext.
+# (see lib/join_handshake.py) rather than in plaintext.
 
 
 @app.get("/api/nodes")

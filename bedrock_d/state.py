@@ -2,8 +2,8 @@
 
 **ONE module owns rqlite reads/writes.** Code imports state helpers from
 ``bedrock_d.state`` (this file), which re-exports the implementations from
-``installer/lib/bedrock_state``, ``installer/lib/rqlite_client``, and
-``installer/lib/state``.
+``lib/bedrock_state``, ``lib/rqlite_client``, and
+``lib/state``.
 
 # What's exposed
 
@@ -26,7 +26,7 @@
 - View-building (``view_builder``) — that's the snapshot side,
   not a state mutator.
 - Direct SQL. If you find yourself wanting raw SQL, write a typed
-  helper in installer/lib/bedrock_state.py and re-export it here.
+  helper in lib/bedrock_state.py and re-export it here.
   Inline SQL across the codebase is exactly what the
   "single-module" rule prevents.
 """
@@ -35,8 +35,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Path-shim so ``lib.*`` (installer/lib/) resolves as an import root.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
+# Path-shim so ``lib.*`` (lib/, repo root) resolves as an import root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # ── rqlite transport ─────────────────────────────────────────────────
 from lib.rqlite_client import (  # noqa: F401, E402

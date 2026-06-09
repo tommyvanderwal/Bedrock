@@ -27,9 +27,9 @@ sys.path.insert(0, str(REPO_ROOT / "installer"))
 
 
 def _module_paths():
-    """Every importable .py under installer/lib + mgmt, expressed as
+    """Every importable .py under lib + mgmt, expressed as
     dotted module paths. Skips test files and the iso-build staged
-    copies (those mirror installer/lib and would double-test)."""
+    copies (those mirror lib and would double-test)."""
     roots = [
         ("installer.lib", REPO_ROOT / "installer" / "lib"),
         ("mgmt", REPO_ROOT / "mgmt"),

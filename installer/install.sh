@@ -618,6 +618,7 @@ LIB_FILES=(
     seaweedfs.py
     dashboard_install.py
     netd.py
+    fence_verdict.py
     l2disc.py
     cert_manager.py
     mdns_responder.py

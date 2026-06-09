@@ -1,7 +1,7 @@
 """Tests for mDNS discovery + TXT round-trip.
 
-The wire-level functions in installer/lib/mdns_responder.py and
-installer/lib/discovery.py have to agree on the binary format —
+The wire-level functions in lib/mdns_responder.py and
+lib/discovery.py have to agree on the binary format —
 this test pins that interop.
 """
 from __future__ import annotations

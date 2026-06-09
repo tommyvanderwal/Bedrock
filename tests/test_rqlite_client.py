@@ -1,4 +1,4 @@
-"""Unit tests for installer/lib/rqlite_client.py.
+"""Unit tests for lib/rqlite_client.py.
 
 Doesn't require a real rqlite instance — mocks the httpx Client's
 `request()` method to return canned rqlite response shapes. This

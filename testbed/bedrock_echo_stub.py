@@ -7,7 +7,7 @@ every reply. The stub never decrypts slot blobs (they're AEAD-encrypted
 opaque bytes from its point of view); it does AEAD-decrypt the envelope
 to extract `(n, slot_blob)` and AEAD-encrypts the reply envelope.
 
-Wire format: see installer/lib/witness.py docstring. Single primitive:
+Wire format: see lib/witness.py docstring. Single primitive:
 ChaCha20-Poly1305 (12-byte nonces, 16-byte tags). 32-byte cluster_key
 loaded from --cluster-key-file or --cluster-key-hex.
 
@@ -35,7 +35,7 @@ NONCE_LEN = 12
 
 # mDNS service advertisement (so a cluster can `discover_echo_witnesses()` and
 # the dashboard 'Scan LAN' finds this Echo by id+pubkey). Mirrors
-# installer/lib/discovery.py's ECHO_MDNS_NAME; the real ESP32 firmware
+# lib/discovery.py's ECHO_MDNS_NAME; the real ESP32 firmware
 # advertises the same service.
 ECHO_MDNS_NAME = b"bedrock-echo.local"
 MDNS_GROUP = "224.0.0.251"

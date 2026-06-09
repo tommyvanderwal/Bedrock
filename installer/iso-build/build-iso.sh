@@ -196,7 +196,7 @@ refresh_payload() {
     # lib/*.py that no longer exists in source. (lesson_iso_payload_drift)
     rsync -a --delete \
         --include='*.py' --include='*.sql' --exclude='*' \
-        "$INSTALLER/lib/"  "$PAYLOAD_DIR/lib/"
+        "$REPO_ROOT/lib/"  "$PAYLOAD_DIR/lib/"
     cp -r "$INSTALLER/configs/"*  "$PAYLOAD_DIR/configs/" 2>/dev/null || true
 
     # ELRepo + DRBD RPMs.

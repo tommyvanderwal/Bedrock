@@ -115,7 +115,7 @@ install -m 0755 -D "$REPO/installer/bedrock-redirect"      "$STAGE/bedrock-redir
 
 # lib/ — every .py + .sql (.md is documentation; not part of the runtime payload)
 mkdir -p "$STAGE/lib"
-find "$REPO/installer/lib" -maxdepth 1 -type f \( -name "*.py" -o -name "*.sql" \) \
+find "$REPO/lib" -maxdepth 1 -type f \( -name "*.py" -o -name "*.sql" \) \
     -exec install -m 0644 {} "$STAGE/lib/" \;
 
 # bedrock_d/ — shipped as a tarball so install.sh doesn't need to

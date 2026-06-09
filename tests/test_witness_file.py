@@ -1,4 +1,4 @@
-"""Fileshare witness backend (installer/lib/witness_file.py) — the slot
+"""Fileshare witness backend (lib/witness_file.py) — the slot
 protocol over a shared directory. These cover the TRANSPORT module only
 (read/write/decode + the validity reuse); netd integration is separate."""
 from __future__ import annotations

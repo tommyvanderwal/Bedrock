@@ -33,7 +33,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# Make installer/lib importable as `lib`
+# Make lib importable as `lib`
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "installer"))
 

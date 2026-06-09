@@ -1,4 +1,4 @@
-"""Unit tests for installer/lib/rqlite_setup.py.
+"""Unit tests for lib/rqlite_setup.py.
 
 Uses a temporary directory for the cluster.json / state.json /
 rqlited.env paths so the tests don't touch the host system.

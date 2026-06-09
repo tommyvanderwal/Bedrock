@@ -1,4 +1,4 @@
-"""Unit tests for installer/lib/view_builder.py.
+"""Unit tests for lib/view_builder.py.
 
 Mocks the rqlite_client and exercises build_snapshot() end-to-end —
 asserts the dict shape, key naming, JSON deserialization, and

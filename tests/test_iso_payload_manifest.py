@@ -1,13 +1,13 @@
 """Guard against ISO-payload drift (lesson_iso_payload_drift).
 
 install.sh fetches lib/ files for an HTTP/network install from an explicit
-``LIB_FILES=(...)`` list. A new module added under installer/lib/ but forgotten
+``LIB_FILES=(...)`` list. A new module added under lib/ but forgotten
 in LIB_FILES is silently missing on a network install — and the completeness
 backstop in install.sh only runs in file:// (offline-ISO) mode, so the network
 path has NO runtime guard. witness_file.py drifted exactly this way.
 
 This test IS the missing CI check: LIB_FILES must equal the set of *.py/*.sql
-files actually under installer/lib/. If you add or remove a lib module, update
+files actually under lib/. If you add or remove a lib module, update
 LIB_FILES in the same change and this test keeps you honest."""
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO / "installer" / "install.sh"
-LIB_DIR = REPO / "installer" / "lib"
+LIB_DIR = REPO / "lib"
 
 
 def _listed_lib_files() -> set[str]:
@@ -41,7 +41,7 @@ def test_lib_files_manifest_matches_source():
         f"lib modules missing from install.sh LIB_FILES (a network install "
         f"would ship without them → ModuleNotFoundError): {sorted(missing)}")
     assert not stale, (
-        f"install.sh LIB_FILES lists files not in installer/lib/ "
+        f"install.sh LIB_FILES lists files not in lib/ "
         f"(install.sh would 404 fetching them): {sorted(stale)}")
 
 

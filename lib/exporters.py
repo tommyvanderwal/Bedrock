@@ -38,7 +38,7 @@ def install(repo: str):
     os.chmod(VM_EXPORTER, 0o755)
 
     # Fetch the observability binaries. Idempotent: skip if already on
-    # disk. The reconciler in installer/lib/observability.py owns the
+    # disk. The reconciler in lib/observability.py owns the
     # systemd units for these — exporters.py only ensures the bytes
     # are available.
     for b in OBS_BINS:

@@ -3,12 +3,12 @@ from rqlite_client directly.
 
 The rule (codebase-rewrite-plan §3.3): one module owns rqlite I/O.
 New code under bedrock_d/ imports from ``bedrock_d.state``. The
-legacy ``installer/lib/`` modules can still talk to rqlite_client
+legacy ``lib/`` modules can still talk to rqlite_client
 directly because that's where the implementation currently lives;
 Stage 7 of the rewrite moves them and this allowlist shrinks.
 
 If you're adding new code that talks to rqlite, add a typed helper
-in installer/lib/bedrock_state.py + re-export from bedrock_d.state.
+in lib/bedrock_state.py + re-export from bedrock_d.state.
 Don't add yourself to ALLOWED below."""
 from __future__ import annotations
 
@@ -27,16 +27,21 @@ ALLOWED = {
     # explicitly; that's its purpose.
     "bedrock_d/orchestrator/sagas/rqlite_backend.py",
     # Legacy implementations (will move in Stage 7).
-    "installer/lib/bedrock_state.py",
-    "installer/lib/rqlite_setup.py",
-    "installer/lib/view_builder.py",     # snapshot reader; not a writer
-    "installer/lib/netd.py",             # election tick reads cluster.json + rqlite
-    "installer/lib/cluster_arbiter.py",
-    "installer/lib/casting_saga.py",     # #7 saga executor: arms/disables vote config
+    "lib/bedrock_state.py",
+    "lib/rqlite_setup.py",
+    "lib/view_builder.py",     # snapshot reader; not a writer
+    "lib/netd.py",             # election tick reads cluster.json + rqlite
+    "lib/cluster_arbiter.py",
+    "lib/casting_saga.py",     # #7 saga executor: arms/disables vote config
 
-    "installer/lib/operator_auth.py",
-    "installer/lib/join_handshake.py",
-    "installer/lib/tier_storage.py",
+    "lib/operator_auth.py",
+    "lib/join_handshake.py",
+    "lib/tier_storage.py",
+    # decide_vm_fence does a level='strong' vms.host read INSIDE the DRBD
+    # fence-decision endpoint path; it must hit rqlite directly (the strict-
+    # leader read IS the majority gate) and cannot route through a cached
+    # bedrock_d.state facade. See docs/explainers/02-bedrock-perspective.md.
+    "lib/fence_verdict.py",
     # mgmt is a peer of bedrock_d at the moment; treat as legacy
     # until Stage 8 splits it.
     "mgmt/app.py",
@@ -59,7 +64,7 @@ ALLOWED = {
     "bedrock_d/vm/migrate.py",
     "bedrock_d/vm/failover.py",
     # Pure rqlite READ facade (like view_builder) — a reader, not a writer.
-    "installer/lib/cluster_state.py",
+    "lib/cluster_state.py",
 }
 
 PATTERN = re.compile(
@@ -72,7 +77,7 @@ PATTERN = re.compile(
 
 
 def _iter_source_files():
-    for sub in ("bedrock_d", "installer/lib", "mgmt"):
+    for sub in ("bedrock_d", "lib", "mgmt"):
         root = REPO / sub
         if not root.exists():
             continue

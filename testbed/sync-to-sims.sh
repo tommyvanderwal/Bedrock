@@ -35,7 +35,7 @@ fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-tar czf "$TMPDIR/lib.tgz" --exclude=__pycache__ --exclude='*.pyc' -C installer lib
+tar czf "$TMPDIR/lib.tgz" --exclude=__pycache__ --exclude='*.pyc' -C . lib
 tar czf "$TMPDIR/mgmt.tgz" --exclude=__pycache__ --exclude='*.pyc' -C mgmt .
 tar czf "$TMPDIR/bedrock_d.tgz" --exclude=__pycache__ --exclude='*.pyc' bedrock_d
 # Staged payload tarball: a top-level `mgmt/` archive that REPLACES the
@@ -54,7 +54,7 @@ cp installer/configs/bedrock-*.service "$TMPDIR/" 2>/dev/null
 # A transient mgmt.tgz miss on 2026-05-29 ran the old orchestrator.py and
 # faked a reboot-resilience FAIL — never again.
 EXPECT_ORCH=$(md5sum mgmt/orchestrator.py | cut -d' ' -f1)
-EXPECT_STATE=$(md5sum installer/lib/state.py | cut -d' ' -f1)
+EXPECT_STATE=$(md5sum lib/state.py | cut -d' ' -f1)
 EXPECT_VMFAIL=$(md5sum bedrock_d/orchestrator/vm_failover.py | cut -d' ' -f1)
 EXPECT_BACKUP=$(md5sum mgmt/backup.py | cut -d' ' -f1)
 EXPECT_APP=$(md5sum mgmt/app.py | cut -d' ' -f1)

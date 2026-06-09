@@ -3,7 +3,7 @@
 Three endpoints — list, upload, delete — over the cluster-wide
 SeaweedFS FUSE mount at ``/mnt/bedrock/iso``. Writes go through
 the FUSE mount so the filer replicates per the /iso/ collection
-policy (see installer/lib/seaweedfs.py::init_collections).
+policy (see lib/seaweedfs.py::init_collections).
 Listings on any node show the same files; a delete on any node
 deletes cluster-wide. Writing directly to the FUSE mount keeps a
 single path: virt-install reads ISOs from ``/mnt/bedrock/iso``, so

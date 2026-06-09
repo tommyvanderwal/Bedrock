@@ -20,7 +20,7 @@ first not-``done`` step runs.
 # What this module is NOT responsible for
 
 - The ``operations``/``operation_steps`` schema — that lives in
-  ``installer/lib/bedrock_schema.sql``.
+  ``lib/bedrock_schema.sql``.
 - The wire-format / rqlite client — those are injected via the
   ``SagaBackend`` protocol. Production wiring is a thin adapter
   around ``installer.lib.rqlite_client``; tests use an in-memory

@@ -378,7 +378,7 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
 
     # DRBD multi-path config regen on mesh path-table change.
     try:
-        from installer.lib import tier_storage as _ts  # type: ignore
+        from lib import tier_storage as _ts  # type: ignore
     except ImportError:
         try:
             import sys as _sys
@@ -398,7 +398,7 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     # is safe on every revision tick.
     try:
         try:
-            from installer.lib import cluster_arbiter as _ca  # type: ignore
+            from lib import cluster_arbiter as _ca  # type: ignore
         except ImportError:
             import sys as _sys2
             _sys2.path.insert(0, "/usr/local/lib/bedrock")
@@ -416,7 +416,7 @@ def _apply_revision(rc: rqlite_client.RqliteClient, revision: int,
     # changed.
     try:
         try:
-            from installer.lib import seaweedfs as _sw  # type: ignore
+            from lib import seaweedfs as _sw  # type: ignore
         except ImportError:
             from lib import seaweedfs as _sw  # type: ignore
         _sw.ensure_iso_library_mount()
@@ -554,7 +554,7 @@ async def _start_local_services():
         try:
             from lib import cluster_arbiter as _ca
         except ImportError:                       # source-tree layout
-            from installer.lib import cluster_arbiter as _ca  # type: ignore
+            from lib import cluster_arbiter as _ca  # type: ignore
         await asyncio.to_thread(_ca.ensure_arbiter_drbd_up)
     except Exception as e:
         log.warning("services: arbiter DRBD up failed "
@@ -580,7 +580,7 @@ async def _start_local_services():
         try:
             from lib import seaweedfs as _sw
         except ImportError:                       # source-tree layout
-            from installer.lib import seaweedfs as _sw  # type: ignore
+            from lib import seaweedfs as _sw  # type: ignore
         log.info("services: starting per-node SeaweedFS "
                  "(weed-volume + weed-s3, + weed-master if in the Raft-3 set)")
         _sw.promote_to_master_volume_host()
@@ -1220,7 +1220,7 @@ async def converge_retry():
     self_name = _self_node_name()
     try:
         try:
-            from installer.lib import cluster_arbiter as _ca  # type: ignore
+            from lib import cluster_arbiter as _ca  # type: ignore
         except ImportError:
             sys.path.insert(0, "/usr/local/lib/bedrock")
             from lib import cluster_arbiter as _ca  # type: ignore

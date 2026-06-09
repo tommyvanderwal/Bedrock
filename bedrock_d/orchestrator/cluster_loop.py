@@ -62,7 +62,7 @@ from bedrock_d.state import RqliteClient  # noqa: E402
 
 log = logging.getLogger("bedrock.cluster_loop")
 
-# rqlite read-consistency (see installer/lib/rqlite_client.py):
+# rqlite read-consistency (see lib/rqlite_client.py):
 #   'none' = this node's LOCAL replica, no leader round-trip, NO Raft barrier.
 # Change DETECTION uses 'none': it only needs to NOTICE a new committed revision,
 # which the local replica applies via Raft within ms (the CDC webhook + the poll

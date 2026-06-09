@@ -1,4 +1,4 @@
-"""Unit tests for the state.json self-heal (installer/lib/state.py).
+"""Unit tests for the state.json self-heal (lib/state.py).
 
 Locks in the fix for the sim-4 2026-05-29 brick: a 0-byte/corrupt
 state.json (power-loss in save()'s rename window) must NOT crash callers
