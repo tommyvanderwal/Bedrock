@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -519,7 +520,24 @@ def _svc_stop(unit: str) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 
+# Serializes the two promote callers (netd's Leader tick and converge_retry).
+# The 2026-06-09 failover measurement caught both running the takeover
+# protocol CONCURRENTLY — interleaved witness claims + double log rounds for
+# zero benefit. Non-blocking: the late caller just reads status and retries
+# on its own next tick.
+_PROMOTE_LOCK = threading.Lock()
+
+
 def promote_to_arbiter_host() -> dict:
+    if not _PROMOTE_LOCK.acquire(blocking=False):
+        return arbiter_status()
+    try:
+        return _promote_to_arbiter_host_locked()
+    finally:
+        _PROMOTE_LOCK.release()
+
+
+def _promote_to_arbiter_host_locked() -> dict:
     """Take over hosting the cluster-singleton services on this node.
 
     Runs the witness slot takeover protocol BEFORE any DRBD or service
@@ -731,6 +749,63 @@ def _self_node_name() -> str:
         return ""
 
 
+# Step-5 readback ceiling. An Echo answers in single-digit ms (first 20 ms
+# poll); a fileshare witness needs one disk IO per write+read pair. 2 s is
+# ~100 polls — if the witness hasn't certified us by then it is unreachable
+# or losing writes, and refusing (retry next tick) is the safe direction.
+READBACK_DEADLINE_S = 2.0
+
+
+def _readback_own_claim(ws, _witness, expected_marker: bytes) -> bool:
+    """Step-5 readback: poll until the witness reflects our just-published
+    CLAIM(|TRANSITIONING) slot, independent of the netd tick thread.
+
+    Echo path: unicast our own slot (heartbeat_all) and drain the ack
+    ourselves — UDP sendto/recvfrom are safe from a second thread, and
+    whichever thread drains the ack updates the same ws.slots cache.
+    Fileshare path: write the slot file directly + read it back (the
+    off-hot-path IO worker's 3 s cadence is far too slow for a failover).
+    Re-pushes every ~200 ms; polls every 20 ms; bounded by
+    READBACK_DEADLINE_S."""
+    file_paths = [p for (_wid, p) in (ws.configured_file_witnesses or [])]
+    _wfile = None
+    if file_paths:
+        try:
+            try:
+                from . import witness_file as _wfile
+            except ImportError:
+                from lib import witness_file as _wfile  # type: ignore
+        except Exception:
+            _wfile = None
+    deadline = time.monotonic() + READBACK_DEADLINE_S
+    n = 0
+    while time.monotonic() < deadline:
+        if n % 10 == 0:                       # push every ~200 ms
+            _witness.heartbeat_all(ws)
+            if _wfile is not None:
+                for path in file_paths:
+                    try:
+                        _wfile.write_own_slot(ws, path)
+                    except Exception:
+                        pass                  # this witness can't certify us
+        n += 1
+        time.sleep(0.02)
+        _witness.drain_replies(ws)
+        own = _witness.own_slot(ws)
+        if own is not None and own.claim and own.marker == expected_marker:
+            return True
+        if _wfile is not None:
+            for path in file_paths:
+                try:
+                    own_f = _wfile.read_slots(ws, path).get(ws.my_node_id)
+                except Exception:
+                    continue
+                if (own_f is not None and own_f.claim
+                        and own_f.marker == expected_marker):
+                    return True
+    return False
+
+
 def _run_takeover_protocol() -> bool:
     """Steps 1-5 of the arbiter takeover protocol. Returns True if it
     is safe to proceed with drbdadm primary + service starts.
@@ -912,33 +987,40 @@ def _run_takeover_protocol() -> bool:
     log.info("arbiter: DRBD generation match (%s); proceeding to claim",
              local_uuid_step3[:12])
 
-    # Step 4: claim the witness as part of the takeover handshake — set our
-    # own slot tag=claim. The arbiter OWNS the claim bit: netd does not
-    # recompute own_tag, so this explicit set is authoritative and the
-    # step-5 readback can't be raced back to 0. netd's election tick (1 Hz)
-    # ships whatever tag we set here on its next heartbeat, and only
-    # refreshes own_marker — never the tag. If this takeover lands us with a
-    # node-majority (the witness wasn't actually pivotal), the next Leader
-    # tick's ensure_witness_claim() releases this claim again — it sticks
-    # only while the witness remains pivotal for our quorum.
+    # Step 4: claim the witness — 2-phase commit, phase 1. Publish
+    # CLAIM|TRANSITIONING: the intent to become the arbiter host, announced
+    # BEFORE any actuation. TRANSITIONING is the same intent the mesh
+    # heartbeat already carries to NEIGHBORS (netd's `transitioning` field,
+    # which peers vote on in _failover_ack_target); this bit carries it to
+    # the WITNESS. While it is set, ensure_witness_claim leaves the tag
+    # alone — the takeover protocol owns it (rewriting it per tick raced
+    # the readback back to 0: the measured ~11 s failover stall,
+    # 2026-06-09). Phase 2 is ensure_witness_claim's hosting write —
+    # HOSTING(|CLAIM if pivotal) — which CLEARS TRANSITIONING; if the
+    # takeover lands us with a node-majority (witness not actually
+    # pivotal), that same write releases the claim again.
     local_uuid = _read_local_drbd_uuid()
     marker_bytes = local_uuid.encode("ascii") if local_uuid else b""
-    _witness.set_own_slot(ws, marker=marker_bytes, tag=_witness.TAG_CLAIM)
+    _witness.set_own_slot(
+        ws, marker=marker_bytes,
+        tag=_witness.TAG_CLAIM | _witness.TAG_TRANSITIONING)
 
-    # Step 5: read it back. Wait up to 3 attempts × ~1.5 s = ~4.5 s.
-    expected_marker = marker_bytes
-    for attempt in range(1, 4):
-        time.sleep(1.5)  # let netd send + receive at least one round-trip
-        own = _witness.own_slot(ws)
-        if own is not None and own.claim and own.marker == expected_marker:
-            log.info("arbiter: own slot readback OK (attempt %d, claim=1, "
-                     "marker=%s)", attempt, local_uuid[:12])
-            return True
-        log.warning("arbiter: own-slot readback attempt %d not yet "
-                    "reflecting claim+marker (have=%r)", attempt,
-                    own and (own.claim, own.marker[:12]))
-    log.error("arbiter: takeover REFUSED — own-slot readback failed "
-              "after 3 attempts; witness unreachable or losing writes")
+    # Step 5: read the claim back — self-sufficiently. The netd election
+    # tick (which normally ships own_slot on its 1 Hz heartbeat) may be the
+    # very thread running THIS protocol, so waiting on it deadlocks into
+    # the tick cadence — that was the old 3 × 1.5 s readback, which could
+    # only succeed when the OTHER converge caller happened to tick. Instead
+    # _readback_own_claim pushes our slot and harvests the reply itself: an
+    # Echo answers its heartbeat synchronously (LAN round-trip, single-digit
+    # ms → first 20 ms poll), and a fileshare witness gets a direct slot
+    # write + read with 20 ms — one disk IO — of breathing room per poll.
+    if _readback_own_claim(ws, _witness, marker_bytes):
+        log.info("arbiter: own slot readback OK (claim=1, marker=%s)",
+                 local_uuid[:12])
+        return True
+    log.error("arbiter: takeover REFUSED — own-slot readback failed after "
+              "%.1f s; witness unreachable or losing writes",
+              READBACK_DEADLINE_S)
     return False
 
 
@@ -1041,6 +1123,14 @@ def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
         hosting = bool(status.get("ip_present"))
 
     if not hosting:
+        # 2PC phase-1 window: a takeover is in flight — the takeover protocol
+        # published CLAIM|TRANSITIONING and OWNS the tag until hosting is
+        # confirmed (the phase-2 write below clears TRANSITIONING) or we
+        # demote (tag=0 there). Rewriting it here raced the step-5 readback
+        # back to 0 every tick — the measured ~11 s failover stall
+        # (2026-06-09). Leave it alone.
+        if cur_tag & _witness.TAG_TRANSITIONING:
+            return False
         # We're in the Leader branch but not actually hosting yet (mid-promote)
         # or we lost actuation — publish NO HOSTING/CLAIM so a far node never
         # treats us as alive-and-hosting on stale truth. (demote clears it too.)
@@ -1051,6 +1141,8 @@ def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
         return True
 
     # We host. CLAIM only when the witness is pivotal (node-votes short).
+    # 2PC phase 2: `desired` never includes TRANSITIONING, so this write is
+    # what clears the transition bit once hosting is actuation-true.
     want_claim = not node_has_majority
     desired = _witness.TAG_HOSTING | (_witness.TAG_CLAIM if want_claim else 0)
     if cur_tag == desired:
@@ -1067,13 +1159,13 @@ def ensure_witness_claim(ws, *, node_has_majority: bool) -> bool:
         # netd republishes own_tag each heartbeat.
         return True
     # We just ADDED the claim — readback-confirm so a peer's takeover sees
-    # fresh+claim and defers. Best-effort; netd keeps publishing.
-    for _ in range(3):
-        time.sleep(1.5)
-        back = _witness.own_slot(ws)
-        if back is not None and back.claim and back.marker == marker:
-            log.info("arbiter: witness claim readback confirmed")
-            return True
+    # fresh+claim and defers. Same self-sufficient fast readback as takeover
+    # step 5 (Echo: ms; fileshare: one 20 ms disk-IO window) — the old
+    # 3 × 1.5 s loop blocked the Leader tick that runs this. Best-effort;
+    # netd keeps publishing either way.
+    if _readback_own_claim(ws, _witness, marker):
+        log.info("arbiter: witness claim readback confirmed")
+        return True
     log.warning("arbiter: witness claim set but readback not yet confirmed "
                 "(witness slow/unreachable); netd will keep publishing")
     return True

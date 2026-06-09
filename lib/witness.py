@@ -72,6 +72,16 @@ TAG_LMS    = TAG_CLAIM  # deprecated alias for the old "last-man-standing" name
 # never pins .254 by mere freshness. Set/cleared by the hosting node only.
 # See docs/witness-death-oracle.md.
 TAG_HOSTING = 0x02
+# Bit 2 = TRANSITIONING: "I am mid-takeover, becoming the arbiter host" — the
+# 2-phase-commit announce bit. Phase 1: the takeover protocol publishes
+# CLAIM|TRANSITIONING (intent, before any actuation). Phase 2: once hosting is
+# confirmed (DRBD Primary + mount + .254), ensure_witness_claim publishes
+# HOSTING(|CLAIM if pivotal) which CLEARS this bit. While TRANSITIONING is set,
+# the per-tick steady-state publisher must NOT rewrite the tag (the takeover
+# protocol owns it) — that wipe was a measured ~11 s failover stall. The mesh
+# heartbeat carries the same intent to NEIGHBORS (`transitioning` field, see
+# netd._failover_ack_target); this bit carries it to the WITNESS.
+TAG_TRANSITIONING = 0x04
 
 # Marker kinds.
 MARKER_KIND_DRBD_ARBITER_UUID = 1
@@ -97,6 +107,11 @@ class Slot:
     def hosting(self) -> bool:
         """True iff this slot's owner is ACTUALLY the arbiter host (death-oracle)."""
         return bool(self.tag & TAG_HOSTING)
+
+    @property
+    def transitioning(self) -> bool:
+        """True iff this slot's owner is mid-takeover (2PC phase 1 announced)."""
+        return bool(self.tag & TAG_TRANSITIONING)
 
     # Deprecated alias for the old "last-man-standing" name.
     @property

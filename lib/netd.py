@@ -1620,10 +1620,26 @@ def _election_tick(d, ws, _witness, _election, _fence_verdict, prev_outcome):
         d.hb_believed_master = current_master or ""
         d.hb_transitioning = False
         d.hb_ack_target = ""
+        # 2PC abort: if we set CLAIM|TRANSITIONING as Leader (takeover
+        # phase 1) and then lost the election before hosting (deferred to
+        # a returning master, vote flipped), drop the announced intent —
+        # a Follower must never keep a witness claim pinned. The hosting
+        # case is handled by the converge demote (which also clears the
+        # tag); this covers the not-yet-hosting window the old per-tick
+        # wipe used to (bugged, but it covered it).
+        if ws.own_tag & _witness.TAG_TRANSITIONING:
+            _witness.set_own_slot(ws, marker=ws.own_marker, tag=0)
     else:  # NoQuorum — advertise nothing definitive.
         d.hb_believed_master = ""
         d.hb_transitioning = False
         d.hb_ack_target = ""
+        # Same 2PC abort as the Follower branch: a NoQuorum node mid-
+        # takeover drops its announced intent. (The witness is usually
+        # unreachable from here so the cleared tag may not ship until
+        # heal — the claim-never-times-out INV-7 path still applies if
+        # we die — but on heal the first heartbeat retracts it.)
+        if ws.own_tag & _witness.TAG_TRANSITIONING:
+            _witness.set_own_slot(ws, marker=ws.own_marker, tag=0)
 
     # 5. Log transitions.
     if prev_outcome != result.outcome.value:
