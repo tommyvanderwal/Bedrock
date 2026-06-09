@@ -45,6 +45,9 @@ ALLOWED = {
     # mgmt is a peer of bedrock_d at the moment; treat as legacy
     # until Stage 8 splits it.
     "mgmt/app.py",
+    # the shared cluster-data infra extracted from app.py during the router split;
+    # build_cluster_state / get_node_info read rqlite directly, same as app.py did.
+    "mgmt/common.py",
     "mgmt/orchestrator.py",
     "mgmt/backup.py",
     "mgmt/victoria.py",
