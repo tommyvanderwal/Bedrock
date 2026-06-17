@@ -13,13 +13,14 @@ wall-clock seconds, and the design is only correct if those costs are bounded an
 
 ![Arbiter failover overview](img/overview-timeline.svg)
 
-## The three perspectives
+## The perspectives
 
 | Doc | Perspective | Answers |
 |-----|-------------|---------|
 | [01 — DRBD's view](01-drbd-perspective.md) | The kernel DRBD driver, **once on each side** | When does DRBD *notice* the peer is gone? Why does it freeze instead of keep writing? What does the fence-peer exit code do? Why does the loser's UUID never change? |
 | [02 — bedrock-d's view](02-bedrock-perspective.md) | The Python daemon **making the call** | How does bedrock-d turn "a peer vanished" into a win/lose verdict? How does the *exclusive witness claim* make an even split safe? How are `rqlited-arbiter` and `weed-filer` **killed** on the loser and **started** on the winner? When does `.254` move? |
 | [03 — timing & races](03-timing-and-races.md) | The clock, **across all layers** | Best case vs worst case, second by second. Can two nodes both be Primary? Can a stale verdict win? Can the witness be double-claimed? Where are the *known* residual races, and why are they bounded? |
+| [04 — network & election](04-network-and-election.md) | **netd mesh + election HB** | What packets fly, how often, to whom? Master polling or symmetric hellos? How do mesh, witness, DRBD, and fence-peer line up on one timeline? Why isn't rqlite `strong` read involved in arbiter fence? |
 
 ## One-paragraph mental model
 
