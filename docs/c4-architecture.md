@@ -1,7 +1,10 @@
 # Bedrock — C4 architecture (draft)
 
-System and **container** levels only. Component-level (`bedrock-d` modules) is a
-follow-up.
+System and **container** levels. For **runtime scenario flows** (DRBD peer loss,
+fence-peer call chain, exact `file:function` references), see
+[`c4-scenarios.md`](c4-scenarios.md).
+
+Component-level (`bedrock-d` module diagram) is still a follow-up.
 
 ## Is Bedrock one system or several?
 
