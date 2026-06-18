@@ -22,9 +22,11 @@ class TestJournalForwardConfig(unittest.TestCase):
         self.assertIn("5140", body)
         self.assertIn("vlagent", body)  # feedback-loop guard
 
-    def test_vlagent_unit_orders_after_rsyslog(self):
+    def test_vlagent_unit_has_no_rsyslog_ordering(self):
+        """vlagent is the TCP listener; rsyslog is the client — no After=rsyslog."""
         unit = observability._vlagent_unit(["node-a"], {"nodes": {"node-a": {"host": "10.0.0.1"}}})
-        self.assertIn("After=network-online.target rsyslog.service", unit)
+        self.assertIn("After=network-online.target", unit)
+        self.assertNotIn("rsyslog", unit)
 
 
 if __name__ == "__main__":

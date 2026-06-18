@@ -197,8 +197,8 @@ def _vlagent_unit(logs_backends: list[str], snapshot: dict) -> str:
         if _backend_url(snapshot, n, 9428))
     return f"""[Unit]
 Description=Bedrock logs agent (vlagent, dual-writes to both VL backends)
-After=network-online.target rsyslog.service
-Wants=network-online.target rsyslog.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
