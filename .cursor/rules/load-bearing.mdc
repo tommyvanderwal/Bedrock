@@ -1,1 +1,6 @@
+---
+description: Load-bearing code only
+alwaysApply: true
+---
+
 Load-bearing code only — every line must earn its place; no new dependencies, wrappers, or speculative layers without an obvious, necessary job.
