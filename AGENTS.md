@@ -1,1 +1,1 @@
-Load-bearing code only — every line must earn its place; no new dependencies, wrappers, or speculative layers without an obvious, necessary job.
+Load-bearing code only; no new dependencies, wrappers, or speculative layers without an obvious, necessary job.
