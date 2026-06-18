@@ -67,22 +67,13 @@ def main() -> int:
     # ── netd thread ───────────────────────────────────────────────
     from lib import netd  # type: ignore
 
-    def _netd_thread():
-        try:
-            netd.run_daemon(shared_state=state)
-        except Exception as e:
-            log.exception("bedrock-d: netd thread crashed: %r", e)
-            # netd crash is bad but should NOT kill the whole daemon —
-            # mgmt + orchestrator may still be able to do useful work
-            # (e.g. serve the dashboard so the operator can diagnose).
-            # Signal shutdown so the operator sees a clean exit rather
-            # than a half-alive process. Per user direction: no
-            # auto-reboot watchdog. They'll see this in journalctl
-            # and decide.
+    def _fatal_thread_exc(args):
+        sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+        os._exit(1)
 
-    t_netd = threading.Thread(target=_netd_thread, name="bedrock-netd",
-                              daemon=True)
-    t_netd.start()
+    threading.excepthook = _fatal_thread_exc
+    threading.Thread(target=netd.run_daemon, kwargs={"shared_state": state},
+                     name="bedrock-netd", daemon=True).start()
     log.info("bedrock-d: netd thread started")
 
     # NOTE: mdns_responder, http_redirect, and cert_manager are not
