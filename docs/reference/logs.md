@@ -3,41 +3,29 @@
 Bedrock has three log channels. Knowing which carries what avoids the
 "I don't see my event" rabbit hole.
 
-## The three channels
+## The log pipeline
 
 ```
    ┌───────────────────────────────────────────────────────────────┐
-   │ 1. push_log()  — mgmt application events                       │
-   │                                                                │
-   │    mgmt/app.py:push_log() does, in order:                      │
-   │      a. WebSocket 'event' broadcast  (instant to all browsers) │
-   │      b. VictoriaLogs JSON insert     (persistent, queryable)   │
-   │                                                                │
-   │    Examples: migrate success, convert steps, join approved,    │
-   │    VM start/stop, ISO upload, operator login.                  │
+   │ 1. push_log()  — mgmt application events (JSON)                  │
+   │    WebSocket (instant UI) + VictoriaLogs /insert/jsonline      │
    └───────────────────────────────────────────────────────────────┘
 
    ┌───────────────────────────────────────────────────────────────┐
-   │ 2. Systemd journal  — per-service stdout/stderr                │
+   │ 2. Host journal  — every systemd unit, kernel, bedrock-d, …      │
    │                                                                │
-   │    `journalctl -u <service>`  on each node.                    │
-   │    Captures: uvicorn access log, rqlite consensus, DRBD        │
-   │    kernel messages, libvirtd, cloud-init, etc.                 │
-   │    Host-only; not surfaced in the dashboard.                   │
-   └───────────────────────────────────────────────────────────────┘
-
-   ┌───────────────────────────────────────────────────────────────┐
-   │ 3. Syslog  → vlagent :5140 → VictoriaLogs                      │
+   │    journald  ──ForwardToSyslog──►  rsyslog  ──TCP :5140──►     │
+   │    bedrock-vlagent  ──dual-write──►  VictoriaLogs (:9428)      │
    │                                                                │
-   │    Every node runs bedrock-vlagent listening on syslog TCP     │
-   │    :5140. It dual-writes to both designated VL backends, so    │
-   │    forwarded syslog ends up queryable next to push_log events. │
-   │    Pointing a host's rsyslog at :5140 is operator config.      │
+   │    Installed on every node by observability.reconcile()        │
+   │    (drop-ins under journald.conf.d/ + rsyslog.d/).           │
+   │    Local copy remains in journald for journalctl -f.           │
    └───────────────────────────────────────────────────────────────┘
 ```
 
-The dashboard Recent Logs panel shows **channel 1** (push_log). Channels 2
-and 3 are host-side tools.
+The dashboard **Recent Logs** panel shows **channel 1** (push_log) live via
+WebSocket. The **Log Explorer** (`/logging`, `/api/logs`) queries VictoriaLogs
+and sees **both** push_log JSON events **and** forwarded journal lines.
 
 ## push_log: what it is and where it lands
 
@@ -93,6 +81,17 @@ VictoriaLogs uses LogsQL. The mgmt app exposes pre-shaped read endpoints
 | `GET /api/logs/node/{name}?limit=&hours=` | `hostname:"<name>"` |
 | `GET /api/logs/vm/{name}?limit=&hours=` | `"<vm-name>"` (free-text in `_msg`) |
 
+Journal-forwarded lines (bedrock-d tracebacks, rqlited, DRBD, …) land in the
+same store. Examples:
+
+```bash
+# bedrock-d crash stacktraces cluster-wide
+curl 'http://<vl>:9428/select/logsql/query?query=_msg:Traceback&limit=20'
+
+# one service on one node (syslog tag / program name varies by emitter)
+curl 'http://<vl>:9428/select/logsql/query?query=hostname:"bedrock-sim-1.bedrock.local" _msg:bedrock-net&limit=50'
+```
+
 Or directly against any logs backend (`<vl>` = a node in `obs_backends.logs`):
 
 ```bash
@@ -109,11 +108,11 @@ curl 'http://<vl>:9428/select/logsql/query?query=hostname:"bedrock-sim-2.bedrock
 
 ## Streaming (journalctl -f equivalents)
 
-The dashboard is the closest to `tail -f` for push_log events. For the
-systemd journal of any service:
+The dashboard Log Explorer tails VictoriaLogs via `/api/logs`. For zero-latency
+local follow, journald still holds a copy on each node:
 
 ```bash
-# unified daemon — uvicorn access, orchestrator/netd, tracebacks
+# unified daemon — uvicorn access, orchestrator/netd, tracebacks (also in VL)
 ssh <node> 'journalctl -u bedrock-d -f'
 
 # rqlite — consensus, leader changes
@@ -161,4 +160,6 @@ fetched once on mount; after that the panel is push-driven.
 - Guest OS activity (arrives via syslog → vlagent, a separate channel).
 
 push_log is for state transitions that change what the cluster is doing.
-Everything else is journal-only.
+Everything else (service stdout/stderr, kernel, netd status lines) arrives via
+the default journal → rsyslog → vlagent pipeline and is queryable in
+VictoriaLogs.

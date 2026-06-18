@@ -123,8 +123,8 @@ The `installer/bedrock-d` entry script:
 1. Builds `BedrockState`, installs SIGTERM/SIGINT handlers that set
    `stop_event`.
 2. Starts the netd thread (`netd.run_daemon(shared_state=state)`), a daemon
-   thread that observes `stop_event`. A netd crash signals shutdown rather than
-   killing mgmt mid-flight, so the operator gets a clean exit and the journal.
+   thread that observes `stop_event`. Uncaught thread exceptions print a full
+   traceback then `os._exit(1)` so systemd restarts the whole process.
 3. `orchestrator.attach_state(state)` + `cluster_arbiter.attach_state(state)`,
    then sets `mgmt_app.app.state.bedrock = state`.
 4. Calls `mgmt_app.serve_main()`, which binds the loopback `:8001` listener in a

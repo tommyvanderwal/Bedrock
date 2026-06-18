@@ -57,6 +57,11 @@ UNIT_VLAGENT = "bedrock-vlagent.service"
 UNIT_VM      = "bedrock-vm.service"
 UNIT_VL      = "bedrock-vl.service"
 
+# Journal → syslog → vlagent (:5140) → VictoriaLogs. Drop-ins only; the
+# stock rsyslog.conf / journald.conf are left untouched.
+JOURNAL_FORWARD_DROPIN = "/etc/systemd/journald.conf.d/50-bedrock-forward.conf"
+RSYSLOG_VLAGENT_DROPIN = "/etc/rsyslog.d/50-bedrock-vlagent.conf"
+
 
 def _write_if_changed(path: str, content: str, mode: int = 0o644) -> bool:
     """Atomic tmp+rename write; return True only if the file changed."""
@@ -184,19 +189,16 @@ WantedBy=multi-user.target
 
 
 def _vlagent_unit(logs_backends: list[str], snapshot: dict) -> str:
-    """vlagent ingests via syslog/JSON push on a local port and forwards
-    to BOTH log backends. Same disk-queue model as vmagent. The local
-    rsyslog setup points at vlagent's listener (or sends to it via UDP
-    syslog) — that wiring is owned by the existing log-shipping config
-    and isn't changed here."""
+    """vlagent ingests syslog on :5140 and dual-writes to both VL backends.
+    Host journal is shipped here by rsyslog (see reconcile_journal_forward)."""
     remotes = " ".join(
         f"-remoteWrite.url={_backend_url(snapshot, n, 9428)}/internal/insert"
         for n in logs_backends
         if _backend_url(snapshot, n, 9428))
     return f"""[Unit]
 Description=Bedrock logs agent (vlagent, dual-writes to both VL backends)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target rsyslog.service
+Wants=network-online.target rsyslog.service
 
 [Service]
 Type=simple
@@ -307,6 +309,58 @@ def _can_start_vm_backend(snapshot: dict, self_name: str) -> bool:
     return _data_dir_seeded(VM_DATA)
 
 
+def _journal_forward_dropin() -> str:
+    return """# Bedrock — forward journal entries to syslog for vlagent pickup.
+# Managed by lib/observability.py
+[Journal]
+ForwardToSyslog=yes
+"""
+
+
+def _rsyslog_vlagent_dropin() -> str:
+    return """# Bedrock — ship journal (via ForwardToSyslog) to local vlagent (:5140).
+# Managed by lib/observability.py — do not edit by hand.
+
+# Avoid feedback loops when vl/VL backend logs re-enter the pipeline.
+if ($programname == 'vlagent' or $programname == 'victoria-logs') then stop
+
+*.* action(
+  type="omfwd"
+  protocol="tcp"
+  target="127.0.0.1"
+  port="5140"
+  template="RSYSLOG_SyslogProtocol23Format"
+  action.resumeRetryCount="-1"
+  queue.type="LinkedList"
+  queue.size="20000"
+  queue.saveonshutdown="on"
+)
+"""
+
+
+def _ensure_rsyslog_package() -> None:
+    """rsyslog is the journal→TCP bridge; install if the ISO/bootstrap skipped it."""
+    if subprocess.run("rpm -q rsyslog", shell=True,
+                      capture_output=True).returncode != 0:
+        _run("dnf install -y -q rsyslog")
+
+
+def reconcile_journal_forward() -> bool:
+    """Ensure journald forwards to syslog and rsyslog ships to vlagent.
+
+    Idempotent: writes two drop-ins, (re)starts services only when content
+    changed. Returns True if any drop-in changed."""
+    _ensure_rsyslog_package()
+    j_changed = _write_if_changed(JOURNAL_FORWARD_DROPIN, _journal_forward_dropin())
+    r_changed = _write_if_changed(RSYSLOG_VLAGENT_DROPIN, _rsyslog_vlagent_dropin())
+    _run("systemctl enable --now rsyslog")
+    if j_changed:
+        _run("systemctl restart systemd-journald")
+    if r_changed:
+        _run("systemctl restart rsyslog")
+    return j_changed or r_changed
+
+
 # ── Reconciler ──────────────────────────────────────────────────────
 
 def reconcile(snapshot: dict, self_name: str) -> None:
@@ -341,6 +395,7 @@ def reconcile(snapshot: dict, self_name: str) -> None:
         _systemd_want(UNIT_VMAGENT, want_running=True, restart_if_running=ch)
 
     if logs_backends:
+        reconcile_journal_forward()
         ch = _write_if_changed(
             f"/etc/systemd/system/{UNIT_VLAGENT}",
             _vlagent_unit(logs_backends, snapshot))

@@ -116,9 +116,10 @@ Two ingress paths:
    `/insert/jsonline` on each backend. Every Bedrock application event
    goes here (operator logins, join requests, seed progress); see
    [reference/logs.md](../reference/logs.md).
-2. **Syslog from cluster nodes** — TCP, RFC 5424, ingested by
-   `bedrock-vlagent` on `:5140` and forwarded. Captures kernel, systemd,
-   libvirtd, qemu, drbd kernel events.
+2. **Syslog from cluster nodes** — journald (`ForwardToSyslog=yes`) → rsyslog
+   → `bedrock-vlagent` on `:5140` → dual-write to both VL backends. Installed
+   by default on every node via `observability.reconcile_journal_forward()`.
+   Captures bedrock-d tracebacks, rqlited, kernel, libvirtd, DRBD, etc.
 
 Dashboard log endpoints in `routes_obs.py` (all call
 `victoria.py:query_logs` against `/select/logsql/query`):

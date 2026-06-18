@@ -179,7 +179,8 @@ loads the DRBD kernel module at every boot — no runtime `modprobe drbd`.
 - `/etc/lvm/lvm.conf`: default.
 - `/etc/selinux/config`: only the `SELINUX=` line is set to `permissive`
   (bootstrap, via `os_setup.configure_base`).
-- `/etc/rsyslog.conf`: untouched (VL ingest is over vlagent's `:5140` listener).
+- `/etc/systemd/journald.conf.d/50-bedrock-forward.conf`: sets `ForwardToSyslog=yes` so journal entries reach rsyslog (written by `observability.reconcile_journal_forward()`).
+- `/etc/rsyslog.d/50-bedrock-vlagent.conf`: forwards syslog (incl. journal) to `127.0.0.1:5140` (local vlagent). Managed by `observability.reconcile_journal_forward()`.
 
 ## Secrets
 

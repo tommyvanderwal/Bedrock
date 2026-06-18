@@ -322,8 +322,8 @@ log "Installing prerequisites..."
 # bundled wheel cache via pip (the alternative — putting httpx in dnf —
 # is a no-op at best and on AlmaLinux 10 makes the line return 1 which
 # previously bricked the rqlite_client transport at firstboot).
-dnf install -y -q python3 python3-pip python3-cryptography curl >/dev/null 2>&1 || {
-    warn "dnf install python3/pip/cryptography/curl returned non-zero (already installed?). Continuing."
+dnf install -y -q python3 python3-pip python3-cryptography curl rsyslog >/dev/null 2>&1 || {
+    warn "dnf install python3/pip/cryptography/curl/rsyslog returned non-zero (already installed?). Continuing."
 }
 # python3-cryptography is the load-bearing one here. Bedrock's
 # peer_auth / join_handshake / witness modules unconditionally import

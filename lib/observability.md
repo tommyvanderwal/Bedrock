@@ -29,7 +29,8 @@ Absolute paths owned here: binaries `VMAGENT_BIN`, `VLAGENT_BIN`, `VM_BIN`, `VL_
 - `_run(cmd) -> None` — `subprocess.run(shell=True, check=False, timeout=30)`, output captured and dropped.
 - `_systemd_want(unit, want_running, restart_if_running=False) -> None` — drive a unit toward running/stopped via `systemctl enable --now` / `disable --now` / `restart`; idempotent (no-op when state already matches); restarts only when running and `restart_if_running` is set.
 - `_backend_url(snapshot, node_name, port) -> str` — resolve a node name to `http://<addr>:<port>`, preferring `nodes[name].loopback_ip` over `host`; empty string if neither is set.
-- `_vmagent_unit(metrics_backends, snapshot) -> str` / `_vlagent_unit(logs_backends, snapshot) -> str` — render the agent unit text, one `-remoteWrite.url` per reachable backend (`:8428/api/v1/write` for metrics, `:9428/internal/insert` for logs). vmagent reads `SCRAPE_FILE` via `-promscrape.config`; vlagent listens on TCP 5140 syslog. Both set `-remoteWrite.maxDiskUsagePerURL=8GB`.
+- `_vmagent_unit(metrics_backends, snapshot) -> str` / `_vlagent_unit(logs_backends, snapshot) -> str` — render the agent unit text, one `-remoteWrite.url` per reachable backend (`:8428/api/v1/write` for metrics, `:9428/internal/insert` for logs). vmagent reads `SCRAPE_FILE` via `-promscrape.config`; vlagent listens on TCP 5140 syslog (`After=rsyslog.service`). Both set `-remoteWrite.maxDiskUsagePerURL=8GB`.
+- `reconcile_journal_forward() -> bool` — write `/etc/systemd/journald.conf.d/50-bedrock-forward.conf` (`ForwardToSyslog=yes`) and `/etc/rsyslog.d/50-bedrock-vlagent.conf` (TCP forward to `127.0.0.1:5140`); enable rsyslog; restart journald/rsyslog only when drop-ins change. Called from `reconcile()` whenever logs backends are configured.
 - `_vm_unit() -> str` / `_vl_unit() -> str` — render the single-binary backend units (VM on `:8428`, 90d retention; VL on `:9428` plus syslog TCP 5141).
 - `_data_dir_seeded(data_dir) -> bool` — `True` if the dir contains a `values.bin` or `items.bin` part anywhere beneath it (real TSDB data vs. empty scaffolding).
 - `_can_start_vm_backend(snapshot, self_name) -> bool` — the metrics-backend start gate (see How it works).
@@ -48,6 +49,7 @@ Absolute paths owned here: binaries `VMAGENT_BIN`, `VLAGENT_BIN`, `VM_BIN`, `VL_
       │     ensure running, restart_if_running = changed
       │
       ├─ logs_backends non-empty:
+      │     reconcile_journal_forward()  (journald + rsyslog drop-ins)
       │     same for bedrock-vlagent.service (dual-write to each logs :9428)
       │
       ├─ want_vm = self_name in metrics_backends
