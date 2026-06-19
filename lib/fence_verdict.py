@@ -5,12 +5,11 @@ synchronous ACT, not a file lookup. On peer loss DRBD spawns `bedrock-fence-peer
 Primary frozen, DRBD waiting for the exit code). The handler POSTs to bedrock-d's
 :8001 HTTP-loopback `/internal/fence-decision {resource, peer_octet}`. bedrock-d then:
 
-  1. Feeds DRBD's AUTHORITATIVE "peer down" evidence into netd's election
-     (shared_state.drbd_down_peers) — DRBD detects a lost peer in ~3-6 s, mesh liveness
-     only after DOWN_HYSTERESIS (~10 s), so this collapses the detection lag.
-  2. Lets netd converge the election on the real partition AND drive the EXCLUSIVE witness
-     claim (ensure_witness_claim) — the claim is what makes an even split safe (only one
-     side reserves the witness vote; two stale files could both read "leader" -> split-brain).
+  1. Feeds DRBD's AUTHORITATIVE "peer down" evidence into the cluster election
+     (shared_state.drbd_down_peers) — DRBD detects a lost peer in ~3-6 s.
+  2. Lets the cluster thread converge the election on the real partition AND drive
+     the EXCLUSIVE witness claim (ensure_witness_claim) — the claim is what makes
+     an even split safe (only one side reserves the witness vote).
   3. Returns the converged verdict; handler -> exit 4 (WIN, outdate peer, continue) /
      6 (LOSE, outdate self, yield) / 1 (undecided, freeze — DRBD's safe default).
 
@@ -41,27 +40,27 @@ ARBITER_RES = "cluster"
 # vm_name that itself contains `-disk` still splits at the last one).
 _VM_RES_RE = re.compile(r"^vm-(.+)-disk\d+$")
 
-# The endpoint waits this long for netd to converge before giving up -> 'undecided' (freeze).
+# The endpoint waits this long for the cluster election to converge before giving up.
 # Must be < the handler's HTTP timeout, which must be < DRBD's (unbounded) handler wait.
 DECIDE_DEADLINE_S = 18.0
-# netd's published (outcome, down_acked) must hold this long before we trust it: a
+# The cluster thread's published (outcome, down_acked) must hold this long before we trust it: a
 # simultaneously-isolated master's per-peer down-evidence arrives over a few election ticks,
 # so we wait for the membership to settle (a transient must not decide). ~3 election ticks.
 DECIDE_STABLE_S = 2.5
 POLL_S = 0.4
-# fence_view is stale (netd wedged) if older than this -> fail safe (freeze).
+# fence_view is stale (cluster thread wedged) if older than this -> fail safe (freeze).
 FRESH_S = 3.0
 
 
 def feed_down(shared_state, peer_octet, *, now: float | None = None) -> None:
-    """Record DRBD's authoritative 'peer <octet> is down' evidence for netd's election
-    (shared_state.drbd_down_peers, monotonic ts). netd forces that peer's liveness False
-    and expires the evidence. Best-effort; never raises."""
+    """Record DRBD's authoritative 'peer <octet> is down' evidence for the cluster
+    election (shared_state.drbd_down_peers, monotonic ts). The cluster thread forces
+    that peer's liveness False and expires the evidence. Best-effort; never raises."""
     if shared_state is None or peer_octet is None:
         return
     now = time.monotonic() if now is None else now
     try:
-        with shared_state.netd_lock:
+        with shared_state.cluster_lock:
             shared_state.drbd_down_peers[int(peer_octet)] = now
     except (OSError, ValueError, TypeError):
         pass
@@ -71,11 +70,10 @@ def decide_fence(shared_state, peer_octet, *, deadline_s: float = DECIDE_DEADLIN
                  stable_s: float = DECIDE_STABLE_S, poll_s: float = POLL_S) -> str:
     """Synchronous fence decision for an arbiter Primary that lost `peer_octet`.
 
-    Feeds the down-evidence, then waits for netd's published `fence_view` to (a) be FRESH
-    (netd ticking), (b) ACK the evidence (peer_octet in down_acked — netd's election has
-    incorporated this loss), and (c) be STABLE (the converged partition view), then maps the
-    outcome -> 'win' (leader) | 'lose' (follower/noquorum) | 'undecided' (deadline -> freeze).
-    The exclusive witness claim is driven by netd's ensure_witness_claim, so a stable
+    Feeds the down-evidence, then waits for the cluster thread's published `fence_view` to
+    (a) be FRESH, (b) ACK the evidence (peer_octet in down_acked), and (c) be STABLE, then
+    maps the outcome -> 'win' (leader) | 'lose' (follower/noquorum) | 'undecided'.
+    The exclusive witness claim is driven by ensure_witness_claim on the Leader path, so a stable
     'leader' here already means the claim is confirmed if the split was witness-pivotal."""
     if shared_state is None or peer_octet is None:
         return "undecided"
@@ -89,7 +87,7 @@ def decide_fence(shared_state, peer_octet, *, deadline_s: float = DECIDE_DEADLIN
         now = time.monotonic()
         feed_down(shared_state, peer_octet, now=now)   # keep evidence alive across the wait
         try:
-            with shared_state.netd_lock:
+            with shared_state.cluster_lock:
                 v = dict(shared_state.fence_view or {})
         except (OSError, RuntimeError):
             v = {}

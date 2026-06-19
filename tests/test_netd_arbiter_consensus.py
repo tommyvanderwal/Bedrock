@@ -3,10 +3,10 @@
 Covers the netd election heartbeat + the cluster_arbiter takeover
 decision matrix:
 
-  * lib.netd.encode/decode_heartbeat — the protocol-4 election heartbeat
+  * lib.cluster_daemon.encode/decode_heartbeat — the protocol-4 election heartbeat
     codec (believed-master / transitioning / arbiter-UUID / ack-target),
     including tamper rejection.
-  * lib.netd._failover_ack_target — the UUID-eligibility-gated vote: a
+  * lib.cluster_daemon._failover_ack_target — the UUID-eligibility-gated vote: a
     superseded candidate is refused (split-brain guard), the lowest-octet
     eligible contender wins.
   * lib.cluster_arbiter._cold_boot_uuid_ok — the cold-boot DRBD-UUID-vs-
@@ -31,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "installer"))
 
 from lib import netd            # noqa: E402
+from lib import cluster_daemon  # noqa: E402
+from lib.cluster_daemon import ClusterDaemon  # noqa: E402
 from lib import cluster_arbiter as ca  # noqa: E402
 from lib import witness         # noqa: E402
 from lib import state as lstate  # noqa: E402
@@ -45,12 +47,12 @@ CU = "u" * 16
 # ────────────────────────────────────────────────────────────────────
 
 def test_heartbeat_roundtrip_carries_all_fields():
-    buf = netd.encode_heartbeat(
+    buf = cluster_daemon.encode_heartbeat(
         cluster_uuid=CU, node="sim-2", ts=12.5,
         believed_master="sim-1", transitioning=True,
         arbiter_uuid="deadbeef", ack_target="sim-2", key=KEY,
     )
-    body = netd.decode_heartbeat(buf, key=KEY)
+    body = cluster_daemon.decode_heartbeat(buf, key=KEY)
     assert body["node"] == "sim-2"
     assert body["believed_master"] == "sim-1"
     assert body["transitioning"] is True
@@ -59,32 +61,32 @@ def test_heartbeat_roundtrip_carries_all_fields():
 
 
 def test_heartbeat_rejected_under_wrong_key():
-    buf = netd.encode_heartbeat(
+    buf = cluster_daemon.encode_heartbeat(
         cluster_uuid=CU, node="sim-2", ts=1.0, believed_master="",
         transitioning=False, arbiter_uuid="", ack_target="", key=KEY,
     )
-    assert netd.decode_heartbeat(buf, key=b"x" * 32) is None
+    assert cluster_daemon.decode_heartbeat(buf, key=b"x" * 32) is None
 
 
 def test_heartbeat_rejected_on_tamper():
-    buf = bytearray(netd.encode_heartbeat(
+    buf = bytearray(cluster_daemon.encode_heartbeat(
         cluster_uuid=CU, node="sim-2", ts=1.0, believed_master="",
         transitioning=False, arbiter_uuid="", ack_target="", key=KEY,
     ))
     buf[-1] ^= 0xFF  # flip a byte
-    assert netd.decode_heartbeat(bytes(buf), key=KEY) is None
+    assert cluster_daemon.decode_heartbeat(bytes(buf), key=KEY) is None
 
 
 # ────────────────────────────────────────────────────────────────────
 #  _failover_ack_target — UUID-eligibility-gated vote
 # ────────────────────────────────────────────────────────────────────
 
-def _daemon(my_node, my_loopback, peer_hb=None, arbiter_uuid=""):
-    d = netd.Daemon(cluster_key=KEY, cluster_uuid=CU,
-                    my_node=my_node, my_loopback=my_loopback)
-    d.peer_hb = peer_hb or {}
-    d.hb_arbiter_uuid = arbiter_uuid
-    return d
+def make_cluster_daemon(my_node, my_loopback, peer_hb=None, arbiter_uuid=""):
+    instance = ClusterDaemon(cluster_key=KEY, cluster_uuid=CU,
+                             my_node=my_node, my_loopback=my_loopback)
+    instance.peer_hb = peer_hb or {}
+    instance.hb_arbiter_uuid = arbiter_uuid
+    return instance
 
 
 def _hb(transitioning, arbiter_uuid, seen=None):
@@ -96,39 +98,39 @@ def _hb(transitioning, arbiter_uuid, seen=None):
 def test_ack_target_picks_lowest_octet_eligible_contender():
     loops = {"sim-2": "100.64.0.2", "sim-3": "100.64.0.3"}
     # self sim-3 (octet 3), peer sim-2 (octet 2) is transitioning + eligible.
-    d = _daemon("sim-3", "100.64.0.3",
-                peer_hb={"sim-2": _hb(True, "abcd")}, arbiter_uuid="ef01")
+    ctrl = make_cluster_daemon("sim-3", "100.64.0.3",
+                               peer_hb={"sim-2": _hb(True, "abcd")}, arbiter_uuid="ef01")
     liveness = {"sim-2": True}
     with mock.patch.object(lstate, "is_uuid_eligible", return_value=True):
-        assert netd._failover_ack_target(d, loops, liveness) == "sim-2"
+        assert cluster_daemon._failover_ack_target(ctrl, loops, liveness) == "sim-2"
 
 
 def test_ack_target_skips_superseded_candidate():
     loops = {"sim-2": "100.64.0.2", "sim-3": "100.64.0.3"}
-    d = _daemon("sim-3", "100.64.0.3",
-                peer_hb={"sim-2": _hb(True, "stale")}, arbiter_uuid="fresh")
+    ctrl = make_cluster_daemon("sim-3", "100.64.0.3",
+                               peer_hb={"sim-2": _hb(True, "stale")}, arbiter_uuid="fresh")
     liveness = {"sim-2": True}
     # sim-2's UUID is superseded (refused) → fall through to self sim-3.
     def elig(uuid, *a, **k):
         return uuid != "stale"
     with mock.patch.object(lstate, "is_uuid_eligible", side_effect=elig):
-        assert netd._failover_ack_target(d, loops, liveness) == "sim-3"
+        assert cluster_daemon._failover_ack_target(ctrl, loops, liveness) == "sim-3"
 
 
 def test_ack_target_abstains_when_no_candidate_eligible():
     loops = {"sim-3": "100.64.0.3"}
-    d = _daemon("sim-3", "100.64.0.3", peer_hb={}, arbiter_uuid="stale")
+    ctrl = make_cluster_daemon("sim-3", "100.64.0.3", peer_hb={}, arbiter_uuid="stale")
     with mock.patch.object(lstate, "is_uuid_eligible", return_value=False):
-        assert netd._failover_ack_target(d, loops, {}) == ""
+        assert cluster_daemon._failover_ack_target(ctrl, loops, {}) == ""
 
 
 def test_ack_target_ignores_non_transitioning_peers():
     loops = {"sim-2": "100.64.0.2", "sim-3": "100.64.0.3"}
     # sim-2 is reachable but NOT transitioning → not a candidate; self wins.
-    d = _daemon("sim-3", "100.64.0.3",
-                peer_hb={"sim-2": _hb(False, "abcd")}, arbiter_uuid="ef01")
+    ctrl = make_cluster_daemon("sim-3", "100.64.0.3",
+                               peer_hb={"sim-2": _hb(False, "abcd")}, arbiter_uuid="ef01")
     with mock.patch.object(lstate, "is_uuid_eligible", return_value=True):
-        assert netd._failover_ack_target(d, loops, {"sim-2": True}) == "sim-3"
+        assert cluster_daemon._failover_ack_target(ctrl, loops, {"sim-2": True}) == "sim-3"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -192,6 +194,8 @@ def _shared_state(my_id=2):
     st = types.SimpleNamespace()
     st.netd_ws = witness.WitnessState(cluster_uuid=CU, cluster_key=KEY,
                                       my_node_id=my_id)
+    st.cluster = types.SimpleNamespace(peer_hb={})
+    st.cluster_lock = __import__("threading").RLock()
     return st
 
 
@@ -271,9 +275,10 @@ def test_takeover_drbd_divergence_refuses(takeover_env):
 # ────────────────────────────────────────────────────────────────────
 
 def _state_with_peer_hb(my_id, peer_hb):
-    """A SHARED_STATE whose .netd.peer_hb is the given dict + a netd_ws."""
+    """A SHARED_STATE whose .cluster.peer_hb is the given dict + a netd_ws."""
     st = types.SimpleNamespace()
-    st.netd = types.SimpleNamespace(peer_hb=peer_hb)
+    st.cluster = types.SimpleNamespace(peer_hb=peer_hb)
+    st.cluster_lock = __import__("threading").RLock()
     st.netd_ws = witness.WitnessState(cluster_uuid=CU, cluster_key=KEY,
                                       my_node_id=my_id, my_node_name="sim-2")
     return st

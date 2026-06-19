@@ -1026,21 +1026,24 @@ def _run_takeover_protocol() -> bool:
 
 def _fresh_peer_hbs() -> dict:
     """Return {peer_name: hb} for every peer whose election heartbeat is
-    FRESH (seen within PEER_HB_FRESH_S). Reads SHARED_STATE.netd.peer_hb,
-    the live per-peer heartbeat record netd maintains. Empty if netd
-    isn't wired or no peer is fresh."""
+    FRESH (seen within PEER_HB_FRESH_S). Reads SHARED_STATE.cluster.peer_hb,
+    maintained by the cluster thread. Empty if cluster isn't wired or no peer
+    is fresh."""
     out: dict = {}
     st = SHARED_STATE
-    d = getattr(st, "netd", None) if st is not None else None
-    peer_hb = getattr(d, "peer_hb", None) if d is not None else None
-    if not peer_hb:
+    if st is None:
         return out
-    now = time.monotonic()
-    for peer, hb in peer_hb.items():
-        if not isinstance(hb, dict):
-            continue
-        if (now - hb.get("seen_at_monotonic", 0.0)) <= PEER_HB_FRESH_S:
-            out[peer] = hb
+    with st.cluster_lock:
+        cluster_daemon = st.cluster
+        peer_hb = getattr(cluster_daemon, "peer_hb", None) if cluster_daemon is not None else None
+        if not peer_hb:
+            return out
+        now = time.monotonic()
+        for peer, hb in peer_hb.items():
+            if not isinstance(hb, dict):
+                continue
+            if (now - hb.get("seen_at_monotonic", 0.0)) <= PEER_HB_FRESH_S:
+                out[peer] = hb
     return out
 
 
@@ -1051,7 +1054,7 @@ def _peer_claims_master_now(ws) -> "str | None":
     when no peer is currently claiming the role (the legitimate
     first-takeover case).
 
-    rqlite-free: reads only netd's in-memory peer heartbeat records."""
+    rqlite-free: reads only the cluster thread's in-memory peer heartbeat records."""
     my_name = getattr(ws, "my_node_name", "") or _self_node_name()
     for peer, hb in _fresh_peer_hbs().items():
         if peer == my_name:

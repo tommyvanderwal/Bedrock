@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
 from lib import witness                 # noqa: E402
 from lib import witness_s3 as w3        # noqa: E402
 from lib import bedrock_state as bs     # noqa: E402
-from lib import netd                    # noqa: E402
+from lib import cluster_daemon  # noqa: E402
 
 
 def _ws():
@@ -33,7 +33,7 @@ def test_drive_resolves_refs_to_clients_and_runs_io(monkeypatch):
     seen = {}
     monkeypatch.setattr(w3, "run_io_cycle",
                         lambda ws_, **k: seen.update(specs=list(ws_.configured_s3_witnesses)))
-    netd._drive_s3_witnesses(ws)
+    cluster_daemon._drive_s3_witnesses(ws)
     # one resolved (wid, S3Config), built from the endpoint + the unsealed secret
     assert len(ws.configured_s3_witnesses) == 1
     wid, cfg = ws.configured_s3_witnesses[0]
@@ -57,7 +57,7 @@ def test_drive_skips_a_witness_whose_secret_cant_be_read(monkeypatch):
     monkeypatch.setattr(bs, "storage_endpoint_secret", _secret)
     monkeypatch.setattr(w3, "run_io_cycle", lambda ws_, **k: None)
     logs = []
-    netd._drive_s3_witnesses(ws, log=logs.append)
+    cluster_daemon._drive_s3_witnesses(ws, log=logs.append)
     ids = [wid for wid, _ in ws.configured_s3_witnesses]
     assert ids == ["good"]                # bad one skipped, good one survives
     assert any("bad" in m for m in logs)  # the skip was logged (fail-loud)
@@ -79,7 +79,7 @@ def test_health_check_flags_a_corrupt_witness(monkeypatch):
     monkeypatch.setattr(bs, "witness_flag_corrupt",
                         lambda wid, reason: (flagged.update({wid: reason}), 1)[1])
     logs = []
-    netd._witness_health_check(ws, None, log=logs.append)
+    cluster_daemon._witness_health_check(ws, None, log=logs.append)
     assert "store lied" in flagged.get("w1", "")
     assert any("FLAGGED CORRUPT" in m for m in logs)
 
@@ -92,7 +92,7 @@ def test_health_check_ok_and_unreachable_never_flag(monkeypatch):
         flagged = {}
         monkeypatch.setattr(bs, "witness_flag_corrupt",
                             lambda wid, reason: flagged.update({wid: reason}))
-        netd._witness_health_check(ws, None)
+        cluster_daemon._witness_health_check(ws, None)
         assert not flagged, f"{verdict} must NOT flag corrupt"
 
 

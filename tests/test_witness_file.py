@@ -16,7 +16,7 @@ import types                   # noqa: E402
 
 from lib import witness        # noqa: E402
 from lib import witness_file   # noqa: E402
-from lib import netd           # noqa: E402
+from lib import cluster_daemon  # noqa: E402
 
 
 _KEY = b"k" * 32
@@ -266,7 +266,7 @@ def test_probe_writable_reason_for_readonly_dir(tmp_path):
         os.chmod(ro, 0o755)   # let pytest clean up
 
 
-# ── netd._witness_file_worker (the background-thread body) ────────────────
+# ── cluster_daemon._witness_file_worker (the background-thread body) ────────────────
 
 def test_witness_file_worker_runs_real_cycle_then_stops(tmp_path):
     """The worker drives the REAL run_io_cycle and produces a verdict, then
@@ -281,7 +281,7 @@ def test_witness_file_worker_runs_real_cycle_then_stops(tmp_path):
         witness_file.run_io_cycle(w, **kw)   # the real thing
         stop["v"] = True                     # one pass, then ask to stop
 
-    netd._witness_file_worker(
+    cluster_daemon._witness_file_worker(
         ws, types.SimpleNamespace(run_io_cycle=cycle_then_stop),
         lambda: stop["v"], interval=0.01)
     assert ws.file_witnesses["fs1"].valid_confirmed is True
@@ -301,7 +301,7 @@ def test_witness_file_worker_survives_a_cycle_exception(tmp_path):
             raise RuntimeError("boom")       # first pass blows up
         stop["v"] = True                     # second pass: survived → stop
 
-    netd._witness_file_worker(
+    cluster_daemon._witness_file_worker(
         ws, types.SimpleNamespace(run_io_cycle=flaky),
         lambda: stop["v"], interval=0.001)
     assert calls["n"] >= 2                    # ran again after the exception

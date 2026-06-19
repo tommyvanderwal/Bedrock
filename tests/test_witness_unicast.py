@@ -13,14 +13,14 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "installer"))
 
 from lib import witness as w          # noqa: E402
-from lib.netd import _parse_echo_addr  # noqa: E402
+from lib import cluster_daemon  # noqa: E402
 
 
 def test_parse_echo_addr_accepts_only_ipv4_unicast():
     # Valid IPv4 unicast literals (the only thing the directed probe may target)
-    assert _parse_echo_addr("192.168.9.50") == ("192.168.9.50", 12321)
-    assert _parse_echo_addr("192.168.9.50:12321") == ("192.168.9.50", 12321)
-    assert _parse_echo_addr("10.0.0.9:9999") == ("10.0.0.9", 9999)
+    assert cluster_daemon._parse_echo_addr("192.168.9.50") == ("192.168.9.50", 12321)
+    assert cluster_daemon._parse_echo_addr("192.168.9.50:12321") == ("192.168.9.50", 12321)
+    assert cluster_daemon._parse_echo_addr("10.0.0.9:9999") == ("10.0.0.9", 9999)
     # Rejected — return None so the election tick never sends to a bad target:
     rejects = [
         "",                  # empty
@@ -39,7 +39,7 @@ def test_parse_echo_addr_accepts_only_ipv4_unicast():
         "a:b:c",             # garbage
     ]
     for bad in rejects:
-        assert _parse_echo_addr(bad) is None, bad
+        assert cluster_daemon._parse_echo_addr(bad) is None, bad
 
 
 def _ws():

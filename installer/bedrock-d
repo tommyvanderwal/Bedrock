@@ -16,7 +16,8 @@ Top-level layout:
       ├── orchestrator tasks: rqlite_subscriber, no_quorum_responder,
       │   boot_orchestrator, converge_retry, backup_scheduler
       └── cert_refresh task (24 h interval)
-    netd thread   — blocking mesh/election/witness loop
+    netd thread     — blocking mesh/routing loop
+    cluster thread  — blocking election/witness/quorum loop
     mdns thread   — blocking UDP responder
 
 On SIGTERM the state.stop_event is set, threads exit, uvicorn returns,
@@ -75,6 +76,14 @@ def main() -> int:
     threading.Thread(target=netd.run_daemon, kwargs={"shared_state": state},
                      name="bedrock-netd", daemon=True).start()
     log.info("bedrock-d: netd thread started")
+
+    from lib import cluster_daemon  # type: ignore
+    threading.Thread(
+        target=cluster_daemon.run_cluster_daemon,
+        kwargs={"shared_state": state},
+        name="bedrock-cluster", daemon=True,
+    ).start()
+    log.info("bedrock-d: cluster thread started")
 
     # NOTE: mdns_responder, http_redirect, and cert_manager are not
     # cluster-decision code paths — they're cosmetic / browser-facing.

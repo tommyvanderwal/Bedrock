@@ -8,8 +8,12 @@ state that the split-daemon design needed.
 Locking discipline:
 
   * netd_lock — held by the netd thread while it mutates Daemon
-    (neighbours, ever_seen_peers, witness state). asyncio readers
-    take a snapshot copy under the lock then process outside.
+    (neighbours, ever_seen_peers). asyncio readers take a snapshot
+    copy under the lock then process outside.
+  * cluster_lock — held by the cluster thread while it mutates
+    ClusterDaemon (peer_hb, election stance) and publishes election
+    outcomes, fence_view, and netd_ws (witness state). The fence
+    endpoint writes drbd_down_peers under cluster_lock too.
   * snapshot_lock — held by rqlite_subscriber while replacing the
     snapshot dict. FastAPI handlers take read snapshots.
 
@@ -47,7 +51,7 @@ class BedrockState:
     cluster_uuid: str = ""
 
     # No-quorum marker semaphore. True = node is in sticky no-quorum
-    # state. netd's election sets True on NoQuorum + holddown;
+    # state. The cluster thread sets True on NoQuorum + holddown;
     # orchestrator's no_quorum_responder sets False after cleanup
     # completes AND quorum is back. The on-disk /run/bedrock-no-quorum
     # file is written/cleared in lockstep so external debug tooling
@@ -60,34 +64,35 @@ class BedrockState:
     netd: Optional[Any] = None  # netd.Daemon; typed as Any to avoid circular import
     netd_lock: threading.RLock = field(default_factory=threading.RLock)
 
-    # Last election outcome (string) — used by netd for transition
-    # logging and by the dashboard for an at-a-glance status.
+    # ── cluster-owned state (election / witness / quorum) ───────────
+    # ClusterDaemon lives here. Single-writer = cluster thread.
+    cluster: Optional[Any] = None  # cluster_daemon.ClusterDaemon
+    cluster_lock: threading.RLock = field(default_factory=threading.RLock)
+
+    # Last election outcome (string) — written by the cluster thread;
+    # read by the dashboard and cluster_arbiter.
     last_election_outcome: str = ""
 
-    # The netd WitnessState (sock + discovered Echo endpoints + the
-    # passive slot cache + own_marker/own_tag). Published by
-    # netd.run_daemon so cluster_arbiter's takeover protocol can read
-    # peers' slots and set its own witness-claim slot at the moment of
-    # promotion (readback-confirmed) without waiting for the slower
-    # netd-election path. cluster_arbiter OWNS own_tag (the claim bit);
-    # netd only refreshes own_marker each tick (Q-01/BAD-4).
+    # WitnessState (sock + discovered Echo endpoints + passive slot cache +
+    # own_marker/own_tag). Published by cluster_daemon.run_cluster_daemon so
+    # cluster_arbiter's takeover protocol can read peers' slots and set its
+    # own witness-claim slot at promote time. cluster_arbiter OWNS own_tag;
+    # the cluster thread refreshes own_marker each tick (Q-01/BAD-4).
     netd_ws: Optional[Any] = None
 
     # ── DRBD fence-peer coordination (replaces /run/bedrock/fence-verdict.json) ──
-    # DRBD detects a lost peer FAST (~3-6 s); netd's mesh liveness is gated by
-    # DOWN_HYSTERESIS (~10 s). On a fence callout the /internal/fence-decision
-    # endpoint feeds DRBD's AUTHORITATIVE per-peer "down" evidence here; netd's
-    # election forces those peers' liveness False, collapsing the detection lag so
-    # the arbitration (incl. the exclusive witness claim driven by netd) converges
-    # in ~seconds instead of ~13 s. Keyed by loopback octet -> monotonic ts;
-    # netd expires entries (DRBD_DOWN_TTL_S) so a healed peer is re-counted.
-    # Written by the endpoint, read+expired by netd — both under netd_lock.
+    # DRBD detects a lost peer FAST (~3-6 s). On a fence callout the
+    # /internal/fence-decision endpoint feeds DRBD's AUTHORITATIVE per-peer
+    # "down" evidence here; the cluster election forces those peers' liveness
+    # False, collapsing detection lag. Keyed by loopback octet -> monotonic ts;
+    # the cluster thread expires entries (DRBD_DOWN_TTL_S) so a healed peer
+    # is re-counted. Written by the endpoint, read+expired by cluster — both
+    # under cluster_lock.
     drbd_down_peers: dict = field(default_factory=dict)
-    # netd publishes the live fence verdict each election tick (in-memory, no file):
+    # The cluster thread publishes the live fence verdict each election tick:
     #   {outcome: str, down_acked: list[int octet], stable_since: float(mono),
     #    updated: float(mono), self_octet: int}
-    # Read by the fence-decision endpoint under netd_lock. `stable_since` resets
-    # when (outcome, down_acked) changes so the endpoint can wait for convergence.
+    # Read by the fence-decision endpoint under cluster_lock.
     fence_view: dict = field(default_factory=dict)
 
     # ── orchestrator-owned state (rqlite_subscriber etc.) ─────────
